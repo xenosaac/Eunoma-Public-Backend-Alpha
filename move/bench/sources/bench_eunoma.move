@@ -13,11 +13,133 @@
 
 module eunoma_bench::bench_eunoma {
     use std::bcs;
+    use std::hash;
     use std::vector;
     use aptos_framework::event;
+
     use eunoma::pool_multi_sig_verifier;
     use eunoma::pool_batch_root_update;
     use eunoma_bench::bench_keys;
+
+    // ========================================================================
+    // Agent D5 — batched-deposit attestation bench helpers.
+    //
+    // Why these live in the bench package (not eunoma_bridge):
+    //   eunoma_bridge's `deposit_batch_with_commitments` requires VaultConfig +
+    //   PreparedDepositBindingVK + VaultConfigCache + chain_id + timestamp +
+    //   `confidential_asset::register_raw` state — all infeasible in a sim
+    //   session that only publishes the three Move packages. Per
+    //   `move/.phase_d_baseline/baseline.json`'s `todo_benches` note:
+    //   "bench_deposit_full … need full state setup (VK + vault + CA
+    //   registration + Groth16 proof). Likely infeasible in sim without
+    //   spoofed VK; defer to testnet measurement."
+    //
+    //   The benches below isolate the parts of the multi-deposit hot path
+    //   that ARE measurable in sim — specifically the multi-sig amortization
+    //   over a batched digest message. The per-item Groth16 verify, CA
+    //   dispatch, nonce-table write, and pool push are O(N) and unchanged
+    //   by the multi-deposit ABI, so they cannot move on the sim signal.
+    //   Testnet measurement at Phase E will catch the full picture.
+    // ========================================================================
+
+    /// Domain prefix for per-item digest. MUST match
+    /// `eunoma::eunoma_bridge::DOMAIN_DEPOSIT_BATCH_ITEM_V1` byte-for-byte
+    /// (verified by re-using the same value here so the digest function
+    /// produces the same bytes the bridge would compute).
+    const DOMAIN_DEPOSIT_BATCH_ITEM_V1: vector<u8> = b"APTOSHIELD_DEPOSIT_BATCH_ITEM_V1";
+
+    /// Local replica of `eunoma_bridge::batch_item_digest`. The bench package
+    /// cannot link a `fun` from `eunoma_bridge` (private), but the algorithm
+    /// is fixed and one-line — pinning it here gives a stable, attribution-
+    /// free bench. If the bridge's digest function ever changes, this
+    /// replica must change in lockstep.
+    fun bench_batch_item_digest(
+        commitment: &vector<u8>,
+        amount_tag: &vector<u8>,
+        ca_payload_hash: &vector<u8>,
+        deposit_nonce: &vector<u8>,
+    ): vector<u8> {
+        let buf = vector::empty<u8>();
+        vector::append(&mut buf, DOMAIN_DEPOSIT_BATCH_ITEM_V1);
+        vector::append(&mut buf, *commitment);
+        vector::append(&mut buf, *amount_tag);
+        vector::append(&mut buf, *ca_payload_hash);
+        vector::append(&mut buf, *deposit_nonce);
+        hash::sha3_256(buf)
+    }
+
+    /// Hardcoded 32-byte placeholder values used by the batch-attestation
+    /// benches. Real on-chain bytes will be Fr scalars from the Gate 4a
+    /// fixture, but the sha3 cost is constant w.r.t. content — these are
+    /// the cheapest representative bytes that still respect the 32-byte
+    /// length invariant the bridge expects.
+    fun fixed_32_bytes(): vector<u8> {
+        x"942a57ac99245f1b86c292b9f835bc920a801db326a996b945c0bdbc48194613"
+    }
+
+    /// Build N parallel per-item digests, each over (commitment, amount_tag,
+    /// ca_payload_hash, deposit_nonce) tuples that mirror the production
+    /// shape. Per-item deposit_nonce differs by index so the resulting
+    /// digests are distinct (matching production where the bridge enforces
+    /// in-batch nonce uniqueness).
+    fun build_n_item_digests(n: u64): vector<vector<u8>> {
+        let digests = vector::empty<vector<u8>>();
+        let i = 0;
+        while (i < n) {
+            // Unique nonce: 32 zero bytes with the LSB set to `i`. The
+            // bridge accepts arbitrary byte vectors as nonces, so any
+            // value with the right uniqueness property works.
+            let nonce_i = vector::empty<u8>();
+            vector::push_back(&mut nonce_i, (i as u8));
+            let j = 1;
+            while (j < 32) {
+                vector::push_back(&mut nonce_i, 0u8);
+                j = j + 1;
+            };
+            let commitment = fixed_32_bytes();
+            let amount_tag = fixed_32_bytes();
+            let cph = fixed_32_bytes();
+            let dig = bench_batch_item_digest(&commitment, &amount_tag, &cph, &nonce_i);
+            vector::push_back(&mut digests, dig);
+            i = i + 1;
+        };
+        digests
+    }
+
+    /// Build the canonical batched-attestation message bytes for N items.
+    /// Mirrors the BCS shape of `eunoma_bridge::BatchDepositAttestationMessage`
+    /// (domain || chain_id || pool_id || op_set_ver || threshold || vault_addr
+    /// || asset_type || item_digests || expiry_secs). The exact field types
+    /// differ slightly (we use plain bytes / scalars for the bench rather
+    /// than full Move framework types like `Object<Metadata>`), so the
+    /// resulting bytes won't match a real on-chain attestation — but the
+    /// per-byte hash cost over the BCS-encoded blob is representative.
+    struct BenchBatchMsg has drop, copy {
+        domain: vector<u8>,
+        chain_id: u8,
+        pool_id: vector<u8>,
+        operator_set_version: u64,
+        threshold: u64,
+        vault_addr: address,
+        asset_type: address, // placeholder for Object<Metadata>
+        item_digests: vector<vector<u8>>,
+        expiry_secs: u64,
+    }
+
+    fun build_batch_msg_bytes(n: u64): vector<u8> {
+        let m = BenchBatchMsg {
+            domain: b"APTOSHIELD_DEPOSIT_BATCH_OK_V1",
+            chain_id: 2u8,
+            pool_id: fixed_32_bytes(),
+            operator_set_version: 1,
+            threshold: 4,
+            vault_addr: @eunoma_bench,
+            asset_type: @eunoma_bench,
+            item_digests: build_n_item_digests(n),
+            expiry_secs: 1_900_000_000,
+        };
+        bcs::to_bytes(&m)
+    }
 
     // Bare-minimum entry. Measures the tx envelope cost (~29 gas). Useful as a
     // floor — subtract this from other bench numbers to get the "pure function
@@ -432,5 +554,66 @@ module eunoma_bench::bench_eunoma {
     public entry fun bench_bcs_encode_attn_dom8_pool8() {
         let msg = mk_msg_realistic(8, 8);
         let _bytes = bcs::to_bytes(&msg);
+    }
+
+    // ====================================================================
+    // Agent D5 — multi-deposit attestation benches.
+    //
+    // What these isolate: the bridge-side cost of (build N per-item digests
+    // + BCS-encode the batched attestation message). NOT the multi-sig
+    // verify itself — `bench_multi_sig_4of7` already measures that. The
+    // coordinator can compute the multi-sig amortization SIM signal as:
+    //
+    //   per_tx_sim_savings_for_n =
+    //       (n − 1) × (bench_multi_sig_4of7 − bench_noop)
+    //     − (bench_deposit_batch_digest_build_nN − bench_noop)
+    //     − (bench_deposit_batch_msg_build_nN − bench_deposit_batch_digest_build_nN)
+    //
+    // For n=4 sim, ~3 × (84−29) = 165 gas saved from amortizing 3 multi-sig
+    // verifies, MINUS the cost of building the batched digest vector and
+    // BCS-encoding the larger attestation message. Net sim signal will be
+    // a single-digit-to-low-hundreds gas saving per batch. Whether that
+    // scales to testnet is open — see `baseline.sim_vs_testnet_caveat`.
+    //
+    // We deliberately do NOT call `pool_multi_sig_verifier::assert_valid_attestation`
+    // inside these benches: bench_keys's hardcoded signatures sign a
+    // DIFFERENT message, so calling the verifier would abort and gas would
+    // not be reported. Splitting the bench cleanly into "build" + "verify"
+    // matches how the coordinator decomposes the savings model anyway.
+    //
+    // Per-item Groth16 verify, CA dispatch, nonce-table write, and pool push
+    // are O(N) and ABI-unchanged by multi-deposit — they cannot move on the
+    // sim signal. Testnet measurement at Phase E will catch the full picture.
+    // ====================================================================
+
+    /// Cost of building N=1 per-item digest + BCS-encoding the batch
+    /// attestation message for a 1-item batch.
+    public entry fun bench_deposit_batch_msg_build_n1() {
+        let _msg = build_batch_msg_bytes(1);
+    }
+
+    /// Cost of building N=2 per-item digests + BCS-encoding the batch
+    /// attestation message for a 2-item batch. Pair with
+    /// `bench_multi_sig_4of7` (=baseline single-deposit attestation cost):
+    /// expected to amortize ~55 sim gas (= bench_multi_sig_4of7 − bench_noop)
+    /// across the 1 extra item, minus the digest/BCS overhead measured here.
+    public entry fun bench_deposit_batch_msg_build_n2() {
+        let _msg = build_batch_msg_bytes(2);
+    }
+
+    /// Cost of building N=4 per-item digests + BCS-encoding the batch
+    /// attestation message for a 4-item batch. The brief's main target —
+    /// projected sim savings of ~165 gas (= 3 × 55 amortized multi-sig)
+    /// minus the digest+BCS overhead measured here.
+    public entry fun bench_deposit_batch_msg_build_n4() {
+        let _msg = build_batch_msg_bytes(4);
+    }
+
+    /// Cost of building N=8 per-item digests + BCS-encoding (max allowed
+    /// batch size). Sanity check the digest+BCS overhead doesn't dominate
+    /// at the upper bound; coordinator uses this to decide whether to ship
+    /// `MAX_BATCH_DEPOSITS = 8` or trim it back.
+    public entry fun bench_deposit_batch_msg_build_n8() {
+        let _msg = build_batch_msg_bytes(8);
     }
 }
