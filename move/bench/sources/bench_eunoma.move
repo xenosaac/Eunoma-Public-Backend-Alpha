@@ -116,11 +116,13 @@ module eunoma_bench::bench_eunoma {
     }
 
     // Build a realistic-shape AttnMsgLike using a fill byte. Total BCS size:
-    //   uleb(24)+24 + 1 + uleb(32)+32 + 8 + 8 + 32 + 32 + uleb(32)+32 + uleb(32)+32
+    //   uleb(domain_len)+domain_len + 1 + uleb(pool_id_len)+pool_id_len
+    //   + 8 + 8 + 32 + 32 + uleb(32)+32 + uleb(32)+32
     //   + uleb(32)+32 + uleb(16)+16 + 8
-    //   = 25 + 1 + 33 + 8 + 8 + 32 + 32 + 33 + 33 + 33 + 17 + 8 = 263 bytes
-    fun mk_msg_realistic(pool_id_len: u64): AttnMsgLike {
-        let domain = repeat_byte(0xAB, 24);
+    //   With domain_len=24, pool_id_len=32: 25 + 1 + 33 + 8 + 8 + 32 + 32 + 33 + 33 + 33 + 17 + 8 = 263 bytes
+    //   With domain_len=8,  pool_id_len=8:  9  + 1 + 9  + 8 + 8 + 32 + 32 + 33 + 33 + 33 + 17 + 8 = 223 bytes
+    fun mk_msg_realistic(domain_len: u64, pool_id_len: u64): AttnMsgLike {
+        let domain = repeat_byte(0xAB, domain_len);
         let pool_id = repeat_byte(0x01, pool_id_len);
         let commitment = repeat_byte(0x11, 32);
         let amount_tag = repeat_byte(0x22, 32);
@@ -404,20 +406,31 @@ module eunoma_bench::bench_eunoma {
     }
 
     /// Probe A: BCS encode a realistic-sized attestation-shape message with
-    /// the CURRENT 32-byte pool_id encoding (matches production Move side).
+    /// the PRE-c1/c3 encoding: 24-byte domain + 32-byte pool_id. Matches
+    /// production Move side BEFORE Phase D Agent D1's changes.
     /// Total BCS size: ~263 bytes.
     public entry fun bench_bcs_encode_attn_pool32() {
-        let msg = mk_msg_realistic(32);
+        let msg = mk_msg_realistic(24, 32);
         let _bytes = bcs::to_bytes(&msg);
     }
 
-    /// Probe B: same as Probe A but pool_id shrunk to 8 bytes (the LE u64
-    /// representation — already what the TS deposit encoder uses, per
-    /// shared/src/attestation.ts). Saves 24 bytes of payload + 1 byte of
-    /// ULEB128 length difference = effectively 24 bytes (uleb(8)=1B, uleb(32)=1B).
+    /// Probe B: pool_id shrunk to 8 bytes (Phase D c1 + c2). Matches
+    /// production AFTER c1/c2 (24-byte domain still). The 8-byte LE u64
+    /// pool_id form mirrors the TS deposit encoder
+    /// (operator-services/shared/src/attestation.ts:60-89).
     /// Total BCS size: ~239 bytes.
     public entry fun bench_bcs_encode_attn_pool8() {
-        let msg = mk_msg_realistic(8);
+        let msg = mk_msg_realistic(24, 8);
+        let _bytes = bcs::to_bytes(&msg);
+    }
+
+    /// Probe C: both domain (24 → 8) AND pool_id (32 → 8) shrunk. Matches
+    /// production AFTER c1 + c2 + c3. Domain separator is now "DEP_OK_1" /
+    /// "WDR_OK_1" (8 bytes each) so the BCS-encoded domain shrinks from 25B
+    /// (uleb(24)=1 + 24) to 9B (uleb(8)=1 + 8) = 16 bytes saved on top of c1/c2.
+    /// Total BCS size: ~223 bytes.
+    public entry fun bench_bcs_encode_attn_dom8_pool8() {
+        let msg = mk_msg_realistic(8, 8);
         let _bytes = bcs::to_bytes(&msg);
     }
 }

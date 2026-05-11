@@ -44,7 +44,9 @@ const DEFAULT_CHAIN_ID = 2;
 // (which in turn shrinks SHA512 input fed to each ed25519 verify on chain).
 // Value 0 (POOL_ID_VALUE) ⇒ 8 zero bytes.
 const POOL_ID_FR_BYTES = new Uint8Array(8);
-const DOMAIN_WITHDRAW_OK_V1 = new TextEncoder().encode("APTOSHIELD_WITHDRAW_OK_V1");
+// Phase D Agent D1 c3: 8-byte tag (was 25-byte "APTOSHIELD_WITHDRAW_OK_V1").
+// MUST match Move-side DOMAIN_WITHDRAW_OK_V1 in eunoma_bridge.move byte-for-byte.
+const DOMAIN_WITHDRAW_OK_V1 = new TextEncoder().encode("WDR_OK_1");
 
 function hex(b: Uint8Array): string {
   return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");

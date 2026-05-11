@@ -96,9 +96,9 @@ export interface AttestationResult {
   threshold_met: boolean;
 }
 
-export const DOMAIN_DEPOSIT_OK_V1 = new TextEncoder().encode(
-  "APTOSHIELD_DEPOSIT_OK_V1",
-);
+// Phase D Agent D1 c3: 8-byte tag (was 24-byte "APTOSHIELD_DEPOSIT_OK_V1").
+// MUST match Move-side DOMAIN_DEPOSIT_OK_V1 in eunoma_bridge.move byte-for-byte.
+export const DOMAIN_DEPOSIT_OK_V1 = new TextEncoder().encode("DEP_OK_1");
 export const POSEIDON_DOMAIN_ASSET_ID = new TextEncoder().encode(
   "APTOSHIELD_ASSET_ID_V1",
 );

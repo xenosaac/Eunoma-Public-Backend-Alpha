@@ -73,8 +73,18 @@ module eunoma::eunoma_bridge {
     /// Domain separators for attestation BCS hashes. These are the first field of the
     /// DepositAttestationMessage / WithdrawAttestationMessage and MUST match the
     /// off-chain TS operator builder byte-for-byte.
-    const DOMAIN_DEPOSIT_OK_V1: vector<u8> = b"APTOSHIELD_DEPOSIT_OK_V1";
-    const DOMAIN_WITHDRAW_OK_V1: vector<u8> = b"APTOSHIELD_WITHDRAW_OK_V1";
+    /// Phase D Agent D1 c3: shrunk from 24-byte / 25-byte ASCII tags to 8-byte
+    /// tags. Domain separation only requires that deposit-domain bytes ≠
+    /// withdraw-domain bytes; the long ASCII forms were a human-readability
+    /// convenience, not a cryptographic requirement. Saves 16 / 17 BCS bytes
+    /// per signed message, which (a) lowers BCS-encode gas (see
+    /// bench_bcs_encode_attn_pool* probes; same slope applies) and (b)
+    /// shrinks SHA512 input fed to each ed25519::signature_verify_strict
+    /// call (4× per deposit / withdraw). The "_V1" suffix on each tag
+    /// preserves forward-compatibility: a future migration (e.g. selectable
+    /// disclosure rules) can rev to "_V2" without colliding with V1 sigs.
+    const DOMAIN_DEPOSIT_OK_V1: vector<u8> = b"DEP_OK_1";   // 8 bytes
+    const DOMAIN_WITHDRAW_OK_V1: vector<u8> = b"WDR_OK_1";  // 8 bytes
 
     /// Length of an Ed25519 public key in bytes.
     const ED25519_PUBLIC_KEY_BYTES: u64 = 32;
