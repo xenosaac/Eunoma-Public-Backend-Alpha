@@ -49,6 +49,12 @@ coverage/
 **/.deposit-proof-tmp/
 **/.withdraw-proof-tmp/
 
+# Local-only tooling (per-machine, never pushed)
+docker-compose.yml
+**/docker-compose.yml
+Dockerfile
+**/Dockerfile
+
 # Internal documentation — local-only, NOT pushed to GitHub public mirror.
 # These contain trade-off analysis, decision logs, narrative / trust-model
 # drafts, testnet address ground-truth, and operator handoff packages —
