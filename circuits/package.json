@@ -17,5 +17,8 @@
     "circomlibjs": "^0.1.7",
     "ffjavascript": "^0.2.62",
     "snarkjs": "^0.7.6"
+  },
+  "devDependencies": {
+    "puppeteer": "^24.43.1"
   }
 }
