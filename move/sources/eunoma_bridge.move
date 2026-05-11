@@ -1697,6 +1697,13 @@ module eunoma::eunoma_bridge {
         memo: vector<u8>,
     ) acquires VaultConfig, PreparedDepositBindingVK, VaultConfigCache {
         assert!(exists<VaultConfig>(@eunoma), E_NOT_INITIALIZED);
+
+        // Gas P3: expiry check uses ONLY `expiry_secs` (not `cfg`); run it
+        // BEFORE `borrow_global_mut<VaultConfig>` so an expired-attestation
+        // abort doesn't pay the VaultConfig write-set entry. (cfg-dependent
+        // checks below stay after the borrow.)
+        assert_not_expired(expiry_secs);
+
         let cfg = borrow_global_mut<VaultConfig>(@eunoma);
 
         // 1. Pause check.
@@ -1708,9 +1715,6 @@ module eunoma::eunoma_bridge {
         // bridge-specific error code so an attacker depositing-from-vault is
         // distinguishable from a legitimate framework abort.
         assert!(signer::address_of(user) != cfg.vault_addr, E_INVALID_DEPOSIT_BINDING_PROOF);
-
-        // 2. Expiry check.
-        assert_not_expired(expiry_secs);
 
         // 3. Nonce-replay check.
         assert!(
