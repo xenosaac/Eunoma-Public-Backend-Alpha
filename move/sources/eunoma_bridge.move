@@ -372,11 +372,20 @@ module eunoma::eunoma_bridge {
     }
 
     /// Phase 2 / Gate 6 — emitted on successful `withdraw_to_recipient`.
+    ///
+    /// Phase D / Agent D6 gas trim: `asset_type` field removed. The vault's
+    /// asset_type is fixed per deployment and readable via the
+    /// `get_asset_type()` view from `VaultConfig`. Indexers that need
+    /// per-event asset disambiguation must read VaultConfig at the same
+    /// version once at startup; removing this field saves the 32-byte BCS
+    /// encoding (address) on every withdraw emit.
+    /// BREAK NOTE: external event subscribers that decoded `asset_type` from
+    /// raw event JSON must migrate to VaultConfig view. The in-tree
+    /// operator-services has no such consumer (verified 2026-05-11).
     #[event]
     struct WithdrawEvent has drop, store {
         nullifier_hash: vector<u8>,
         recipient: address,
-        asset_type: Object<fungible_asset::Metadata>,
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         vault_sequence: u64,
@@ -401,11 +410,14 @@ module eunoma::eunoma_bridge {
     /// would emit `u64::MAX`. Until then the bridge emits 0 unconditionally and a
     /// follow-up gate replaces this single field once the architecture is pinned.
     /// TODO pool gate: replace placeholder leaf_index = 0 with real value.
+    /// Phase D / Agent D6 gas trim: `asset_type` field removed (32-byte BCS).
+    /// Same rationale as WithdrawEvent — asset_type is fixed per deployment
+    /// and obtainable via `get_asset_type()` from VaultConfig. Saves storage
+    /// gas on every deposit (hot path).
     #[event]
     struct DepositEvent has drop, store {
         commitment: vector<u8>,
         leaf_index: u64,
-        asset_type: Object<fungible_asset::Metadata>,
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         deposit_nonce: vector<u8>,
@@ -1855,10 +1867,11 @@ module eunoma::eunoma_bridge {
         pending_queue::deposit_precomputed(commitment, 0);
 
         // 10. Emit completion event.
+        // Phase D / Agent D6: asset_type field removed from DepositEvent — see
+        // struct definition comment. Indexers read asset_type from VaultConfig.
         event::emit(DepositEvent {
             commitment,
             leaf_index,
-            asset_type: cfg.asset_type,
             amount_tag,
             ca_payload_hash,
             deposit_nonce,
@@ -2068,10 +2081,11 @@ module eunoma::eunoma_bridge {
         );
 
         // 13. Emit completion event.
+        // Phase D / Agent D6: asset_type field removed from WithdrawEvent —
+        // see struct definition comment.
         event::emit(WithdrawEvent {
             nullifier_hash,
             recipient,
-            asset_type: cfg.asset_type,
             amount_tag,
             ca_payload_hash,
             vault_sequence,

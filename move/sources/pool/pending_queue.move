@@ -144,15 +144,19 @@ module eunoma::pool_pending_queue {
     //      the logical batch this deposit will be folded into. The operator
     //      may submit a different actual batch_size; this is a hint for
     //      indexers.
-    //   * queue_position — equal to deposit_index for MVP (1:1).
     //   * compliance_attestation_id — opaque link to off-chain KYC/screening
     //      record. Type u64 is sufficient to address a per-operator nonce.
+    //
+    // Phase D / Agent D6 gas trim: `queue_position` field removed. In the MVP
+    // it always equals `deposit_index` (1:1 mapping), so consumers should
+    // use `deposit_index`. The in-tree operator script
+    // (testnet_batch_root_update.ts) already reads `deposit_index`, not
+    // `queue_position`. Saves 8 bytes per emit on the deposit hot path.
     #[event]
     struct DepositQueued has drop, store {
         deposit_index: u64,
         leaf_commitment: vector<u8>,
         deposit_batch_id: u64,
-        queue_position: u64,
         compliance_attestation_id: u64,
     }
 
@@ -276,12 +280,12 @@ module eunoma::pool_pending_queue {
         q.next_index = idx + 1;
 
         // Step 3: emit event.
+        // Phase D / Agent D6: queue_position dropped (= idx; redundant in MVP).
         let batch_id = idx / DEFAULT_BATCH_SIZE;
         event::emit(DepositQueued {
             deposit_index: idx,
             leaf_commitment,
             deposit_batch_id: batch_id,
-            queue_position: idx,
             compliance_attestation_id,
         });
     }
@@ -327,12 +331,12 @@ module eunoma::pool_pending_queue {
 
         q.next_index = idx + 1;
 
+        // Phase D / Agent D6: queue_position dropped (= idx; redundant in MVP).
         let batch_id = idx / DEFAULT_BATCH_SIZE;
         event::emit(DepositQueued {
             deposit_index: idx,
             leaf_commitment,
             deposit_batch_id: batch_id,
-            queue_position: idx,
             compliance_attestation_id,
         });
     }

@@ -192,6 +192,19 @@ module eunoma::pool_batch_root_update {
     // Events
     // ========================================================================
 
+    /// Phase D / Agent D6 gas trim: `queue_range_hash` and
+    /// `frontier_or_meta_hash` removed (saves 64 bytes / ~5 gas per emit in
+    /// local sim, likely more on testnet due to per-byte storage charges).
+    ///
+    /// Both fields are SIGNED INPUTS to the canonical attestation message
+    /// (see `canonical_message_bytes`) and are verified on-chain via
+    /// `E_INV5_QUEUE_RANGE_HASH_MISMATCH` and the frontier_or_meta_hash check.
+    /// Once verified, they have no further on-chain consumer; the event copy
+    /// was observability-only. External indexers wishing to audit the signed
+    /// message can reconstruct both hashes from the on-chain commitment list +
+    /// the batch range (start_index..end_index, already in this event).
+    /// No operator-services consumer reads these fields from the event
+    /// (verified 2026-05-11).
     #[event]
     struct BatchRootUpdated has drop, store {
         batch_id: u64,
@@ -200,8 +213,6 @@ module eunoma::pool_batch_root_update {
         start_index: u64,
         end_index: u64,
         batch_size: u64,
-        queue_range_hash: vector<u8>,
-        frontier_or_meta_hash: vector<u8>,
     }
 
     // ========================================================================
@@ -543,6 +554,9 @@ module eunoma::pool_batch_root_update {
         h.next_unfinalized_index = end_index;
         h.last_batch_id = batch_id;
 
+        // Phase D / Agent D6: queue_range_hash + frontier_or_meta_hash removed
+        // from BatchRootUpdated emit — see struct comment. Both are already
+        // verified upstream (E_INV5 + frontier check) and have no consumer.
         event::emit(BatchRootUpdated {
             batch_id,
             old_root,
@@ -550,8 +564,6 @@ module eunoma::pool_batch_root_update {
             start_index,
             end_index,
             batch_size,
-            queue_range_hash,
-            frontier_or_meta_hash,
         });
     }
 
