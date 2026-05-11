@@ -12,6 +12,7 @@
 // surface on the production deployment.
 
 module eunoma_bench::bench_eunoma {
+    use std::bcs;
     use std::vector;
     use aptos_framework::event;
     use eunoma::pool_multi_sig_verifier;
@@ -81,6 +82,71 @@ module eunoma_bench::bench_eunoma {
         let i: u64 = 0;
         while (i < 32) {
             vector::push_back(&mut v, (i as u8));
+            i = i + 1;
+        };
+        v
+    }
+
+    // ----- Phase D-Agent-D1 BCS-shrink slope probes -----
+    //
+    // These probes measure the gas cost of BCS-encoding a struct whose total
+    // serialized size approximates the realistic DepositAttestationMessage
+    // (~200 bytes BCS). The goal is to bound the gas/byte slope of
+    // `bcs::to_bytes` on the attestation hot path so we can decide whether
+    // shrinking the on-wire payload (pool_id u64 instead of vector<u8>, etc.)
+    // gives any measurable saving.
+    //
+    // We can't use the production DepositAttestationMessage struct directly
+    // (it's module-private). Mirror its field layout & sizes here so BCS cost
+    // matches the production hot path to within a few bytes.
+
+    struct AttnMsgLike has drop {
+        domain: vector<u8>,        // ~24 bytes
+        chain_id: u8,
+        pool_id: vector<u8>,       // current: 32 bytes (Move pool_id_to_fr_bytes)
+        operator_set_version: u64,
+        threshold: u64,
+        vault_addr: address,       // 32 bytes
+        asset_type: address,       // 32 bytes
+        commitment: vector<u8>,    // 32 bytes
+        amount_tag: vector<u8>,    // 32 bytes
+        ca_payload_hash: vector<u8>, // 32 bytes
+        deposit_nonce: vector<u8>, // ~16 bytes
+        expiry_secs: u64,
+    }
+
+    // Build a realistic-shape AttnMsgLike using a fill byte. Total BCS size:
+    //   uleb(24)+24 + 1 + uleb(32)+32 + 8 + 8 + 32 + 32 + uleb(32)+32 + uleb(32)+32
+    //   + uleb(32)+32 + uleb(16)+16 + 8
+    //   = 25 + 1 + 33 + 8 + 8 + 32 + 32 + 33 + 33 + 33 + 17 + 8 = 263 bytes
+    fun mk_msg_realistic(pool_id_len: u64): AttnMsgLike {
+        let domain = repeat_byte(0xAB, 24);
+        let pool_id = repeat_byte(0x01, pool_id_len);
+        let commitment = repeat_byte(0x11, 32);
+        let amount_tag = repeat_byte(0x22, 32);
+        let ca_payload_hash = repeat_byte(0x33, 32);
+        let deposit_nonce = repeat_byte(0x44, 16);
+        AttnMsgLike {
+            domain,
+            chain_id: 2,
+            pool_id,
+            operator_set_version: 1,
+            threshold: 4,
+            vault_addr: @0x1,
+            asset_type: @0x2,
+            commitment,
+            amount_tag,
+            ca_payload_hash,
+            deposit_nonce,
+            expiry_secs: 1735689600,
+        }
+    }
+
+    fun repeat_byte(b: u8, n: u64): vector<u8> {
+        let v = vector::empty<u8>();
+        let i = 0;
+        while (i < n) {
+            vector::push_back(&mut v, b);
             i = i + 1;
         };
         v
@@ -335,5 +401,23 @@ module eunoma_bench::bench_eunoma {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
         ];
         let _ = pool_batch_root_update::is_root_in_history(bogus_root);
+    }
+
+    /// Probe A: BCS encode a realistic-sized attestation-shape message with
+    /// the CURRENT 32-byte pool_id encoding (matches production Move side).
+    /// Total BCS size: ~263 bytes.
+    public entry fun bench_bcs_encode_attn_pool32() {
+        let msg = mk_msg_realistic(32);
+        let _bytes = bcs::to_bytes(&msg);
+    }
+
+    /// Probe B: same as Probe A but pool_id shrunk to 8 bytes (the LE u64
+    /// representation — already what the TS deposit encoder uses, per
+    /// shared/src/attestation.ts). Saves 24 bytes of payload + 1 byte of
+    /// ULEB128 length difference = effectively 24 bytes (uleb(8)=1B, uleb(32)=1B).
+    /// Total BCS size: ~239 bytes.
+    public entry fun bench_bcs_encode_attn_pool8() {
+        let msg = mk_msg_realistic(8);
+        let _bytes = bcs::to_bytes(&msg);
     }
 }

@@ -1188,6 +1188,32 @@ module eunoma::eunoma_bridge {
         buf
     }
 
+    /// Phase D Agent D1 — 8-byte LE u64 encoding of `POOL_ID_VALUE` for use as
+    /// the `pool_id` field of `DepositAttestationMessage`. The 32-byte LE Fr
+    /// form (`pool_id_to_fr_bytes`) is still used for the Groth16 binding-proof
+    /// public input (where field-element width is mandatory), but the
+    /// attestation-signing message only needs an unambiguous 8-byte u64 — which
+    /// is what the off-chain TS deposit encoder already produces (see
+    /// `operator-services/shared/src/attestation.ts:60-89`). Shrinking from
+    /// 32 → 8 bytes on the attestation hot path:
+    ///   * saves 24 BCS bytes per signed message (24 bytes of payload; the
+    ///     ULEB128 length prefix stays 1 byte for both 8 and 32),
+    ///   * shrinks the SHA512 input fed to each ed25519::signature_verify_strict
+    ///     call (4× per deposit at 4-of-7),
+    ///   * fixes a pre-existing Move-vs-TS parity bug (Move signed-over 32 B,
+    ///     TS signed-over 8 B on deposit — see attestation.ts comment line 60).
+    fun pool_id_to_le_u64_bytes(): vector<u8> {
+        let n = POOL_ID_VALUE;
+        let buf = vector::empty<u8>();
+        let i = 0;
+        while (i < 8) {
+            vector::push_back(&mut buf, ((n & 0xFFu64) as u8));
+            n = n >> 8;
+            i = i + 1;
+        };
+        buf
+    }
+
     /// Helper: deserialize a 32-byte LE Fr scalar. Aborts on malformed bytes.
     fun de_fr(bytes: vector<u8>): crypto_algebra::Element<Fr> {
         let opt = crypto_algebra::deserialize<Fr, FormatFrLsb>(&bytes);
@@ -1780,7 +1806,15 @@ module eunoma::eunoma_bridge {
         //    sign over the recomputed hash; a stand-alone equality check would
         //    permit a future bug where the bridge accepts an operator signature
         //    over a hash that doesn't match the recomputed value.
-        let pool_id_bytes = pool_id_to_fr_bytes();
+        // Phase D Agent D1 — 8-byte LE u64 pool_id (vs prior 32-byte LE Fr) for
+        // the attestation message body only. The Groth16 binding-proof public
+        // input below (step 6) still calls `pool_id_to_fr_bytes()` because that
+        // path NEEDS a 32-byte Fr representation. The on-the-wire signed
+        // message is now 24 bytes shorter, which (a) matches the TS deposit
+        // encoder byte-for-byte (`shared/src/attestation.ts:60-89` — fixes a
+        // pre-existing Move-vs-TS parity bug) and (b) shrinks SHA512 input
+        // bytes to each of the 4 ed25519::signature_verify_strict calls.
+        let pool_id_bytes = pool_id_to_le_u64_bytes();
         let chain_id_u8 = chain_id::get();
         let msg = new_deposit_attestation_message(
             cfg,
