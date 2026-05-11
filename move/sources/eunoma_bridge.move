@@ -1156,6 +1156,10 @@ module eunoma::eunoma_bridge {
     /// Decision (subagent — documented in REPORT_GATE_4B): hardcoded constant 0
     /// for now (matches Gate 4a fixture). The pool gate (post-batching-decision)
     /// may rewrite this to a per-pool registry lookup.
+    /// Gas P4: build the 32-byte buffer in one pass instead of an 8-byte temp
+    /// followed by a call to `bytes_to_field_le32` (which re-allocates and does
+    /// another 32 push_backs). Saves one alloc + one helper call + ~8 ops per
+    /// deposit/withdraw on the attestation hot path.
     fun pool_id_to_fr_bytes(): vector<u8> {
         let n = POOL_ID_VALUE;
         let buf = vector::empty<u8>();
@@ -1165,7 +1169,11 @@ module eunoma::eunoma_bridge {
             n = n >> 8;
             i = i + 1;
         };
-        bytes_to_field_le32(&buf)
+        while (i < FR_BYTES) {
+            vector::push_back(&mut buf, 0u8);
+            i = i + 1;
+        };
+        buf
     }
 
     /// Helper: deserialize a 32-byte LE Fr scalar. Aborts on malformed bytes.
