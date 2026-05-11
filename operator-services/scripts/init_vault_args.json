@@ -1,0 +1,54 @@
+{
+  "function_id": "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820::eunoma_bridge::init_vault_with_ca_registration",
+  "type_args": [],
+  "args": [
+    {
+      "type": "address",
+      "value": "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820"
+    },
+    {
+      "type": "address",
+      "value": "0xa"
+    },
+    {
+      "type": "hex",
+      "value": [
+        "0x44cb9b9ae8d47d105adce29eba5e087c39580ca6e1f2caa9ab74e4b5eaed8bc2",
+        "0x51bb376f54a216b2688e8f5f1c0685b57fe208f439c2f48e640a2c5db8b0c6f4",
+        "0xd0d6250306085136f7f215edad6e45511ca5f9009e05d1b9f0252edbcb0cf797",
+        "0xe3ea9e3bf3691452bb237ca82bad66ddf8d257ec19fadbe2c994e97bb188686f",
+        "0x93ce34d48f1d3d948b823518fa7e1e7da78dd7a70d82372f9adf0e30b3f0ea85",
+        "0x70ee42c73e38e65e4f87e26c64a9ab09299d055a5c78b9d6c2c767b1a3e12c03",
+        "0x20fe64a4444d201d226291272f9bc4dfdffac97cc29d6fe985fd575de2dbf163"
+      ]
+    },
+    {
+      "type": "u64",
+      "value": "0"
+    },
+    {
+      "type": "u64",
+      "value": "4"
+    },
+    {
+      "type": "hex",
+      "value": "0x65756e6f6d612d627269646765"
+    },
+    {
+      "type": "hex",
+      "value": "0x34c45300041a10ca5b1c6959e98a5433878f7eafdef24bd2ecd0052a443e8616"
+    },
+    {
+      "type": "hex",
+      "value": [
+        "0xe4ae6ee5d0cc4ce0203d75d5f59cdc87d52f77a937fbf7d951adbde78c09545d"
+      ]
+    },
+    {
+      "type": "hex",
+      "value": [
+        "0x07ae51b6991467e29e1c4b2ebf1aa10eafb4dbaa99a53bb6d42ce2f454fb4a01"
+      ]
+    }
+  ]
+}

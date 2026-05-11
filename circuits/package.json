@@ -1,0 +1,21 @@
+{
+  "name": "aptosshield-circuits",
+  "version": "0.1.0",
+  "description": "ConfidentialAPT shielded-bridge Circom circuits (deposit-binding, etc.)",
+  "private": true,
+  "scripts": {
+    "compile": "bash scripts/compile.sh",
+    "setup": "bash scripts/setup_dev.sh",
+    "prove": "bash scripts/prove.sh",
+    "verify": "bash scripts/verify.sh",
+    "export": "node scripts/export_to_move.js",
+    "parity": "node scripts/poseidon_parity.js",
+    "all": "bash scripts/compile.sh && bash scripts/setup_dev.sh && bash scripts/prove.sh && bash scripts/verify.sh && node scripts/export_to_move.js"
+  },
+  "dependencies": {
+    "circomlib": "^2.0.5",
+    "circomlibjs": "^0.1.7",
+    "ffjavascript": "^0.2.62",
+    "snarkjs": "^0.7.6"
+  }
+}

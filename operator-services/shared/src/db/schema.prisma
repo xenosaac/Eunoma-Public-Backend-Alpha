@@ -1,0 +1,76 @@
+// Prisma schema — deposit-related tables only (Gate 4c).
+// Withdraw + maintenance tables defer to Gates 5/6.
+//
+// Test environments use SQLite via DATABASE_URL=file:./test.db.
+// Production uses PostgreSQL.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model OperatorSetSnapshot {
+  operator_set_version BigInt   @id
+  pubkeys              Bytes // BCS-encoded vector<vector<u8>>
+  main_index           Int
+  threshold            Int
+  captured_at          DateTime @default(now())
+}
+
+model DepositRequest {
+  request_id            String   @id
+  user_addr             String
+  vault_addr            String
+  asset_type            String
+  amount                BigInt
+  deposit_blind         Bytes
+  amount_tag            Bytes
+  commitment            Bytes
+  deposit_binding_proof Bytes
+  ca_payload_hash       Bytes
+  ca_payload_jsonb      Json
+  deposit_nonce         Bytes    @unique
+  expiry                BigInt
+  status                String // "received" | "verified" | "complete" | "rejected"
+  created_at            DateTime @default(now())
+
+  signatures AttestationSignature[]
+  payload    CAPayload?
+  audit_logs AuditLog[]
+}
+
+model AttestationSignature {
+  id                  String   @id @default(uuid())
+  request_id          String
+  operator_slot       Int
+  signature_bytes     Bytes
+  message_bytes_hash  Bytes
+  verification_status String // "valid" | "invalid"
+  created_at          DateTime @default(now())
+
+  request DepositRequest @relation(fields: [request_id], references: [request_id])
+}
+
+model CAPayload {
+  id            String   @id @default(uuid())
+  request_id    String   @unique
+  payload_jsonb Json
+  computed_hash Bytes
+  created_at    DateTime @default(now())
+
+  request DepositRequest @relation(fields: [request_id], references: [request_id])
+}
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  request_id    String?
+  event_type    String
+  payload_jsonb Json
+  timestamp     DateTime @default(now())
+
+  request DepositRequest? @relation(fields: [request_id], references: [request_id])
+}

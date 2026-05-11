@@ -1,0 +1,17 @@
+# Local npm install
+node_modules/
+
+# Trusted setup artifacts (regenerable; large)
+generated/*.ptau
+generated/*.zkey
+generated/*.wtns
+generated/deposit_binding_js/
+
+# Keep these (small, needed by Move tests):
+!generated/deposit_binding_vk.json
+!generated/deposit_binding.r1cs
+!generated/deposit_binding.sym
+!generated/proof_valid.json
+!generated/public_valid.json
+!generated/public_invalid_*.json
+!generated/move_fixtures/

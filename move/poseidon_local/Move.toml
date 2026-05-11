@@ -1,0 +1,27 @@
+[package]
+name = "eunoma_pool"
+version = "1.0.0"
+authors = []
+
+[addresses]
+# Unpinned for testnet publish: override at CLI via `--named-addresses eunoma_pool=<addr>`.
+# Unit tests use the [dev-addresses] override below (0xCAFE preserved for test reproducibility).
+eunoma_pool = "_"
+
+[dev-addresses]
+eunoma_pool = "0xCAFE"
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "aptos-framework"
+
+[dependencies.AptosStdlib]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "aptos-stdlib"
+
+[dependencies.MoveStdlib]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "move-stdlib"

@@ -1,0 +1,46 @@
+[package]
+name = "eunoma_bridge"
+version = "0.1.0"
+authors = []
+
+[addresses]
+# Gate 4d testnet publish: pinned to bridge-admin for `aptos move publish`.
+# To restore unit-test mode (uses [dev-addresses] 0xBEEF), re-set to "_".
+# Both modes still resolve cleanly because dev-addresses only override when "_".
+eunoma = "_"
+
+[dev-addresses]
+eunoma = "0xBEEF"
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "aptos-framework"
+
+[dependencies.AptosStdlib]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "aptos-stdlib"
+
+[dependencies.MoveStdlib]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "move-stdlib"
+
+# NOTE: Gate 2 declares the Poseidon dep so Gates 4/5 can use eunoma_pool::poseidon_bn254
+# without a Move.toml change. Gate 2 admin functions don't actually call Poseidon.
+# Gate 4d testnet publish: switched to local poseidon_local/ (a verbatim copy of
+# Poseidon_Research/aptos_move sources) so the named address can be unpinned ("_")
+# and overridden at publish time. Poseidon_Research/ remains untouched per brief.
+#
+# Gate 5 / Step 4 (2026-05-08): added sources/pool/ — three modules ported from
+# Poseidon_Research/AptosShield_Spike/move/sources/ (pending_queue,
+# batch_root_update, multi_sig_verifier). Namespace was flattened from spike's
+# `aptosshield_spike::*` to `eunoma::pool_*` (Move only supports two-segment
+# module paths `address::module`, so `pool::xxx` was rendered as `pool_xxx`).
+# Verifier was parameterized (Option Xb) — see LOCAL_INTEGRATION_INTERFACE_SPEC.md
+# §6 for rationale. shielded_pool dep unchanged: still resolves to A2 byte-equal
+# Poseidon snapshot in ./poseidon_local/. Spike sources at
+# Poseidon_Research/AptosShield_Spike/ remain untouched (cp not mv).
+[dependencies.eunoma_pool]
+local = "./poseidon_local"

@@ -1,0 +1,66 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+build/
+dist/
+*.tsbuildinfo
+.next/
+
+# Aptos local state
+.aptos/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Env / secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+**/.vault-ek.json
+**/.recipient-ek.json
+**/.user-ek.json
+**/.operator-keys.json
+**/.partner-keys.json
+**/.*-ek.json
+**/.ek.json
+**/secrets/
+
+# Circuit byproducts (keep .zkey/.ptau/.vk.json explicitly committed; ignore intermediate witness/r1cs)
+*.r1cs
+*.wtns
+*.sym
+
+# Test outputs
+coverage/
+.nyc_output/
+
+# Runtime proof-gen scratch (regenerated each script run)
+**/.deposit-proof-tmp/
+**/.withdraw-proof-tmp/
+
+# Internal documentation — local-only, NOT pushed to GitHub public mirror.
+# These contain trade-off analysis, decision logs, narrative / trust-model
+# drafts, testnet address ground-truth, and operator handoff packages —
+# all of which are session-state for the local agent, not public docs.
+# (per 2026-05-10 session boundary)
+/README.md
+/ARCHITECTURE.md
+/STATUS.md
+/TESTNET_ADDRESSES.md
+/docs/HANDOFF_PACKAGE.md
+/docs/CODING_AGENT_PROMPT.md
+/circuits/scripts/README.md
+/operator-services/README.md
+/operator-services/main-operator/README.md
+/operator-services/scripts/README.md
