@@ -68,10 +68,11 @@ const CHAIN_ID = 2;
 // thread it through all consumers (buildWithdrawProof + buildWithdrawCAPayload
 // + attestation msg). No code path can choose a divergent CA amount.
 
-// Bridge attestation msg uses `pool_id_to_fr_bytes()` = 32-byte LE u64(POOL_ID_VALUE=0)
-// padded with zeros (NOT the 19-byte UTF-8 string stored in RootHistory.pool_id).
-const POOL_ID_FR_BYTES = new Uint8Array(32); // = u64(0) LE + 24 zeros
-const DOMAIN_WITHDRAW_OK_V1 = new TextEncoder().encode('APTOSHIELD_WITHDRAW_OK_V1');
+// Phase D Agent D1 c2: pool_id in WithdrawAttestationMessage is 8-byte LE u64
+// (was 32-byte LE-padded). Move side `pool_id_to_le_u64_bytes` outputs 8B.
+const POOL_ID_FR_BYTES = new Uint8Array(8); // = u64(0) LE = 8 zeros
+// Phase D Agent D1 c3: 8-byte domain tag (was 25-byte "APTOSHIELD_WITHDRAW_OK_V1").
+const DOMAIN_WITHDRAW_OK_V1 = new TextEncoder().encode('WDR_OK_1');
 
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');

@@ -292,12 +292,17 @@ async function main() {
   console.log('\n[step 5] build attestation message + 4 operator signatures ...');
   const depositNonce = randomBytes(32);
   const expirySecs = BigInt(Math.floor(Date.now() / 1000) + 60 * 60); // +1h
-  const poolIdLe32 = u64ToFieldLe32(POOL_ID_VALUE);
+  // Phase D Agent D1 c1: pool_id in DepositAttestationMessage is 8-byte LE u64
+  // (was 32-byte Fr LSB). Move-side `pool_id_to_le_u64_bytes` produces 8B; TS
+  // must match byte-for-byte for the 4-of-7 ed25519 signature to verify.
+  const poolIdLe8 = new Uint8Array(8);
+  let _v = POOL_ID_VALUE;
+  for (let i = 0; i < 8; i++) { poolIdLe8[i] = Number(_v & 0xffn); _v >>= 8n; }
 
   const attestMsg: DepositAttestationMessageStruct = {
     domain: DOMAIN_DEPOSIT_OK_V1,
     chain_id: CHAIN_ID,
-    pool_id: poolIdLe32,
+    pool_id: poolIdLe8,
     operator_set_version: 0n,
     threshold: 4n,
     vault_addr: vaultAddrBytes,
