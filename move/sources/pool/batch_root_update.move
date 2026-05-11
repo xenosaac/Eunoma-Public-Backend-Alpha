@@ -563,12 +563,21 @@ module eunoma::pool_batch_root_update {
             // eunoma_bridge::withdraw_to_recipient), so latest-batch-id
             // wins is the safe semantic here. See LOCAL_ERRATA R7-9.
             if (pending_queue::commitment_index_initialized()) {
-                let i = start_index;
-                while (i < end_index) {
-                    let c = pending_queue::commitment_at_index(i);
-                    smart_table::upsert(&mut v2.finalized_commitments, c, batch_id);
-                    i = i + 1;
-                };
+                // 5.11 D3 perf: delegate the per-leaf upsert loop to a
+                // friend-only batched helper in pool_pending_queue. That
+                // helper hoists exists<PCI>+borrow_global<PCI> out of the
+                // loop (1× vs N×) and keeps the table::borrow + upsert in a
+                // single tight intra-module iteration (eliminates the N
+                // cross-module calls to commitment_at_index). Semantics —
+                // including the R7-9 latest-batch-id-wins upsert defense —
+                // are byte-equivalent. See finalize_commitments_into_v2 in
+                // pool_pending_queue.move for the contract.
+                pending_queue::finalize_commitments_into_v2(
+                    &mut v2.finalized_commitments,
+                    start_index,
+                    end_index,
+                    batch_id,
+                );
             };
         };
 

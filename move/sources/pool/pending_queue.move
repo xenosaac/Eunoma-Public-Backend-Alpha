@@ -42,6 +42,7 @@ module eunoma::pool_pending_queue {
     use aptos_framework::event;
 
     use aptos_std::table::{Self, Table};
+    use aptos_std::smart_table::{Self, SmartTable};
 
     use eunoma_pool::poseidon_bn254;
 
@@ -377,6 +378,49 @@ module eunoma::pool_pending_queue {
     #[view]
     public fun commitment_index_initialized(): bool {
         exists<PendingCommitmentIndex>(@eunoma)
+    }
+
+    /// 5.11 D3 perf: amortized batched commitment finalize-into-V2.
+    ///
+    /// Semantically equivalent to the legacy inner loop in
+    /// `pool_batch_root_update::update_root_batch`:
+    ///
+    ///     let i = start;
+    ///     while (i < end) {
+    ///         let c = commitment_at_index(i);
+    ///         smart_table::upsert(target, c, batch_id);
+    ///         i = i + 1;
+    ///     };
+    ///
+    /// — same set of commitments inserted, same upsert (latest-batch-id-wins)
+    /// semantic preserving R7-9's duplicate-DoS defense (see batch_root_update
+    /// line ~497 commentary on `upsert` vs `add`).
+    ///
+    /// Optimization: hoists the `exists<PendingCommitmentIndex>` / `borrow_global`
+    /// out of the loop (paid ONCE instead of N times) and keeps the per-iter
+    /// `table::borrow` + `smart_table::upsert` inline within a single module
+    /// boundary (eliminates the per-iter cross-module call to
+    /// `commitment_at_index`). For N=64 this collapses ~64 `borrow_global` +
+    /// 64 cross-module function-call frames into 1 + 64 within-module
+    /// iterations.
+    ///
+    /// Friend-only — only the V2 dual-write path may call this. The
+    /// pre-existing `commitment_at_index(idx)` view remains the public
+    /// single-index entry for tests / off-chain consumers.
+    public(friend) fun finalize_commitments_into_v2(
+        target: &mut SmartTable<vector<u8>, u64>,
+        start: u64,
+        end: u64,
+        batch_id: u64,
+    ) acquires PendingCommitmentIndex {
+        assert!(exists<PendingCommitmentIndex>(@eunoma), E_COMMITMENT_INDEX_NOT_INITIALIZED);
+        let pci = borrow_global<PendingCommitmentIndex>(@eunoma);
+        let i = start;
+        while (i < end) {
+            let c = *table::borrow(&pci.commitments, i);
+            smart_table::upsert(target, c, batch_id);
+            i = i + 1;
+        };
     }
 
     #[view]
