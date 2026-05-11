@@ -108,9 +108,11 @@ module eunoma::eunoma_bridge {
 
     /// Number of public inputs the deposit-binding Groth16 circuit declares.
     /// Wire order (MUST match Gate 4a circuit's `main { public [...] }`):
-    ///   [commitment, amount_tag, asset_id, vault_addr_hash, chain_id, pool_id]
-    /// snarkjs convention: VK IC vector length must be exactly 1 + N_PUBLIC_INPUTS = 7.
-    const N_PUBLIC_INPUTS: u64 = 6;
+    ///   [commitment, amount_tag, asset_id, vault_addr_hash]
+    /// Phase F W3: chain_id + pool_id removed from publics — baked as compile-time
+    /// constants inside the circuit (CHAIN_ID = 2, POOL_ID = 0; testnet-only VK).
+    /// snarkjs convention: VK IC vector length must be exactly 1 + N_PUBLIC_INPUTS = 5.
+    const N_PUBLIC_INPUTS: u64 = 4;
 
     /// Uncompressed bn254 point sizes (matches `FormatG1Uncompr` / `FormatG2Uncompr`).
     const G1_UNCOMPRESSED_BYTES: u64 = 64;
@@ -125,7 +127,8 @@ module eunoma::eunoma_bridge {
     const PROOF_BYTES: u64 = 256;
 
     /// VK IC length invariant (snarkjs convention from LOCAL_CONFIRMATION 8.7).
-    const VK_IC_LENGTH: u64 = 7; // 1 + N_PUBLIC_INPUTS
+    /// Phase F W3: 7 → 5 (chain_id + pool_id removed from publics).
+    const VK_IC_LENGTH: u64 = 5; // 1 + N_PUBLIC_INPUTS
 
     /// Domain separators for Poseidon-based asset_id / vault_addr_hash derivation.
     /// Mirrors must be reproduced byte-for-byte by off-chain operator code (Gate 4c).
@@ -143,10 +146,12 @@ module eunoma::eunoma_bridge {
     /// Number of public inputs the withdraw Groth16 circuit declares.
     /// Wire order (MUST match Gate 6 circuit's `main { public [...] }`):
     ///   [root, nullifier_hash, asset_id, recipient_hash, amount_tag,
-    ///    ca_payload_hash, request_hash, vault_sequence, chain_id]
-    /// snarkjs convention: VK IC vector length = 1 + N_WITHDRAW_PUBLIC_INPUTS = 10.
-    const N_WITHDRAW_PUBLIC_INPUTS: u64 = 9;
-    const WITHDRAW_VK_IC_LENGTH: u64 = 10;
+    ///    ca_payload_hash, request_hash, vault_sequence]
+    /// Phase F W3: chain_id removed from publics — baked as compile-time constant
+    /// inside the circuit (CHAIN_ID = 2; testnet-only VK).
+    /// snarkjs convention: VK IC vector length = 1 + N_WITHDRAW_PUBLIC_INPUTS = 9.
+    const N_WITHDRAW_PUBLIC_INPUTS: u64 = 8;
+    const WITHDRAW_VK_IC_LENGTH: u64 = 9;
 
     /// Constant pool identifier baked into the bridge. Pool dispatch is deferred
     /// (architecture-agnostic Gate 4b — see `LOCAL_ARCHITECTURE_UPDATE_DEPOSIT_BATCHING.md`),
@@ -218,7 +223,7 @@ module eunoma::eunoma_bridge {
     /// Stored at `@eunoma` and READ ONLY by `assert_valid_deposit_binding_proof`.
     /// Layout matches Gate 4a's exported VK fixture (snarkjs uncompressed format):
     ///   * `alpha_g1`, `beta_g2`, `gamma_g2`, `delta_g2` — sized 64 / 128 / 128 / 128 bytes.
-    ///   * `ic` — vector of 64-byte G1 points; length MUST equal `VK_IC_LENGTH` (= 7 = 1 + 6).
+    ///   * `ic` — vector of 64-byte G1 points; length MUST equal `VK_IC_LENGTH` (= 5 = 1 + 4).
     ///
     /// Lifecycle:
     ///   1. Deployer (admin == `@eunoma`) calls `publish_deposit_binding_vk` ONCE
@@ -1258,48 +1263,23 @@ module eunoma::eunoma_bridge {
         r.vault_addr_hash_fr
     }
 
-    /// Read the live `chain_id` from the framework and pad to 32-byte LE Fr.
-    /// Decision (subagent — documented in REPORT_GATE_4B): use `chain_id::get(): u8`
-    /// from `aptos_framework::chain_id`. Mainnet = 1, testnet = 2 (matches Gate 4a
-    /// fixture's chain_id = 2).
-    fun chain_id_to_fr_bytes(): vector<u8> {
-        let id: u8 = chain_id::get();
-        let buf = vector::empty<u8>();
-        vector::push_back(&mut buf, id);
-        bytes_to_field_le32(&buf)
-    }
-
-    /// Encode the bridge constant `POOL_ID_VALUE` (u64) as 32-byte LE Fr.
-    /// Decision (subagent — documented in REPORT_GATE_4B): hardcoded constant 0
-    /// for now (matches Gate 4a fixture). The pool gate (post-batching-decision)
-    /// may rewrite this to a per-pool registry lookup.
-    /// Gas P4: build the 32-byte buffer in one pass instead of an 8-byte temp
-    /// followed by a call to `bytes_to_field_le32` (which re-allocates and does
-    /// another 32 push_backs). Saves one alloc + one helper call + ~8 ops per
-    /// deposit/withdraw on the attestation hot path.
-    fun pool_id_to_fr_bytes(): vector<u8> {
-        let n = POOL_ID_VALUE;
-        let buf = vector::empty<u8>();
-        let i = 0;
-        while (i < 8) {
-            vector::push_back(&mut buf, ((n & 0xFFu64) as u8));
-            n = n >> 8;
-            i = i + 1;
-        };
-        while (i < FR_BYTES) {
-            vector::push_back(&mut buf, 0u8);
-            i = i + 1;
-        };
-        buf
-    }
+    // Phase F W3 — removed: `chain_id_to_fr_bytes()` and `pool_id_to_fr_bytes()`.
+    // These two helpers used to build the 32-byte LE Fr public inputs for the
+    // Groth16 deposit/withdraw circuits. After W3 baked chain_id + pool_id into
+    // the circuits as compile-time constants, both publics are gone and the
+    // helpers became dead code. The on-chain attestation message still carries
+    // chain_id (via `chain_id::get(): u8`) and pool_id (via
+    // `pool_id_to_le_u64_bytes`), so the user-visible bridge behavior is
+    // unchanged — but the circuit no longer needs the 32-byte Fr encodings.
 
     /// Phase D Agent D1 — 8-byte LE u64 encoding of `POOL_ID_VALUE` for use as
-    /// the `pool_id` field of `DepositAttestationMessage`. The 32-byte LE Fr
-    /// form (`pool_id_to_fr_bytes`) is still used for the Groth16 binding-proof
-    /// public input (where field-element width is mandatory), but the
-    /// attestation-signing message only needs an unambiguous 8-byte u64 — which
-    /// is what the off-chain TS deposit encoder already produces (see
-    /// `operator-services/shared/src/attestation.ts:60-89`). Shrinking from
+    /// the `pool_id` field of `DepositAttestationMessage`. The previous 32-byte
+    /// LE Fr form was removed by Phase F W3 (chain_id + pool_id are now baked
+    /// into the Groth16 circuit as compile-time constants, so the circuit no
+    /// longer needs an Fr-encoded pool_id public input). The attestation-signing
+    /// message uses an unambiguous 8-byte u64 — matching the off-chain TS
+    /// deposit encoder (see `operator-services/shared/src/attestation.ts:60-89`).
+    /// Shrinking from
     /// 32 → 8 bytes on the attestation hot path:
     ///   * saves 24 BCS bytes per signed message (24 bytes of payload; the
     ///     ULEB128 length prefix stays 1 byte for both 8 and 32),
@@ -1353,7 +1333,10 @@ module eunoma::eunoma_bridge {
     /// (c) any field deserialization fails, or (d) the pairing equation does not hold.
     ///
     /// Public-input wire order (must match Gate 4a circuit verbatim):
-    ///   [commitment, amount_tag, asset_id, vault_addr_hash, chain_id, pool_id]
+    ///   [commitment, amount_tag, asset_id, vault_addr_hash]
+    /// Phase F W3: chain_id + pool_id removed from publics — baked as compile-time
+    /// constants in the circuit. Saves 2 G1 mults on-chain (IC[5], IC[6] no longer
+    /// scalar-multiplied into the public-input accumulator).
     /// Reordering breaks the verifier silently — IC scalar mul is order-sensitive.
     fun assert_valid_deposit_binding_proof(
         commitment: vector<u8>,
@@ -1366,7 +1349,7 @@ module eunoma::eunoma_bridge {
         assert!(exists<PreparedDepositBindingVK>(@eunoma), E_NOT_INITIALIZED);
         let pvk = borrow_global<PreparedDepositBindingVK>(@eunoma);
 
-        // IC length invariant (must equal VK_IC_LENGTH = 7 = 1 + l for l = 6 publics).
+        // IC length invariant (must equal VK_IC_LENGTH = 5 = 1 + l for l = 4 publics).
         assert!(vector::length(&pvk.pvk_uvw_gamma_g1) == VK_IC_LENGTH, E_INVALID_DEPOSIT_BINDING_PROOF);
         // Defensive size checks on prepared VK byte sizes — already asserted at
         // `publish_prepared_deposit_binding_vk` time. (A future T3 lever may elide
@@ -1395,8 +1378,8 @@ module eunoma::eunoma_bridge {
 
         // Public-input vector. Sizes are asserted via de_fr's deserialize check.
         // Wire order MUST match Gate 4a circuit:
-        //   [0] commitment, [1] amount_tag, [2] asset_id, [3] vault_addr_hash,
-        //   [4] chain_id, [5] pool_id
+        //   [0] commitment, [1] amount_tag, [2] asset_id, [3] vault_addr_hash
+        // Phase F W3: chain_id + pool_id removed (baked as circuit constants).
         assert!(vector::length(&commitment) == FR_BYTES, E_INVALID_DEPOSIT_BINDING_PROOF);
         assert!(vector::length(&amount_tag) == FR_BYTES, E_INVALID_DEPOSIT_BINDING_PROOF);
         // Phase B L-α — read cached asset_id + vault_addr_hash (skips 2× hash_3).
@@ -1405,16 +1388,12 @@ module eunoma::eunoma_bridge {
         let cache = borrow_global<VaultConfigCache>(@eunoma);
         let asset_id        = cache.cached_asset_id;
         let vault_addr_hash = cache.cached_vault_addr_hash;
-        let chain_id_fr     = chain_id_to_fr_bytes();
-        let pool_id_fr      = pool_id_to_fr_bytes();
 
         let publics = vector[
             de_fr(commitment),
             de_fr(amount_tag),
             de_fr(asset_id),
             de_fr(vault_addr_hash),
-            de_fr(chain_id_fr),
-            de_fr(pool_id_fr),
         ];
 
         // Proof bytes layout per Gate 4a (uncompressed): a (64) || b (128) || c (64).
@@ -1442,10 +1421,12 @@ module eunoma::eunoma_bridge {
     }
 
     /// Phase 2 / Gate 6 — verify Withdraw Groth16 proof against PreparedWithdrawProofVK.
-    /// Mirror of `assert_valid_deposit_binding_proof` but with 9 publics + IC length 10.
+    /// Mirror of `assert_valid_deposit_binding_proof` but with 8 publics + IC length 9.
     /// Wire order (MUST match Gate 6 circuit):
     ///   [root, nullifier_hash, asset_id, recipient_hash, amount_tag, ca_payload_hash,
-    ///    request_hash, vault_sequence, chain_id]
+    ///    request_hash, vault_sequence]
+    /// Phase F W3: chain_id removed from publics — baked as compile-time constant
+    /// in the circuit. Saves 1 G1 mult on-chain.
     fun assert_valid_withdraw_proof(
         root: vector<u8>,
         nullifier_hash: vector<u8>,
@@ -1492,7 +1473,7 @@ module eunoma::eunoma_bridge {
         assert!(vector::length(&request_hash) == FR_BYTES, E_INVALID_WITHDRAW_PROOF);
 
         // Build public input vector. Wire order MUST match Gate 6 circuit.
-        let chain_id_fr       = chain_id_to_fr_bytes();
+        // Phase F W3: chain_id removed (baked as circuit constant CHAIN_ID = 2).
         let vault_sequence_fr = u64_to_fr_bytes(vault_sequence);
 
         let publics = vector[
@@ -1504,7 +1485,6 @@ module eunoma::eunoma_bridge {
             de_fr(ca_payload_hash),
             de_fr(request_hash),
             de_fr(vault_sequence_fr),
-            de_fr(chain_id_fr),
         ];
 
         // Proof bytes layout: a (G1 64) || b (G2 128) || c (G1 64) = 256.
@@ -1598,9 +1578,8 @@ module eunoma::eunoma_bridge {
         ic_2: vector<u8>,
         ic_3: vector<u8>,
         ic_4: vector<u8>,
-        ic_5: vector<u8>,
-        ic_6: vector<u8>,
     ) {
+        // Phase F W3 — IC count reduced 7 → 5 (chain_id + pool_id removed as publics).
         let admin_addr = signer::address_of(admin);
         assert!(admin_addr == @eunoma, E_NOT_ADMIN);
         assert!(!exists<DepositBindingVK>(@eunoma), E_ALREADY_INITIALIZED);
@@ -1616,10 +1595,8 @@ module eunoma::eunoma_bridge {
         assert!(vector::length(&ic_2) == G1_UNCOMPRESSED_BYTES, E_INVALID_DEPOSIT_BINDING_PROOF);
         assert!(vector::length(&ic_3) == G1_UNCOMPRESSED_BYTES, E_INVALID_DEPOSIT_BINDING_PROOF);
         assert!(vector::length(&ic_4) == G1_UNCOMPRESSED_BYTES, E_INVALID_DEPOSIT_BINDING_PROOF);
-        assert!(vector::length(&ic_5) == G1_UNCOMPRESSED_BYTES, E_INVALID_DEPOSIT_BINDING_PROOF);
-        assert!(vector::length(&ic_6) == G1_UNCOMPRESSED_BYTES, E_INVALID_DEPOSIT_BINDING_PROOF);
 
-        let ic = vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6];
+        let ic = vector[ic_0, ic_1, ic_2, ic_3, ic_4];
         // Belt-and-suspenders: re-check IC length after assembly.
         assert!(vector::length(&ic) == VK_IC_LENGTH, E_INVALID_DEPOSIT_BINDING_PROOF);
 
@@ -1708,8 +1685,9 @@ module eunoma::eunoma_bridge {
     // ========================================================================
 
     /// Phase 2 / Gate 6 admin entry — publish the Withdraw circuit Groth16 VK.
-    /// Args mirror `publish_deposit_binding_vk` shape but with 10 IC slots
-    /// (= 1 + N_WITHDRAW_PUBLIC_INPUTS = 10) instead of 7.
+    /// Args mirror `publish_deposit_binding_vk` shape but with 9 IC slots
+    /// (= 1 + N_WITHDRAW_PUBLIC_INPUTS = 9) instead of 5.
+    /// Phase F W3: IC count reduced 10 → 9 (chain_id removed as a public).
     public entry fun publish_withdraw_proof_vk(
         admin: &signer,
         alpha_g1: vector<u8>,
@@ -1725,7 +1703,6 @@ module eunoma::eunoma_bridge {
         ic_6: vector<u8>,
         ic_7: vector<u8>,
         ic_8: vector<u8>,
-        ic_9: vector<u8>,
     ) {
         let admin_addr = signer::address_of(admin);
         assert!(admin_addr == @eunoma, E_NOT_ADMIN);
@@ -1745,9 +1722,8 @@ module eunoma::eunoma_bridge {
         assert!(vector::length(&ic_6) == G1_UNCOMPRESSED_BYTES, E_INVALID_WITHDRAW_PROOF);
         assert!(vector::length(&ic_7) == G1_UNCOMPRESSED_BYTES, E_INVALID_WITHDRAW_PROOF);
         assert!(vector::length(&ic_8) == G1_UNCOMPRESSED_BYTES, E_INVALID_WITHDRAW_PROOF);
-        assert!(vector::length(&ic_9) == G1_UNCOMPRESSED_BYTES, E_INVALID_WITHDRAW_PROOF);
 
-        let ic = vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6, ic_7, ic_8, ic_9];
+        let ic = vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6, ic_7, ic_8];
         assert!(vector::length(&ic) == WITHDRAW_VK_IC_LENGTH, E_INVALID_WITHDRAW_PROOF);
 
         move_to(admin, WithdrawProofVK { alpha_g1, beta_g2, gamma_g2, delta_g2, ic });
@@ -1912,13 +1888,14 @@ module eunoma::eunoma_bridge {
         //    permit a future bug where the bridge accepts an operator signature
         //    over a hash that doesn't match the recomputed value.
         // Phase D Agent D1 — 8-byte LE u64 pool_id (vs prior 32-byte LE Fr) for
-        // the attestation message body only. The Groth16 binding-proof public
-        // input below (step 6) still calls `pool_id_to_fr_bytes()` because that
-        // path NEEDS a 32-byte Fr representation. The on-the-wire signed
-        // message is now 24 bytes shorter, which (a) matches the TS deposit
-        // encoder byte-for-byte (`shared/src/attestation.ts:60-89` — fixes a
-        // pre-existing Move-vs-TS parity bug) and (b) shrinks SHA512 input
-        // bytes to each of the 4 ed25519::signature_verify_strict calls.
+        // the attestation message body. Phase F W3 removed the chain_id +
+        // pool_id Groth16 publics entirely (baked into the circuit as
+        // compile-time constants), so no 32-byte Fr representation is needed
+        // anywhere. The on-the-wire signed message stays 24 bytes shorter than
+        // the pre-D1 encoding, which (a) matches the TS deposit encoder
+        // byte-for-byte (`shared/src/attestation.ts:60-89` — fixes a pre-existing
+        // Move-vs-TS parity bug) and (b) shrinks SHA512 input bytes to each of
+        // the 4 ed25519::signature_verify_strict calls.
         let pool_id_bytes = pool_id_to_le_u64_bytes();
         let chain_id_u8 = chain_id::get();
         let msg = new_deposit_attestation_message(

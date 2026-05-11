@@ -320,6 +320,10 @@ export async function buildWithdrawProof(inputs: WithdrawProofInputs): Promise<W
   console.log(`[wproof] request_hash    = 0x${hex(requestHash)}`);
 
   // ---- 4. Write circom input JSON ----
+  // Phase F W3: chain_id is baked into the withdraw circuit as compile-time
+  // constant CHAIN_ID = 2. No longer part of witness inputs. `chainIdLe32`
+  // is still computed above because the off-circuit compose6 cross-check
+  // needs the 32-byte LE Fr representation.
   fs.mkdirSync(TMP_DIR, { recursive: true });
   const circomInput: Record<string, any> = {
     root: le32ToDec(inputs.root),
@@ -330,7 +334,6 @@ export async function buildWithdrawProof(inputs: WithdrawProofInputs): Promise<W
     ca_payload_hash: le32ToDec(inputs.caPayloadHash),
     request_hash: le32ToDec(requestHash),
     vault_sequence: le32ToDec(vaultSequenceLe32),
-    chain_id: le32ToDec(chainIdLe32),
     nullifier: le32ToDec(inputs.nullifier),
     secret: le32ToDec(inputs.secret),
     amount: inputs.amountOctas.toString(),
@@ -372,6 +375,7 @@ export async function buildWithdrawProof(inputs: WithdrawProofInputs): Promise<W
   proofBytes.set(cBytes, 64 + 128);
 
   // ---- 8. Sanity check public inputs ----
+  // Phase F W3: 9 → 8 publics (chain_id removed — circuit constant).
   const pub = JSON.parse(fs.readFileSync(publicPath, 'utf-8')) as string[];
   const expected = [
     le32ToDec(inputs.root),
@@ -382,9 +386,8 @@ export async function buildWithdrawProof(inputs: WithdrawProofInputs): Promise<W
     le32ToDec(inputs.caPayloadHash),
     le32ToDec(requestHash),
     le32ToDec(vaultSequenceLe32),
-    le32ToDec(chainIdLe32),
   ];
-  for (let i = 0; i < 9; i++) {
+  for (let i = 0; i < 8; i++) {
     if (pub[i] !== expected[i]) {
       throw new Error(`public[${i}] mismatch: snarkjs=${pub[i]} expected=${expected[i]}`);
     }

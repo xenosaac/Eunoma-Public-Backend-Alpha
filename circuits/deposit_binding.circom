@@ -47,6 +47,12 @@ pragma circom 2.1.6;
 include "../node_modules/circomlib/circuits/poseidon.circom";
 include "../node_modules/circomlib/circuits/bitify.circom";
 
+// Phase F W3 — chain_id and pool_id are hardcoded compile-time constants
+// declared inside the template (circom 2.x requires var inside templates/functions).
+// This VK is testnet-only (CHAIN_ID = 2 = Aptos testnet, POOL_ID = 0 = frozen pool).
+// Mainnet deployment requires a separate compile+trusted-setup with CHAIN_ID = 1.
+// See circuits/CHAIN_VARIANT.md for full rationale.
+
 // 5-input Poseidon composed from hash_3 + hash_2.
 template Compose5() {
     signal input in[5];
@@ -69,13 +75,15 @@ template Compose5() {
 }
 
 template DepositBinding() {
-    // -------- public inputs --------
+    // Phase F W3 — hardcoded chain_id + pool_id (testnet variant).
+    var CHAIN_ID = 2;
+    var POOL_ID  = 0;
+
+    // -------- public inputs (Phase F W3: chain_id+pool_id removed, baked as constants) --------
     signal input commitment;
     signal input amount_tag;
     signal input asset_id;
     signal input vault_addr_hash;
-    signal input chain_id;
-    signal input pool_id;
 
     // -------- private inputs --------
     signal input nullifier;
@@ -87,25 +95,25 @@ template DepositBinding() {
     component amount_bits = Num2Bits(64);
     amount_bits.in <== amount;
 
-    // 2. commitment = compose5(nullifier, secret, asset_id, amount, pool_id)
+    // 2. commitment = compose5(nullifier, secret, asset_id, amount, POOL_ID)
     component cmt = Compose5();
     cmt.in[0] <== nullifier;
     cmt.in[1] <== secret;
     cmt.in[2] <== asset_id;
     cmt.in[3] <== amount;
-    cmt.in[4] <== pool_id;
+    cmt.in[4] <== POOL_ID;
     cmt.out === commitment;
 
-    // 3. amount_tag = compose5(amount, deposit_blind, asset_id, vault_addr_hash, chain_id)
+    // 3. amount_tag = compose5(amount, deposit_blind, asset_id, vault_addr_hash, CHAIN_ID)
     component tag = Compose5();
     tag.in[0] <== amount;
     tag.in[1] <== deposit_blind;
     tag.in[2] <== asset_id;
     tag.in[3] <== vault_addr_hash;
-    tag.in[4] <== chain_id;
+    tag.in[4] <== CHAIN_ID;
     tag.out === amount_tag;
 }
 
-// Public inputs in this order: commitment, amount_tag, asset_id,
-// vault_addr_hash, chain_id, pool_id.
-component main { public [commitment, amount_tag, asset_id, vault_addr_hash, chain_id, pool_id] } = DepositBinding();
+// Public inputs in this order: commitment, amount_tag, asset_id, vault_addr_hash.
+// (Phase F W3: chain_id, pool_id removed from publics — baked as constants above.)
+component main { public [commitment, amount_tag, asset_id, vault_addr_hash] } = DepositBinding();

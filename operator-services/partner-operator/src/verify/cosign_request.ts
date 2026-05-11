@@ -165,9 +165,9 @@ export async function verifyCoSignRequest(
   // Step 6 — verify deposit-binding Groth16 proof. snarkjs format publics +
   // proof. We accept the partner re-running the verifier off-chain (cheap;
   // ~10ms on snarkjs). Public inputs MUST contain commitment, amount_tag,
-  // asset_id, vault_addr_hash, chain_id, pool_id (in that order — Gate 4a
-  // wire order).
-  if (body.public_inputs.length !== 6) {
+  // asset_id, vault_addr_hash (in that order — Phase F W3 wire order;
+  // chain_id + pool_id are baked as circuit compile-time constants).
+  if (body.public_inputs.length !== 4) {
     return { ok: false, reason: "public_inputs_wrong_length" };
   }
   let proofOk: boolean;

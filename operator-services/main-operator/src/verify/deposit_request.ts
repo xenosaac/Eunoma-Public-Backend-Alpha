@@ -87,7 +87,8 @@ export async function verifyDepositRequest(
   }
 
   // Step 2 — verify deposit-binding proof off-chain via snarkjs.
-  if (body.public_inputs.length !== 6) {
+  // Phase F W3: 6 → 4 (chain_id + pool_id baked as circuit constants).
+  if (body.public_inputs.length !== 4) {
     return { ok: false, reason: "public_inputs_wrong_length" };
   }
   let proofOk: boolean;

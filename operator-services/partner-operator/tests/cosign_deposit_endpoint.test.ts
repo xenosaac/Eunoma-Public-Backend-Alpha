@@ -106,7 +106,9 @@ describe("partner-operator POST /v1/cosign/deposit", () => {
     const priv = JSON.parse(readFileSync(privPath, "utf-8"));
     const blindDec: string = priv.deposit_blind;
     const amountDec: string = priv.amount;
-    const chainIdNum = Number(priv.chain_id);
+    // Phase F W3: chain_id no longer in valid_input.json — it's a circuit
+    // compile-time constant. Hardcode 2 (testnet, matches baked CHAIN_ID).
+    const chainIdNum = priv.chain_id !== undefined ? Number(priv.chain_id) : 2;
 
     function decimalToLe32(dec: string): Uint8Array {
       const n = BigInt(dec);

@@ -76,11 +76,12 @@ function main() {
     if (vk.protocol !== 'groth16') {
         throw new Error(`unexpected VK.protocol = ${vk.protocol}`);
     }
-    if (vk.nPublic !== 6) {
-        throw new Error(`expected 6 public inputs, VK.nPublic = ${vk.nPublic}`);
+    // Phase F W3: chain_id + pool_id hardcoded → publics 6 → 4, IC length 7 → 5.
+    if (vk.nPublic !== 4) {
+        throw new Error(`expected 4 public inputs, VK.nPublic = ${vk.nPublic}`);
     }
-    if (vk.IC.length !== 7) {
-        throw new Error(`expected vk.IC length 7 (= 1 + n_public_inputs), got ${vk.IC.length}`);
+    if (vk.IC.length !== 5) {
+        throw new Error(`expected vk.IC length 5 (= 1 + n_public_inputs), got ${vk.IC.length}`);
     }
 
     // ---------- VK bytes ----------
@@ -141,7 +142,7 @@ function main() {
     emit('proof_valid_b', proof_bytes.b);
     emit('proof_valid_c', proof_bytes.c);
 
-    moveOut.push('    // ---- Valid public inputs (commitment, amount_tag, asset_id, vault_addr_hash, chain_id, pool_id) ----');
+    moveOut.push('    // ---- Valid public inputs (commitment, amount_tag, asset_id, vault_addr_hash) — Phase F W3 ----');
     pub_valid.forEach((hex, i) => emit(`public_valid_${i}`, hex));
 
     moveOut.push('    // ---- Negative public inputs (same valid proof; should be REJECTED) ----');

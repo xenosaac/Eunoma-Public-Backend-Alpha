@@ -40,13 +40,14 @@ async function main() {
     const commitment = compose5(nullifier, secret, asset_id, amount, pool_id);
     const amount_tag = compose5(amount, deposit_blind, asset_id, vault_addr_hash, chain_id);
 
+    // Phase F W3 — chain_id + pool_id are now hardcoded compile-time constants in
+    // deposit_binding.circom (CHAIN_ID = 2, POOL_ID = 0). They are no longer JSON
+    // inputs. The circuit still uses the values; we just don't pass them.
     const validInput = {
         commitment:      commitment.toString(),
         amount_tag:      amount_tag.toString(),
         asset_id:        asset_id.toString(),
         vault_addr_hash: vault_addr_hash.toString(),
-        chain_id:        chain_id.toString(),
-        pool_id:         pool_id.toString(),
         nullifier:       nullifier.toString(),
         secret:          secret.toString(),
         amount:          amount.toString(),
@@ -70,8 +71,9 @@ async function main() {
     };
 
     // public_signals are returned by snarkjs in the SAME ORDER as the public inputs
-    // declared on `component main { public [...] }`. Our order is:
-    //   [commitment, amount_tag, asset_id, vault_addr_hash, chain_id, pool_id]
+    // declared on `component main { public [...] }`. Phase F W3 order is:
+    //   [commitment, amount_tag, asset_id, vault_addr_hash]
+    // (chain_id and pool_id removed — now compile-time constants in the circuit.)
     fs.mkdirSync(path.resolve(__dirname, '..', 'generated'), { recursive: true });
 
     const validPub = [
@@ -79,8 +81,6 @@ async function main() {
         amount_tag.toString(),
         asset_id.toString(),
         vault_addr_hash.toString(),
-        chain_id.toString(),
-        pool_id.toString(),
     ];
 
     // Negative #1: wrong amount_tag (flip a bit).

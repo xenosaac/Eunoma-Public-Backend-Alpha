@@ -49,6 +49,12 @@ include "../node_modules/circomlib/circuits/poseidon.circom";
 include "../node_modules/circomlib/circuits/bitify.circom";
 include "../node_modules/circomlib/circuits/comparators.circom";
 
+// Phase F W3 — chain_id hardcoded as compile-time constant declared inside the
+// template (pool_id was already hardcoded via `cmt.in[4] <== 0` for the commitment
+// recomputation). This VK is testnet-only (CHAIN_ID = 2 = Aptos testnet).
+// Mainnet deployment requires a separate compile+setup.
+// See circuits/CHAIN_VARIANT.md for full rationale.
+
 // 5-input Poseidon (matches deposit_binding.circom Compose5 exactly).
 // compose5(a,b,c,d,e) = hash_2(hash_3(a,b,c), hash_2(d,e))
 template Compose5() {
@@ -144,7 +150,11 @@ template MerkleInclusion(depth) {
 }
 
 template WithdrawProof() {
-    // -------- public inputs (10 total: 9 mandatory per HANDOFF + pool_id is hardcoded constant) --------
+    // Phase F W3 — hardcoded chain_id (testnet variant). pool_id was already a constant
+    // (= 0) below at the commitment-recomputation step.
+    var CHAIN_ID = 2;
+
+    // -------- public inputs (Phase F W3: chain_id removed, baked as constant; 8 publics) --------
     signal input root;
     signal input nullifier_hash;
     signal input asset_id;
@@ -153,7 +163,6 @@ template WithdrawProof() {
     signal input ca_payload_hash;
     signal input request_hash;
     signal input vault_sequence;
-    signal input chain_id;
 
     // -------- private inputs --------
     signal input nullifier;
@@ -196,31 +205,32 @@ template WithdrawProof() {
     nh.inputs[0] <== nullifier;
     nh.out === nullifier_hash;
 
-    // 5. amount_tag = Compose6(amount, withdraw_blind, recipient_hash, asset_id, chain_id, vault_sequence)
+    // 5. amount_tag = Compose6(amount, withdraw_blind, recipient_hash, asset_id, CHAIN_ID, vault_sequence)
     component tag = Compose6();
     tag.in[0] <== amount;
     tag.in[1] <== withdraw_blind;
     tag.in[2] <== recipient_hash;
     tag.in[3] <== asset_id;
-    tag.in[4] <== chain_id;
+    tag.in[4] <== CHAIN_ID;
     tag.in[5] <== vault_sequence;
     tag.out === amount_tag;
 
-    // 6. request_hash = Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id, vault_sequence, chain_id)
+    // 6. request_hash = Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id, vault_sequence, CHAIN_ID)
     component req = Compose6();
     req.in[0] <== amount_tag;
     req.in[1] <== recipient_hash;
     req.in[2] <== ca_payload_hash;
     req.in[3] <== asset_id;
     req.in[4] <== vault_sequence;
-    req.in[5] <== chain_id;
+    req.in[5] <== CHAIN_ID;
     req.out === request_hash;
 
     // (7. Public input equality is enforced implicitly by `===` constraints above.)
 }
 
 // Public inputs in this order: root, nullifier_hash, asset_id, recipient_hash,
-// amount_tag, ca_payload_hash, request_hash, vault_sequence, chain_id.
+// amount_tag, ca_payload_hash, request_hash, vault_sequence.
+// (Phase F W3: chain_id removed from publics — baked as `CHAIN_ID` constant above.)
 component main { public [
     root,
     nullifier_hash,
@@ -229,6 +239,5 @@ component main { public [
     amount_tag,
     ca_payload_hash,
     request_hash,
-    vault_sequence,
-    chain_id
+    vault_sequence
 ] } = WithdrawProof();

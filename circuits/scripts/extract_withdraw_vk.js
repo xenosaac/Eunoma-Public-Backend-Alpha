@@ -23,8 +23,9 @@ function g2Uncompr(arr) {
 const vkPath = path.resolve(__dirname, '..', 'generated', 'withdrawal_proof_vk.json');
 const vk = JSON.parse(fs.readFileSync(vkPath, 'utf8'));
 if (vk.protocol !== 'groth16') throw new Error(`bad protocol: ${vk.protocol}`);
-if (vk.nPublic !== 9) throw new Error(`expected 9 publics, got ${vk.nPublic}`);
-if (vk.IC.length !== 10) throw new Error(`expected IC length 10, got ${vk.IC.length}`);
+// Phase F W3: chain_id hardcoded → publics 9 → 8, IC length 10 → 9.
+if (vk.nPublic !== 8) throw new Error(`expected 8 publics, got ${vk.nPublic}`);
+if (vk.IC.length !== 9) throw new Error(`expected IC length 9, got ${vk.IC.length}`);
 
 const out = {
   alpha_g1: g1Uncompr(vk.vk_alpha_1),

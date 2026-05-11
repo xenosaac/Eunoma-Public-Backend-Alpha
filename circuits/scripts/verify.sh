@@ -57,8 +57,6 @@ cat > /tmp/oversized_amount_input.json <<'EOF'
   "amount_tag":      "0",
   "asset_id":        "7",
   "vault_addr_hash": "0",
-  "chain_id":        "2",
-  "pool_id":         "0",
   "nullifier":       "1",
   "secret":          "1",
   "amount":          "18446744073709551616",

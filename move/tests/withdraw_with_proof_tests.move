@@ -57,7 +57,8 @@ module eunoma::withdraw_with_proof_tests {
     const VK_BETA_G2:  vector<u8> = x"1ca4e89cceb6a9b7caabcd83980fcd69ef6df2b9d5f7b45d082e247807493c0ce21e5e7224aab40a95a0434fe84af514f9f81a5a4884abccad4fb8ec072a620d688459b1d0c167b809117b8cd25eb18b191f1a6f1406d4873ce49d06439c9e0fc8226b4a8f6578991eade15e60729cd6854e7160ae4b5d9640993c13184cb80b";
     const VK_GAMMA_G2: vector<u8> = x"edf692d95cbdde46ddda5ef7d422436779445c5e66006a42761e1f12efde0018c212f3aeb785e49712e7a9353349aaf1255dfb31b7bf60723a480d9293938e19aa7dfa6601cce64c7bd3430c69e7d1e38f40cb8d8071ab4aeb6d8cdba55ec8125b9722d1dcdaac55f38eb37033314bbc95330c69ad999eec75f05f58d0890609";
     const VK_DELTA_G2: vector<u8> = x"f90f5a8b532b23ae490058b5ff02d77593e1a5aed2c5b9bd5d7533063564df135c085c7f10ac290ec62c14383743cdc2498e17df4046356b9aaa9c81bfdc6513a50cdccdca2b620b9315ab0b6fe634949f72d8fabf59dd1a1f76df02ae12c027133e056be139efd886cf17bb70912ca80ca1bbeb788fc41312ed762567f60f18";
-    // 10 IC slots for withdraw circuit (= 1 + 9 publics)
+    // Phase F W3: 9 IC slots for withdraw circuit (= 1 + 8 publics).
+    // chain_id baked as circuit constant; removed from publics.
     const IC_BYTES: vector<u8> = x"5186582b4f3661924411d7c182b4f7dc7e055084b6c4f26f21ab0566f04dc81c2c996565814f37f70fd6fe438bd2932d1c959a48ee177fd039edc0e3ef80e914";
 
     // 256-byte size-correct withdraw proof = G1(64) || G2(128) || G1(64)
@@ -157,7 +158,7 @@ module eunoma::withdraw_with_proof_tests {
             admin,
             VK_ALPHA_G1, VK_BETA_G2, VK_GAMMA_G2, VK_DELTA_G2,
             IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
-            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
+            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
         );
         eunoma_bridge::init_used_nullifiers_table(admin);
         // RootHistory baseline: zero32 is the empty-tree root, automatically
@@ -216,7 +217,7 @@ module eunoma::withdraw_with_proof_tests {
             admin,
             VK_ALPHA_G1, VK_BETA_G2, VK_GAMMA_G2, VK_DELTA_G2,
             IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
-            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
+            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
         );
         eunoma_bridge::publish_prepared_withdraw_proof_vk(admin);
         eunoma_bridge::init_used_nullifiers_table(admin);
@@ -386,7 +387,7 @@ module eunoma::withdraw_with_proof_tests {
             attacker,
             VK_ALPHA_G1, VK_BETA_G2, VK_GAMMA_G2, VK_DELTA_G2,
             IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
-            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
+            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
         );
     }
 
@@ -407,14 +408,14 @@ module eunoma::withdraw_with_proof_tests {
             admin,
             VK_ALPHA_G1, VK_BETA_G2, VK_GAMMA_G2, VK_DELTA_G2,
             IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
-            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
+            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
         );
         // Second publish must abort E_ALREADY_INITIALIZED (5)
         eunoma_bridge::publish_withdraw_proof_vk(
             admin,
             VK_ALPHA_G1, VK_BETA_G2, VK_GAMMA_G2, VK_DELTA_G2,
             IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
-            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
+            IC_BYTES, IC_BYTES, IC_BYTES, IC_BYTES,
         );
     }
 

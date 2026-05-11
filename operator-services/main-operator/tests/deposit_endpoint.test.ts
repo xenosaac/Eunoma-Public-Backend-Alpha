@@ -106,7 +106,11 @@ describe("main-operator POST /v1/deposit/request-attestation", () => {
     }
     const blind = decimalToLe32(priv.deposit_blind);
     const amount = BigInt(priv.amount);
-    const chainId = Number(priv.chain_id);
+    // Phase F W3: chain_id is no longer in valid_input.json (it's a circuit
+    // compile-time constant now). For the off-circuit amount_tag recomputation
+    // we still need the value — hardcoded to 2 (testnet, matching the circuit's
+    // baked CHAIN_ID).
+    const chainId = priv.chain_id !== undefined ? Number(priv.chain_id) : 2;
 
     const recomputed = await recomputeAmountTag({
       amount,

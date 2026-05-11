@@ -139,14 +139,16 @@ export async function buildDepositProof(
   );
 
   // ---- 3. Write circom input JSON ----
+  // Phase F W3: chain_id + pool_id are baked into the circuit as compile-time
+  // constants (CHAIN_ID = 2, POOL_ID = 0). They are NO LONGER part of the
+  // witness inputs JSON. Keep `chainIdLe32` / `poolIdLe32` locals because they
+  // are still needed for the off-circuit compose5 cross-check.
   fs.mkdirSync(TMP_DIR, { recursive: true });
   const circomInput = {
     commitment: le32ToDec(commitment),
     amount_tag: le32ToDec(amountTag),
     asset_id: le32ToDec(assetIdLe32),
     vault_addr_hash: le32ToDec(vaultAddrHashLe32),
-    chain_id: le32ToDec(chainIdLe32),
-    pool_id: le32ToDec(poolIdLe32),
     nullifier: le32ToDec(inputs.nullifier),
     secret: le32ToDec(inputs.secret),
     amount: inputs.amountOctas.toString(),
@@ -186,16 +188,15 @@ export async function buildDepositProof(
   proofBytes.set(cBytes, 64 + 128);
 
   // Sanity: confirm public_testnet.json matches our computed values.
+  // Phase F W3: 6 → 4 publics (chain_id + pool_id removed — circuit constants).
   const pub = JSON.parse(fs.readFileSync(publicPath, 'utf-8')) as string[];
   const expected = [
     le32ToDec(commitment),
     le32ToDec(amountTag),
     le32ToDec(assetIdLe32),
     le32ToDec(vaultAddrHashLe32),
-    le32ToDec(chainIdLe32),
-    le32ToDec(poolIdLe32),
   ];
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 4; i++) {
     if (pub[i] !== expected[i]) {
       throw new Error(
         `public[${i}] mismatch: snarkjs=${pub[i]} expected=${expected[i]}`,
