@@ -46,7 +46,9 @@ module eunoma_bench::bench_eunoma {
     /// `eunoma::eunoma_bridge::DOMAIN_DEPOSIT_BATCH_ITEM_V1` byte-for-byte
     /// (verified by re-using the same value here so the digest function
     /// produces the same bytes the bridge would compute).
-    const DOMAIN_DEPOSIT_BATCH_ITEM_V1: vector<u8> = b"APTOSHIELD_DEPOSIT_BATCH_ITEM_V1";
+    // Codex P3 fix: sync to production-shortened domain (D5 coordinator-time
+    // edit shrank both batch domains to consistency with D1's principle).
+    const DOMAIN_DEPOSIT_BATCH_ITEM_V1: vector<u8> = b"DEP_BATCH_ITEM_1";
 
     /// Local replica of `eunoma_bridge::batch_item_digest`. The bench package
     /// cannot link a `fun` from `eunoma_bridge` (private), but the algorithm
@@ -128,7 +130,7 @@ module eunoma_bench::bench_eunoma {
 
     fun build_batch_msg_bytes(n: u64): vector<u8> {
         let m = BenchBatchMsg {
-            domain: b"APTOSHIELD_DEPOSIT_BATCH_OK_V1",
+            domain: b"DEP_BATCH_OK_1",  // Codex P3 fix: match production-shortened domain
             chain_id: 2u8,
             pool_id: fixed_32_bytes(),
             operator_set_version: 1,

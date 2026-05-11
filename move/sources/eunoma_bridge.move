@@ -2229,7 +2229,13 @@ module eunoma::eunoma_bridge {
         //    amount_tag, ca_payload_hash, or nonce) flips the corresponding
         //    item_digest and the recomputed message bytes will not match what
         //    operators signed => E_INVALID_OPERATOR_SIGNATURE.
-        let pool_id_bytes = pool_id_to_fr_bytes();
+        //
+        // Codex P2 fix (post-Phase-D integration review): use the 8-byte LE u64
+        // pool_id encoding consistent with the single-deposit and withdraw
+        // attestation paths (Phase D Agent D1 c1/c2). Batch attestation needs
+        // an unambiguous pool_id; the 32-byte Fr form is only required for
+        // Groth16 public-input binding, which the batch path does not need.
+        let pool_id_bytes = pool_id_to_le_u64_bytes();
         let chain_id_u8 = chain_id::get();
         // batch_id is sha3 over the just-computed digest vector — globally
         // unique per attestation since digests include unique deposit_nonces.

@@ -312,7 +312,9 @@ module eunoma::deposit_batch_tests {
     ): vector<u8> {
         let msg = eunoma_bridge::test_call_new_batch_deposit_attestation_message(
             /*chain_id=*/ 2u8,
-            /*pool_id=*/ x"0000000000000000000000000000000000000000000000000000000000000000",
+            // Codex P2 fix: 8-byte LE u64 pool_id (matches D1 c1/c2/c3 +
+            // production batch encoding post-Codex-P2-fix on eunoma_bridge:2232).
+            /*pool_id=*/ x"0000000000000000",
             item_digests,
             TEST_EXPIRY,
         );
