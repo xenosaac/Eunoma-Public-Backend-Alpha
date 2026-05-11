@@ -2059,7 +2059,13 @@ module eunoma::eunoma_bridge {
         // slot. Strictly tighter than a bare equality check.
 
         // 8. Build canonical WithdrawAttestationMessage and verify 4-of-7 sigs.
-        let pool_id_bytes = pool_id_to_fr_bytes();
+        // Phase D Agent D1 candidate 2: same 32-byte → 8-byte LE u64 pool_id
+        // shrink applied to deposit attestation (commit 1) extended here to
+        // withdraw. The withdraw path does NOT pass pool_id into any Groth16
+        // public input (vs deposit), so the 32-byte Fr form was never required
+        // here either. Off-chain TS withdraw encoder (main-operator
+        // routes/withdraw.ts) is updated in lock-step to encode 8 bytes too.
+        let pool_id_bytes = pool_id_to_le_u64_bytes();
         let chain_id_u8   = chain_id::get();
         let msg = new_withdraw_attestation_message(
             cfg,
@@ -2422,7 +2428,9 @@ module eunoma::eunoma_bridge {
         expiry_secs: u64,
     ): vector<u8> acquires VaultConfig {
         let cfg = borrow_global<VaultConfig>(@eunoma);
-        let pool_id_bytes = pool_id_to_fr_bytes();
+        // Mirror production withdraw path (Phase D Agent D1 c2): 8-byte LE u64
+        // pool_id, not 32-byte LE Fr.
+        let pool_id_bytes = pool_id_to_le_u64_bytes();
         let chain_id_u8 = chain_id::get();
         let msg = new_withdraw_attestation_message(
             cfg,
