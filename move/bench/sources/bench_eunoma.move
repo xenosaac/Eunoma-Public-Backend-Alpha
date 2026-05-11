@@ -15,6 +15,7 @@ module eunoma_bench::bench_eunoma {
     use std::vector;
     use aptos_framework::event;
     use eunoma::pool_multi_sig_verifier;
+    use eunoma::pool_batch_root_update;
     use eunoma_bench::bench_keys;
 
     // Bare-minimum entry. Measures the tx envelope cost (~29 gas). Useful as a
@@ -297,5 +298,42 @@ module eunoma_bench::bench_eunoma {
             deposit_batch_id: 0,
             compliance_attestation_id: 0,
         });
+    }
+    /// Phase D / Agent D7 — measure the cost of `is_root_in_history(<unknown>)`
+    /// in isolation. The Phase D7 fail-fast hoist relocates this call from
+    /// "after borrow_global_mut<VaultConfig>" to "before borrow_global_mut",
+    /// so an invalid-root abort no longer pays the VaultConfig write-set
+    /// entry (Aptos charges write-set storage gas even on aborted tx).
+    ///
+    /// This bench measures `is_root_in_history` ALONE — answers the question:
+    /// "what does it cost to call this read-only check?" Useful because the
+    /// hoist moves it earlier in the call graph; if its cost ever spikes
+    /// (e.g. someone makes V2 lookup O(N) by accident), the hoist would
+    /// regress every withdraw success path, not just abort paths.
+    ///
+    /// On the eunoma_bench session (RootHistoryV2 not initialized), this
+    /// hits the V1 fallback path (linear scan over h.root_history), which
+    /// in a fresh session has zero entries -> returns false immediately.
+    /// Expected gas: tx-envelope (~29) + 1 exists<...> check + 1 borrow_global
+    /// + length(0) early-exit ≈ 35-50 gas. Subtract bench_noop (29) for the
+    /// pure function cost (~10-25 gas).
+    ///
+    /// NOTE: requires RootHistory to exist at the session-derived address.
+    /// In a fresh session it does NOT exist, so the entry just calls
+    /// is_root_in_history and the bench is "what does V2-absent + V1-absent
+    /// cost". Bench is informational only — primary value of the Phase D7
+    /// hoist is on the ABORT path, where a real withdraw_to_recipient call
+    /// with an invalid root saves one VaultConfig write-set entry. That
+    /// saving only materializes on testnet (or a fully-bootstrapped sim
+    /// session, which the bench infra does not currently set up).
+    public entry fun bench_is_root_in_history_unknown() {
+        // Read-only no-op when RootHistory doesn't exist (early return false).
+        // When RootHistory exists with N entries, costs O(N) for the linear
+        // scan in the V1 fallback (or O(1) lookup in V2 post-migration).
+        let bogus_root = vector[
+            0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let _ = pool_batch_root_update::is_root_in_history(bogus_root);
     }
 }

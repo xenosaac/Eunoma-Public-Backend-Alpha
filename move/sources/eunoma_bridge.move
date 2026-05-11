@@ -1941,22 +1941,40 @@ module eunoma::eunoma_bridge {
         let _ = relayer;
 
         assert!(exists<VaultConfig>(@eunoma), E_NOT_INITIALIZED);
-        let cfg = borrow_global_mut<VaultConfig>(@eunoma);
 
-        // 1. Pause check.
-        assert!(!cfg.paused, E_BRIDGE_PAUSED);
-
-        // 2. Expiry check.
+        // Phase D / Agent D7 fail-fast hoist: run read-only validation BEFORE
+        // borrow_global_mut<VaultConfig>. On Aptos, a borrow_global_mut creates
+        // a write-set entry that is finalized at the abort point — so an
+        // assertion after the borrow that fails pays the write-set cost. The
+        // three checks below (expiry, root-in-history, nullifier-table-exists)
+        // depend ONLY on arguments + read-only-global state and therefore can
+        // safely move above the mut borrow. Mirrors deposit Phase A (commit
+        // 9127260) which hoisted `assert_not_expired` for the same reason.
+        //
+        // Reordering preserves all abort codes — test_b7 / test_b3 still abort
+        // with E_EXPIRED_ATTESTATION (15) / E_INVALID_ROOT (20) from this
+        // module (`expected_failure` only checks abort_code + location, not
+        // PC). Pause check stays below the mut borrow because it dereferences
+        // `cfg.paused` which requires the resource.
+        //
+        // Pause-vs-expiry ordering note: if the bridge is paused AND the
+        // attestation is expired, post-hoist E_EXPIRED_ATTESTATION fires
+        // first. Tests do not exercise that compound state; the abort-code
+        // contract for each individual failure mode is preserved.
         assert_not_expired(expiry_secs);
-
-        // 3. Root must be in root_history.
         assert!(
             pool_batch_root_update::is_root_in_history(root),
             E_INVALID_ROOT,
         );
-
-        // 4. Nullifier not already consumed.
         assert!(exists<UsedNullifiers>(@eunoma), E_NOT_INITIALIZED);
+
+        let cfg = borrow_global_mut<VaultConfig>(@eunoma);
+
+        // 1. Pause check (cfg.paused — requires the mut borrow above).
+        assert!(!cfg.paused, E_BRIDGE_PAUSED);
+
+        // 4. Nullifier not already consumed. `exists<UsedNullifiers>` already
+        //    asserted above; safe to take the mut borrow directly.
         let nulls = borrow_global_mut<UsedNullifiers>(@eunoma);
         assert!(
             !table::contains(&nulls.table, nullifier_hash),
