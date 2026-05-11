@@ -256,8 +256,14 @@ module eunoma::pool_pending_queue {
         let leaf_acc_input = poseidon_bn254::hash_2(idx_fr, leaf_commitment);
         let new_acc = poseidon_bn254::hash_2(q.acc_hash, leaf_acc_input);
 
-        q.acc_hash = new_acc;
+        // Gas P6: push the new accumulator into history first (explicit copy),
+        // then move it into `q.acc_hash` as the last use. Previously the order
+        // was `q.acc_hash = new_acc;` first which forced an IMPLICIT copy
+        // (compiler must keep `new_acc` alive for the explicit `copy` on the
+        // next line), then an EXPLICIT copy — two 32-byte copies per deposit.
+        // This ordering yields one explicit copy + one move = one copy total.
         vector::push_back(&mut q.acc_history, copy new_acc);
+        q.acc_hash = new_acc;
 
         // Round-7 Item B.2 hook: populate PendingCommitmentIndex if initialized.
         // The `if (exists<...>)` guard ensures pre-init deposits do NOT abort
@@ -304,8 +310,11 @@ module eunoma::pool_pending_queue {
         let leaf_acc_input = poseidon_bn254::hash_2(idx_fr, leaf_commitment);
         let new_acc = poseidon_bn254::hash_2(q.acc_hash, leaf_acc_input);
 
-        q.acc_hash = new_acc;
+        // Gas P6: push first (explicit copy), then move into acc_hash. See
+        // matching comment in `deposit` above for rationale (saves one 32-byte
+        // implicit vector copy per call).
         vector::push_back(&mut q.acc_history, copy new_acc);
+        q.acc_hash = new_acc;
 
         // Round-7 Item B.2 hook: populate PendingCommitmentIndex if initialized.
         // Mirror of `deposit` hook — bridge calls `deposit_precomputed` from
