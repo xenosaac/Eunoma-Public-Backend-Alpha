@@ -133,15 +133,27 @@ module eunoma::pool_multi_sig_verifier {
         let i = 0;
         while (i < MAX_OPERATORS) {
             let sig = vector::borrow(&signatures, i);
-            let pubkey = vector::borrow(operator_pubkeys, i);
+            let sig_len = vector::length(sig);
 
-            if (vector::length(sig) > 0) {
-                // A signature is supplied for slot i.
+            if (sig_len > 0) {
+                // A signature is supplied for slot i. Inlined former
+                // `verify_operator_signature` helper: removes per-slot
+                // function frame and folds the length-checks against
+                // the already-required non-empty-sig branch (P1).
+                let pubkey = vector::borrow(operator_pubkeys, i);
+                let pk_len = vector::length(pubkey);
                 assert!(
-                    vector::length(pubkey) > 0,
+                    pk_len > 0,
                     E_SIGNATURE_FOR_INACTIVE_OPERATOR,
                 );
-                let ok = verify_operator_signature(pubkey, &message_bytes, sig);
+                let ok =
+                    pk_len == ED25519_PUBLIC_KEY_BYTES
+                        && sig_len == ED25519_SIGNATURE_BYTES
+                        && ed25519::signature_verify_strict(
+                            &ed25519::new_signature_from_bytes(*sig),
+                            &ed25519::new_unvalidated_public_key_from_bytes(*pubkey),
+                            *&message_bytes,
+                        );
                 assert!(ok, E_INVALID_OPERATOR_SIGNATURE);
 
                 valid_count = valid_count + 1;
@@ -178,22 +190,6 @@ module eunoma::pool_multi_sig_verifier {
     // ========================================================================
     // Internal helpers
     // ========================================================================
-
-    fun verify_operator_signature(
-        pubkey: &vector<u8>,
-        message_bytes: &vector<u8>,
-        signature: &vector<u8>,
-    ): bool {
-        if (vector::length(pubkey) != ED25519_PUBLIC_KEY_BYTES) {
-            return false
-        };
-        if (vector::length(signature) != ED25519_SIGNATURE_BYTES) {
-            return false
-        };
-        let pk = ed25519::new_unvalidated_public_key_from_bytes(*pubkey);
-        let sig = ed25519::new_signature_from_bytes(*signature);
-        ed25519::signature_verify_strict(&sig, &pk, *message_bytes)
-    }
 
     fun assert_valid_operator_set(
         operator_pubkeys: &vector<vector<u8>>,
