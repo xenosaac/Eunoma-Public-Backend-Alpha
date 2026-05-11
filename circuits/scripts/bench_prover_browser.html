@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Phase F W4 — Browser prover bench</title>
+</head>
+<body>
+<h1>Browser prover bench</h1>
+<pre id="log">starting...</pre>
+<script src="/circuits/node_modules/snarkjs/build/snarkjs.min.js"></script>
+<script>
+window.__benchResult = null;
+window.__benchError = null;
+const logEl = document.getElementById('log');
+function log(msg) { logEl.textContent += '\n' + msg; }
+
+function stats(arr) {
+    const sorted = [...arr].sort((a, b) => a - b);
+    const n = sorted.length;
+    const median = n % 2 === 0
+        ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+        : sorted[Math.floor(n / 2)];
+    return {
+        n,
+        min_ms: +sorted[0].toFixed(2),
+        median_ms: +median.toFixed(2),
+        max_ms: +sorted[n - 1].toFixed(2),
+        avg_ms: +(sorted.reduce((a, b) => a + b, 0) / n).toFixed(2),
+        raw_ms: sorted.map((x) => +x.toFixed(2)),
+    };
+}
+
+async function bench(label, wasmUrl, zkeyUrl, inputUrl, iters, warmup) {
+    log(`[${label}] loading...`);
+    const inputResp = await fetch(inputUrl);
+    const input = await inputResp.json();
+    // snarkjs.groth16.fullProve accepts URLs (strings) for wasm + zkey; it'll fetch them.
+
+    let peakHeapMb = 0;
+    const hasMemoryApi = !!performance.memory;
+    const poller = setInterval(() => {
+        if (hasMemoryApi) {
+            peakHeapMb = Math.max(peakHeapMb, performance.memory.usedJSHeapSize / 1024 / 1024);
+        }
+    }, 25);
+
+    // warmup
+    for (let i = 0; i < warmup; i++) {
+        await snarkjs.groth16.fullProve(input, wasmUrl, zkeyUrl);
+    }
+    log(`[${label}] warmup done; running ${iters} iterations`);
+    const times = [];
+    for (let i = 0; i < iters; i++) {
+        const t0 = performance.now();
+        await snarkjs.groth16.fullProve(input, wasmUrl, zkeyUrl);
+        const t1 = performance.now();
+        times.push(t1 - t0);
+        log(`[${label}] iter ${i+1}: ${(t1-t0).toFixed(1)}ms`);
+    }
+    clearInterval(poller);
+
+    const s = stats(times);
+    s.peak_js_heap_mb = hasMemoryApi ? +peakHeapMb.toFixed(1) : null;
+    s.has_memory_api = hasMemoryApi;
+    log(`[${label}] median=${s.median_ms}ms peak_heap=${s.peak_js_heap_mb}MB`);
+    return s;
+}
+
+async function main() {
+    const iters = parseInt(new URLSearchParams(location.search).get('iters') || '5', 10);
+    const warmup = 1;
+
+    const deposit = await bench(
+        'deposit_binding',
+        '/circuits/generated/deposit_binding_js/deposit_binding.wasm',
+        '/circuits/generated/deposit_binding_final.zkey',
+        '/circuits/inputs/valid_input.json',
+        iters, warmup,
+    );
+
+    const withdraw = await bench(
+        'withdrawal_proof',
+        '/circuits/generated/withdrawal_proof_js/withdrawal_proof.wasm',
+        '/circuits/generated/withdrawal_proof_final.zkey',
+        '/circuits/inputs/withdraw_valid_input.json',
+        iters, warmup,
+    );
+
+    window.__benchResult = {
+        captured_on: new Date().toISOString(),
+        user_agent: navigator.userAgent,
+        iters, warmup,
+        deposit_binding: { constraints: 3343, ...deposit },
+        withdrawal_proof: { constraints: 16073, ...withdraw },
+    };
+    log('DONE');
+}
+
+main().catch((e) => {
+    window.__benchError = String(e && e.stack || e);
+    log('ERROR: ' + window.__benchError);
+});
+</script>
+</body>
+</html>

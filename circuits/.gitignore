@@ -5,7 +5,8 @@ node_modules/
 generated/*.ptau
 generated/*.zkey
 generated/*.wtns
-generated/deposit_binding_js/
+generated/deposit_binding_js
+generated/witness_valid.wtns
 
 # Keep these (small, needed by Move tests):
 !generated/deposit_binding_vk.json
@@ -15,3 +16,8 @@ generated/deposit_binding_js/
 !generated/public_valid.json
 !generated/public_invalid_*.json
 !generated/move_fixtures/
+
+# Phase F W4 — proof-of-concept optimized circuit artifacts (large; regenerable)
+generated_w4/*.zkey
+generated_w4/*.wtns
+generated_w4/withdrawal_proof_js/

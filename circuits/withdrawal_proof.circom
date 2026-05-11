@@ -48,6 +48,7 @@ pragma circom 2.1.6;
 include "../node_modules/circomlib/circuits/poseidon.circom";
 include "../node_modules/circomlib/circuits/bitify.circom";
 include "../node_modules/circomlib/circuits/comparators.circom";
+include "../node_modules/circomlib/circuits/switcher.circom";
 
 // 5-input Poseidon (matches deposit_binding.circom Compose5 exactly).
 // compose5(a,b,c,d,e) = hash_2(hash_3(a,b,c), hash_2(d,e))
@@ -109,34 +110,23 @@ template MerkleInclusion(depth) {
     cur[0] <== leaf;
 
     component hashers[depth];
-    // Intermediate signals for branch-free mux (R1CS = 1 mul per constraint).
-    signal not_idx[depth];
-    signal left_via_cur[depth];
-    signal left_via_sib[depth];
-    signal right_via_sib[depth];
-    signal right_via_cur[depth];
-    signal left[depth];
-    signal right[depth];
+    // Phase F W4: switch from 4-mul branch-free mux to circomlib Switcher (1 mul/level).
+    //   Switcher: aux = (R-L)*sel; outL = aux+L; outR = -aux+R
+    // Same semantics as before: path_index==0 -> (cur, sibling); path_index==1 -> (sibling, cur).
+    component sw[depth];
 
     for (var i = 0; i < depth; i++) {
-        // Force path_index to be 0 or 1: idx*(idx-1) === 0
+        // Force path_index to be 0 or 1 (Switcher does NOT enforce this).
         path_index[i] * (path_index[i] - 1) === 0;
-        not_idx[i] <== 1 - path_index[i];
 
-        // (left, right) = path_index ? (sibling, cur) : (cur, sibling)
-        //   left  = cur*not_idx + sibling*idx
-        //   right = sibling*not_idx + cur*idx
-        left_via_cur[i]  <== cur[i]  * not_idx[i];
-        left_via_sib[i]  <== path[i] * path_index[i];
-        right_via_sib[i] <== path[i] * not_idx[i];
-        right_via_cur[i] <== cur[i]  * path_index[i];
-
-        left[i]  <== left_via_cur[i]  + left_via_sib[i];
-        right[i] <== right_via_sib[i] + right_via_cur[i];
+        sw[i] = Switcher();
+        sw[i].sel <== path_index[i];
+        sw[i].L   <== cur[i];
+        sw[i].R   <== path[i];
 
         hashers[i] = Poseidon(2);
-        hashers[i].inputs[0] <== left[i];
-        hashers[i].inputs[1] <== right[i];
+        hashers[i].inputs[0] <== sw[i].outL;
+        hashers[i].inputs[1] <== sw[i].outR;
         cur[i + 1] <== hashers[i].out;
     }
 
