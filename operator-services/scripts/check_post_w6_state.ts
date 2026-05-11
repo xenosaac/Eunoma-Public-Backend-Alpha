@@ -17,7 +17,7 @@ import { loadSecretHex } from '../shared/src/secrets.js';
 
 const VAULT = '0xe596a6cac39c63e3701449d5f55911c96ab9f54fbb8315b9cade58e4c2438306';
 const RECIPIENT = '0xa2f32e7b3dca7710b6dc3e45ad3bff5a74a76e226212d729ed4c68336cb4c334';
-const BRIDGE = '0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820';
+const BRIDGE = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
 
 async function main() {
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));

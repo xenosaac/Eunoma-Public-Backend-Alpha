@@ -19,7 +19,7 @@ import {
 import { loadSecretHex } from '../shared/src/secrets.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const BRIDGE_ADDR = '0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820';
+const BRIDGE_ADDR = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
 
 function hexToBytes(h: string): Uint8Array {
   const s = h.startsWith('0x') ? h.slice(2) : h;

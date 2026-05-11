@@ -71,6 +71,7 @@ async function main() {
       signer: recipientAccount,
       tokenAddress: APT_METADATA,
       decryptionKey: recipientDk,
+      options: { maxGasAmount: 200_000, gasUnitPrice: 100 },
     });
     console.log(`  tx = ${regResp.hash}`);
     console.log(`  success = ${regResp.success}`);

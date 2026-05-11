@@ -77,10 +77,12 @@ async function main() {
   if (!alreadyRegistered) {
     // ---- 3. Register CA balance ----
     console.log('\n[register] aptos.confidentialAsset.registerBalance ...');
+    // W3 cap maxGasAmount — SDK default is 2M which exceeds fresh-address balance.
     const regResp = await ca.registerBalance({
       signer: userAccount,
       tokenAddress: APT_METADATA,
       decryptionKey: userDk,
+      options: { maxGasAmount: 200_000, gasUnitPrice: 100 },
     });
     console.log(`  tx = ${regResp.hash}`);
     console.log(`  success = ${regResp.success}`);
@@ -100,6 +102,7 @@ async function main() {
     signer: userAccount,
     tokenAddress: APT_METADATA,
     amount: VEIL_AMOUNT_OCTAS,
+    options: { maxGasAmount: 200_000, gasUnitPrice: 100 },
   });
   console.log(`  tx = ${depResp.hash}`);
   console.log(`  success = ${depResp.success}`);

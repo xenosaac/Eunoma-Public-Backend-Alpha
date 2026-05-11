@@ -47,7 +47,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.join(__dirname, 'testnet_state.json');
 
 const BRIDGE_ADDR =
-  '0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820';
+  '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
 const APT_METADATA = '0xa'; // testnet APT FA metadata
 const VAULT_SEED_HEX = '65756e6f6d612d627269646765'; // "eunoma-bridge"
 const CHAIN_ID = 2; // testnet
@@ -145,33 +145,39 @@ async function main() {
   console.log(`wrote CLI args → ${argsPath}`);
 
   // ---- 6. Simulate FIRST via local-session (zero gas) ----
-  console.log('\n[simulate] aptos move run --local ...');
-  const simCmd = [
-    'aptos',
-    'move',
-    'run',
-    '--profile eunoma-admin',
-    `--json-file '${argsPath}'`,
-    '--local',
-    '--assume-yes',
-  ].join(' ');
-  let simOut = '';
-  try {
-    simOut = execSync(simCmd, { encoding: 'utf-8', cwd: path.dirname(__dirname) });
-  } catch (e: any) {
-    simOut = (e.stdout || '') + (e.stderr || '');
-    console.error(simOut);
-    throw new Error('simulation failed — see output above');
+  // W3 NOTE: simulation is rate-limited by the anonymous RPC quota
+  // (40000 CU / 5min). Skippable via SKIP_SIM=1 for fresh-address runs.
+  if (process.env.SKIP_SIM === '1') {
+    console.log('\n[simulate] SKIP_SIM=1 — skipping local simulation');
+  } else {
+    console.log('\n[simulate] aptos move run --local ...');
+    const simCmd = [
+      'aptos',
+      'move',
+      'run',
+      '--profile eunoma-admin',
+      `--json-file '${argsPath}'`,
+      '--local',
+      '--assume-yes',
+    ].join(' ');
+    let simOut = '';
+    try {
+      simOut = execSync(simCmd, { encoding: 'utf-8', cwd: path.dirname(__dirname) });
+    } catch (e: any) {
+      simOut = (e.stdout || '') + (e.stderr || '');
+      console.error(simOut);
+      throw new Error('simulation failed — see output above');
+    }
+    console.log(simOut);
+    // Parse simulation result; CLI prefixes "Simulating transaction locally..." text before JSON.
+    const simJsonStart = simOut.indexOf('{');
+    const simParsed = JSON.parse(simOut.slice(simJsonStart));
+    if (simParsed.Result?.success === false) {
+      throw new Error(`simulation reverted: ${JSON.stringify(simParsed.Result, null, 2)}`);
+    }
+    const simGas = simParsed.Result?.gas_used;
+    console.log(`simulation OK — estimated gas = ${simGas}`);
   }
-  console.log(simOut);
-  // Parse simulation result; CLI prefixes "Simulating transaction locally..." text before JSON.
-  const simJsonStart = simOut.indexOf('{');
-  const simParsed = JSON.parse(simOut.slice(simJsonStart));
-  if (simParsed.Result?.success === false) {
-    throw new Error(`simulation reverted: ${JSON.stringify(simParsed.Result, null, 2)}`);
-  }
-  const simGas = simParsed.Result?.gas_used;
-  console.log(`simulation OK — estimated gas = ${simGas}`);
 
   // ---- 7. Submit on-chain ----
   console.log('\n[submit] aptos move run ...');

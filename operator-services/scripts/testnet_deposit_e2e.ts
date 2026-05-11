@@ -55,7 +55,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.join(__dirname, 'testnet_state.json');
 
 const BRIDGE_ADDR =
-  '0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820';
+  '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
 const APT_METADATA = '0xa';
 const CHAIN_ID = 2; // testnet
 // Phase 2.Y / W.3 — amount overridable via env DEPOSIT_AMOUNT_OCTAS for B.5+ deposits.
@@ -156,10 +156,12 @@ async function main() {
   }
 
   if (needRollover) {
+    // W3: cap maxGasAmount — SDK default 2M exceeds fresh-address balance check.
     const rolloverResp = await ca.rolloverPendingBalance({
       signer: userAccount,
       tokenAddress: APT_METADATA,
       checkNormalized: false,
+      options: { maxGasAmount: 200_000, gasUnitPrice: 100 },
     });
     const last = rolloverResp[rolloverResp.length - 1];
     console.log(`  rollover tx = ${last.hash}, success=${last.success}, gas=${last.gas_used}`);

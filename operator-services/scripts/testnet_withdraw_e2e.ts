@@ -42,7 +42,7 @@ import { loadOperatorKeys } from '../shared/src/secrets.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.join(__dirname, 'testnet_state.json');
 
-const BRIDGE_ADDR = '0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820';
+const BRIDGE_ADDR = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
 const APT_METADATA = '0xa';
 const CHAIN_ID = 2;
 // Phase 2.Y / W.1 — Amount-binding operator obligation (per HANDOFF Section 4 Step 4
@@ -363,7 +363,9 @@ async function main() {
         Array.from(caPayload.memo),
       ],
     },
-    options: { maxGasAmount: 1_000_000, gasUnitPrice: 100 },
+    // W3: cap to 500K (was 1M) — fresh-address has < 1 APT after deposit; chain-side
+    // withdraw_to_recipient typically uses ~11K gas so 500K is still ~45× margin.
+    options: { maxGasAmount: 500_000, gasUnitPrice: 100 },
   });
 
   console.log('  skipping simulate (ts-sdk simulator gas cap is tighter than chain) ...');

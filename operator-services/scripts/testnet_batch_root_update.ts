@@ -143,7 +143,7 @@ function encodeAttestationMessage(msg: {
   return ser.toUint8Array();
 }
 
-const BRIDGE_ADDR = '0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820';
+const BRIDGE_ADDR = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
 
 async function main() {
   console.log('Phase 1 closed-loop test: testnet batch_root_update');

@@ -1,10 +1,10 @@
 {
-  "function_id": "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820::eunoma_bridge::init_vault_with_ca_registration",
+  "function_id": "0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a::eunoma_bridge::init_vault_with_ca_registration",
   "type_args": [],
   "args": [
     {
       "type": "address",
-      "value": "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820"
+      "value": "0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a"
     },
     {
       "type": "address",
@@ -41,13 +41,13 @@
     {
       "type": "hex",
       "value": [
-        "0xe4ae6ee5d0cc4ce0203d75d5f59cdc87d52f77a937fbf7d951adbde78c09545d"
+        "0xae6844496dc55396927460fe759de860350c3bcbfb37c9fb61f3036a37de8a42"
       ]
     },
     {
       "type": "hex",
       "value": [
-        "0x07ae51b6991467e29e1c4b2ebf1aa10eafb4dbaa99a53bb6d42ce2f454fb4a01"
+        "0xb17e67890068a162d8e623d327e02746293239aff40c361979913d22ce486e03"
       ]
     }
   ]
