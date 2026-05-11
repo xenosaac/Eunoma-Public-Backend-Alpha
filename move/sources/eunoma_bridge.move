@@ -31,6 +31,7 @@
 ///       zkrp_new_balance, sigma_proto_comm/resp).
 module eunoma::eunoma_bridge {
     use std::bcs;
+    use std::hash;
     use std::option;
     use std::vector;
     use std::signer;
@@ -73,8 +74,29 @@ module eunoma::eunoma_bridge {
     /// Domain separators for attestation BCS hashes. These are the first field of the
     /// DepositAttestationMessage / WithdrawAttestationMessage and MUST match the
     /// off-chain TS operator builder byte-for-byte.
-    const DOMAIN_DEPOSIT_OK_V1: vector<u8> = b"APTOSHIELD_DEPOSIT_OK_V1";
-    const DOMAIN_WITHDRAW_OK_V1: vector<u8> = b"APTOSHIELD_WITHDRAW_OK_V1";
+    /// Phase D Agent D1 c3: shrunk from 24-byte / 25-byte ASCII tags to 8-byte
+    /// tags. Domain separation only requires deposit-domain ≠ withdraw-domain;
+    /// long ASCII was human-readability convenience, not crypto requirement.
+    const DOMAIN_DEPOSIT_OK_V1: vector<u8> = b"DEP_OK_1";   // 8 bytes
+    const DOMAIN_WITHDRAW_OK_V1: vector<u8> = b"WDR_OK_1";  // 8 bytes
+    /// Agent D5 — domain separator for the batched-deposit attestation. Distinct
+    /// from the single-deposit domain so a batch attestation cannot be replayed
+    /// as N single-deposit attestations (and vice-versa).
+    const DOMAIN_DEPOSIT_BATCH_OK_V1: vector<u8> = b"DEP_BATCH_OK_1";  // 14 bytes
+    /// Agent D5 — domain separator for per-item digests inside a batch deposit.
+    /// Each item digest = sha3_256(domain || commitment || amount_tag ||
+    /// ca_payload_hash || deposit_nonce). Off-chain TS must mirror this prefix.
+    const DOMAIN_DEPOSIT_BATCH_ITEM_V1: vector<u8> = b"DEP_BATCH_ITEM_1";  // 16 bytes
+
+    /// Agent D5 — maximum number of deposits in a single batch.
+    const MAX_BATCH_DEPOSITS: u64 = 8;
+
+    /// Agent D5 — error: batch size out of allowed range [1, MAX_BATCH_DEPOSITS].
+    const E_BATCH_SIZE_OUT_OF_RANGE: u64 = 25;
+    /// Agent D5 — error: per-deposit parallel vectors are not all the same length.
+    const E_BATCH_LENGTH_MISMATCH: u64 = 26;
+    /// Agent D5 — error: duplicate deposit_nonce inside a single batch call.
+    const E_BATCH_DUPLICATE_NONCE: u64 = 27;
 
     /// Length of an Ed25519 public key in bytes.
     const ED25519_PUBLIC_KEY_BYTES: u64 = 32;
@@ -411,6 +433,17 @@ module eunoma::eunoma_bridge {
         deposit_nonce: vector<u8>,
     }
 
+    /// Agent D5 — emitted once per `deposit_batch_with_commitments` call, in
+    /// addition to the per-item `DepositEvent`s. Indexers that want to know
+    /// "this batch landed together" join on `batch_id` (= sha3 of the
+    /// item_digests vector — globally unique per attestation).
+    #[event]
+    struct BatchDepositEvent has drop, store {
+        batch_id: vector<u8>,
+        batch_size: u64,
+        asset_type: Object<fungible_asset::Metadata>,
+    }
+
     // ========================================================================
     // Attestation message structs (Section 2.4)
     //
@@ -430,6 +463,38 @@ module eunoma::eunoma_bridge {
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         deposit_nonce: vector<u8>,
+        expiry_secs: u64,
+    }
+
+    /// Agent D5 — canonical attestation message for `deposit_batch_with_commitments`.
+    ///
+    /// Design notes:
+    ///   * `item_digests` is a positional vector. Item `i` of the call corresponds to
+    ///     `item_digests[i]` in this struct. The bridge recomputes each digest from the
+    ///     per-deposit fields (commitment, amount_tag, recomputed ca_payload_hash,
+    ///     deposit_nonce) and compares byte-for-byte; any drift triggers
+    ///     E_INVALID_OPERATOR_SIGNATURE downstream (the recomputed message bytes won't
+    ///     match the bytes operators signed).
+    ///   * `expiry_secs` is a single shared expiry — the operator authorizes the whole
+    ///     batch to be finalized before that wall-clock. Cuts attestation issuance
+    ///     overhead vs N independent expiries.
+    ///   * `domain` is `DOMAIN_DEPOSIT_BATCH_OK_V1`, distinct from the single-deposit
+    ///     domain, so a batch attestation cannot be reused as a single-deposit
+    ///     attestation and vice-versa.
+    ///   * `operator_set_version` + `threshold` are pulled from the live VaultConfig at
+    ///     verification time (mirrors single-deposit semantics). A batch signed under
+    ///     operator-set version V cannot be replayed after rotation to V+1.
+    ///
+    /// Field order is part of the BCS encoding. DO NOT reorder.
+    struct BatchDepositAttestationMessage has drop, store, copy {
+        domain: vector<u8>,
+        chain_id: u8,
+        pool_id: vector<u8>,
+        operator_set_version: u64,
+        threshold: u64,
+        vault_addr: address,
+        asset_type: Object<fungible_asset::Metadata>,
+        item_digests: vector<vector<u8>>,
         expiry_secs: u64,
     }
 
@@ -893,6 +958,58 @@ module eunoma::eunoma_bridge {
         }
     }
 
+    /// Agent D5 — compute the per-item digest the bridge embeds inside a
+    /// `BatchDepositAttestationMessage.item_digests` slot.
+    ///
+    /// Digest = sha3_256(DOMAIN_DEPOSIT_BATCH_ITEM_V1 || commitment || amount_tag
+    ///                   || ca_payload_hash || deposit_nonce).
+    ///
+    /// Off-chain TS operators MUST mirror this byte-for-byte; we use std::hash
+    /// (sha3-256) rather than Poseidon because (a) the digest's only purpose is
+    /// to bind a tuple of opaque byte strings into the BCS attestation message
+    /// — no Fr-arithmetic constraint is needed, and (b) sha3-256 is cheap
+    /// compared to Poseidon and keeps the off-chain implementation portable
+    /// across any TS sha3 library. The domain prefix prevents collision with
+    /// other sha3 hash usages in the bridge.
+    fun batch_item_digest(
+        commitment: &vector<u8>,
+        amount_tag: &vector<u8>,
+        ca_payload_hash: &vector<u8>,
+        deposit_nonce: &vector<u8>,
+    ): vector<u8> {
+        let buf = vector::empty<u8>();
+        vector::append(&mut buf, DOMAIN_DEPOSIT_BATCH_ITEM_V1);
+        vector::append(&mut buf, *commitment);
+        vector::append(&mut buf, *amount_tag);
+        vector::append(&mut buf, *ca_payload_hash);
+        vector::append(&mut buf, *deposit_nonce);
+        hash::sha3_256(buf)
+    }
+
+    /// Agent D5 — build a canonical `BatchDepositAttestationMessage`. Mirrors
+    /// `new_deposit_attestation_message` for the single-deposit path: pulls
+    /// `operator_set_version` + `threshold` from VaultConfig so a batched
+    /// attestation cannot be replayed across operator-set rotations.
+    fun new_batch_deposit_attestation_message(
+        cfg: &VaultConfig,
+        chain_id: u8,
+        pool_id: vector<u8>,
+        item_digests: vector<vector<u8>>,
+        expiry_secs: u64,
+    ): BatchDepositAttestationMessage {
+        BatchDepositAttestationMessage {
+            domain: DOMAIN_DEPOSIT_BATCH_OK_V1,
+            chain_id,
+            pool_id,
+            operator_set_version: cfg.operator_set_version,
+            threshold: cfg.attestation_threshold,
+            vault_addr: cfg.vault_addr,
+            asset_type: cfg.asset_type,
+            item_digests,
+            expiry_secs,
+        }
+    }
+
     fun new_withdraw_attestation_message(
         cfg: &VaultConfig,
         chain_id: u8,
@@ -1171,6 +1288,32 @@ module eunoma::eunoma_bridge {
         };
         while (i < FR_BYTES) {
             vector::push_back(&mut buf, 0u8);
+            i = i + 1;
+        };
+        buf
+    }
+
+    /// Phase D Agent D1 — 8-byte LE u64 encoding of `POOL_ID_VALUE` for use as
+    /// the `pool_id` field of `DepositAttestationMessage`. The 32-byte LE Fr
+    /// form (`pool_id_to_fr_bytes`) is still used for the Groth16 binding-proof
+    /// public input (where field-element width is mandatory), but the
+    /// attestation-signing message only needs an unambiguous 8-byte u64 — which
+    /// is what the off-chain TS deposit encoder already produces (see
+    /// `operator-services/shared/src/attestation.ts:60-89`). Shrinking from
+    /// 32 → 8 bytes on the attestation hot path:
+    ///   * saves 24 BCS bytes per signed message (24 bytes of payload; the
+    ///     ULEB128 length prefix stays 1 byte for both 8 and 32),
+    ///   * shrinks the SHA512 input fed to each ed25519::signature_verify_strict
+    ///     call (4× per deposit at 4-of-7),
+    ///   * fixes a pre-existing Move-vs-TS parity bug (Move signed-over 32 B,
+    ///     TS signed-over 8 B on deposit — see attestation.ts comment line 60).
+    fun pool_id_to_le_u64_bytes(): vector<u8> {
+        let n = POOL_ID_VALUE;
+        let buf = vector::empty<u8>();
+        let i = 0;
+        while (i < 8) {
+            vector::push_back(&mut buf, ((n & 0xFFu64) as u8));
+            n = n >> 8;
             i = i + 1;
         };
         buf
@@ -1768,7 +1911,15 @@ module eunoma::eunoma_bridge {
         //    sign over the recomputed hash; a stand-alone equality check would
         //    permit a future bug where the bridge accepts an operator signature
         //    over a hash that doesn't match the recomputed value.
-        let pool_id_bytes = pool_id_to_fr_bytes();
+        // Phase D Agent D1 — 8-byte LE u64 pool_id (vs prior 32-byte LE Fr) for
+        // the attestation message body only. The Groth16 binding-proof public
+        // input below (step 6) still calls `pool_id_to_fr_bytes()` because that
+        // path NEEDS a 32-byte Fr representation. The on-the-wire signed
+        // message is now 24 bytes shorter, which (a) matches the TS deposit
+        // encoder byte-for-byte (`shared/src/attestation.ts:60-89` — fixes a
+        // pre-existing Move-vs-TS parity bug) and (b) shrinks SHA512 input
+        // bytes to each of the 4 ed25519::signature_verify_strict calls.
+        let pool_id_bytes = pool_id_to_le_u64_bytes();
         let chain_id_u8 = chain_id::get();
         let msg = new_deposit_attestation_message(
             cfg,
@@ -1866,6 +2017,321 @@ module eunoma::eunoma_bridge {
     }
 
     // ========================================================================
+    // Agent D5 — Additive multi-deposit entry function (no ABI break to
+    // `deposit_with_commitment`).
+    // ========================================================================
+    //
+    // RATIONALE
+    //   Each call of `deposit_with_commitment` performs one 4-of-7 Ed25519
+    //   multi-sig verify (4× `ed25519::signature_verify_strict` natives). A
+    //   user-session that wishes to deposit N commitments pays for N such
+    //   verifications. With a single batched attestation over all N items
+    //   we pay for the multi-sig exactly once. Per-deposit Groth16, CA
+    //   dispatch, nonce-table inserts, and pool-queue pushes remain O(N)
+    //   and unchanged.
+    //
+    // SECURITY MODEL
+    //   * The batched attestation message embeds a positional vector of
+    //     per-item digests, where each digest = sha3_256(domain ||
+    //     commitment_i || amount_tag_i || ca_payload_hash_i || deposit_nonce_i).
+    //     This binds *every* commitment-specific datum into the operator
+    //     signature — an attacker cannot substitute or reorder items in a
+    //     pre-signed batch attestation without breaking the recomputed
+    //     attestation bytes (=> E_INVALID_OPERATOR_SIGNATURE).
+    //   * Distinct domain separator (`DOMAIN_DEPOSIT_BATCH_OK_V1`) prevents
+    //     replay of a batch attestation as a single-deposit attestation (or
+    //     vice-versa).
+    //   * `operator_set_version` is pulled live from VaultConfig, so a batch
+    //     attestation produced under operator-set version V cannot be replayed
+    //     after rotation to V+1 (forbidden action #18, same as single-deposit).
+    //   * Each per-deposit `deposit_nonce_i` is checked against the
+    //     `used_deposit_nonces` table (no in-batch duplicates AND no replay
+    //     against historical deposits). Inserts happen BEFORE the per-item
+    //     CA dispatch — same "burn before dispatch" semantics as single deposit.
+    //
+    // PARTIAL-FAILURE SEMANTICS
+    //   *Atomic*: if any single item fails *any* gate (binding proof, CA
+    //   dispatch, nonce duplicate, item-digest mismatch, etc.), the entire
+    //   transaction reverts via Move's standard rollback. This is the
+    //   simplest and safest semantics — soft-failure would require persisting
+    //   partial-batch state and would let attackers grief honest batches by
+    //   crafting one bad item. Operators are expected to validate proofs
+    //   off-chain before issuing a batch attestation.
+    //
+    // BATCH SIZE BOUND
+    //   `MAX_BATCH_DEPOSITS = 8`. Each item carries a full
+    //   `confidential_transfer_raw` payload (15 nested byte vectors plus
+    //   commitment / proof / nonce / amount_tag), so the entry-function
+    //   argument list and BCS-encoded tx size grow ~linearly with N. At N=8
+    //   the tx already runs ~4× the size of a single-deposit call and the
+    //   per-deposit Groth16 cost begins to dominate any multi-sig amortization.
+    //   N=1 is permitted (semantically equivalent to single-deposit but pays
+    //   a slight overhead penalty for the batch dispatch path).
+    //
+    // ABI STABILITY
+    //   `deposit_with_commitment` is unchanged. TypeScript clients that depend
+    //   on the existing 21-arg signature continue to compile and route the
+    //   same way. Clients that opt into batched deposits add a new
+    //   `submit_batch(...)` helper that targets `deposit_batch_with_commitments`.
+    //
+    /// Batched-deposit entry. Verification gates (in order):
+    ///   1. Bridge initialized + pause check.
+    ///   2. Expiry check (same single shared `expiry_secs` as single-deposit).
+    ///   3. Batch size in [1, MAX_BATCH_DEPOSITS].
+    ///   4. All parallel input vectors have length == batch size.
+    ///   5. For each item i:
+    ///       a. `user != vault_addr` (defensive: prevents deposit-from-vault).
+    ///       b. `deposit_nonce_i` not previously consumed AND not duplicated
+    ///          inside the batch (E_DEPOSIT_NONCE_REPLAY / E_BATCH_DUPLICATE_NONCE).
+    ///       c. Recompute `ca_payload_hash_i` from the per-item CA payload fields.
+    ///       d. Compute `item_digest_i` = sha3_256(domain || commitment_i ||
+    ///          amount_tag_i || ca_payload_hash_i || deposit_nonce_i).
+    ///   6. Build the canonical `BatchDepositAttestationMessage` and verify the
+    ///      single 4-of-7 operator attestation (E_INVALID_OPERATOR_SIGNATURE
+    ///      bubbles up from multi_sig_verifier if any item drifted from the
+    ///      operator-signed digest vector).
+    ///   7. For each item i:
+    ///       a. Verify Groth16 deposit-binding proof (E_INVALID_DEPOSIT_BINDING_PROOF).
+    ///       b. Mark `deposit_nonce_i` consumed (burn before CA dispatch).
+    ///       c. Read `leaf_index_i` from `pending_queue::pending_tail()`.
+    ///       d. Dispatch CA `confidential_transfer_raw` for this item.
+    ///       e. Push `commitment_i` into the pending queue.
+    ///       f. Emit per-item `DepositEvent`.
+    ///   8. Emit one `BatchDepositEvent` summarizing the call.
+    public entry fun deposit_batch_with_commitments(
+        user: &signer,
+
+        // Per-item shielded-pool deposit fields (parallel vectors of length N).
+        commitments: vector<vector<u8>>,
+        amount_tags: vector<vector<u8>>,
+        deposit_binding_proofs: vector<vector<u8>>,
+        deposit_nonces: vector<vector<u8>>,
+
+        // Shared attestation fields (one for the whole batch).
+        expiry_secs: u64,
+        operator_signatures: vector<vector<u8>>,
+
+        // Per-item CA payload fields. Outer vector length == N; each inner
+        // shape matches the single-deposit ABI verbatim.
+        new_balance_p_vec: vector<vector<vector<u8>>>,
+        new_balance_r_vec: vector<vector<vector<u8>>>,
+        new_balance_r_eff_aud_vec: vector<vector<vector<u8>>>,
+        amount_p_vec: vector<vector<vector<u8>>>,
+        amount_r_sender_vec: vector<vector<vector<u8>>>,
+        amount_r_recip_vec: vector<vector<vector<u8>>>,
+        amount_r_eff_aud_vec: vector<vector<vector<u8>>>,
+        ek_volun_auds_vec: vector<vector<vector<u8>>>,
+        amount_r_volun_auds_vec: vector<vector<vector<vector<u8>>>>,
+        zkrp_new_balance_vec: vector<vector<u8>>,
+        zkrp_amount_vec: vector<vector<u8>>,
+        sigma_proto_comm_vec: vector<vector<vector<u8>>>,
+        sigma_proto_resp_vec: vector<vector<vector<u8>>>,
+        memo_vec: vector<vector<u8>>,
+    ) acquires VaultConfig, PreparedDepositBindingVK, VaultConfigCache {
+        assert!(exists<VaultConfig>(@eunoma), E_NOT_INITIALIZED);
+
+        // 2. Expiry check FIRST (before VaultConfig borrow — mirrors Gas P3 of
+        //    single-deposit so an expired-attestation abort doesn't pay the
+        //    VaultConfig write-set entry).
+        assert_not_expired(expiry_secs);
+
+        let cfg = borrow_global_mut<VaultConfig>(@eunoma);
+
+        // 1. Pause check.
+        assert!(!cfg.paused, E_BRIDGE_PAUSED);
+
+        // 3. Batch size in [1, MAX_BATCH_DEPOSITS].
+        let n = vector::length(&commitments);
+        assert!(n >= 1 && n <= MAX_BATCH_DEPOSITS, E_BATCH_SIZE_OUT_OF_RANGE);
+
+        // 4. All parallel vectors must have the same length.
+        assert!(vector::length(&amount_tags) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&deposit_binding_proofs) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&deposit_nonces) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&new_balance_p_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&new_balance_r_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&new_balance_r_eff_aud_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&amount_p_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&amount_r_sender_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&amount_r_recip_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&amount_r_eff_aud_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&ek_volun_auds_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&amount_r_volun_auds_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&zkrp_new_balance_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&zkrp_amount_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&sigma_proto_comm_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&sigma_proto_resp_vec) == n, E_BATCH_LENGTH_MISMATCH);
+        assert!(vector::length(&memo_vec) == n, E_BATCH_LENGTH_MISMATCH);
+
+        // 5a. Defensive: deposit-from-vault rejected.
+        assert!(signer::address_of(user) != cfg.vault_addr, E_INVALID_DEPOSIT_BINDING_PROOF);
+
+        // 5b-d. Precompute per-item ca_payload_hash, item_digest, and detect
+        //       in-batch nonce duplicates. We do this in a SINGLE forward pass
+        //       so the multi-sig verify can run once on the resulting digest
+        //       vector.
+        let item_digests = vector::empty<vector<u8>>();
+        let ca_payload_hashes = vector::empty<vector<u8>>();
+        let i = 0;
+        while (i < n) {
+            // Nonce must be unique within the batch AND not already consumed.
+            let nonce_i = vector::borrow(&deposit_nonces, i);
+            assert!(
+                !table::contains(&cfg.used_deposit_nonces, *nonce_i),
+                E_DEPOSIT_NONCE_REPLAY,
+            );
+            // Linear scan for in-batch duplicates. N ≤ MAX_BATCH_DEPOSITS = 8
+            // so the O(N²) cost is bounded at 64 comparisons — comfortably
+            // cheaper than even a single ed25519 verify. Done here (pre-multisig)
+            // so a duplicate-nonce batch fails fast with the dedicated abort
+            // code rather than via the more opaque CA path.
+            let j = 0;
+            while (j < i) {
+                let nonce_j = vector::borrow(&deposit_nonces, j);
+                assert!(*nonce_i != *nonce_j, E_BATCH_DUPLICATE_NONCE);
+                j = j + 1;
+            };
+
+            // Recompute ca_payload_hash for item i (same digest the operator
+            // signed over off-chain).
+            let cph_i = hash_confidential_transfer_payload(
+                cfg.asset_type,
+                cfg.vault_addr,
+                *vector::borrow(&new_balance_p_vec, i),
+                *vector::borrow(&new_balance_r_vec, i),
+                *vector::borrow(&new_balance_r_eff_aud_vec, i),
+                *vector::borrow(&amount_p_vec, i),
+                *vector::borrow(&amount_r_sender_vec, i),
+                *vector::borrow(&amount_r_recip_vec, i),
+                *vector::borrow(&amount_r_eff_aud_vec, i),
+                *vector::borrow(&ek_volun_auds_vec, i),
+                *vector::borrow(&amount_r_volun_auds_vec, i),
+                *vector::borrow(&zkrp_new_balance_vec, i),
+                *vector::borrow(&zkrp_amount_vec, i),
+                *vector::borrow(&sigma_proto_comm_vec, i),
+                *vector::borrow(&sigma_proto_resp_vec, i),
+                *vector::borrow(&memo_vec, i),
+            );
+
+            let digest_i = batch_item_digest(
+                vector::borrow(&commitments, i),
+                vector::borrow(&amount_tags, i),
+                &cph_i,
+                nonce_i,
+            );
+            vector::push_back(&mut item_digests, digest_i);
+            vector::push_back(&mut ca_payload_hashes, cph_i);
+            i = i + 1;
+        };
+
+        // 6. Build canonical batch attestation message and verify the single
+        //    4-of-7 operator attestation. Any drift in any item (commitment,
+        //    amount_tag, ca_payload_hash, or nonce) flips the corresponding
+        //    item_digest and the recomputed message bytes will not match what
+        //    operators signed => E_INVALID_OPERATOR_SIGNATURE.
+        //
+        // Codex P2 fix (post-Phase-D integration review): use the 8-byte LE u64
+        // pool_id encoding consistent with the single-deposit and withdraw
+        // attestation paths (Phase D Agent D1 c1/c2). Batch attestation needs
+        // an unambiguous pool_id; the 32-byte Fr form is only required for
+        // Groth16 public-input binding, which the batch path does not need.
+        let pool_id_bytes = pool_id_to_le_u64_bytes();
+        let chain_id_u8 = chain_id::get();
+        // batch_id is sha3 over the just-computed digest vector — globally
+        // unique per attestation since digests include unique deposit_nonces.
+        let batch_id = compute_batch_id(&item_digests);
+        let msg = new_batch_deposit_attestation_message(
+            cfg,
+            chain_id_u8,
+            pool_id_bytes,
+            item_digests,
+            expiry_secs,
+        );
+        multi_sig_verifier::assert_valid_attestation(
+            bcs::to_bytes(&msg),
+            operator_signatures,
+            &cfg.operator_pubkeys,
+            cfg.attestation_threshold,
+            cfg.main_operator_index,
+        );
+
+        // 7. Per-item finalization. Each iteration replicates the
+        //    `deposit_with_commitment` per-item ordering verbatim (proof
+        //    verify, nonce burn, CA dispatch, pending_tail read, pool push,
+        //    event emit) — only the multi-sig verify has been hoisted to
+        //    step 6. Order matches the single-deposit path so any future
+        //    re-ordering optimization applies uniformly to both flows.
+        let i = 0;
+        while (i < n) {
+            // 7a. Verify Groth16 deposit-binding proof for this item.
+            assert_valid_deposit_binding_proof(
+                *vector::borrow(&commitments, i),
+                *vector::borrow(&amount_tags, i),
+                *vector::borrow(&deposit_binding_proofs, i),
+            );
+
+            // 7b. Burn nonce before CA dispatch.
+            let nonce_i = *vector::borrow(&deposit_nonces, i);
+            table::add(&mut cfg.used_deposit_nonces, nonce_i, true);
+
+            // 7c. CA cross-module dispatch.
+            confidential_asset::confidential_transfer_raw(
+                user,
+                cfg.asset_type,
+                cfg.vault_addr,
+                *vector::borrow(&new_balance_p_vec, i),
+                *vector::borrow(&new_balance_r_vec, i),
+                *vector::borrow(&new_balance_r_eff_aud_vec, i),
+                *vector::borrow(&amount_p_vec, i),
+                *vector::borrow(&amount_r_sender_vec, i),
+                *vector::borrow(&amount_r_recip_vec, i),
+                *vector::borrow(&amount_r_eff_aud_vec, i),
+                *vector::borrow(&ek_volun_auds_vec, i),
+                *vector::borrow(&amount_r_volun_auds_vec, i),
+                *vector::borrow(&zkrp_new_balance_vec, i),
+                *vector::borrow(&zkrp_amount_vec, i),
+                *vector::borrow(&sigma_proto_comm_vec, i),
+                *vector::borrow(&sigma_proto_resp_vec, i),
+                *vector::borrow(&memo_vec, i),
+            );
+
+            // 7d. Read leaf_index POST-CA, PRE-pool-push (mirrors single-deposit).
+            let leaf_index_i = pending_queue::pending_tail();
+
+            // 7e. Pool queue push.
+            let commitment_i = *vector::borrow(&commitments, i);
+            pending_queue::deposit_precomputed(commitment_i, 0);
+
+            // 7f. Per-item DepositEvent (identical shape to single-deposit
+            //     path — indexers can consume both flows uniformly).
+            event::emit(DepositEvent {
+                commitment: commitment_i,
+                leaf_index: leaf_index_i,
+                asset_type: cfg.asset_type,
+                amount_tag: *vector::borrow(&amount_tags, i),
+                ca_payload_hash: *vector::borrow(&ca_payload_hashes, i),
+                deposit_nonce: nonce_i,
+            });
+
+            i = i + 1;
+        };
+
+        // 8. Emit the batch summary event.
+        event::emit(BatchDepositEvent {
+            batch_id,
+            batch_size: n,
+            asset_type: cfg.asset_type,
+        });
+    }
+
+    /// Agent D5 — compute a stable batch identifier from the per-item digests.
+    /// Pure sha3 over the BCS encoding of the digest vector; collision-resistant
+    /// because each item digest already incorporates a unique `deposit_nonce`.
+    fun compute_batch_id(item_digests: &vector<vector<u8>>): vector<u8> {
+        hash::sha3_256(bcs::to_bytes(item_digests))
+    }
+
+    // ========================================================================
     // Gate 6 — Main withdraw entry function (HANDOFF Section 2.5 + 4)
     // ========================================================================
 
@@ -1928,22 +2394,40 @@ module eunoma::eunoma_bridge {
         let _ = relayer;
 
         assert!(exists<VaultConfig>(@eunoma), E_NOT_INITIALIZED);
-        let cfg = borrow_global_mut<VaultConfig>(@eunoma);
 
-        // 1. Pause check.
-        assert!(!cfg.paused, E_BRIDGE_PAUSED);
-
-        // 2. Expiry check.
+        // Phase D / Agent D7 fail-fast hoist: run read-only validation BEFORE
+        // borrow_global_mut<VaultConfig>. On Aptos, a borrow_global_mut creates
+        // a write-set entry that is finalized at the abort point — so an
+        // assertion after the borrow that fails pays the write-set cost. The
+        // three checks below (expiry, root-in-history, nullifier-table-exists)
+        // depend ONLY on arguments + read-only-global state and therefore can
+        // safely move above the mut borrow. Mirrors deposit Phase A (commit
+        // 9127260) which hoisted `assert_not_expired` for the same reason.
+        //
+        // Reordering preserves all abort codes — test_b7 / test_b3 still abort
+        // with E_EXPIRED_ATTESTATION (15) / E_INVALID_ROOT (20) from this
+        // module (`expected_failure` only checks abort_code + location, not
+        // PC). Pause check stays below the mut borrow because it dereferences
+        // `cfg.paused` which requires the resource.
+        //
+        // Pause-vs-expiry ordering note: if the bridge is paused AND the
+        // attestation is expired, post-hoist E_EXPIRED_ATTESTATION fires
+        // first. Tests do not exercise that compound state; the abort-code
+        // contract for each individual failure mode is preserved.
         assert_not_expired(expiry_secs);
-
-        // 3. Root must be in root_history.
         assert!(
             pool_batch_root_update::is_root_in_history(root),
             E_INVALID_ROOT,
         );
-
-        // 4. Nullifier not already consumed.
         assert!(exists<UsedNullifiers>(@eunoma), E_NOT_INITIALIZED);
+
+        let cfg = borrow_global_mut<VaultConfig>(@eunoma);
+
+        // 1. Pause check (cfg.paused — requires the mut borrow above).
+        assert!(!cfg.paused, E_BRIDGE_PAUSED);
+
+        // 4. Nullifier not already consumed. `exists<UsedNullifiers>` already
+        //    asserted above; safe to take the mut borrow directly.
         let nulls = borrow_global_mut<UsedNullifiers>(@eunoma);
         assert!(
             !table::contains(&nulls.table, nullifier_hash),
@@ -1994,7 +2478,13 @@ module eunoma::eunoma_bridge {
         // slot. Strictly tighter than a bare equality check.
 
         // 8. Build canonical WithdrawAttestationMessage and verify 4-of-7 sigs.
-        let pool_id_bytes = pool_id_to_fr_bytes();
+        // Phase D Agent D1 candidate 2: same 32-byte → 8-byte LE u64 pool_id
+        // shrink applied to deposit attestation (commit 1) extended here to
+        // withdraw. The withdraw path does NOT pass pool_id into any Groth16
+        // public input (vs deposit), so the 32-byte Fr form was never required
+        // here either. Off-chain TS withdraw encoder (main-operator
+        // routes/withdraw.ts) is updated in lock-step to encode 8 bytes too.
+        let pool_id_bytes = pool_id_to_le_u64_bytes();
         let chain_id_u8   = chain_id::get();
         let msg = new_withdraw_attestation_message(
             cfg,
@@ -2337,6 +2827,55 @@ module eunoma::eunoma_bridge {
         msg.operator_set_version
     }
 
+    /// Agent D5 — test-only re-export of `batch_item_digest`. Lets tests build
+    /// the same per-item digest the bridge will recompute, without duplicating
+    /// the domain-prefix / append logic in test code (= drift risk).
+    #[test_only]
+    public fun test_call_batch_item_digest(
+        commitment: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        deposit_nonce: vector<u8>,
+    ): vector<u8> {
+        batch_item_digest(&commitment, &amount_tag, &ca_payload_hash, &deposit_nonce)
+    }
+
+    /// Agent D5 — test-only re-export of the batch attestation builder. Mirrors
+    /// `test_call_new_deposit_attestation_message` for the single-deposit path:
+    /// pulls operator_set_version + threshold from live VaultConfig so the test
+    /// can BCS-encode the canonical attestation bytes and sign them with the
+    /// operator secret keys.
+    #[test_only]
+    public fun test_call_new_batch_deposit_attestation_message(
+        chain_id: u8,
+        pool_id: vector<u8>,
+        item_digests: vector<vector<u8>>,
+        expiry_secs: u64,
+    ): BatchDepositAttestationMessage acquires VaultConfig {
+        let cfg = borrow_global<VaultConfig>(@eunoma);
+        new_batch_deposit_attestation_message(
+            cfg,
+            chain_id,
+            pool_id,
+            item_digests,
+            expiry_secs,
+        )
+    }
+
+    /// Agent D5 — test-only accessor exposing `MAX_BATCH_DEPOSITS`. Tests that
+    /// exercise the upper-bound rejection use this to stay in sync if the
+    /// constant ever changes.
+    #[test_only]
+    public fun test_call_max_batch_deposits(): u64 { MAX_BATCH_DEPOSITS }
+
+    /// Agent D5 — test-only error-code re-exports for batched-deposit tests.
+    #[test_only]
+    public fun e_batch_size_out_of_range(): u64 { E_BATCH_SIZE_OUT_OF_RANGE }
+    #[test_only]
+    public fun e_batch_length_mismatch(): u64 { E_BATCH_LENGTH_MISMATCH }
+    #[test_only]
+    public fun e_batch_duplicate_nonce(): u64 { E_BATCH_DUPLICATE_NONCE }
+
     /// Test-only: build the canonical BCS-encoded WithdrawAttestationMessage
     /// bytes that operators sign (and that the bridge re-derives inside
     /// `withdraw_to_recipient` step 8). Mirrors the production call site exactly:
@@ -2356,7 +2895,9 @@ module eunoma::eunoma_bridge {
         expiry_secs: u64,
     ): vector<u8> acquires VaultConfig {
         let cfg = borrow_global<VaultConfig>(@eunoma);
-        let pool_id_bytes = pool_id_to_fr_bytes();
+        // Mirror production withdraw path (Phase D Agent D1 c2): 8-byte LE u64
+        // pool_id, not 32-byte LE Fr.
+        let pool_id_bytes = pool_id_to_le_u64_bytes();
         let chain_id_u8 = chain_id::get();
         let msg = new_withdraw_attestation_message(
             cfg,

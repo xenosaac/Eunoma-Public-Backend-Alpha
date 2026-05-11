@@ -1,0 +1,36 @@
+[package]
+name = "eunoma_bench"
+version = "0.1.0"
+authors = []
+
+[addresses]
+# Phase D.0 gas-measurement subpackage.
+#
+# Unpinned at compile time; the measure_gas.sh harness binds this + eunoma +
+# eunoma_pool to a derived ed25519 address before `aptos move publish --session`.
+# Never published to testnet — only to ephemeral sim sessions for gas readout.
+eunoma_bench = "_"
+
+[dev-addresses]
+eunoma_bench = "0xDEED"
+
+[dependencies.eunoma_bridge]
+local = "../"
+
+[dependencies.eunoma_pool]
+local = "../poseidon_local"
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "aptos-framework"
+
+[dependencies.AptosStdlib]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "aptos-stdlib"
+
+[dependencies.MoveStdlib]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "move-stdlib"

@@ -263,13 +263,16 @@ module eunoma::round7_v2_tests {
     }
 
     // ========================================================================
-    // Test 4 — update_root_batch dual-writes V1 + V2 (LOAD-BEARING).
+    // Test 4 — update_root_batch finalizes into V2 post-migration (LOAD-BEARING).
     //
     // Setup: init V2 + init commitment index, queue 8 deposits, finalize batch.
     // Verify:
-    //   - V1 root_history_length grew from 1 to 2.
+    //   - V1 root_history_length is UNCHANGED (Phase D Agent D2 — V1 retired
+    //     post-migration: V2 is canonical, V1 stops growing once
+    //     migration_complete=true).
     //   - V2.root_set contains the new finalized root.
     //   - V2.finalized_commitments contains EVERY queued commitment.
+    //   - v2_set_equals_v1 still holds (V2 ⊇ V1).
     // ========================================================================
 
     #[test(framework = @aptos_framework, admin = @eunoma)]
@@ -307,11 +310,16 @@ module eunoma::round7_v2_tests {
         let new_root = finalize_one_batch(admin, &sks, 8, 1, 0xBEEF7777);
         let v1_len_after = batch_root_update::root_history_length();
 
-        // V1 grew by 1 (HC-9 dual-write preserved).
-        assert!(v1_len_after == v1_len_before + 1, 7420);
+        // Phase D Agent D2 — V1 retired post-migration. V1 is frozen at the
+        // pre-migration length; V2 alone records the new root. V2 ⊇ V1
+        // invariant still holds because V2 strictly grows while V1 stays put.
+        assert!(v1_len_after == v1_len_before, 7420);
 
         // V2.root_set contains new_root.
         assert!(batch_root_update::v2_contains_root(new_root) == true, 7421);
+
+        // v2_set_equals_v1 invariant — ∀r∈V1: r∈V2 still holds (V2 superset).
+        assert!(batch_root_update::v2_set_equals_v1() == true, 7422);
 
         // V2.finalized_commitments contains all 8 commitments.
         let j = 0;

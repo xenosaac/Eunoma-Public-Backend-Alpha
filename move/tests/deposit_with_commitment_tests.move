@@ -245,7 +245,11 @@ module eunoma::deposit_with_commitment_tests {
     ): vector<u8> {
         let msg = eunoma_bridge::test_call_new_deposit_attestation_message(
             /*chain_id=*/ 2u8,
-            /*pool_id=*/ x"0000000000000000000000000000000000000000000000000000000000000000",
+            // Phase D Agent D1: production deposit path now passes 8-byte LE u64
+            // pool_id into the attestation message (matches TS encoder + saves
+            // 24 BCS bytes on the signed message). Test fixture must mirror so
+            // signatures the test produces match the bytes the bridge recomputes.
+            /*pool_id=*/ x"0000000000000000",
             commitment,
             amount_tag,
             ca_payload_hash,

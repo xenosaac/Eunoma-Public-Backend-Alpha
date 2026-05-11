@@ -38,8 +38,15 @@ const DEFAULT_BRIDGE_ADDR =
   "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820";
 const DEFAULT_ASSET_ID = "0xa";
 const DEFAULT_CHAIN_ID = 2;
-const POOL_ID_FR_BYTES = new Uint8Array(32);
-const DOMAIN_WITHDRAW_OK_V1 = new TextEncoder().encode("APTOSHIELD_WITHDRAW_OK_V1");
+// Phase D Agent D1 c2: pool_id encoded as 8-byte LE u64 in the canonical
+// WithdrawAttestationMessage (was 32-byte LE Fr). Matches Move-side
+// pool_id_to_le_u64_bytes() and saves 24 BCS bytes on the signed message
+// (which in turn shrinks SHA512 input fed to each ed25519 verify on chain).
+// Value 0 (POOL_ID_VALUE) ⇒ 8 zero bytes.
+const POOL_ID_FR_BYTES = new Uint8Array(8);
+// Phase D Agent D1 c3: 8-byte tag (was 25-byte "APTOSHIELD_WITHDRAW_OK_V1").
+// MUST match Move-side DOMAIN_WITHDRAW_OK_V1 in eunoma_bridge.move byte-for-byte.
+const DOMAIN_WITHDRAW_OK_V1 = new TextEncoder().encode("WDR_OK_1");
 
 function hex(b: Uint8Array): string {
   return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
