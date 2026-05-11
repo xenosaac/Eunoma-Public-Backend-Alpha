@@ -484,8 +484,30 @@ module eunoma::pool_batch_root_update {
         // current_finalized_root advances; old roots stay valid for any
         // in-flight withdrawal proofs (root-history semantics for
         // withdraw verification).
+        //
+        // Phase D Agent D2 — V1 retirement gate. Post-migration, V2 is the
+        // canonical read source (is_root_in_history fast-paths through V2
+        // when migration_complete=true) and V2 ⊇ V1 by construction at
+        // migration time. So V1 only needs to keep growing while it's still
+        // the source of truth — i.e. when V2 is absent OR V2 is partial
+        // (migration_complete=false). Once migrated, V1 is frozen; V2 alone
+        // accumulates new finalized roots. This preserves:
+        //   - is_root_in_history correctness (reads V2 post-migration)
+        //   - v2_set_equals_v1 invariant (∀r∈V1: r∈V2 — V2 just has more)
+        //   - in-flight withdrawal proofs (atomic single-tx migration with
+        //     migration_complete=true set in same move_to; no observable
+        //     partial state across blocks)
+        // Gas: skips one storage write (root_history vector slot) per batch
+        // post-migration, plus the copy+push_back instruction cost.
         // ----------------------------------------------------------------
-        vector::push_back(&mut h.root_history, copy new_root);
+        let v1_still_canonical = if (exists<RootHistoryV2>(@eunoma)) {
+            !borrow_global<RootHistoryV2>(@eunoma).migration_complete
+        } else {
+            true
+        };
+        if (v1_still_canonical) {
+            vector::push_back(&mut h.root_history, copy new_root);
+        };
 
         // Round-7 Item B.4 — V2 dual-write block.
         //
