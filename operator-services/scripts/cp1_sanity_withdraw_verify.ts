@@ -1,19 +1,22 @@
 // CP1 sanity — proves the refactored shared canonical / Groth16 verify path is
 // byte-faithful and that the new 256B↔snarkjs-JSON round-trip preserves verify=true.
 //
-// Scope note: the withdrawal circuit's on-disk zkey (May 8) is out of sync with
-// the regenerated wasm + VK (May 11) — circuit team didn't finish the regen
-// loop after Phase F W3 removed the chain_id public input. We cannot generate
-// a fresh, verify=true withdrawal proof until that's fixed (deferred to CP5 /
-// circuits team). For CP1 we exercise the new shared code path against the
-// fully-aligned DEPOSIT pipeline (proof_valid.json + public_valid.json +
-// deposit_binding_vk.json) — the only thing different between deposit and
-// withdraw at the verifier level is which VK is loaded. compact256ToSnarkjsProof,
-// g1ToBytes, g2ToBytes, and the verify-via-snarkjs wrapper are exercised here
-// against a real, verify=true proof.
+// Scope note: BLOCKER 1 layer 1 was fixed on 2026-05-12 by regenerating the
+// withdrawal artifact set (r1cs/sym/wasm/zkey/vk) from current
+// withdrawal_proof.circom against pot15_final.ptau, contributor entropy
+// `eunoma-blocker1-zkey-entropy-2026-05-12`. We now exercise both:
+//   - the aligned DEPOSIT pipeline (proof_valid.json + public_valid.json +
+//     deposit_binding_vk.json) — the cross-check that compact256ToSnarkjsProof,
+//     g1ToBytes, g2ToBytes, and verifyGroth16Proof handle real verify=true
+//     proofs end-to-end; and
+//   - the WITHDRAW pipeline (withdraw_proof_valid.json + withdraw_public_valid.json
+//     + withdrawal_proof_vk.json) — directly exercises
+//     verifyWithdrawalGroth16Proof on the freshly-generated artifacts.
 //
-// Additionally we load the withdrawal VK and confirm it parses with nPublic=8
-// (matches the W3 circuit). The withdrawal compose6/derive helpers are unit-
+// Note: the regenerated withdrawal VK is NOT yet published to the testnet
+// bridge (publish_withdraw_proof_vk is once-only; a fresh-address redeploy is
+// required to adopt it). That gates CP5 testnet E2E, not CP1 / off-chain
+// verification. The withdrawal compose6/derive helpers are unit-
 // validated against snapshot vectors captured from the prior script-inline
 // implementation.
 
@@ -36,6 +39,7 @@ import {
   loadDepositBindingVk,
   loadWithdrawalProofVk,
   verifyGroth16Proof,
+  verifyWithdrawalGroth16Proof,
 } from '../shared/src/proof_verify.js';
 import {
   hash2,
@@ -280,12 +284,49 @@ async function main(): Promise<void> {
     if (vk.nPublic !== 8) throw new Error(`expected nPublic=8, got ${vk.nPublic}`);
   });
 
-  console.log('\n[cp1] all sanity checks PASS');
-  console.log(
-    '[cp1] NOTE: full withdrawal verify=true sanity blocked by stale zkey ' +
-    '(circuits/generated/withdrawal_proof_final.zkey May 8 vs wasm/VK May 11). ' +
-    'Deferred to CP5 E2E gate — circuit team must regenerate zkey before then.',
-  );
+  // --- Real withdraw verify=true round-trip (BLOCKER 1 fix, 2026-05-12). ---
+  const withdrawProofPath = path.join(GEN_DIR, 'withdraw_proof_valid.json');
+  const withdrawPublicPath = path.join(GEN_DIR, 'withdraw_public_valid.json');
+  if (!fs.existsSync(withdrawProofPath) || !fs.existsSync(withdrawPublicPath)) {
+    console.error(
+      `\n[cp1] missing withdrawal fixtures (${withdrawProofPath} / ${withdrawPublicPath}). ` +
+      `Run snarkjs groth16 prove against withdrawal_proof_final.zkey to regenerate.`,
+    );
+    process.exit(1);
+  }
+  const withdrawProof = JSON.parse(fs.readFileSync(withdrawProofPath, 'utf-8'));
+  const withdrawPublic = JSON.parse(fs.readFileSync(withdrawPublicPath, 'utf-8')) as string[];
+
+  let withdrawPacked256: Uint8Array = new Uint8Array(0);
+  await step('pack withdraw proof → 256B via shared g1ToBytes/g2ToBytes', () => {
+    const a = g1ToBytes(withdrawProof.pi_a);
+    const b = g2ToBytes(withdrawProof.pi_b);
+    const c = g1ToBytes(withdrawProof.pi_c);
+    if (a.length !== 64 || b.length !== 128 || c.length !== 64) {
+      throw new Error(`bad slice lens: a=${a.length} b=${b.length} c=${c.length}`);
+    }
+    withdrawPacked256 = new Uint8Array(256);
+    withdrawPacked256.set(a, 0);
+    withdrawPacked256.set(b, 64);
+    withdrawPacked256.set(c, 64 + 128);
+  });
+
+  await step('verifyWithdrawalGroth16Proof(packed256, publics) === true', async () => {
+    if (withdrawPublic.length !== 8) {
+      throw new Error(`expected 8 public inputs, got ${withdrawPublic.length}`);
+    }
+    const ok = await verifyWithdrawalGroth16Proof(withdrawPacked256, withdrawPublic);
+    if (ok !== true) throw new Error('verify returned false on fresh withdraw proof — BLOCKER 1 regen failed');
+  });
+
+  await step('withdraw tamper detection: flip 1 byte → verify === false', async () => {
+    const tampered = new Uint8Array(withdrawPacked256);
+    tampered[0] ^= 0x01;
+    const ok = await verifyWithdrawalGroth16Proof(tampered, withdrawPublic);
+    if (ok !== false) throw new Error('tampered withdraw proof verified — verifier is broken');
+  });
+
+  console.log('\n[cp1] all sanity checks PASS (deposit + withdraw verify=true real round-trip)');
 }
 
 main().catch((err) => {
