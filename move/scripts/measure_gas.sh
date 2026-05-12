@@ -44,10 +44,8 @@ if [[ -z "${1:-}" ]]; then
 fi
 FN="$1"
 
-# Pinned key + derived address. Address = sha3_256(pubkey || 0x00).
-# Making these reproducible across all measurements + all agents lets the
-# function-id template be one fixed string and lets the published gas_used be
-# byte-identical between baseline + candidate runs.
+# Sim-session sender material is local-only. Keep it out of git history; callers
+# that need bit-identical gas runs should export the same values in their shell.
 PRIVATE_KEY="${EUNOMA_GAS_PRIVATE_KEY:?EUNOMA_GAS_PRIVATE_KEY env var required}"
 DERIVED_ADDR="${EUNOMA_GAS_DERIVED_ADDR:?EUNOMA_GAS_DERIVED_ADDR env var required}"
 GAS_UNIT_PRICE=100
