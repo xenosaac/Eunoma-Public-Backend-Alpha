@@ -17,9 +17,11 @@ import {
   Ed25519PrivateKey,
 } from '@aptos-labs/ts-sdk';
 import { loadSecretHex } from '../shared/src/secrets.js';
+import { targetBridge, targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const BRIDGE_ADDR = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
+const BRIDGE_ADDR = targetBridge();
+const DEPLOY_ID = targetDeployId();
 
 function hexToBytes(h: string): Uint8Array {
   const s = h.startsWith('0x') ? h.slice(2) : h;
@@ -33,7 +35,7 @@ async function main() {
   const admin = Account.fromPrivateKey({
     privateKey: new Ed25519PrivateKey(hexToBytes(loadSecretHex('ADMIN_PRIVATE_KEY_HEX', 32))),
   });
-  console.log(`admin = ${admin.accountAddress.toString()}`);
+  console.log(`admin = ${admin.accountAddress.toString()}  target_deploy=${DEPLOY_ID}  bridge=${BRIDGE_ADDR}`);
 
   // Extract VK
   const vkScript = path.resolve(__dirname, '..', '..', 'circuits', 'scripts', 'extract_withdraw_vk.js');
@@ -92,7 +94,19 @@ async function main() {
   console.log(`  tx=${r3.hash} gas=${r3.gas_used} success=${r3.success}`);
   if (!r3.success) throw new Error(`tx3 failed: ${r3.vm_status}`);
 
-  console.log('\n✓ all 3 admin txs success — withdraw infrastructure live on testnet');
+  updateTargetDeploy((d) => {
+    d.vk ??= {};
+    d.vk.publish_withdraw_proof_vk_tx = r1.hash;
+    d.vk.publish_withdraw_proof_vk_gas = Number(r1.gas_used);
+    d.vk.publish_prepared_withdraw_proof_vk_tx = r2.hash;
+    d.vk.publish_prepared_withdraw_proof_vk_gas = Number(r2.gas_used);
+    d.publishes ??= {};
+    d.publishes.init_used_nullifiers_table = {
+      tx: r3.hash, gas_used: Number(r3.gas_used), gas_unit_price: Number(r3.gas_unit_price ?? 100),
+    };
+  });
+  console.log(`\n[state] deploys.${DEPLOY_ID}.{vk.publish_withdraw_proof_vk_tx, vk.publish_prepared_withdraw_proof_vk_tx, publishes.init_used_nullifiers_table} written`);
+  console.log('✓ all 3 admin txs success — withdraw infrastructure live on testnet');
 }
 
 main().catch((e) => { console.error('FATAL:', e); process.exit(1); });

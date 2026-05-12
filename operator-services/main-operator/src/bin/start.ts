@@ -66,9 +66,12 @@ async function main() {
 
   // Read on-chain VaultConfig defaults at boot for vault_addr / asset_type.
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
-  const bridgeAddr =
-    process.env.BRIDGE_PACKAGE_ADDRESS ??
-    "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820";
+  const bridgeAddr = process.env.BRIDGE_PACKAGE_ADDRESS;
+  if (!bridgeAddr) {
+    throw new Error(
+      "BRIDGE_PACKAGE_ADDRESS env var is required — refuse to default to a stale bridge address",
+    );
+  }
   let vaultAddr: Uint8Array;
   let assetType: Uint8Array;
   try {

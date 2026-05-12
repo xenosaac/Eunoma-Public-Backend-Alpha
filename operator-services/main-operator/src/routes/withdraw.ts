@@ -157,10 +157,13 @@ export function registerWithdrawRoutes(
   const verifyProof = hooks.verifyProof ?? defaultVerifyWithdrawalGroth16Proof;
   const fanOutWithdrawCoSign = hooks.fanOutWithdrawCoSign ?? defaultFanOutWithdrawCoSignRequests;
   const nowSecs = hooks.nowSecs ?? (() => BigInt(Math.floor(Date.now() / 1000)));
+  // Resolution: explicit hooks.bridgeAddr > BRIDGE_PACKAGE_ADDRESS env > test
+  // sentinel. Production entry (main-operator/src/bin/start.ts) env-or-throws
+  // before registering the routes, so the sentinel is never hit in prod.
+  // Tests that stub `readChainVaultState` never dereference bridgeAddr; tests
+  // that need a real address pass it via hooks.bridgeAddr.
   const bridgeAddr =
-    hooks.bridgeAddr ??
-    process.env.BRIDGE_PACKAGE_ADDRESS ??
-    "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820";
+    hooks.bridgeAddr ?? process.env.BRIDGE_PACKAGE_ADDRESS ?? ("0x" + "11".repeat(32));
 
   const vaultAddrHexCfg = "0x" + hex(cfg.vault_addr);
   const assetTypeHexCfg = "0x" + hex(cfg.asset_type);

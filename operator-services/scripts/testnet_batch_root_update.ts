@@ -143,7 +143,10 @@ function encodeAttestationMessage(msg: {
   return ser.toUint8Array();
 }
 
-const BRIDGE_ADDR = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
+import { targetBridge, targetDeploy, targetDeployId } from './_lib/state.js';
+
+const BRIDGE_ADDR = targetBridge();
+const DEPLOY_ID = targetDeployId();
 
 async function main() {
   console.log('Phase 1 closed-loop test: testnet batch_root_update');
@@ -207,22 +210,17 @@ async function main() {
   console.log(`[step 3] queue_range_hash = ${toHex(queue_range_hash)}`);
 
   // Step 4: harvest leaves from the deposit tx that queued them.
-  // Phase 2.Y / W.4: dynamic — pick the deposit tx by start_index from
-  // state.deposits[]. Phase 2.X hardcoded B.4's tx (only one then). Now that
-  // B.5+ exists, look up state.deposits[start_index].tx generically. Sanity
-  // check below verifies leaf vs on-chain acc_history.
-  const stateForTx = JSON.parse(
-    fs.readFileSync(path.join(__dirname, 'testnet_state.json'), 'utf-8'),
-  );
-  const depositList = stateForTx.deposits as { tx: string; commitment: string }[] | undefined;
-  if (!Array.isArray(depositList) || depositList.length <= Number(start_index)) {
+  // W.4: dynamic — pick the deposit tx by start_index from the deploy's
+  // deposits[] array. Sanity check below verifies leaf vs on-chain acc_history.
+  const depositList = (targetDeploy().deposits ?? []) as { tx: string; commitment: string }[];
+  if (depositList.length <= Number(start_index)) {
     throw new Error(
-      `state.deposits[${start_index}] not found — expected at least ${Number(start_index) + 1} deposit entries; ` +
+      `deploys.${DEPLOY_ID}.deposits[${start_index}] not found — expected at least ${Number(start_index) + 1} deposit entries; ` +
       `re-run testnet_deposit_e2e.ts to populate`,
     );
   }
   const depositTxHash = depositList[Number(start_index)].tx;
-  console.log(`[step 4] using deposit tx ${depositTxHash} (= state.deposits[${start_index}])`);
+  console.log(`[step 4] using deposit tx ${depositTxHash} (= deploys.${DEPLOY_ID}.deposits[${start_index}])`);
   const depTxResp = await fetch(
     `https://fullnode.testnet.aptoslabs.com/v1/transactions/by_hash/${depositTxHash}`,
   );

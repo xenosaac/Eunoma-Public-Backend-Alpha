@@ -27,9 +27,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadSecretHex } from '../shared/src/secrets.js';
+import { targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STATE_PATH = path.join(__dirname, 'testnet_state.json');
+const DEPLOY_ID = targetDeployId();
 
 const APT_METADATA = '0xa';
 
@@ -85,19 +86,19 @@ async function main() {
     console.log('skipping register; recipient already has CA store');
   }
 
-  // ---- 4. Persist state ----
-  const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
-  state.recipient_ca = state.recipient_ca || {};
-  state.recipient_ca.recipient_address = recipientAccount.accountAddress.toString();
-  state.recipient_ca.asset_type = APT_METADATA;
-  state.recipient_ca.recipient_decryption_key_secret_hex = recipientDk.toString();
-  state.recipient_ca.recipient_encryption_key_pub_hex = recipientDk.publicKey().toString();
-  if (registerTxHash) {
-    state.recipient_ca.register_tx = registerTxHash;
-    state.recipient_ca.register_gas = registerGas;
-  }
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-  console.log(`\npersisted to ${STATE_PATH}`);
+  // ---- 4. Persist to staged deploy slot ----
+  updateTargetDeploy((d) => {
+    d.recipient_ca ??= {};
+    d.recipient_ca.recipient_address = recipientAccount.accountAddress.toString();
+    d.recipient_ca.asset_type = APT_METADATA;
+    d.recipient_ca.recipient_decryption_key_secret_hex = recipientDk.toString();
+    d.recipient_ca.recipient_encryption_key_pub_hex = recipientDk.publicKey().toString();
+    if (registerTxHash) {
+      d.recipient_ca.register_tx = registerTxHash;
+      d.recipient_ca.register_gas = registerGas;
+    }
+  });
+  console.log(`\n[state] deploys.${DEPLOY_ID}.recipient_ca written`);
 }
 
 main().catch((e) => {

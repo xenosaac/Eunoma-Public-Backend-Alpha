@@ -42,9 +42,13 @@ export function defaultTestConfig(opts: {
     main_op_pubkey: opts.main_op_pubkey,
     min_expiry_window_secs: 30,
     max_horizon_secs: 3600,
-    bridge_addr:
-      process.env.BRIDGE_PACKAGE_ADDRESS ??
-      "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820",
+    // TESTS ONLY: synthetic sentinel (0x11..11) so unit tests stay env-
+    // independent. NEVER a real bridge address. Tests that exercise a chain
+    // reader must pass `bridge_addr` directly when building the cfg (CP4
+    // partner tests stub the chain reader so this sentinel is never
+    // dereferenced as a real address). Production reads from env via
+    // partner-operator/src/bin/start.ts (env-or-throw).
+    bridge_addr: "0x" + "11".repeat(32),
     bearer_token: opts.bearer_token ?? "test-partner-token",
     rate_limit_max_per_window: 100,
     rate_limit_window_ms: 60_000,

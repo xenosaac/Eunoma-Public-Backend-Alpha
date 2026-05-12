@@ -39,10 +39,12 @@ import { buildWithdrawProof } from './build_testnet_withdraw_proof.js';
 import { buildWithdrawCAPayload } from '../shared/src/build_withdraw_ca_payload.js';
 import { loadOperatorKeys } from '../shared/src/secrets.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STATE_PATH = path.join(__dirname, 'testnet_state.json');
+import { targetBridge, targetDeploy, targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
-const BRIDGE_ADDR = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const BRIDGE_ADDR = targetBridge();
+const DEPLOY_ID = targetDeployId();
 const APT_METADATA = '0xa';
 const CHAIN_ID = 2;
 // Phase 2.Y / W.1 — Amount-binding operator obligation (per HANDOFF Section 4 Step 4
@@ -186,24 +188,25 @@ async function main() {
   // for B.4 backward compat). state.deposits[index] holds the chosen witness.
   // For B.5 (= leafIndex=1), set WITHDRAW_DEPOSIT_INDEX=1.
   const withdrawIndex = process.env.WITHDRAW_DEPOSIT_INDEX ? Number(process.env.WITHDRAW_DEPOSIT_INDEX) : 0;
-  console.log(`\n[step 2] read deposit witness from testnet_state.json (deposits[${withdrawIndex}]) ...`);
-  const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
-  if (!Array.isArray(state.deposits) || state.deposits.length <= withdrawIndex) {
+  console.log(`\n[step 2] read deposit witness from deploys.${DEPLOY_ID}.deposits[${withdrawIndex}] ...`);
+  const deploy = targetDeploy();
+  const deposits = deploy.deposits ?? [];
+  if (deposits.length <= withdrawIndex) {
     throw new Error(
-      `state.deposits[${withdrawIndex}] not found — found ${state.deposits?.length ?? 0} deposits; ` +
+      `deploys.${DEPLOY_ID}.deposits[${withdrawIndex}] not found — found ${deposits.length} deposits; ` +
       `re-run testnet_deposit_e2e.ts (with DEPOSIT_AMOUNT_OCTAS env if needed)`,
     );
   }
-  const depositWitness = state.deposits[withdrawIndex];
+  const depositWitness = deposits[withdrawIndex];
   if (!depositWitness?.nullifier || !depositWitness?.secret) {
-    throw new Error(`state.deposits[${withdrawIndex}] missing nullifier/secret`);
+    throw new Error(`deploys.${DEPLOY_ID}.deposits[${withdrawIndex}] missing nullifier/secret`);
   }
   const nullifier = fromHex(depositWitness.nullifier);
   const secret = fromHex(depositWitness.secret);
   const amountOctas = BigInt(depositWitness.amount_octas);
   // Multi-leaf merkle: pass all known commitments so build_merkle_path
   // (W.2) can compute correct sibling values for the chosen leafIndex.
-  const allLeaves: Uint8Array[] = (state.deposits as { commitment: string }[]).map(
+  const allLeaves: Uint8Array[] = (deposits as { commitment: string }[]).map(
     (d) => fromHex(d.commitment),
   );
   console.log(`  leafIndex         = ${withdrawIndex} (= state.deposits[${withdrawIndex}])`);
@@ -387,22 +390,23 @@ async function main() {
   if (result.success) {
     console.log(`  ✓ FULL CA dispatch succeeded — withdraw closed loop ON CHAIN`);
     // Persist tx evidence to state.json for W.5 chain state delta verify + W.6 docs
-    state.withdraw = state.withdraw || {};
-    state.withdraw.tx = result.hash;
-    state.withdraw.gas_used = Number(result.gas_used ?? 0);
-    state.withdraw.gas_unit_price = Number(result.gas_unit_price ?? 100);
-    state.withdraw.amount_octas = amountOctas.toString();
-    state.withdraw.recipient = recipientAddr;
-    state.withdraw.nullifier_hash = '0x' + hex(proofResult.nullifierHash);
-    state.withdraw.recipient_hash = '0x' + hex(proofResult.recipientHash);
-    state.withdraw.amount_tag = '0x' + hex(proofResult.amountTag);
-    state.withdraw.ca_payload_hash = '0x' + hex(ca_payload_hash);
-    state.withdraw.request_hash = '0x' + hex(proofResult.requestHash);
-    state.withdraw.vault_sequence_pre = vaultSequence.toString();
-    state.withdraw.expiry_secs = expirySecs.toString();
-    state.withdraw.withdraw_blind = '0x' + hex(withdrawBlind);
-    fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-    console.log(`  state.json updated (state.withdraw block)`);
+    updateTargetDeploy((d) => {
+      d.withdraw ??= {};
+      d.withdraw.tx = result.hash;
+      d.withdraw.gas_used = Number(result.gas_used ?? 0);
+      d.withdraw.gas_unit_price = Number(result.gas_unit_price ?? 100);
+      d.withdraw.amount_octas = amountOctas.toString();
+      d.withdraw.recipient = recipientAddr;
+      d.withdraw.nullifier_hash = '0x' + hex(proofResult.nullifierHash);
+      d.withdraw.recipient_hash = '0x' + hex(proofResult.recipientHash);
+      d.withdraw.amount_tag = '0x' + hex(proofResult.amountTag);
+      d.withdraw.ca_payload_hash = '0x' + hex(ca_payload_hash);
+      d.withdraw.request_hash = '0x' + hex(proofResult.requestHash);
+      d.withdraw.vault_sequence_pre = vaultSequence.toString();
+      d.withdraw.expiry_secs = expirySecs.toString();
+      d.withdraw.withdraw_blind = '0x' + hex(withdrawBlind);
+    });
+    console.log(`  [state] deploys.${DEPLOY_ID}.withdraw written`);
   } else {
     console.log(`  ✗ UNEXPECTED ABORT — investigate vm_status above`);
   }

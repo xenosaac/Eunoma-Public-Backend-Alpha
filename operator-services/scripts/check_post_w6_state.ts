@@ -14,10 +14,12 @@
 import { Aptos, AptosConfig, Network } from '@aptos-labs/ts-sdk';
 import { ConfidentialAsset, TwistedEd25519PrivateKey } from '@aptos-labs/confidential-asset';
 import { loadSecretHex } from '../shared/src/secrets.js';
+import { targetBridge, targetDeploy, targetVault } from './_lib/state.js';
 
-const VAULT = '0xe596a6cac39c63e3701449d5f55911c96ab9f54fbb8315b9cade58e4c2438306';
-const RECIPIENT = '0xa2f32e7b3dca7710b6dc3e45ad3bff5a74a76e226212d729ed4c68336cb4c334';
-const BRIDGE = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
+const BRIDGE = targetBridge();
+const VAULT = targetVault();
+const RECIPIENT = targetDeploy().recipient_ca?.recipient_address;
+if (!RECIPIENT) throw new Error(`target deploy has no recipient_ca.recipient_address — run testnet_register_recipient_ca.ts first`);
 
 async function main() {
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));

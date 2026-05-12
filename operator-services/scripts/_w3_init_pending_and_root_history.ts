@@ -3,8 +3,10 @@
 //                         pool_batch_root_update::initialize(empty_tree_root=ZERO32, chain_id=2, pool_id=ZERO32)
 import { Account, Aptos, AptosConfig, Network, Ed25519PrivateKey } from '@aptos-labs/ts-sdk';
 import { loadSecretHex } from '../shared/src/secrets.js';
+import { targetBridge, targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
-const BRIDGE_ADDR = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
+const BRIDGE_ADDR = targetBridge();
+const DEPLOY_ID = targetDeployId();
 const ZERO32 = Array.from(new Uint8Array(32));
 
 function hexToBytes(h: string): Uint8Array {
@@ -32,16 +34,29 @@ async function main() {
   const admin = Account.fromPrivateKey({
     privateKey: new Ed25519PrivateKey(hexToBytes(loadSecretHex('ADMIN_PRIVATE_KEY_HEX', 32))),
   });
-  console.log(`admin = ${admin.accountAddress.toString()}`);
+  console.log(`admin = ${admin.accountAddress.toString()}  target_deploy=${DEPLOY_ID}  bridge=${BRIDGE_ADDR}`);
 
   console.log('\n[1/3] pool_pending_queue::initialize');
-  await callEntry(aptos, admin, 'pool_pending_queue::initialize', []);
+  const r1 = await callEntry(aptos, admin, 'pool_pending_queue::initialize', []);
 
   console.log('\n[2/3] pool_pending_queue::initialize_commitment_index');
-  await callEntry(aptos, admin, 'pool_pending_queue::initialize_commitment_index', []);
+  const r2 = await callEntry(aptos, admin, 'pool_pending_queue::initialize_commitment_index', []);
 
   console.log('\n[3/3] pool_batch_root_update::initialize(empty_tree_root=ZERO32, chain_id=2, pool_id=ZERO32)');
-  // initialize(admin, empty_tree_root: vec<u8>, chain_id: u8, pool_id: vec<u8>)
-  await callEntry(aptos, admin, 'pool_batch_root_update::initialize', [ZERO32, 2, ZERO32], 150_000);
+  const r3 = await callEntry(aptos, admin, 'pool_batch_root_update::initialize', [ZERO32, 2, ZERO32], 150_000);
+
+  updateTargetDeploy((d) => {
+    d.publishes ??= {};
+    d.publishes.pool_pending_queue_initialize = {
+      tx: r1.hash, gas_used: Number(r1.gas_used), gas_unit_price: Number(r1.gas_unit_price ?? 100),
+    };
+    d.publishes.pool_pending_queue_init_commitment_index = {
+      tx: r2.hash, gas_used: Number(r2.gas_used), gas_unit_price: Number(r2.gas_unit_price ?? 100),
+    };
+    d.publishes.pool_batch_root_update_initialize = {
+      tx: r3.hash, gas_used: Number(r3.gas_used), gas_unit_price: Number(r3.gas_unit_price ?? 100),
+    };
+  });
+  console.log(`\n[state] deploys.${DEPLOY_ID}.publishes.{pool_pending_queue_*,pool_batch_root_update_initialize} written`);
 }
 main().catch((e) => { console.error('FATAL:', e); process.exit(1); });

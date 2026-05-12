@@ -13,8 +13,10 @@ import {
   Ed25519PrivateKey,
 } from '@aptos-labs/ts-sdk';
 import { loadOperatorKeys, loadSecretHex } from '../shared/src/secrets.js';
+import { targetBridge, targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
-const BRIDGE_ADDR = '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
+const BRIDGE_ADDR = targetBridge();
+const DEPLOY_ID = targetDeployId();
 
 function hexToBytes(h: string): Uint8Array {
   const s = h.startsWith('0x') ? h.slice(2) : h;
@@ -28,7 +30,7 @@ async function main() {
   const admin = Account.fromPrivateKey({
     privateKey: new Ed25519PrivateKey(hexToBytes(loadSecretHex('ADMIN_PRIVATE_KEY_HEX', 32))),
   });
-  console.log(`admin = ${admin.accountAddress.toString()}`);
+  console.log(`admin = ${admin.accountAddress.toString()}  target_deploy=${DEPLOY_ID}  bridge=${BRIDGE_ADDR}`);
 
   const keys = loadOperatorKeys();
   keys.sort((a, b) => a.slot - b.slot);
@@ -45,7 +47,21 @@ async function main() {
   });
   const submitted = await aptos.signAndSubmitTransaction({ signer: admin, transaction: tx });
   console.log(`submitted: ${submitted.hash}`);
-  const result = await aptos.waitForTransaction({ transactionHash: submitted.hash });
+  const result: any = await aptos.waitForTransaction({ transactionHash: submitted.hash });
   console.log(`success=${result.success}, gas=${result.gas_used}, vm_status=${result.vm_status}`);
+  if (!result.success) throw new Error(`pool_multi_sig_verifier::initialize failed: ${result.vm_status}`);
+
+  updateTargetDeploy((d) => {
+    d.publishes ??= {};
+    d.publishes.pool_multi_sig_verifier_initialize = {
+      tx: result.hash,
+      gas_used: Number(result.gas_used),
+      gas_unit_price: Number(result.gas_unit_price ?? 100),
+      main_operator_index: 0,
+      attestation_threshold: 4,
+      operator_pubkeys_hex: keys.map((k) => k.public_key),
+    };
+  });
+  console.log(`[state] deploys.${DEPLOY_ID}.publishes.pool_multi_sig_verifier_initialize written`);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

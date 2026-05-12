@@ -29,9 +29,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadSecretHex } from '../shared/src/secrets.js';
+import { targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STATE_PATH = path.join(__dirname, 'testnet_state.json');
+const DEPLOY_ID = targetDeployId();
 
 const APT_METADATA = '0xa';
 const VEIL_AMOUNT_OCTAS = 50_000_000n; // 0.5 APT
@@ -119,22 +120,22 @@ async function main() {
   console.log('\n[verify] CA pending balance after veil...');
   // Skip getBalance — requires WASM; we'll just trust the deposit tx.
 
-  // ---- 6. Persist state ----
-  const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
-  state.user_ca = state.user_ca || {};
-  state.user_ca.user_address = userAccount.accountAddress.toString();
-  state.user_ca.asset_type = APT_METADATA;
-  state.user_ca.user_decryption_key_secret_hex = userDk.toString();
-  state.user_ca.user_encryption_key_pub_hex = userDk.publicKey().toString();
-  if (registerTxHash) {
-    state.user_ca.register_tx = registerTxHash;
-    state.user_ca.register_gas = registerGas;
-  }
-  state.user_ca.veil_deposit_tx = veilTxHash;
-  state.user_ca.veil_deposit_gas = veilGas;
-  state.user_ca.veil_amount_octas = VEIL_AMOUNT_OCTAS.toString();
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-  console.log(`\npersisted to ${STATE_PATH}`);
+  // ---- 6. Persist to staged deploy slot ----
+  updateTargetDeploy((d) => {
+    d.user_ca ??= {};
+    d.user_ca.user_address = userAccount.accountAddress.toString();
+    d.user_ca.asset_type = APT_METADATA;
+    d.user_ca.user_decryption_key_secret_hex = userDk.toString();
+    d.user_ca.user_encryption_key_pub_hex = userDk.publicKey().toString();
+    if (registerTxHash) {
+      d.user_ca.register_tx = registerTxHash;
+      d.user_ca.register_gas = registerGas;
+    }
+    d.user_ca.veil_deposit_tx = veilTxHash;
+    d.user_ca.veil_deposit_gas = veilGas;
+    d.user_ca.veil_amount_octas = VEIL_AMOUNT_OCTAS.toString();
+  });
+  console.log(`\n[state] deploys.${DEPLOY_ID}.user_ca written`);
 }
 
 main().catch((e) => {

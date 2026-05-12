@@ -42,12 +42,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadOperatorKeys, loadSecretHex } from '../shared/src/secrets.js';
+import { targetBridge, targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STATE_PATH = path.join(__dirname, 'testnet_state.json');
 
-const BRIDGE_ADDR =
-  '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
+const BRIDGE_ADDR = targetBridge();
+const DEPLOY_ID = targetDeployId();
 const APT_METADATA = '0xa'; // testnet APT FA metadata
 const VAULT_SEED_HEX = '65756e6f6d612d627269646765'; // "eunoma-bridge"
 const CHAIN_ID = 2; // testnet
@@ -123,6 +123,8 @@ async function main() {
   const sigmaCommHex = sigmaProof.commitment.map((b) => hex(b));
   const sigmaRespHex = sigmaProof.response.map((b) => hex(b));
 
+  console.log(`target_deploy=${DEPLOY_ID} bridge=${BRIDGE_ADDR}`);
+
   // ---- 5. Build aptos CLI --json-file payload ----
   const cliJson = {
     function_id: `${BRIDGE_ADDR}::eunoma_bridge::init_vault_with_ca_registration`,
@@ -140,7 +142,9 @@ async function main() {
     ],
   };
 
-  const argsPath = path.join(__dirname, 'init_vault_args.json');
+  // Per-deploy args file lands in /tmp so it never leaks back into the repo
+  // (the previous in-tree path tracked a bridge address with every run).
+  const argsPath = path.join('/tmp', `init_vault_args.${DEPLOY_ID}.json`);
   fs.writeFileSync(argsPath, JSON.stringify(cliJson, null, 2));
   console.log(`wrote CLI args → ${argsPath}`);
 
@@ -155,7 +159,7 @@ async function main() {
       'aptos',
       'move',
       'run',
-      '--profile eunoma-admin',
+      `--profile ${process.env.PROFILE ?? 'eunoma-admin'}`,
       `--json-file '${argsPath}'`,
       '--local',
       '--assume-yes',
@@ -185,7 +189,7 @@ async function main() {
     'aptos',
     'move',
     'run',
-    '--profile eunoma-admin',
+    `--profile ${process.env.PROFILE ?? 'eunoma-admin'}`,
     `--json-file '${argsPath}'`,
     '--assume-yes',
   ].join(' ');
@@ -211,21 +215,21 @@ async function main() {
   console.log(`  gas_used = ${gasUsed}`);
   console.log(`  gas_unit_price = ${gasUnitPrice}`);
 
-  // ---- 8. Persist to state ----
-  const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
-  state.vault = state.vault || {};
-  state.vault.address = vaultAddrHex;
-  state.vault.asset_type = APT_METADATA;
-  state.vault.init_tx = txHash;
-  state.vault.init_gas_used = gasUsed;
-  state.vault.init_gas_unit_price = gasUnitPrice;
-  state.vault.main_operator_index = MAIN_OPERATOR_INDEX;
-  state.vault.attestation_threshold = ATTESTATION_THRESHOLD;
-  state.vault.operator_pubkeys_hex = operatorPubkeysHex;
-  state.vault.vault_seed_hex = '0x' + VAULT_SEED_HEX;
-  state.vault.vault_ek_hex = vaultEkHex;
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-  console.log(`\npersisted to ${STATE_PATH}`);
+  // ---- 8. Persist to staged deploy slot ----
+  updateTargetDeploy((d) => {
+    d.vault ??= {};
+    d.vault.address = vaultAddrHex;
+    d.vault.asset_type = APT_METADATA;
+    d.vault.init_tx = txHash;
+    d.vault.init_gas_used = Number(gasUsed);
+    d.vault.init_gas_unit_price = Number(gasUnitPrice);
+    d.vault.main_operator_index = MAIN_OPERATOR_INDEX;
+    d.vault.attestation_threshold = ATTESTATION_THRESHOLD;
+    d.vault.operator_pubkeys_hex = operatorPubkeysHex;
+    d.vault.vault_seed_hex = '0x' + VAULT_SEED_HEX;
+    d.vault.vault_ek_hex = vaultEkHex;
+  });
+  console.log(`\n[state] deploys.${DEPLOY_ID}.vault written (address=${vaultAddrHex})`);
 }
 
 main().catch((e) => {

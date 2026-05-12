@@ -51,11 +51,12 @@ import {
 import { u64ToFieldLe32 } from '../shared/src/hex.js';
 import { loadOperatorKeys, loadSecretHex } from '../shared/src/secrets.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STATE_PATH = path.join(__dirname, 'testnet_state.json');
+import { targetBridge, targetDeploy, targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
-const BRIDGE_ADDR =
-  '0x9c51607926e57b50c1963508863769821078ca46f42cd4f922659325e7546a5a';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const BRIDGE_ADDR = targetBridge();
+const DEPLOY_ID = targetDeployId();
 const APT_METADATA = '0xa';
 const CHAIN_ID = 2; // testnet
 // Phase 2.Y / W.3 — amount overridable via env DEPOSIT_AMOUNT_OCTAS for B.5+ deposits.
@@ -103,11 +104,13 @@ async function main() {
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
   const ca = new ConfidentialAsset({ config: aptos.config });
 
-  // Load state
-  const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
-  const vaultAddrHex = state.vault.address as string;
-  if (!vaultAddrHex) throw new Error('vault.address missing — run Phase 3 first');
+  // Load state from the active / target deploy slot.
+  const deploy = targetDeploy();
+  const vaultAddrHex = deploy.vault?.address as string;
+  if (!vaultAddrHex) throw new Error(`deploys.${DEPLOY_ID}.vault.address missing — run Phase 3 first`);
   const vaultAddrBytes = AccountAddress.from(vaultAddrHex).toUint8Array();
+  console.log(`deploy_id      = ${DEPLOY_ID}`);
+  console.log(`bridge         = ${BRIDGE_ADDR}`);
   console.log(`vault          = ${vaultAddrHex}`);
 
   // Load user TwistedEd25519 from env
@@ -119,7 +122,7 @@ async function main() {
 
   // Vault TwistedEd25519 public key — we need this to encrypt the transfer-amount
   // chunks under the recipient (vault) key.
-  const vaultEkBytes = fromHex(state.vault.vault_ek_hex);
+  const vaultEkBytes = fromHex(deploy.vault!.vault_ek_hex);
   const vaultEk = new TwistedEd25519PublicKey(vaultEkBytes);
 
   // ---- 1. Roll over user pending balance ----
@@ -166,8 +169,11 @@ async function main() {
     const last = rolloverResp[rolloverResp.length - 1];
     console.log(`  rollover tx = ${last.hash}, success=${last.success}, gas=${last.gas_used}`);
     if (!last.success) throw new Error(`rollover failed: ${last.vm_status}`);
-    state.user_ca.rollover_tx = last.hash;
-    state.user_ca.rollover_gas = Number(last.gas_used ?? 0);
+    updateTargetDeploy((d) => {
+      d.user_ca ??= {};
+      d.user_ca.rollover_tx = last.hash;
+      d.user_ca.rollover_gas = Number(last.gas_used ?? 0);
+    });
   }
 
   // Re-fetch balance post-rollover
@@ -415,14 +421,16 @@ async function main() {
     signing_slots: [0, 1, 2, 3],
     has_effective_auditor: hasEffectiveAuditor,
   };
-  state.deposits = state.deposits || [];
-  state.deposits.push(newDeposit);
-  // Keep state.deposit pointing at the FIRST deposit (B.4) for backward compat;
-  // do NOT overwrite with the new deposit. Multi-deposit consumers should iterate
-  // state.deposits[] instead.
-  if (!state.deposit) state.deposit = newDeposit;
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-  console.log(`\npersisted to ${STATE_PATH} (state.deposits[${state.deposits.length - 1}] = new deposit; leafIndex = ${state.deposits.length - 1})`);
+  updateTargetDeploy((d) => {
+    d.deposits ??= [];
+    d.deposits.push(newDeposit);
+    // Keep d.deposit pointing at the FIRST deposit (B.4) for backward compat;
+    // do NOT overwrite with the new deposit. Multi-deposit consumers should
+    // iterate d.deposits[] instead.
+    if (!d.deposit) d.deposit = newDeposit;
+  });
+  const totalDeposits = (targetDeploy().deposits ?? []).length;
+  console.log(`\n[state] deploys.${DEPLOY_ID}.deposits[${totalDeposits - 1}] = new deposit (leafIndex = ${totalDeposits - 1})`);
 }
 
 main().catch((e) => {
