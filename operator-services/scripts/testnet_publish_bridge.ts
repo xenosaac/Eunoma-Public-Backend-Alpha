@@ -42,10 +42,11 @@ function publishPackage(
   namedAddresses: string,
 ): { tx: string; gas_used: number; gas_unit_price: number } {
   const cmd =
-    `aptos move publish --profile ${PROFILE} --included-artifacts none --assume-yes ` +
+    `aptos move publish --profile ${PROFILE} --package-dir "${packageDir}" ` +
+    `--included-artifacts none --assume-yes ` +
     `--max-gas 1500000 --named-addresses "${namedAddresses}"`;
-  console.log(`\n[publish] $ ${cmd}  (cwd=${packageDir})`);
-  const stdout = execSync(cmd, { encoding: 'utf-8', cwd: packageDir });
+  console.log(`\n[publish] $ ${cmd}  (cwd=${REPO_ROOT})`);
+  const stdout = execSync(cmd, { encoding: 'utf-8', cwd: REPO_ROOT });
   process.stdout.write(stdout);
 
   const jsonStart = stdout.indexOf('{');

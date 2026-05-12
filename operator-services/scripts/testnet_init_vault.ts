@@ -45,6 +45,7 @@ import { loadOperatorKeys, loadSecretHex } from '../shared/src/secrets.js';
 import { targetBridge, targetDeployId, updateTargetDeploy } from './_lib/state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
 const BRIDGE_ADDR = targetBridge();
 const DEPLOY_ID = targetDeployId();
@@ -166,7 +167,7 @@ async function main() {
     ].join(' ');
     let simOut = '';
     try {
-      simOut = execSync(simCmd, { encoding: 'utf-8', cwd: path.dirname(__dirname) });
+      simOut = execSync(simCmd, { encoding: 'utf-8', cwd: REPO_ROOT });
     } catch (e: any) {
       simOut = (e.stdout || '') + (e.stderr || '');
       console.error(simOut);
@@ -195,7 +196,7 @@ async function main() {
   ].join(' ');
   let subOut = '';
   try {
-    subOut = execSync(subCmd, { encoding: 'utf-8', cwd: path.dirname(__dirname) });
+    subOut = execSync(subCmd, { encoding: 'utf-8', cwd: REPO_ROOT });
   } catch (e: any) {
     subOut = (e.stdout || '') + (e.stderr || '');
     console.error(subOut);
