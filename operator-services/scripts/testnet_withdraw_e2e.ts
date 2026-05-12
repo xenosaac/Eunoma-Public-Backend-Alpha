@@ -210,8 +210,8 @@ async function main() {
     (d) => fromHex(d.commitment),
   );
   console.log(`  leafIndex         = ${withdrawIndex} (= state.deposits[${withdrawIndex}])`);
-  console.log(`  nullifier         = ${depositWitness.nullifier}`);
-  console.log(`  secret            = ${depositWitness.secret}`);
+  console.log(`  nullifier         = [redacted]`);
+  console.log(`  secret            = [redacted]`);
   console.log(`  amount_octas      = ${amountOctas}`);
   console.log(`  deposit commitment= ${depositWitness.commitment}`);
   console.log(`  total leaves      = ${allLeaves.length} (multi-leaf merkle path)`);

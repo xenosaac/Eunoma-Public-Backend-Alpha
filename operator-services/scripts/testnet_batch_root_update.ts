@@ -317,7 +317,8 @@ async function main() {
     const sk = new Ed25519PrivateKey(hexToBytes(k.private_key));
     const sig = sk.sign(msgBytes);
     sigs[slot] = sig.toUint8Array();
-    console.log(`  slot ${slot} (${k.private_key.slice(0, 20)}...): sig ${toHex(sigs[slot]).slice(0, 30)}...`);
+    const pubPrefix = k.public_key ? k.public_key.replace(/^0x/, '').slice(0, 16) : 'unknown';
+    console.log(`  slot ${slot} (role=${k.role ?? 'operator'} pub=0x${pubPrefix}…): sig ${toHex(sigs[slot]).slice(0, 30)}...`);
   }
 
   // Step 7: build + submit transaction
