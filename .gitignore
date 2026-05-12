@@ -71,7 +71,10 @@ Dockerfile
 /TESTNET_ADDRESSES.md
 /docs/HANDOFF_PACKAGE.md
 /docs/CODING_AGENT_PROMPT.md
+/docs/privacy_protocol_comparison_2026-05.md
+/docs/privacy_protocol_comparison_2026-05.xlsx
 /circuits/scripts/README.md
 /operator-services/README.md
 /operator-services/main-operator/README.md
 /operator-services/scripts/README.md
+/move/.phase_g_archive/
