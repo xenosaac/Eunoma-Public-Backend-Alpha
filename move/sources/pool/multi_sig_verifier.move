@@ -122,7 +122,7 @@ module eunoma::pool_multi_sig_verifier {
             E_BAD_OPERATOR_SET_LENGTH,
         );
         assert!(
-            threshold >= 1 && threshold <= MAX_OPERATORS,
+            threshold >= SPIKE_THRESHOLD && threshold <= MAX_OPERATORS,
             E_BAD_THRESHOLD,
         );
         assert!(main_operator_index < MAX_OPERATORS, E_BAD_MAIN_OPERATOR_INDEX);

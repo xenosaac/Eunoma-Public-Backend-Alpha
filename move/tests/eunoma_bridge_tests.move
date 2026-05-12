@@ -795,4 +795,58 @@ module eunoma::eunoma_bridge_tests {
         let (_new_sks, new_pks) = gen_seven_active_operators();
         eunoma_bridge::update_operator_set(admin, new_pks, 0, 4); // OLD admin → E_NOT_ADMIN (1)
     }
+
+    // ========================================================================
+    // Test 20: init_vault rejects threshold below MIN_THRESHOLD (4-of-7 invariant)
+    // ========================================================================
+
+    #[test(framework = @aptos_framework, admin = @eunoma, main = @0xA001)]
+    #[expected_failure(abort_code = 9, location = eunoma::eunoma_bridge)]
+    fun test_init_vault_rejects_threshold_three(
+        framework: &signer,
+        admin: &signer,
+        main: &signer,
+    ) {
+        timestamp::set_time_has_started_for_testing(framework);
+        timestamp::update_global_time_for_test_secs(1_700_000_000);
+        let admin_addr = signer::address_of(admin);
+        if (!account::exists_at(admin_addr)) {
+            account::create_account_for_test(admin_addr);
+        };
+        let metadata = make_test_metadata(admin);
+        let (_sks, pks) = gen_seven_active_operators();
+
+        // Threshold = 3 < MIN_THRESHOLD (4) → must abort E_BAD_THRESHOLD (9).
+        eunoma_bridge::init_vault(
+            admin,
+            signer::address_of(main),
+            metadata,
+            pks,
+            0,
+            3,
+            VAULT_SEED,
+            b"vault_ek",
+            vector::empty<vector<u8>>(),
+            vector::empty<vector<u8>>(),
+        );
+    }
+
+    // ========================================================================
+    // Test 21: update_operator_set rejects threshold below MIN_THRESHOLD
+    // ========================================================================
+
+    #[test(framework = @aptos_framework, admin = @eunoma, main = @0xA001)]
+    #[expected_failure(abort_code = 9, location = eunoma::eunoma_bridge)]
+    fun test_update_operator_set_rejects_threshold_three(
+        framework: &signer,
+        admin: &signer,
+        main: &signer,
+    ) {
+        let main_addr = signer::address_of(main);
+        let (_admin_addr, _metadata, _sks, _pks) =
+            setup_vault_default(framework, admin, main_addr);
+        // 7 active slots; threshold = 3 < MIN_THRESHOLD (4) → E_BAD_THRESHOLD (9).
+        let (_new_sks, new_pks) = gen_seven_active_operators();
+        eunoma_bridge::update_operator_set(admin, new_pks, 0, 3);
+    }
 }

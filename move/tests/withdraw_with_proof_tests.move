@@ -769,11 +769,16 @@ module eunoma::withdraw_with_proof_tests {
         main_op: &signer,
         relayer: &signer,
     ) {
-        setup_for_withdraw_pre_sig(framework, admin, signer::address_of(main_op));
+        // Need full setup (returns asset_type) so we can pass the canonical
+        // recomputed ca_payload_hash through the new payload-hash invariant
+        // (E_PAYLOAD_HASH_MISMATCH = 17) and reach the sig verification gate.
+        let main_op_addr = signer::address_of(main_op);
+        let (asset_type, _sks) = setup_for_withdraw_full_with_keys(framework, admin, main_op_addr);
         let recipient = @0xBABE;
         // Use the canonical recipient_hash so gate 6 passes; the sig gate (8)
         // then fails because we pass 7 empty sigs.
         let real_recipient_hash = eunoma_bridge::test_call_derive_recipient_hash(recipient);
+        let cph_recomp = empty_ca_payload_hash_recomputed(asset_type, recipient);
 
         eunoma_bridge::withdraw_to_recipient(
             relayer,
@@ -782,7 +787,7 @@ module eunoma::withdraw_with_proof_tests {
             recipient,
             real_recipient_hash,
             fr_safe_bytes(0x33),
-            fr_safe_bytes(0x44),
+            cph_recomp,
             fr_safe_bytes(0x55),
             0,
             fixture_proof_bytes(),
@@ -858,24 +863,21 @@ module eunoma::withdraw_with_proof_tests {
     }
 
     // --------------------------------------------------------------------
-    // B6: ca_payload_hash mismatch surfaces as E_INVALID_OPERATOR_SIGNATURE
-    // (108 from pool_multi_sig_verifier).
+    // B6: ca_payload_hash mismatch with bridge-recomputed value aborts with
+    // E_PAYLOAD_HASH_MISMATCH (17 from eunoma_bridge).
     //
-    // The bridge does NOT separately enforce
-    // `ca_payload_hash == hash_confidential_transfer_payload(payload args)`.
-    // Instead, the recomputed hash is fed into the WithdrawAttestationMessage
-    // body and operators sign over that — so any mismatch between the value
-    // operators signed over (cph_recomp_for_signing) and the value the
-    // bridge derives (cph_recomp_actual) breaks signature verification.
-    // (Mirrors deposit-side REPORT_GATE_4B test 3 design decision.)
-    //
-    // Setup: real keys so sigs verify when the operator-signed hash matches
-    // the bridge-derived hash. Then we sign over a DIFFERENT cph value so
-    // sig verify fails on the first slot (108).
+    // Bridge now directly enforces
+    // `ca_payload_hash == hash_confidential_transfer_payload(payload args)`
+    // before the attestation message build / sig verify / Groth16 verify
+    // gates, so any drift between the client-supplied hash and the recomputed
+    // value is caught here rather than surfaced indirectly through
+    // E_INVALID_OPERATOR_SIGNATURE downstream. This closes the fork where the
+    // Groth16 verifier (which consumes `ca_payload_hash` as a public input)
+    // could see a different hash than the one operators signed over.
     // --------------------------------------------------------------------
 
     #[test(framework = @aptos_framework, admin = @eunoma, main_op = @0xA001, relayer = @0xCAFE)]
-    #[expected_failure(abort_code = 108, location = eunoma::pool_multi_sig_verifier)]
+    #[expected_failure(abort_code = 17, location = eunoma::eunoma_bridge)]
     fun test_b6_ca_payload_hash_mismatch_aborts(
         framework: &signer,
         admin: &signer,

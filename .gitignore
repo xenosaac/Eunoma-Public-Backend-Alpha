@@ -36,6 +36,11 @@ Thumbs.db
 **/.ek.json
 **/secrets/
 
+# Testnet state — contains note nullifiers, secrets, deposit_blind, and
+# decryption keys. ROTATE keys when regenerating; never commit.
+operator-services/scripts/testnet_state.json
+operator-services/scripts/testnet_state*.json
+
 # Circuit byproducts (keep .zkey/.ptau/.vk.json explicitly committed; ignore intermediate witness/r1cs)
 *.r1cs
 *.wtns

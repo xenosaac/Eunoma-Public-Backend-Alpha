@@ -68,8 +68,11 @@ module eunoma::eunoma_bridge {
     /// is identity. Empty pubkey => inactive slot.
     const MAX_OPERATORS: u64 = 7;
 
-    /// Minimum allowable threshold value.
-    const MIN_THRESHOLD: u64 = 1;
+    /// Minimum allowable threshold value. Hardened to 4 to make the documented
+    /// 4-of-7 attestation a bridge-layer invariant (matches
+    /// `multi_sig_verifier::SPIKE_THRESHOLD`). Governance via `update_operator_set`
+    /// cannot reduce the threshold below this floor.
+    const MIN_THRESHOLD: u64 = 4;
 
     /// Domain separators for attestation BCS hashes. These are the first field of the
     /// DepositAttestationMessage / WithdrawAttestationMessage and MUST match the
@@ -2448,11 +2451,17 @@ module eunoma::eunoma_bridge {
         );
         // Truncate to fit Fr (Phase 2 fix; off-chain mirrors).
         let ca_payload_hash_recomputed = ca_payload_hash_to_fr_safe(ca_payload_hash_raw);
-        // Bridge does NOT separately enforce ca_payload_hash == recomputed (mirror
-        // of deposit decision REPORT_GATE_4B test 3): the recomputed value is fed
-        // into the WithdrawAttestationMessage body; operator signed over the exact
-        // same hash; any mismatch yields E_INVALID_OPERATOR_SIGNATURE on the main
-        // slot. Strictly tighter than a bare equality check.
+        // Bridge enforces ca_payload_hash == recomputed so both the
+        // WithdrawAttestationMessage body and the Groth16 proof verifier (below)
+        // observe the same hash. Unlike the deposit path — which doesn't pass
+        // ca_payload_hash into a Groth16 public input — the withdraw verifier
+        // consumes `ca_payload_hash` as a public input, so any drift between the
+        // client-supplied value and the recomputed value would let attestation
+        // and zk verifier sign off on different CA payloads. Enforce equality.
+        assert!(
+            ca_payload_hash == ca_payload_hash_recomputed,
+            E_PAYLOAD_HASH_MISMATCH
+        );
 
         // 8. Build canonical WithdrawAttestationMessage and verify 4-of-7 sigs.
         // Phase D Agent D1 candidate 2: same 32-byte → 8-byte LE u64 pool_id
