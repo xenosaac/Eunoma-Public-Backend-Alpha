@@ -20,12 +20,15 @@ import {
 } from "./verify/deposit_request.js";
 import { fanOutCoSignRequests } from "./partner_client.js";
 import { registerRecipientRolloverRoute } from "./routes/recipient_rollover.js";
-import { registerWithdrawRoutes } from "./routes/withdraw.js";
+import { registerWithdrawRoutes, type WithdrawRouteHooks } from "./routes/withdraw.js";
 import { randomUUID } from "node:crypto";
 
 export interface MainServerOptions {
   cfg: MainOperatorConfig;
   store?: Store;
+  /// Optional injection of stubs for /v1/withdraw/* (chain reader, CA payload
+  /// builder, Groth16 verifier, partner cosign fanout). Default {} — production.
+  withdrawRouteHooks?: WithdrawRouteHooks;
 }
 
 export function buildMainServer(opts: MainServerOptions): {
@@ -58,7 +61,7 @@ export function buildMainServer(opts: MainServerOptions): {
   fastify.get("/v1/health", async () => ({ ok: true, slot: cfg.main_slot }));
 
   registerRecipientRolloverRoute(fastify);
-  registerWithdrawRoutes(fastify);
+  registerWithdrawRoutes(fastify, store, cfg, opts.withdrawRouteHooks ?? {});
 
   fastify.get("/v1/operator-set", async () => ({
     operator_set_version: cfg.operator_set_version.toString(),

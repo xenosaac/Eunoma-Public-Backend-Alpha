@@ -14,6 +14,8 @@ export interface PartnerOperatorConfig {
   signer: Signer; // Ed25519 signing identity (in-memory test impl by default)
   main_op_pubkey: Uint8Array; // 32-byte Ed25519 pubkey for verifying main-op auth
   min_expiry_window_secs: number; // reject requests that expire too soon
+  max_horizon_secs: number;       // reject withdraw expiries farther than this in the future
+  bridge_addr: string;            // Aptos package address — used by partner to read VaultConfig
   // W1 — auth + rate limit
   bearer_token: string; // token this partner expects from main in Authorization header
   rate_limit_max_per_window: number;
@@ -39,6 +41,10 @@ export function defaultTestConfig(opts: {
     signer: opts.signer ?? new InMemoryEd25519Signer(),
     main_op_pubkey: opts.main_op_pubkey,
     min_expiry_window_secs: 30,
+    max_horizon_secs: 3600,
+    bridge_addr:
+      process.env.BRIDGE_PACKAGE_ADDRESS ??
+      "0x8268f56bdd9814d1cc925b861eaa1203d41c7f5425b3d2df887f618ffeb24820",
     bearer_token: opts.bearer_token ?? "test-partner-token",
     rate_limit_max_per_window: 100,
     rate_limit_window_ms: 60_000,

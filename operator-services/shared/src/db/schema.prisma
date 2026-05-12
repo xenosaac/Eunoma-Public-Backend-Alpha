@@ -1,5 +1,4 @@
-// Prisma schema — deposit-related tables only (Gate 4c).
-// Withdraw + maintenance tables defer to Gates 5/6.
+// Prisma schema — deposit + withdraw tables.
 //
 // Test environments use SQLite via DATABASE_URL=file:./test.db.
 // Production uses PostgreSQL.
@@ -63,6 +62,38 @@ model CAPayload {
   created_at    DateTime @default(now())
 
   request DepositRequest @relation(fields: [request_id], references: [request_id])
+}
+
+// Withdraw lifecycle row. Inserted at /v1/withdraw/prepare under
+// `status='PREPARED'`; mutated by /v1/withdraw/finalize to FINALIZED/FAILED;
+// or by background job to EXPIRED. The Store's `insertWithdrawRequestActiveOnly`
+// is the only path that creates these rows and is responsible for atomically
+// rejecting duplicate active (vault_addr, vault_sequence). DO NOT add
+// `@@unique([vault_addr, vault_sequence])` — vault_sequence is a chain
+// counter that doesn't advance on PREPARED/FAILED/EXPIRED, so an unconditional
+// unique self-DoS's re-prepare; partial unique on status='PREPARED' has the
+// same flaw because it can't reference expiry in the predicate.
+model WithdrawRequest {
+  request_id       String    @id
+  status           String // "PREPARED" | "FINALIZED" | "FAILED" | "EXPIRED"
+  disclosed_amount BigInt
+  withdraw_blind   Bytes
+  recipient        Bytes
+  recipient_hash   Bytes
+  vault_addr       Bytes
+  asset_type       Bytes // 32B Aptos address (e.g. 0xa) — for CA payload + attestation msg
+  asset_id_le32    Bytes // 32B Fr — for circuit / amount_tag / request_hash
+  chain_id         Int
+  vault_sequence   BigInt
+  ca_payload_hash  Bytes
+  ca_payload_jsonb Json
+  expiry           BigInt
+  created_at       DateTime  @default(now())
+  finalized_at     DateTime?
+
+  @@index([status])
+  @@index([expiry])
+  @@index([vault_addr, vault_sequence])
 }
 
 model AuditLog {

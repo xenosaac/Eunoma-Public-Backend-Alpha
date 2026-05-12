@@ -35,12 +35,18 @@ import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   getPoseidon,
-  hash2,
-  hash3,
   compose5,
 } from '../shared/src/poseidon_mirror.js';
 import { POOL_ID_VALUE } from '../shared/src/types.js';
 import { u64ToFieldLe32, u8ToFieldLe32 } from '../shared/src/hex.js';
+import {
+  deriveRecipientHash,
+  deriveAmountTag,
+  deriveRequestHash,
+  le32ToDec,
+  g1ToBytes,
+  g2ToBytes,
+} from '../shared/src/withdraw_canonical.js';
 import { computeMerklePath } from './build_merkle_path.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -51,10 +57,6 @@ const TMP_DIR = path.join(__dirname, '.withdraw-proof-tmp');
 const TREE_DEPTH = 20;
 const ZERO32 = new Uint8Array(32);
 
-const POSEIDON_DOMAIN_RECIPIENT_HASH = new TextEncoder().encode(
-  'APTOSHIELD_RECIPIENT_HASH_V1',
-);
-
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
@@ -63,70 +65,6 @@ function fromHex(s: string): Uint8Array {
   const out = new Uint8Array(h.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
   return out;
-}
-function le32ToDec(buf: Uint8Array): string {
-  if (buf.length !== 32) throw new Error(`expected 32-byte buffer; got ${buf.length}`);
-  let n = 0n;
-  for (let i = buf.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(buf[i]);
-  return n.toString();
-}
-function decToLe32(dec: string): Uint8Array {
-  let n = BigInt(dec);
-  const out = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) {
-    out[i] = Number(n & 0xffn);
-    n >>= 8n;
-  }
-  if (n !== 0n) throw new Error(`Fr exceeds 32 bytes: ${dec}`);
-  return out;
-}
-function g1ToBytes(arr: string[]): Uint8Array {
-  const out = new Uint8Array(64);
-  out.set(decToLe32(arr[0]), 0);
-  out.set(decToLe32(arr[1]), 32);
-  return out;
-}
-function g2ToBytes(arr: string[][]): Uint8Array {
-  const [x, y] = arr;
-  const out = new Uint8Array(128);
-  out.set(decToLe32(x[0]), 0);
-  out.set(decToLe32(x[1]), 32);
-  out.set(decToLe32(y[0]), 64);
-  out.set(decToLe32(y[1]), 96);
-  return out;
-}
-
-/** Pad arbitrary <=32 byte buffer into 32-byte LE Fr buffer. */
-function padToFr(src: Uint8Array): Uint8Array {
-  if (src.length > 32) throw new Error(`>32 bytes: ${src.length}`);
-  const out = new Uint8Array(32);
-  out.set(src, 0);
-  return out;
-}
-
-/** 6-input Poseidon: compose6(a,b,c,d,e,f) = hash2(hash3(a,b,c), hash3(d,e,f)).
- * Mirror of the circuit's Compose6 template; bytes-identical because the
- * underlying Poseidon hash_2/hash_3 are circomlibjs (matches Move-side A2-frozen). */
-async function compose6(
-  a: Uint8Array,
-  b: Uint8Array,
-  c: Uint8Array,
-  d: Uint8Array,
-  e: Uint8Array,
-  f: Uint8Array,
-): Promise<Uint8Array> {
-  const lo = await hash3(a, b, c);
-  const hi = await hash3(d, e, f);
-  return hash2(lo, hi);
-}
-
-/** Mirror of Move's `derive_recipient_hash`: hash3(domain, hi, lo). */
-async function deriveRecipientHash(addr32: Uint8Array): Promise<Uint8Array> {
-  if (addr32.length !== 32) throw new Error('recipient must be 32 bytes');
-  const hi = padToFr(addr32.slice(0, 16));
-  const lo = padToFr(addr32.slice(16, 32));
-  const domain = padToFr(POSEIDON_DOMAIN_RECIPIENT_HASH);
-  return hash3(domain, hi, lo);
 }
 
 /** Phase 2.X legacy fallback: 1-leaf tree where the only leaf sits at index 0
@@ -272,10 +210,6 @@ export async function buildWithdrawProof(inputs: WithdrawProofInputs): Promise<W
   }
 
   // ---- 3. Public-input derivations ----
-  const { hash1 } = await import('../shared/src/poseidon_mirror.js')
-    .then((m: any) => m.getPoseidon ? import('../shared/src/poseidon_mirror.js') : m)
-    .catch(() => ({ hash1: undefined as any }));
-
   // hash1 (1-input Poseidon) — use circomlibjs Poseidon directly since shared lib
   // exposes hash2/hash3 only. ESM-safe dynamic import (replaces stale require()).
   const { buildPoseidon } = (await import('circomlibjs')) as any;
@@ -297,22 +231,22 @@ export async function buildWithdrawProof(inputs: WithdrawProofInputs): Promise<W
   const vaultSequenceLe32 = u64ToFieldLe32(inputs.vaultSequence);
   const chainIdLe32 = u8ToFieldLe32(inputs.chainId);
 
-  const amountTag = await compose6(
-    amountLe32,
-    inputs.withdrawBlind,
-    recipientHash,
-    inputs.assetIdLe32,
-    chainIdLe32,
-    vaultSequenceLe32,
-  );
-  const requestHash = await compose6(
-    amountTag,
-    recipientHash,
-    inputs.caPayloadHash,
-    inputs.assetIdLe32,
-    vaultSequenceLe32,
-    chainIdLe32,
-  );
+  const amountTag = await deriveAmountTag({
+    amount: inputs.amountOctas,
+    withdraw_blind: inputs.withdrawBlind,
+    recipient_hash: recipientHash,
+    asset_id_le32: inputs.assetIdLe32,
+    chain_id: inputs.chainId,
+    vault_sequence: inputs.vaultSequence,
+  });
+  const requestHash = await deriveRequestHash({
+    amount_tag: amountTag,
+    recipient_hash: recipientHash,
+    ca_payload_hash: inputs.caPayloadHash,
+    asset_id_le32: inputs.assetIdLe32,
+    vault_sequence: inputs.vaultSequence,
+    chain_id: inputs.chainId,
+  });
 
   console.log(`[wproof] nullifier_hash  = 0x${hex(nullifierHash)}`);
   console.log(`[wproof] recipient_hash  = 0x${hex(recipientHash)}`);

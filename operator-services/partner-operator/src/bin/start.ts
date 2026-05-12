@@ -64,6 +64,8 @@ async function main() {
     signer,
     main_op_pubkey: new Uint8Array(Buffer.from(mainKey.public_key.replace(/^0x/, ""), "hex")),
     min_expiry_window_secs: 30,
+    max_horizon_secs: Number(process.env.MAX_HORIZON_SECS ?? 3600),
+    bridge_addr: bridgeAddr,
     bearer_token: myBearer,
     rate_limit_max_per_window: Number(process.env.RATE_LIMIT_MAX_PER_WINDOW ?? 10),
     rate_limit_window_ms: Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000),
