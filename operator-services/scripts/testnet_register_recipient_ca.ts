@@ -33,21 +33,23 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEPLOY_ID = targetDeployId();
 
 const APT_METADATA = '0xa';
+const BRIDGE_RECIPIENT_PROFILE = process.env.BRIDGE_RECIPIENT_PROFILE ?? 'bridge-spare';
 
 function getBridgeSpareAccount(): Account {
   const configPath = path.join(__dirname, '..', '..', '.aptos', 'config.yaml');
   const yaml = fs.readFileSync(configPath, 'utf-8');
   const m = yaml.match(
-    /bridge-spare:[\s\S]*?private_key:\s*(?:"|')?([^\s"']+)(?:"|')?/,
+    new RegExp(`${BRIDGE_RECIPIENT_PROFILE}:[\\s\\S]*?private_key:\\s*(?:"|')?([^\\s"']+)(?:"|')?`),
   );
-  if (!m) throw new Error('cannot find bridge-spare private_key in config');
+  if (!m) throw new Error(`cannot find ${BRIDGE_RECIPIENT_PROFILE} private_key in config`);
   const raw = m[1].trim().replace(/^ed25519-priv-/, '');
   return Account.fromPrivateKey({ privateKey: new Ed25519PrivateKey(raw) });
 }
 
 async function main() {
   const recipientAccount = getBridgeSpareAccount();
-  console.log(`bridge-spare addr = ${recipientAccount.accountAddress.toString()}`);
+  console.log(`bridge-recipient profile = ${BRIDGE_RECIPIENT_PROFILE}`);
+  console.log(`bridge-recipient addr = ${recipientAccount.accountAddress.toString()}`);
 
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
   const ca = new ConfidentialAsset({ config: aptos.config });
@@ -91,7 +93,6 @@ async function main() {
     d.recipient_ca ??= {};
     d.recipient_ca.recipient_address = recipientAccount.accountAddress.toString();
     d.recipient_ca.asset_type = APT_METADATA;
-    d.recipient_ca.recipient_decryption_key_secret_hex = recipientDk.toString();
     d.recipient_ca.recipient_encryption_key_pub_hex = recipientDk.publicKey().toString();
     if (registerTxHash) {
       d.recipient_ca.register_tx = registerTxHash;

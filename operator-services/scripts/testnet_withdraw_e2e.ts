@@ -47,6 +47,8 @@ const BRIDGE_ADDR = targetBridge();
 const DEPLOY_ID = targetDeployId();
 const APT_METADATA = '0xa';
 const CHAIN_ID = 2;
+const BRIDGE_RELAYER_PROFILE = process.env.BRIDGE_RELAYER_PROFILE ?? 'bridge-relayer';
+const BRIDGE_RECIPIENT_PROFILE = process.env.BRIDGE_RECIPIENT_PROFILE ?? 'bridge-spare';
 // Phase 2.Y / W.1 — Amount-binding operator obligation (per HANDOFF Section 4 Step 4
 // + Section 1.6 line 117-118 + R6-10 errata).
 //
@@ -147,10 +149,12 @@ function encodeWithdrawAttestationMessage(msg: {
 async function main() {
   console.log('=== Phase 2 Gate 6 testnet withdraw e2e ===');
 
-  const relayerAccount = loadAccount('bridge-relayer');
-  const recipientAddr = loadAccountAddrFromConfig('bridge-spare');
-  console.log(`relayer        = ${relayerAccount.accountAddress.toString()}`);
-  console.log(`recipient      = ${recipientAddr} (bridge-spare)`);
+  const relayerAccount = loadAccount(BRIDGE_RELAYER_PROFILE);
+  const recipientAddr = loadAccountAddrFromConfig(BRIDGE_RECIPIENT_PROFILE);
+  console.log(`relayer profile  = ${BRIDGE_RELAYER_PROFILE}`);
+  console.log(`recipient profile= ${BRIDGE_RECIPIENT_PROFILE}`);
+  console.log(`relayer          = ${relayerAccount.accountAddress.toString()}`);
+  console.log(`recipient        = ${recipientAddr}`);
 
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
 
@@ -404,7 +408,6 @@ async function main() {
       d.withdraw.request_hash = '0x' + hex(proofResult.requestHash);
       d.withdraw.vault_sequence_pre = vaultSequence.toString();
       d.withdraw.expiry_secs = expirySecs.toString();
-      d.withdraw.withdraw_blind = '0x' + hex(withdrawBlind);
     });
     console.log(`  [state] deploys.${DEPLOY_ID}.withdraw written`);
   } else {

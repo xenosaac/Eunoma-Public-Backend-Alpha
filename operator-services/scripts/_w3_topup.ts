@@ -24,6 +24,7 @@ import { loadSecretHex } from '../shared/src/secrets.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const APT_METADATA = '0xa';
 const TOPUP_OCTAS = process.env.TOPUP_OCTAS ? BigInt(process.env.TOPUP_OCTAS) : 10_000_000n;
+const BRIDGE_USER_PROFILE = process.env.BRIDGE_USER_PROFILE ?? 'bridge-user';
 
 function loadAccount(profile: string): Account {
   const cfgPath = path.join(__dirname, '..', '..', '.aptos', 'config.yaml');
@@ -35,7 +36,8 @@ function loadAccount(profile: string): Account {
 }
 
 async function main() {
-  const user = loadAccount('bridge-user');
+  const user = loadAccount(BRIDGE_USER_PROFILE);
+  console.log(`bridge-user profile = ${BRIDGE_USER_PROFILE}`);
   console.log(`bridge-user = ${user.accountAddress.toString()}`);
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
   const ca = new ConfidentialAsset({ config: aptos.config });

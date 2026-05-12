@@ -36,16 +36,18 @@ const DEPLOY_ID = targetDeployId();
 
 const APT_METADATA = '0xa';
 const VEIL_AMOUNT_OCTAS = 50_000_000n; // 0.5 APT
+const BRIDGE_USER_PROFILE = process.env.BRIDGE_USER_PROFILE ?? 'bridge-user';
 
-// Read aptos config to get bridge-user private key
+// Read aptos config to get the bridge-user private key. Override with
+// BRIDGE_USER_PROFILE during full key-rotation redeploys.
 function getBridgeUserAccount(): Account {
   const configPath = path.join(__dirname, '..', '..', '.aptos', 'config.yaml');
   const yaml = fs.readFileSync(configPath, 'utf-8');
-  // Simple parse: find bridge-user block, then the ed25519-priv-0x...
+  // Simple parse: find the profile block, then the ed25519-priv-0x...
   const userMatch = yaml.match(
-    /bridge-user:[\s\S]*?private_key:\s*(?:"|')?([^\s"']+)(?:"|')?/,
+    new RegExp(`${BRIDGE_USER_PROFILE}:[\\s\\S]*?private_key:\\s*(?:"|')?([^\\s"']+)(?:"|')?`),
   );
-  if (!userMatch) throw new Error('cannot find bridge-user private_key in config');
+  if (!userMatch) throw new Error(`cannot find ${BRIDGE_USER_PROFILE} private_key in config`);
   let raw = userMatch[1].trim();
   // Strip aip-80 prefix if present
   raw = raw.replace(/^ed25519-priv-/, '');
@@ -56,6 +58,7 @@ function getBridgeUserAccount(): Account {
 async function main() {
   // Bridge-user account (already funded with 5 APT in Gate 4d).
   const userAccount = getBridgeUserAccount();
+  console.log(`bridge-user profile = ${BRIDGE_USER_PROFILE}`);
   console.log(`bridge-user addr = ${userAccount.accountAddress.toString()}`);
 
   // Set up Aptos client + CA helper.
@@ -125,7 +128,6 @@ async function main() {
     d.user_ca ??= {};
     d.user_ca.user_address = userAccount.accountAddress.toString();
     d.user_ca.asset_type = APT_METADATA;
-    d.user_ca.user_decryption_key_secret_hex = userDk.toString();
     d.user_ca.user_encryption_key_pub_hex = userDk.publicKey().toString();
     if (registerTxHash) {
       d.user_ca.register_tx = registerTxHash;

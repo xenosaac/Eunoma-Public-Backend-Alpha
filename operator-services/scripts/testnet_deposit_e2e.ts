@@ -59,6 +59,8 @@ const BRIDGE_ADDR = targetBridge();
 const DEPLOY_ID = targetDeployId();
 const APT_METADATA = '0xa';
 const CHAIN_ID = 2; // testnet
+const BRIDGE_USER_PROFILE = process.env.BRIDGE_USER_PROFILE ?? 'bridge-user';
+const BRIDGE_RELAYER_PROFILE = process.env.BRIDGE_RELAYER_PROFILE ?? 'bridge-relayer';
 // Phase 2.Y / W.3 — amount overridable via env DEPOSIT_AMOUNT_OCTAS for B.5+ deposits.
 // Default 0.1 APT preserves Phase 2.X B.4 reproducibility.
 const CA_TRANSFER_AMOUNT_OCTAS: bigint = process.env.DEPOSIT_AMOUNT_OCTAS
@@ -75,7 +77,7 @@ function fromHex(s: string): Uint8Array {
   return out;
 }
 
-function loadAccount(profile: 'bridge-user' | 'bridge-relayer'): Account {
+function loadAccount(profile: string): Account {
   const configPath = path.join(__dirname, '..', '..', '.aptos', 'config.yaml');
   const yaml = fs.readFileSync(configPath, 'utf-8');
   const re = new RegExp(
@@ -96,10 +98,12 @@ function randomFr(): Uint8Array {
 }
 
 async function main() {
-  const userAccount = loadAccount('bridge-user');
-  const relayerAccount = loadAccount('bridge-relayer');
-  console.log(`bridge-user    = ${userAccount.accountAddress.toString()}`);
-  console.log(`bridge-relayer = ${relayerAccount.accountAddress.toString()}`);
+  const userAccount = loadAccount(BRIDGE_USER_PROFILE);
+  const relayerAccount = loadAccount(BRIDGE_RELAYER_PROFILE);
+  console.log(`bridge-user profile    = ${BRIDGE_USER_PROFILE}`);
+  console.log(`bridge-relayer profile = ${BRIDGE_RELAYER_PROFILE}`);
+  console.log(`bridge-user            = ${userAccount.accountAddress.toString()}`);
+  console.log(`bridge-relayer         = ${relayerAccount.accountAddress.toString()}`);
 
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
   const ca = new ConfidentialAsset({ config: aptos.config });
