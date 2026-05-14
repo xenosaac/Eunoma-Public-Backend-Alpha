@@ -21,6 +21,7 @@ export function bearerAuthHook(opts: BearerAuthOptions) {
   }
   const exempt = new Set(opts.exemptPaths ?? []);
   return async function bearerAuth(req: FastifyRequest, reply: FastifyReply) {
+    if (req.method === "OPTIONS") return;
     // Strip query string for exact-path matching (req.url includes querystring).
     const path = req.url.split("?", 1)[0];
     if (exempt.has(path)) return;

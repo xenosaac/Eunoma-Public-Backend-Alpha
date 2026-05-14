@@ -269,6 +269,12 @@ function setupCluster(opts: ClusterOpts = {}): Cluster {
         const msgBytes = rebuildMsgBytesFromCosignBody(body);
         return fanoutStub(body, partners, msgBytes);
       },
+      submitWithdrawTx: async () => ({
+        tx: "0x" + "12".repeat(32),
+        success: true,
+        vm_status: "Executed successfully",
+        gas_used: "12345",
+      }),
     },
   });
   return {
@@ -380,14 +386,16 @@ describe("CP4 /v1/withdraw/finalize partner cosign + fanout", () => {
     const { res, body } = await callFinalize(cluster.server, happy);
     expect(res.statusCode).toBe(200);
     expect(Object.keys(body).sort()).toEqual([
-      "attestation_msg_bcs",
+      "gas_used",
       "request_id",
-      "signatures",
-      "threshold_met",
+      "success",
+      "tx",
+      "vm_status",
     ]);
-    expect(body.threshold_met).toBe(true);
-    expect(body.signatures).toHaveLength(7);
-    expect(body.signatures.filter((s: any) => s.signature_hex !== null)).toHaveLength(4);
+    expect(body.success).toBe(true);
+    expect(body.tx).toMatch(/^0x[0-9a-f]+$/);
+    expect(body.vm_status).toBe("Executed successfully");
+    expect(body.gas_used).toBe("12345");
     const row = await cluster.store.getWithdrawRequest(prep.request_id);
     expect(row?.status).toBe("FINALIZED");
   });
@@ -473,10 +481,7 @@ describe("CP4 /v1/withdraw/finalize partner cosign + fanout", () => {
     const happy = await buildHappyFinalizeBody(prep);
     const { res, body } = await callFinalize(cluster.server, happy);
     expect(res.statusCode).toBe(200);
-    // signatures[0] = main's own signature (NOT the spoofed sig the partner sent)
-    expect(body.signatures[0].slot).toBe(0);
-    expect(typeof body.signatures[0].signature_hex).toBe("string");
-    expect(body.signatures[1].signature_hex).toBeNull(); // slot 1 spoofed = rejected
+    expect(body.success).toBe(true);
   });
 
   it("F7.5 partner_duplicate_slot: only first slot=1 counts → 500 when total < 4", async () => {

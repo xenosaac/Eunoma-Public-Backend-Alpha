@@ -21,6 +21,8 @@ import {
 import { fanOutCoSignRequests } from "./partner_client.js";
 import { registerRecipientRolloverRoute } from "./routes/recipient_rollover.js";
 import { registerWithdrawRoutes, type WithdrawRouteHooks } from "./routes/withdraw.js";
+import { registerAppConfigRoute, type AppConfigRouteHooks } from "./routes/app_config.js";
+import { registerRootRoutes, type RootRouteHooks } from "./routes/root.js";
 import { randomUUID } from "node:crypto";
 
 export interface MainServerOptions {
@@ -29,7 +31,15 @@ export interface MainServerOptions {
   /// Optional injection of stubs for /v1/withdraw/* (chain reader, CA payload
   /// builder, Groth16 verifier, partner cosign fanout). Default {} — production.
   withdrawRouteHooks?: WithdrawRouteHooks;
+  appConfigRouteHooks?: AppConfigRouteHooks;
+  rootRouteHooks?: RootRouteHooks;
 }
+
+const ALLOWED_CORS_ORIGINS = new Set([
+  "https://app.eunoma.xyz",
+  "http://localhost:3000",
+  "http://localhost:3008",
+]);
 
 export function buildMainServer(opts: MainServerOptions): {
   server: FastifyInstance;
@@ -40,13 +50,28 @@ export function buildMainServer(opts: MainServerOptions): {
 
   const fastify = Fastify({ logger: false });
 
-  // W1: bearer-token auth for all non-health routes + rate limit on
+  fastify.addHook("onRequest", async (req, reply) => {
+    const origin = req.headers.origin;
+    if (origin && ALLOWED_CORS_ORIGINS.has(origin)) {
+      reply.header("Access-Control-Allow-Origin", origin);
+      reply.header("Vary", "Origin");
+      reply.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      reply.header("Access-Control-Allow-Headers", "authorization,content-type");
+      reply.header("Access-Control-Max-Age", "600");
+    }
+    if (req.method === "OPTIONS") {
+      reply.code(204).send();
+      return reply;
+    }
+  });
+
+  // W1: bearer-token auth for all non-public routes + rate limit on
   // heavy verification endpoints. Both run as onRequest hooks.
   fastify.addHook(
     "onRequest",
     bearerAuthHook({
       expectedToken: cfg.bearer_token,
-      exemptPaths: ["/v1/health"],
+      exemptPaths: ["/v1/health", "/v1/app/config", "/v1/root/current"],
     }),
   );
   fastify.addHook(
@@ -60,6 +85,8 @@ export function buildMainServer(opts: MainServerOptions): {
 
   fastify.get("/v1/health", async () => ({ ok: true, slot: cfg.main_slot }));
 
+  registerAppConfigRoute(fastify, cfg, opts.appConfigRouteHooks ?? {});
+  registerRootRoutes(fastify, cfg, opts.rootRouteHooks ?? {});
   registerRecipientRolloverRoute(fastify);
   registerWithdrawRoutes(fastify, store, cfg, opts.withdrawRouteHooks ?? {});
 
@@ -85,7 +112,15 @@ export function buildMainServer(opts: MainServerOptions): {
     }
 
     const now_secs = Math.floor(Date.now() / 1000);
-    const verification = await verifyDepositRequest(cfg, body, now_secs);
+    let verification;
+    try {
+      verification = await verifyDepositRequest(cfg, body, now_secs);
+    } catch {
+      return reply.code(400).send({
+        error: "deposit_request_rejected",
+        reason: "malformed_payload",
+      });
+    }
     if (!verification.ok || !verification.ca_payload_hash) {
       return reply.code(400).send({
         error: "deposit_request_rejected",

@@ -6,7 +6,7 @@
 // All 6 partner processes plus the main share the same .env (per-slot fields
 // disambiguate via PARTNER_*_SLOT_<N>).
 
-import { Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
+import { AccountAddress, Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
 import {
   InMemoryEd25519Signer,
   loadOperatorKeyForSlot,
@@ -32,7 +32,8 @@ async function main() {
     new Uint8Array(Buffer.from(myKey.private_key.replace(/^0x/, ""), "hex")),
   );
 
-  // Read on-chain VaultConfig for vault_addr / asset_type.
+  // Read on-chain VaultConfig at boot. Attestation bytes must match these
+  // values exactly; fail fast instead of starting against stale defaults.
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
   const bridgeAddr = process.env.BRIDGE_PACKAGE_ADDRESS;
   if (!bridgeAddr) {
@@ -40,26 +41,20 @@ async function main() {
       "BRIDGE_PACKAGE_ADDRESS env var is required — refuse to default to a stale bridge address",
     );
   }
-  let vaultAddr: Uint8Array;
-  let assetType: Uint8Array;
-  try {
-    const vc = (await aptos.getAccountResource({
-      accountAddress: bridgeAddr,
-      resourceType: `${bridgeAddr}::eunoma_bridge::VaultConfig`,
-    })) as any;
-    vaultAddr = new Uint8Array(Buffer.from(vc.vault_addr.replace(/^0x/, ""), "hex"));
-    assetType = new Uint8Array(Buffer.from(vc.asset_type.inner.replace(/^0x/, ""), "hex"));
-  } catch (err: any) {
-    console.warn(`[partner-operator slot=${slot}] could not read chain VaultConfig (${err?.message}); using defaults`);
-    vaultAddr = new Uint8Array(32).fill(0x11);
-    assetType = new Uint8Array(32).fill(0x22);
-  }
+  const vc = (await aptos.getAccountResource({
+    accountAddress: bridgeAddr,
+    resourceType: `${bridgeAddr}::eunoma_bridge::VaultConfig`,
+  })) as any;
+  const vaultAddr = AccountAddress.from(vc.vault_addr).toUint8Array();
+  const assetType = AccountAddress.from(vc.asset_type.inner).toUint8Array();
+  const operatorSetVersion = BigInt(vc.operator_set_version);
+  const threshold = BigInt(vc.attestation_threshold);
 
   const cfg: PartnerOperatorConfig = {
     port,
     slot,
-    operator_set_version: 1n,
-    threshold: 4n,
+    operator_set_version: operatorSetVersion,
+    threshold,
     vault_addr: vaultAddr,
     asset_type: assetType,
     chain_id: 2,

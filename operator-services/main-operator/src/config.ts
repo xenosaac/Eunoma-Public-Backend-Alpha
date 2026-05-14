@@ -4,6 +4,9 @@ import { InMemoryEd25519Signer, Signer } from "@eunoma/shared";
 
 export interface MainOperatorConfig {
   port: number;
+  network?: "testnet" | "mainnet" | "devnet" | "local" | string;
+  bridge_package_address?: string;
+  vault_ek_hex?: string;
   main_slot: number; // 0..6
   operator_set_version: bigint;
   threshold: bigint;
@@ -33,6 +36,9 @@ export function defaultMainConfig(opts: {
   const signer = opts.signer ?? new InMemoryEd25519Signer();
   return {
     port: 0,
+    network: "testnet",
+    bridge_package_address: undefined,
+    vault_ek_hex: undefined,
     main_slot: 0,
     operator_set_version: 1n,
     threshold: 4n,

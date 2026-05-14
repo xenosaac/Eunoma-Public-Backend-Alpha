@@ -7,7 +7,7 @@
 //
 // All previous CA / batch / withdraw script paths still work in parallel.
 
-import { Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
+import { AccountAddress, Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
 import {
   InMemoryStore,
   PostgresStore,
@@ -42,14 +42,14 @@ async function main() {
     const u = process.env[`PARTNER_URL_SLOT_${s}`] ?? `http://127.0.0.1:${3000 + s}`;
     const t = process.env[`PARTNER_BEARER_TOKEN_SLOT_${s}`];
     if (!t) {
-      throw new Error(`PARTNER_BEARER_TOKEN_SLOT_${s} not set in env`);
+      throw new Error(`partner auth token for slot ${s} is not configured`);
     }
     partnerUrls.push(u);
     partnerBearerTokens.push(t);
   }
 
   const bearerToken = process.env.OPERATOR_BEARER_TOKEN;
-  if (!bearerToken) throw new Error("OPERATOR_BEARER_TOKEN not set");
+  if (!bearerToken) throw new Error("operator auth token is not configured");
 
   // Load all 7 pubkeys for the operator set vector (main is slot 0).
   const allPubkeys: Uint8Array[] = [];
@@ -64,7 +64,8 @@ async function main() {
     new Uint8Array(Buffer.from(mainKey.private_key.replace(/^0x/, ""), "hex")),
   );
 
-  // Read on-chain VaultConfig defaults at boot for vault_addr / asset_type.
+  // Read on-chain VaultConfig at boot. Attestation bytes must match these
+  // values exactly; fail fast instead of starting against stale defaults.
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
   const bridgeAddr = process.env.BRIDGE_PACKAGE_ADDRESS;
   if (!bridgeAddr) {
@@ -72,26 +73,23 @@ async function main() {
       "BRIDGE_PACKAGE_ADDRESS env var is required — refuse to default to a stale bridge address",
     );
   }
-  let vaultAddr: Uint8Array;
-  let assetType: Uint8Array;
-  try {
-    const vc = (await aptos.getAccountResource({
-      accountAddress: bridgeAddr,
-      resourceType: `${bridgeAddr}::eunoma_bridge::VaultConfig`,
-    })) as any;
-    vaultAddr = new Uint8Array(Buffer.from(vc.vault_addr.replace(/^0x/, ""), "hex"));
-    assetType = new Uint8Array(Buffer.from(vc.asset_type.inner.replace(/^0x/, ""), "hex"));
-  } catch (err: any) {
-    console.warn(`[main-operator] could not read chain VaultConfig (${err?.message}); using defaults`);
-    vaultAddr = new Uint8Array(32).fill(0x11);
-    assetType = new Uint8Array(32).fill(0x22);
-  }
+  const vc = (await aptos.getAccountResource({
+    accountAddress: bridgeAddr,
+    resourceType: `${bridgeAddr}::eunoma_bridge::VaultConfig`,
+  })) as any;
+  const vaultAddr = AccountAddress.from(vc.vault_addr).toUint8Array();
+  const assetType = AccountAddress.from(vc.asset_type.inner).toUint8Array();
+  const operatorSetVersion = BigInt(vc.operator_set_version);
+  const threshold = BigInt(vc.attestation_threshold);
 
   const cfg: MainOperatorConfig = {
     port,
+    network: "testnet",
+    bridge_package_address: bridgeAddr,
+    vault_ek_hex: process.env.VAULT_EK_HEX,
     main_slot: mainSlot,
-    operator_set_version: 1n,
-    threshold: 4n,
+    operator_set_version: operatorSetVersion,
+    threshold,
     vault_addr: vaultAddr,
     asset_type: assetType,
     chain_id: 2,
@@ -113,6 +111,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[main-operator] fatal:", err);
+  void err;
+  console.error("[main-operator] fatal: startup_failed");
   process.exit(1);
 });

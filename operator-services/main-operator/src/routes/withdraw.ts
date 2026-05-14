@@ -21,15 +21,24 @@
 //   - store / chain RPC / key load transient        → row UNCHANGED, 5xx
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { AccountAddress, Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
+import {
+  Account,
+  AccountAddress,
+  Aptos,
+  AptosConfig,
+  Ed25519PrivateKey,
+  Network,
+} from "@aptos-labs/ts-sdk";
 import { ed25519 } from "@noble/curves/ed25519";
 import { randomBytes, randomUUID } from "node:crypto";
 import {
   buildWithdrawCAPayload as defaultBuildWithdrawCAPayload,
   DOMAIN_WITHDRAW_OK_V1,
   encodeWithdrawAttestationMessage,
+  hexToBytes,
   hashConfidentialTransferPayload,
   loadOperatorKeyForSlot,
+  loadSecretHex,
   POOL_ID_FR_BYTES,
   deriveAssetId,
   deriveRecipientHash,
@@ -139,6 +148,30 @@ export interface WithdrawRouteHooks {
   fanOutWithdrawCoSign?: typeof defaultFanOutWithdrawCoSignRequests;
   /// Optional override for bridge package address (production reads env).
   bridgeAddr?: string;
+  /// Submit withdraw_to_recipient. Tests inject this to avoid live chain I/O.
+  submitWithdrawTx?: (input: SubmitWithdrawTxInput) => Promise<SubmitWithdrawTxResult>;
+}
+
+export interface SubmitWithdrawTxInput {
+  root: Uint8Array;
+  nullifier_hash: Uint8Array;
+  recipient: string;
+  recipient_hash: Uint8Array;
+  amount_tag: Uint8Array;
+  ca_payload_hash: Uint8Array;
+  request_hash: Uint8Array;
+  vault_sequence: bigint;
+  withdraw_proof: Uint8Array;
+  expiry_secs: bigint;
+  operator_signatures: Uint8Array[];
+  ca_payload: FinalizeBody["ca_payload"];
+}
+
+export interface SubmitWithdrawTxResult {
+  tx: string;
+  success: boolean;
+  vm_status: string;
+  gas_used: string;
 }
 
 function addrBytes(hexStr: string): Uint8Array {
@@ -164,6 +197,9 @@ export function registerWithdrawRoutes(
   // that need a real address pass it via hooks.bridgeAddr.
   const bridgeAddr =
     hooks.bridgeAddr ?? process.env.BRIDGE_PACKAGE_ADDRESS ?? ("0x" + "11".repeat(32));
+  const submitWithdrawTx =
+    hooks.submitWithdrawTx ?? ((input: SubmitWithdrawTxInput) =>
+      defaultSubmitWithdrawTx(aptos, bridgeAddr, input));
 
   const vaultAddrHexCfg = "0x" + hex(cfg.vault_addr);
   const assetTypeHexCfg = "0x" + hex(cfg.asset_type);
@@ -511,10 +547,9 @@ export function registerWithdrawRoutes(
     let mainKey;
     try {
       mainKey = loadOperatorKeyForSlot(0);
-    } catch (err: any) {
+    } catch {
       return reply.code(500).send({
         error: "operator_key_load_failed",
-        detail: err?.message ?? String(err),
       });
     }
 
@@ -595,10 +630,13 @@ export function registerWithdrawRoutes(
     // -------- F1 strict aggregation --------
     const mainSlot = cfg.main_slot;
     const signatures: Array<{ slot: number; signature_hex: string | null }> = [];
+    const signatureBytes: Uint8Array[] = [];
     for (let i = 0; i < 7; i++) {
       signatures.push({ slot: i, signature_hex: null });
+      signatureBytes.push(new Uint8Array(0));
     }
     signatures[mainSlot] = { slot: mainSlot, signature_hex: "0x" + hex(mainSig) };
+    signatureBytes[mainSlot] = mainSig;
 
     const validSlots = new Set<number>([mainSlot]);
     for (let i = 0; i < partnerResults.length; i++) {
@@ -638,6 +676,7 @@ export function registerWithdrawRoutes(
         slot: r.slot,
         signature_hex: "0x" + hex(r.signature_bytes),
       };
+      signatureBytes[r.slot] = r.signature_bytes;
     }
 
     const count = validSlots.size;
@@ -650,24 +689,111 @@ export function registerWithdrawRoutes(
       });
     }
 
+    let txResult: SubmitWithdrawTxResult;
     try {
-      await store.updateWithdrawRequestStatus(request_id, "FINALIZED", new Date());
-    } catch (err: any) {
-      // Status update transient — refuse to release sigs without persistent
-      // FINALIZED record. Row stays PREPARED for retry.
-      return reply.code(500).send({
-        error: "store_unavailable",
-        detail: err?.message ?? String(err),
+      txResult = await submitWithdrawTx({
+        root: rootBytes,
+        nullifier_hash: nullifierHashBytes,
+        recipient,
+        recipient_hash: row.recipient_hash,
+        amount_tag: amountTagServer,
+        ca_payload_hash: row.ca_payload_hash,
+        request_hash: requestHashServer,
+        vault_sequence: row.vault_sequence,
+        withdraw_proof: proofBytes,
+        expiry_secs: row.expiry,
+        operator_signatures: signatureBytes,
+        ca_payload,
       });
+    } catch {
+      return reply.code(502).send({
+        error: "withdraw_submit_failed",
+        request_id,
+      });
+    }
+
+    if (txResult.success) {
+      try {
+        await store.updateWithdrawRequestStatus(request_id, "FINALIZED", new Date());
+      } catch (err: any) {
+        return reply.code(500).send({
+          error: "store_unavailable",
+          detail: err?.message ?? String(err),
+          request_id,
+          tx: txResult.tx,
+          success: txResult.success,
+          vm_status: txResult.vm_status,
+          gas_used: txResult.gas_used,
+        });
+      }
     }
 
     return reply.code(200).send({
       request_id,
-      attestation_msg_bcs: "0x" + hex(msgBytes),
-      signatures,
-      threshold_met: true,
+      tx: txResult.tx,
+      success: txResult.success,
+      vm_status: txResult.vm_status,
+      gas_used: txResult.gas_used,
     });
   });
+}
+
+async function defaultSubmitWithdrawTx(
+  aptos: Aptos,
+  bridgeAddr: string,
+  input: SubmitWithdrawTxInput,
+): Promise<SubmitWithdrawTxResult> {
+  const relayer = Account.fromPrivateKey({
+    privateKey: new Ed25519PrivateKey(hexToBytes(loadSecretHex("RELAYER_PRIVATE_KEY_HEX", 32))),
+  });
+  const payload = input.ca_payload;
+  const tx = await aptos.transaction.build.simple({
+    sender: relayer.accountAddress,
+    data: {
+      function: `${bridgeAddr}::eunoma_bridge::withdraw_to_recipient`,
+      functionArguments: [
+        Array.from(input.root),
+        Array.from(input.nullifier_hash),
+        input.recipient,
+        Array.from(input.recipient_hash),
+        Array.from(input.amount_tag),
+        Array.from(input.ca_payload_hash),
+        Array.from(input.request_hash),
+        input.vault_sequence,
+        Array.from(input.withdraw_proof),
+        input.expiry_secs,
+        input.operator_signatures.map((s) => Array.from(s)),
+        caHexArrayToBytes(payload.new_balance_p ?? []).map((c) => Array.from(c)),
+        caHexArrayToBytes(payload.new_balance_r ?? []).map((c) => Array.from(c)),
+        caHexArrayToBytes(payload.new_balance_r_eff_aud ?? []).map((c) => Array.from(c)),
+        caHexArrayToBytes(payload.amount_p ?? []).map((c) => Array.from(c)),
+        caHexArrayToBytes(payload.amount_r_sender ?? []).map((c) => Array.from(c)),
+        caHexArrayToBytes(payload.amount_r_recip ?? []).map((c) => Array.from(c)),
+        caHexArrayToBytes(payload.amount_r_eff_aud ?? []).map((c) => Array.from(c)),
+        caHexArrayToBytes(payload.ek_volun_auds ?? []).map((c) => Array.from(c)),
+        caHexMatrixToBytes(payload.amount_r_volun_auds ?? []).map((row) =>
+          row.map((c) => Array.from(c)),
+        ),
+        Array.from(fromHex(payload.zkrp_new_balance ?? "0x")),
+        Array.from(fromHex(payload.zkrp_amount ?? "0x")),
+        caHexArrayToBytes(payload.sigma_proto_comm ?? []).map((c) => Array.from(c)),
+        caHexArrayToBytes(payload.sigma_proto_resp ?? []).map((c) => Array.from(c)),
+        Array.from(fromHex(payload.memo ?? "0x")),
+      ],
+    },
+    options: { maxGasAmount: 500_000, gasUnitPrice: 100 },
+  });
+  const submitted = await aptos.signAndSubmitTransaction({ signer: relayer, transaction: tx });
+  const result: any = await aptos.waitForTransaction({
+    transactionHash: submitted.hash,
+    options: { checkSuccess: false },
+  });
+  return {
+    tx: result.hash ?? submitted.hash,
+    success: Boolean(result.success),
+    vm_status: String(result.vm_status ?? ""),
+    gas_used: String(result.gas_used ?? "0"),
+  };
 }
 
 async function markFailed(store: Store, request_id: string): Promise<void> {

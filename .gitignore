@@ -78,3 +78,7 @@ Dockerfile
 /operator-services/main-operator/README.md
 /operator-services/scripts/README.md
 /move/.phase_g_archive/
+
+# Local agent handoff notes. Never commit: may include instance IDs, public IPs,
+# operational topology, deployment commands, and environment variable names.
+/.agent-local/
