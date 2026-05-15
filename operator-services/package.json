@@ -20,6 +20,7 @@
     "local:dkg:init": "npm run local:cluster:config",
     "local:hpke:init": "node scripts/local_ca_dkg_v2_hpke_init.mjs",
     "local:ca-dkg:v2": "node scripts/local_ca_dkg_v2.mjs",
+    "local:vault-ek:derive": "node scripts/local_vault_ek_derive.mjs",
     "local:ca:registration": "node scripts/local_ca_registration.mjs",
     "local:online-frost-dkg-smoke": "node scripts/local_frost_dkg_v2.mjs",
     "local:frost-rotation-apply": "node scripts/local_frost_rotation_apply.mjs",
