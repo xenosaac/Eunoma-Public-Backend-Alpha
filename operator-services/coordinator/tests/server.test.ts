@@ -840,4 +840,184 @@ describe("coordinator", () => {
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe("no_ca_dkg_v2_record_for_dkg_epoch");
   });
+
+  it("vault_ek round1 forwards to all 5 selected slots concurrently (Promise.all)", async () => {
+    // Killer concurrency test: each mocked worker waits at a barrier until externally
+    // released. If the coordinator awaits sequentially, only one mock will be blocked at the
+    // barrier at a time — observed count never reaches 5. Promise.all hits all 5 in flight
+    // before any one returns.
+    const { sha256 } = await import("@noble/hashes/sha256");
+    const { bytesToHex } = await import("@noble/hashes/utils");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    // Pre-compute the worker-transcript-hash for each slot so the mock returns valid
+    // contributions that pass assembleVaultEkTranscript.
+    const hContributionPerSlot: Record<number, string> = {};
+    const workerHashPerSlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      hContributionPerSlot[slot] = h32(String((slot % 9) + 1));
+      const enc = new TextEncoder();
+      const sortedSlotsJoined = expectedSelectedSlots.join(",");
+      const bytes = new Uint8Array([
+        ...enc.encode("EUNOMA_VAULT_EK_DERIVATION_V1"),
+        ...enc.encode(dkgEpoch),
+        ...enc.encode(":"),
+        ...enc.encode(caDkgTranscriptHashHex),
+        ...enc.encode(":"),
+        ...enc.encode(rosterHashHex),
+        ...enc.encode(":"),
+        ...enc.encode(sortedSlotsJoined),
+        ...enc.encode(":"),
+        ...enc.encode(slot.toString()),
+        ...enc.encode(":"),
+        ...enc.encode(hContributionPerSlot[slot]),
+      ]);
+      workerHashPerSlot[slot] = bytesToHex(sha256(bytes));
+    }
+
+    let inFlight = 0;
+    let peakInFlight = 0;
+    let releaseBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const observedBodies: Array<Record<string, unknown>> = [];
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path.endsWith("/round1")) {
+          observedBodies.push(body as Record<string, unknown>);
+          inFlight += 1;
+          peakInFlight = Math.max(peakInFlight, inFlight);
+          // Block here until the test releases the barrier — and crucially, BEFORE
+          // releasing, assert that all 5 mocks have arrived.
+          if (inFlight === 5) {
+            // Schedule the release on the next microtask so we know the 5th caller is also
+            // genuinely awaiting the barrier (not just observed-then-returned synchronously).
+            queueMicrotask(() => releaseBarrier());
+          }
+          await barrier;
+          inFlight -= 1;
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              hContribution: hContributionPerSlot[slot],
+              schnorrProof: { R: h32("3"), s: h32("4") },
+              workerTranscriptHash: workerHashPerSlot[slot],
+            },
+          };
+        }
+        if (path.endsWith("/verify")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { vaultEk: h32("f"), finalTranscriptHash: h32("e") },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-concurrent",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    // The killer assertion: at some point all 5 round1 mocks must have been in flight
+    // simultaneously. Sequential await would peak at 1.
+    expect(peakInFlight).toBe(5);
+
+    // All 5 bodies must carry the new Phase 2 fields.
+    expect(observedBodies).toHaveLength(5);
+    for (let i = 0; i < 5; i += 1) {
+      const body = observedBodies[i];
+      expect(body.requestId).toBe("vault-ek-concurrent");
+      expect(body.sessionId).toBe("vault-ek-concurrent");
+      expect(typeof body.playerId).toBe("number");
+      expect(Array.isArray(body.peerAddresses)).toBe(true);
+      expect((body.peerAddresses as string[]).length).toBe(5);
+      expect(Array.isArray(body.lagrangeCoefficients)).toBe(true);
+      expect((body.lagrangeCoefficients as string[]).length).toBe(5);
+    }
+  });
+
+  it("returns 409 vault_ek_derivation_in_flight when a second request arrives during one", async () => {
+    // Lock-contention test: the first request hangs at the round1 mock until we release a
+    // deferred; a concurrent second request must get 409 quickly because the in-flight lock
+    // is held.
+    const caDkgV2Roster = dkgRoster();
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+
+    let releaseFirst: () => void = () => {};
+    const firstHeld = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstCallStarted = false;
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round1")) {
+          firstCallStarted = true;
+          await firstHeld; // hold all 5 round1 mocks here until released
+          return {
+            slot,
+            ok: false,
+            statusCode: 503,
+            body: { error: "mpc_inverse_unavailable" },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+
+    const firstPromise = server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-lock-1",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    // Wait for the first request to actually grab the lock + reach the mocked round1.
+    while (!firstCallStarted) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    // Now issue the second request — it must return 409 quickly because the lock is still
+    // held by the first.
+    const secondRes = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-lock-2",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    expect(secondRes.statusCode).toBe(409);
+    expect(secondRes.json().error).toBe("vault_ek_derivation_in_flight");
+
+    // Release the first request — it may return any error since we mocked 503 on round1, but
+    // it must complete (not deadlock).
+    releaseFirst();
+    const firstRes = await firstPromise;
+    // First request returns 503 from the mock — anything except a hang is fine here.
+    expect([200, 503]).toContain(firstRes.statusCode);
+  });
 });

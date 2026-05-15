@@ -6,6 +6,7 @@ import {
   ForbiddenPlaintextFieldError,
   caDkgV2RosterHash,
   frostDkgV2RosterHash,
+  lagrangeCoefficientsAtZero,
   parseCaRegistrationAggregateRequest,
   parseCaRegistrationAggregateResult,
   parseCaRegistrationChallengeRequest,
@@ -23,6 +24,7 @@ import {
   parseSessionShareEnvelope,
   parseVaultEkContributions,
   rosterHash,
+  scalarHexFromBigint,
   UnderQuorumError,
   validateCaDkgV2Roster,
   validateFrostDkgV2Roster,
@@ -87,6 +89,46 @@ export function buildCoordinatorServer(
   if (!opts.roster && !opts.caDkgV2Roster) {
     throw new Error("coordinator requires DEOPERATOR_ROSTER_JSON or CA_DKG_V2_ROSTER_JSON");
   }
+
+  // Process-wide async lock for /v2/derive/vault_ek/start. The current MASCOT runtime uses a
+  // fixed port range (EUNOMA_MPC_PARTY_PORT_BASE + slot), so two concurrent derivations would
+  // collide on peer ports. Phase 2 ships single-session-at-a-time semantics: the lock is
+  // acquired before any worker dispatch and released in finally. If a new derivation arrives
+  // while one is in flight, it gets HTTP 409 `vault_ek_derivation_in_flight` quickly (~100ms
+  // wait). Concurrent support is out of scope (plan §"Concurrent vault_ek derivations").
+  let vaultEkInFlight: Promise<unknown> | null = null;
+  const vaultEkLockAcquireTimeoutMs = 100;
+  async function acquireVaultEkDerivationLock(): Promise<{ release: () => void } | "busy"> {
+    const start = Date.now();
+    while (vaultEkInFlight !== null) {
+      if (Date.now() - start > vaultEkLockAcquireTimeoutMs) {
+        return "busy";
+      }
+      // Wait for the current holder to settle; ignore its outcome (we only care that the
+      // lock slot is free). If the holder rejects, vaultEkInFlight has already been cleared
+      // by the holder's finally.
+      try {
+        await Promise.race([
+          vaultEkInFlight,
+          new Promise((resolve) => setTimeout(resolve, 25)),
+        ]);
+      } catch {
+        // The holder failed; loop iteration will re-check vaultEkInFlight.
+      }
+    }
+    let resolveHeld: (value: void) => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      resolveHeld = resolve;
+    });
+    vaultEkInFlight = held;
+    return {
+      release: () => {
+        vaultEkInFlight = null;
+        resolveHeld();
+      },
+    };
+  }
+
   const store = opts.store ?? new InMemoryCoordinatorStore();
   const server = Fastify({ logger: false });
   const currentRosterHash = opts.roster ? rosterHash(opts.roster) : undefined;
@@ -348,22 +390,69 @@ export function buildCoordinatorServer(
         });
       }
       const selectedSlots = lowestEligibleSlots(dkgRoster, DEOPERATOR_THRESHOLD);
+      const sortedSelectedSlots = [...selectedSlots].sort((a, b) => a - b);
       const selectionRationale = "coordinator-chosen" as const;
 
+      // Phase 2: compute Lagrange coefficients (public) and peer addresses (deterministic
+      // from S + EUNOMA_MPC_PARTY_PORT_BASE) for the per-party MASCOT fan-out.
+      const lambdas = lagrangeCoefficientsAtZero(sortedSelectedSlots);
+      const lagrangeCoefficients = lambdas.map(scalarHexFromBigint);
+      const portBase = Number(process.env.EUNOMA_MPC_PARTY_PORT_BASE ?? 14000);
+      const peerAddresses = sortedSelectedSlots.map((slot) => `127.0.0.1:${portBase + slot}`);
+      const sessionId = requestId;
+
+      // Acquire the single-session lock before issuing any worker calls. Without this guard
+      // two concurrent /v2/derive/vault_ek/start requests would collide on MASCOT ports.
+      const lock = await acquireVaultEkDerivationLock();
+      if (lock === "busy") {
+        return reply.code(409).send({
+          error: "vault_ek_derivation_in_flight",
+          requestId,
+          message:
+            "another vault_ek derivation is in progress; retry shortly. Concurrent " +
+            "vault_ek derivations are out of scope in Phase 2 (per plan).",
+        });
+      }
+      try {
+      // Concurrent fan-out via Promise.allSettled — each worker spawns its own MASCOT party
+      // and blocks waiting for peers, so sequential await would deadlock (plan §"Coordinator
+      // delta"). The mocked FROST DKG path (server.ts:548) is the established pattern.
+      const settled = await Promise.allSettled(
+        sortedSelectedSlots.map((slot, ordinalIndex) =>
+          singleNodeForwarder(
+            "/worker/v2/derive/vault_ek/round1",
+            {
+              dkgEpoch,
+              caDkgTranscriptHash: caDkgTranscriptHashInput,
+              rosterHash: dkgRosterHash,
+              selectedSlots: sortedSelectedSlots,
+              selfSlot: slot,
+              requestId,
+              sessionId,
+              playerId: ordinalIndex,
+              peerAddresses,
+              lagrangeCoefficients,
+            },
+            dkgRoster,
+            slot,
+          ),
+        ),
+      );
+      // Propagate 503 first if any worker reports adapter-unavailable; otherwise propagate
+      // the first 4xx/5xx or rejection.
       const roundResults: Array<{ slot: number; body: Record<string, unknown> }> = [];
-      for (const slot of selectedSlots) {
-        const forwarded = await singleNodeForwarder(
-          "/worker/v2/derive/vault_ek/round1",
-          {
-            dkgEpoch,
-            caDkgTranscriptHash: caDkgTranscriptHashInput,
-            rosterHash: dkgRosterHash,
-            selectedSlots,
-            selfSlot: slot,
-          },
-          dkgRoster,
-          slot,
-        );
+      for (let i = 0; i < settled.length; i += 1) {
+        const slot = sortedSelectedSlots[i];
+        const res = settled[i];
+        if (res.status === "rejected") {
+          return reply.code(502).send({
+            error: "round1_forward_rejected",
+            slot,
+            requestId,
+            reason: res.reason instanceof Error ? res.reason.message : String(res.reason),
+          });
+        }
+        const forwarded = res.value;
         if (
           forwarded.statusCode === 503 &&
           forwarded.body &&
@@ -382,10 +471,7 @@ export function buildCoordinatorServer(
             requestId,
           });
         }
-        roundResults.push({
-          slot,
-          body: forwarded.body as Record<string, unknown>,
-        });
+        roundResults.push({ slot, body: forwarded.body as Record<string, unknown> });
       }
 
       const contributions: VaultEkContribution[] = parseVaultEkContributions(
@@ -490,6 +576,12 @@ export function buildCoordinatorServer(
         transcriptHash: finalTranscriptHash,
         transcriptPath,
       });
+      } finally {
+        // Always release the in-flight lock — even on early returns above (Fastify treats a
+        // `return reply` as the response value, but the JS code path still falls through to
+        // finally).
+        lock.release();
+      }
     } catch (err) {
       if (requestId) await store.markAborted(requestId);
       if (err instanceof ForbiddenPlaintextFieldError) {

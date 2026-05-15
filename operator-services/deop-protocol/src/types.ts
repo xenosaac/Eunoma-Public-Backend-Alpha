@@ -493,6 +493,30 @@ export interface VaultEkDerivationInput {
   roster: CaDkgV2Roster;
 }
 
+/**
+ * Phase 2 wire shape for `/worker/v2/derive/vault_ek/round1`. Adds the fields each MASCOT
+ * party needs to spawn its own subprocess + recompute the Lagrange coefficient locally.
+ * `selectedSlots` is already in the Phase 1 shape; it is duplicated here for clarity since
+ * `playerId` is the ordinal within sorted(`selectedSlots`).
+ */
+export interface VaultEkRound1Request {
+  dkgEpoch: string;
+  caDkgTranscriptHash: HexString;
+  rosterHash: HexString;
+  selectedSlots: number[];
+  selfSlot: number;
+  /** Phase 2: identifier for this derivation request (echoed in the artifact). */
+  requestId: string;
+  /** Phase 2: outer coordination session — equal to requestId in Phase 2. */
+  sessionId: string;
+  /** Phase 2: this party's ordinal within sorted(selectedSlots), 0..N-1. */
+  playerId: number;
+  /** Phase 2: ordered `host:port` for the 5 MASCOT peers, in player-ordinal order. */
+  peerAddresses: string[];
+  /** Phase 2: hex-encoded Lagrange coefficients at x=0 for sorted(selectedSlots). */
+  lagrangeCoefficients: HexString[];
+}
+
 export interface VaultEkDerivationTranscript {
   scheme: "vault_ek_derivation_v1";
   dkgEpoch: string;

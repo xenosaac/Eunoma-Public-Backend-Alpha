@@ -1,4 +1,5 @@
 import { bytesToHex, hexToBytes, normalizeHex, sha256 } from "@eunoma/shared";
+import type { HexString } from "@eunoma/shared";
 import { DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD } from "./constants.js";
 import { assertNoForbiddenPlaintextFields } from "./forbidden.js";
 import { caDkgV2RosterHash } from "./roster.js";
@@ -9,6 +10,13 @@ import type {
   VaultEkDerivationInput,
   VaultEkDerivationTranscript,
 } from "./types.js";
+
+/**
+ * Ed25519 scalar field prime Q. Identical to the Rust constant in
+ * crypto-worker-rust/src/mpc_spdz_adapter.rs and to scripts/_lib/mpc_spdz_constants.mjs.
+ */
+export const ED25519_SCALAR_Q =
+  7237005577332262213973186563042994240857116359379907606001950938285454250989n;
 
 /**
  * Canonical byte layout for the per-worker transcript hash. MUST stay byte-identical with
@@ -295,5 +303,86 @@ export function parseVaultEkContributions(value: unknown): VaultEkContribution[]
     throw new VaultEkDerivationError("INVALID_CONTRIBUTION_SHAPE", "contributions must be an array");
   }
   return value.map((item) => parseVaultEkContribution(item));
+}
+
+/**
+ * Lagrange coefficients at x=0 for the Shamir set { x_j = sortedSelectedSlots[j] + 1 } over
+ * the Ed25519 scalar field. Returns N values in player-ordinal order (j = 0..N-1):
+ *
+ *   λ_i(0) = Π_{j ≠ i} (-x_j) * (x_i - x_j)^-1   mod Q
+ *
+ * Pure-bigint modular arithmetic. Used by the coordinator's vault_ek round1 fan-out and by
+ * the Rust adapter's defense-in-depth recompute (which must produce the same bytes).
+ */
+export function lagrangeCoefficientsAtZero(sortedSelectedSlots: number[]): bigint[] {
+  if (sortedSelectedSlots.length === 0) {
+    throw new Error("sortedSelectedSlots must be non-empty");
+  }
+  for (let i = 1; i < sortedSelectedSlots.length; i += 1) {
+    if (sortedSelectedSlots[i - 1] >= sortedSelectedSlots[i]) {
+      throw new Error("sortedSelectedSlots must be strictly ascending");
+    }
+  }
+  const q = ED25519_SCALAR_Q;
+  const xs = sortedSelectedSlots.map((slot) => BigInt(slot + 1));
+  const lambdas: bigint[] = [];
+  for (let i = 0; i < xs.length; i += 1) {
+    let num = 1n;
+    let den = 1n;
+    for (let j = 0; j < xs.length; j += 1) {
+      if (j === i) continue;
+      // num *= (-x_j) mod q
+      const negXj = modPositive(-xs[j], q);
+      num = (num * negXj) % q;
+      // den *= (x_i - x_j) mod q
+      const diff = modPositive(xs[i] - xs[j], q);
+      den = (den * diff) % q;
+    }
+    const denInv = modInverse(den, q);
+    lambdas.push((num * denInv) % q);
+  }
+  return lambdas;
+}
+
+/**
+ * Encode a bigint scalar as the same 32-byte little-endian lowercase-hex layout used by
+ * curve25519-dalek's `Scalar::to_bytes()` (which the Rust adapter parses via
+ * `Scalar::from_bytes_mod_order`). Reduces mod Q before serializing.
+ */
+export function scalarHexFromBigint(value: bigint): HexString {
+  const q = ED25519_SCALAR_Q;
+  let v = value % q;
+  if (v < 0n) v += q;
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i += 1) {
+    bytes[i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
+  return bytesToHex(bytes);
+}
+
+function modPositive(value: bigint, modulus: bigint): bigint {
+  const r = value % modulus;
+  return r < 0n ? r + modulus : r;
+}
+
+function modPow(base: bigint, exponent: bigint, modulus: bigint): bigint {
+  if (modulus === 1n) return 0n;
+  let result = 1n;
+  let b = modPositive(base, modulus);
+  let e = exponent;
+  while (e > 0n) {
+    if ((e & 1n) === 1n) {
+      result = (result * b) % modulus;
+    }
+    b = (b * b) % modulus;
+    e >>= 1n;
+  }
+  return result;
+}
+
+function modInverse(value: bigint, modulus: bigint): bigint {
+  // Fermat's little theorem (modulus is prime).
+  return modPow(modPositive(value, modulus), modulus - 2n, modulus);
 }
 

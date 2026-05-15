@@ -705,6 +705,62 @@ fn emit_worker_transcript_hash_parity_fixture() {
     .expect("write parity fixture");
 }
 
+/// Emits a JSON fixture with Lagrange coefficients at x=0 for several Shamir sets. The TS
+/// helper `lagrangeCoefficientsAtZero` must produce byte-identical hex outputs for the same
+/// inputs (validated by `deop-protocol/tests/vault_ek_derivation.test.ts`).
+#[test]
+fn emit_lagrange_parity_fixture() {
+    use curve25519_dalek::scalar::Scalar;
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures");
+    fs::create_dir_all(&fixture_dir).expect("fixture dir");
+
+    fn lagrange(slots: &[usize]) -> Vec<String> {
+        // Same algorithm as MpcSpdzInverseAdapter::compute_lagrange_coefficient_at_zero,
+        // expressed in Scalar arithmetic.
+        let mut out = Vec::with_capacity(slots.len());
+        for i in 0..slots.len() {
+            let x_i = Scalar::from((slots[i] as u64) + 1);
+            let mut num = Scalar::ONE;
+            let mut den = Scalar::ONE;
+            for (j, slot) in slots.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let x_j = Scalar::from((*slot as u64) + 1);
+                num *= -x_j;
+                den *= x_i - x_j;
+            }
+            let lambda = num * den.invert();
+            out.push(scalar_hex(&lambda));
+        }
+        out
+    }
+
+    let cases = vec![
+        ("lowest5", vec![0usize, 1, 2, 3, 4]),
+        ("alt5", vec![0usize, 2, 3, 4, 6]),
+        ("hi5", vec![2usize, 3, 4, 5, 6]),
+    ];
+    let mut payload = serde_json::Map::new();
+    for (label, slots) in &cases {
+        let coefs = lagrange(slots);
+        payload.insert(
+            label.to_string(),
+            serde_json::json!({
+                "sortedSelectedSlots": slots,
+                "lagrangeCoefficients": coefs,
+            }),
+        );
+    }
+    fs::write(
+        fixture_dir.join("vault_ek_lagrange_parity.json"),
+        serde_json::to_vec_pretty(&serde_json::Value::Object(payload)).unwrap(),
+    )
+    .expect("write lagrange fixture");
+}
+
 // === Regression tests added for the H-generator correction ===
 
 /// Build a 7-slot Pedersen VSS using coefficients `(coeffs, blind_coeffs)` of degree 4

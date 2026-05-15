@@ -9,6 +9,9 @@ import {
 } from "../src/index.js";
 import {
   assembleVaultEkTranscript,
+  ED25519_SCALAR_Q,
+  lagrangeCoefficientsAtZero,
+  scalarHexFromBigint,
   VaultEkDerivationError,
   workerTranscriptHashCanonical,
 } from "../src/vault_ek_derivation.js";
@@ -430,5 +433,55 @@ describe("assembleVaultEkTranscript", () => {
     });
     expect(observed).toBe(fixture.workerTranscriptHash);
     expect(fixture.workerTranscriptDomain).toBe("EUNOMA_VAULT_EK_DERIVATION_V1");
+  });
+
+  it("Lagrange coefficients match the Rust parity fixture", () => {
+    const fixturePath = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "..",
+      "crypto-worker-rust",
+      "tests",
+      "fixtures",
+      "vault_ek_lagrange_parity.json",
+    );
+    const raw = readFileSync(fixturePath, "utf8");
+    const fixture = JSON.parse(raw) as Record<
+      string,
+      { sortedSelectedSlots: number[]; lagrangeCoefficients: string[] }
+    >;
+    for (const [label, { sortedSelectedSlots, lagrangeCoefficients }] of Object.entries(
+      fixture,
+    )) {
+      const observed = lagrangeCoefficientsAtZero(sortedSelectedSlots).map(scalarHexFromBigint);
+      expect(observed, `Lagrange parity mismatch for ${label}`).toEqual(lagrangeCoefficients);
+    }
+  });
+
+  it("Lagrange reconstruction recovers f(0) for an arbitrary degree-4 polynomial", () => {
+    // f(x) = 7 + 3x + 9x^2 + 11x^3 + 5x^4 mod Q. Σ λ_i * f(x_i) must equal f(0) = 7.
+    const slots = [0, 2, 3, 4, 6];
+    const coeffs = [7n, 3n, 9n, 11n, 5n];
+    const q = ED25519_SCALAR_Q;
+    const lambdas = lagrangeCoefficientsAtZero(slots);
+    let acc = 0n;
+    for (let i = 0; i < slots.length; i += 1) {
+      const x = BigInt(slots[i] + 1);
+      // Horner mod Q
+      let fx = coeffs[4];
+      for (let k = 3; k >= 0; k -= 1) {
+        fx = (fx * x + coeffs[k]) % q;
+      }
+      acc = (acc + lambdas[i] * fx) % q;
+    }
+    expect(acc).toBe(7n);
+  });
+
+  it("scalarHexFromBigint encodes 32 bytes little-endian", () => {
+    expect(scalarHexFromBigint(0n)).toBe("00".repeat(32));
+    expect(scalarHexFromBigint(1n)).toBe("01" + "00".repeat(31));
+    expect(scalarHexFromBigint(256n)).toBe("0001" + "00".repeat(30));
+    // Values are reduced mod Q.
+    expect(scalarHexFromBigint(ED25519_SCALAR_Q)).toBe("00".repeat(32));
   });
 });
