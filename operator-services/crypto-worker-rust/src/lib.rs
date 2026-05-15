@@ -2725,6 +2725,498 @@ pub mod ca_dkg_v2 {
     }
 }
 
+pub mod mpc_inverse_adapter {
+    use curve25519_dalek::scalar::Scalar;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum AdapterError {
+        McpSpdzNotAvailable,
+        InvalidInput(String),
+        Internal(String),
+    }
+
+    impl std::fmt::Display for AdapterError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                AdapterError::McpSpdzNotAvailable => write!(f, "mp-spdz runtime not available"),
+                AdapterError::InvalidInput(msg) => write!(f, "adapter input invalid: {msg}"),
+                AdapterError::Internal(msg) => write!(f, "adapter internal: {msg}"),
+            }
+        }
+    }
+
+    impl std::error::Error for AdapterError {}
+
+    #[derive(Debug, Clone)]
+    pub struct InversionContext {
+        pub dkg_epoch: String,
+        pub ca_dkg_transcript_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub roster_hash: String,
+    }
+
+    pub trait MpcInverseAdapter: Send + Sync {
+        fn compute_inverse_share(
+            &self,
+            dk_share: &Scalar,
+            ctx: &InversionContext,
+        ) -> Result<Scalar, AdapterError>;
+    }
+
+    pub struct UnavailableMpcInverseAdapter;
+
+    impl MpcInverseAdapter for UnavailableMpcInverseAdapter {
+        fn compute_inverse_share(
+            &self,
+            _dk_share: &Scalar,
+            _ctx: &InversionContext,
+        ) -> Result<Scalar, AdapterError> {
+            Err(AdapterError::McpSpdzNotAvailable)
+        }
+    }
+}
+
+pub mod vault_ek_derivation_v2 {
+    use crate::ca_dkg_v2::load_ca_dkg_v2_share;
+    use crate::mpc_inverse_adapter::{AdapterError, InversionContext, MpcInverseAdapter};
+    use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
+    use curve25519_dalek::{
+        constants::RISTRETTO_BASEPOINT_POINT,
+        ristretto::{CompressedRistretto, RistrettoPoint},
+        scalar::Scalar,
+    };
+    use rand::rngs::OsRng;
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256, Sha512};
+    use std::path::Path;
+
+    pub(crate) const WORKER_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_V1";
+    pub(crate) const FINAL_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_FINAL_V1";
+    pub(crate) const SCHNORR_CHALLENGE_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_SCHNORR_V1";
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round1Request {
+        pub dkg_epoch: String,
+        pub ca_dkg_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SchnorrProof {
+        pub r: String,
+        pub s: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round1Result {
+        pub slot: usize,
+        pub h_contribution: String,
+        pub schnorr_proof: SchnorrProof,
+        pub worker_transcript_hash: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ContributionInput {
+        pub slot: usize,
+        pub h_contribution: String,
+        pub schnorr_proof: SchnorrProof,
+        pub worker_transcript_hash: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VerifyRequest {
+        pub dkg_epoch: String,
+        pub ca_dkg_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub contributions: Vec<ContributionInput>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VerifyResult {
+        pub vault_ek: String,
+        pub final_transcript_hash: String,
+    }
+
+    pub fn run_round1(
+        state_dir: &Path,
+        req: &Round1Request,
+        adapter: &dyn MpcInverseAdapter,
+    ) -> WorkerResult<Round1Result> {
+        validate_selected_slots(&req.selected_slots)?;
+        assert_slot(req.self_slot)?;
+        if !req.selected_slots.contains(&req.self_slot) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot {} not in selected_slots",
+                req.self_slot
+            )));
+        }
+        let ca_dkg_transcript_hash = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
+        let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+
+        let share = load_ca_dkg_v2_share(state_dir)?;
+        if share.slot != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 slot {} does not match self_slot {}",
+                share.slot, req.self_slot
+            )));
+        }
+        if share.dkg_epoch != req.dkg_epoch {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 dkg_epoch {} does not match request {}",
+                share.dkg_epoch, req.dkg_epoch
+            )));
+        }
+        if share.transcript_hash.to_lowercase() != ca_dkg_transcript_hash {
+            return Err(WorkerError::InvalidRequest(
+                "ca_dkg_transcript_hash does not match local share".to_string(),
+            ));
+        }
+
+        let dk_share = scalar_from_hex(&share.dk_share)?;
+        let ctx = InversionContext {
+            dkg_epoch: req.dkg_epoch.clone(),
+            ca_dkg_transcript_hash: ca_dkg_transcript_hash.clone(),
+            selected_slots: req.selected_slots.clone(),
+            self_slot: req.self_slot,
+            roster_hash: roster_hash.clone(),
+        };
+        let inv_share = adapter
+            .compute_inverse_share(&dk_share, &ctx)
+            .map_err(adapter_error_to_worker)?;
+
+        let h_contribution = RISTRETTO_BASEPOINT_POINT * inv_share;
+        let h_contribution_hex = compressed_hex(&h_contribution);
+        let worker_transcript_hash = worker_transcript_hash(
+            &req.dkg_epoch,
+            &ca_dkg_transcript_hash,
+            &roster_hash,
+            &sorted_unique_slots(&req.selected_slots)?,
+            req.self_slot,
+            &h_contribution_hex,
+        );
+        let proof = schnorr_pok(&inv_share, &h_contribution, &worker_transcript_hash);
+
+        Ok(Round1Result {
+            slot: req.self_slot,
+            h_contribution: h_contribution_hex,
+            schnorr_proof: proof,
+            worker_transcript_hash,
+        })
+    }
+
+    pub fn run_verify(req: &VerifyRequest) -> WorkerResult<VerifyResult> {
+        validate_selected_slots(&req.selected_slots)?;
+        if req.contributions.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "expected {DEOPERATOR_THRESHOLD} contributions, got {}",
+                req.contributions.len()
+            )));
+        }
+        let ca_dkg_transcript_hash = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
+        let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        let sorted_slots = sorted_unique_slots(&req.selected_slots)?;
+        let selected_set: std::collections::BTreeSet<usize> = sorted_slots.iter().copied().collect();
+
+        let mut seen = [false; DEOPERATOR_COUNT];
+        let mut points: Vec<RistrettoPoint> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        let mut ordered: Vec<(usize, String, SchnorrProof)> =
+            Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for contribution in &req.contributions {
+            assert_slot(contribution.slot)?;
+            if !selected_set.contains(&contribution.slot) {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "contribution slot {} not in selected_slots",
+                    contribution.slot
+                )));
+            }
+            if seen[contribution.slot] {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate contribution slot {}",
+                    contribution.slot
+                )));
+            }
+            seen[contribution.slot] = true;
+
+            let h_contribution_norm = normalize_hex(&contribution.h_contribution, 32)?;
+            let expected_worker_hash = worker_transcript_hash(
+                &req.dkg_epoch,
+                &ca_dkg_transcript_hash,
+                &roster_hash,
+                &sorted_slots,
+                contribution.slot,
+                &h_contribution_norm,
+            );
+            let supplied = normalize_hex(&contribution.worker_transcript_hash, 32)?;
+            if supplied != expected_worker_hash {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "worker_transcript_hash mismatch for slot {}",
+                    contribution.slot
+                )));
+            }
+
+            let point = decompress_hex(&h_contribution_norm)?;
+            if !verify_schnorr_pok(&point, &contribution.schnorr_proof, &expected_worker_hash)? {
+                return Err(WorkerError::Crypto(format!(
+                    "schnorr verification failed for slot {}",
+                    contribution.slot
+                )));
+            }
+            points.push(point);
+            ordered.push((
+                contribution.slot,
+                h_contribution_norm,
+                contribution.schnorr_proof.clone(),
+            ));
+        }
+
+        let mut vault_ek = RistrettoPoint::default();
+        for point in &points {
+            vault_ek += point;
+        }
+        let vault_ek_hex = compressed_hex(&vault_ek);
+        ordered.sort_by_key(|item| item.0);
+        let final_transcript_hash = final_transcript_hash(
+            &req.dkg_epoch,
+            &ca_dkg_transcript_hash,
+            &roster_hash,
+            &sorted_slots,
+            &vault_ek_hex,
+            &ordered,
+        );
+
+        Ok(VerifyResult {
+            vault_ek: vault_ek_hex,
+            final_transcript_hash,
+        })
+    }
+
+    pub fn schnorr_pok(
+        secret: &Scalar,
+        h_contribution: &RistrettoPoint,
+        worker_transcript_hash: &str,
+    ) -> SchnorrProof {
+        let mut rng = OsRng;
+        let r = Scalar::random(&mut rng);
+        let r_point = RISTRETTO_BASEPOINT_POINT * r;
+        let challenge = schnorr_challenge(worker_transcript_hash, &r_point, h_contribution);
+        let s = r + challenge * secret;
+        SchnorrProof {
+            r: compressed_hex(&r_point),
+            s: hex_encode(s.to_bytes().as_slice()),
+        }
+    }
+
+    pub fn verify_schnorr_pok(
+        h_contribution: &RistrettoPoint,
+        proof: &SchnorrProof,
+        worker_transcript_hash: &str,
+    ) -> WorkerResult<bool> {
+        let r_point = decompress_hex(&normalize_hex(&proof.r, 32)?)?;
+        let s = scalar_from_hex(&proof.s)?;
+        let challenge = schnorr_challenge(worker_transcript_hash, &r_point, h_contribution);
+        let lhs = RISTRETTO_BASEPOINT_POINT * s;
+        let rhs = r_point + h_contribution * challenge;
+        Ok(lhs == rhs)
+    }
+
+    pub fn worker_transcript_hash(
+        dkg_epoch: &str,
+        ca_dkg_transcript_hash: &str,
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        slot: usize,
+        h_contribution_hex: &str,
+    ) -> String {
+        let joined_slots = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WORKER_TRANSCRIPT_DOMAIN.as_bytes());
+        bytes.extend_from_slice(dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(ca_dkg_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(roster_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined_slots.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(h_contribution_hex.as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    pub fn final_transcript_hash(
+        dkg_epoch: &str,
+        ca_dkg_transcript_hash: &str,
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        vault_ek_hex: &str,
+        ordered_contributions: &[(usize, String, SchnorrProof)],
+    ) -> String {
+        let joined_slots = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FINAL_TRANSCRIPT_DOMAIN.as_bytes());
+        bytes.extend_from_slice(dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(ca_dkg_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(roster_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined_slots.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_hex.as_bytes());
+        for (slot, h_contribution_hex, proof) in ordered_contributions {
+            bytes.push(b':');
+            bytes.extend_from_slice(slot.to_string().as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(h_contribution_hex.as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(proof.r.to_lowercase().as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(proof.s.to_lowercase().as_bytes());
+        }
+        sha256_hex(&bytes)
+    }
+
+    fn schnorr_challenge(
+        worker_transcript_hash: &str,
+        r_point: &RistrettoPoint,
+        h_contribution: &RistrettoPoint,
+    ) -> Scalar {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SCHNORR_CHALLENGE_DOMAIN.as_bytes());
+        bytes.extend_from_slice(worker_transcript_hash.to_lowercase().as_bytes());
+        bytes.extend_from_slice(r_point.compress().as_bytes());
+        bytes.extend_from_slice(h_contribution.compress().as_bytes());
+        let digest = Sha512::digest(&bytes);
+        let mut wide = [0u8; 64];
+        wide.copy_from_slice(digest.as_slice());
+        Scalar::from_bytes_mod_order_wide(&wide)
+    }
+
+    fn validate_selected_slots(slots: &[usize]) -> WorkerResult<()> {
+        if slots.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "selected_slots must have {DEOPERATOR_THRESHOLD} entries, got {}",
+                slots.len()
+            )));
+        }
+        let mut seen = [false; DEOPERATOR_COUNT];
+        for slot in slots {
+            assert_slot(*slot)?;
+            if seen[*slot] {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate selected_slots entry {slot}"
+                )));
+            }
+            seen[*slot] = true;
+        }
+        Ok(())
+    }
+
+    fn sorted_unique_slots(slots: &[usize]) -> WorkerResult<Vec<usize>> {
+        validate_selected_slots(slots)?;
+        let mut copy = slots.to_vec();
+        copy.sort_unstable();
+        Ok(copy)
+    }
+
+    fn adapter_error_to_worker(err: AdapterError) -> WorkerError {
+        match err {
+            AdapterError::McpSpdzNotAvailable => {
+                WorkerError::NotImplemented("mpc_inverse_unavailable")
+            }
+            AdapterError::InvalidInput(msg) => WorkerError::InvalidRequest(msg),
+            AdapterError::Internal(msg) => WorkerError::Crypto(msg),
+        }
+    }
+
+    fn compressed_hex(point: &RistrettoPoint) -> String {
+        hex_encode(point.compress().as_bytes())
+    }
+
+    fn decompress_hex(hex: &str) -> WorkerResult<RistrettoPoint> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != 32 {
+            return Err(WorkerError::InvalidRequest(
+                "Ristretto point must be 32 bytes".to_string(),
+            ));
+        }
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&bytes);
+        CompressedRistretto(buf)
+            .decompress()
+            .ok_or_else(|| WorkerError::InvalidRequest("invalid Ristretto point".to_string()))
+    }
+
+    fn scalar_from_hex(hex: &str) -> WorkerResult<Scalar> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != 32 {
+            return Err(WorkerError::InvalidRequest(format!(
+                "scalar must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&bytes);
+        Ok(Scalar::from_bytes_mod_order(buf))
+    }
+
+    fn normalize_hex(hex: &str, expected_bytes: usize) -> WorkerResult<String> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != expected_bytes {
+            return Err(WorkerError::InvalidRequest(format!(
+                "expected {expected_bytes}-byte hex, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(hex_encode(&bytes))
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex_encode(Sha256::digest(bytes).as_slice())
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WorkerError::InvalidRequest("expected even-length hex".to_string()));
+        }
+        (0..raw.len())
+            .step_by(2)
+            .map(|idx| {
+                u8::from_str_radix(&raw[idx..idx + 2], 16)
+                    .map_err(|err| WorkerError::InvalidRequest(err.to_string()))
+            })
+            .collect()
+    }
+
+}
+
 pub mod frost_dkg_v2 {
     use crate::hpke_aead::{self, HpkeEnvelope};
     use crate::local_state::slot_to_identifier;

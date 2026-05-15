@@ -1,0 +1,18 @@
+{
+  "caDkgTranscriptHash": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+  "dkgEpoch": "7",
+  "finalTranscriptDomain": "EUNOMA_VAULT_EK_DERIVATION_FINAL_V1",
+  "hContribution": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+  "rosterHash": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+  "schnorrChallengeDomain": "EUNOMA_VAULT_EK_DERIVATION_SCHNORR_V1",
+  "slot": 4,
+  "sortedSelectedSlots": [
+    0,
+    1,
+    2,
+    4,
+    5
+  ],
+  "workerTranscriptDomain": "EUNOMA_VAULT_EK_DERIVATION_V1",
+  "workerTranscriptHash": "cbe0217671fa6f080f6a0ddb75282756e4fec154ad00ca41f5fe41648f37660c"
+}
