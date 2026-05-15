@@ -31,7 +31,7 @@
     "testnet:vault:init": "node scripts/testnet_vault_init.mjs",
     "testnet:e2e": "node scripts/testnet_e2e_fail_closed.mjs",
     "testnet:rotate-frost-config": "node scripts/testnet_rotate_frost_config.mjs",
-    "privacy:scan": "node -e \"const {spawnSync}=require('node:child_process'); const terms=[['VAULT','_DECRYPTION','_KEY','_HEX'].join(''),['disclosed','_amount'].join(''),['deposit','_blind'].join(''),['withdraw','_blind'].join(''),['/','v1','/'].join(''),['main','_operator','_index'].join(''),['main','-operator'].join(''),['partner','-operator'].join('')].join('|'); const r=spawnSync('rg',['-n',terms,'shared','deop-protocol','crypto-worker-client','deoperator-node','coordinator','relayer'],{stdio:'inherit'}); process.exit(r.status===1?0:(r.status??1));\""
+    "privacy:scan": "node -e \"const {spawnSync}=require('node:child_process'); const terms=[['VAULT','_DECRYPTION','_KEY','_HEX'].join(''),['disclosed','_amount'].join(''),['deposit','_blind'].join(''),['withdraw','_blind'].join(''),['/','v1','/'].join(''),['main','_operator','_index'].join(''),['main','-operator'].join(''),['partner','-operator'].join(''),['DKINV','_HEX'].join(''),['dk','_inverse'].join(''),['inverse','Share'].join(''),['dk','Inverse'].join(''),['inv','_share'].join('')].join('|'); const r=spawnSync('rg',['-n',terms,'shared','deop-protocol','crypto-worker-client','deoperator-node','coordinator','relayer'],{stdio:'inherit'}); process.exit(r.status===1?0:(r.status??1));\""
   },
   "devDependencies": {
     "@noble/ed25519": "^3.1.0",

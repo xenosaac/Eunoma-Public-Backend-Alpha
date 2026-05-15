@@ -476,3 +476,37 @@ export interface AptosTestnetChainConfigV2 {
   chainId: 2;
   nodeUrl: string;
 }
+
+export interface VaultEkContribution {
+  slot: number;
+  hContribution: HexString;
+  schnorrProof: { R: HexString; s: HexString };
+  workerTranscriptHash: HexString;
+}
+
+export interface VaultEkDerivationInput {
+  dkgEpoch: string;
+  caDkgTranscriptHash: HexString;
+  selectedSlots: number[];
+  rosterHash: HexString;
+  contributions: VaultEkContribution[];
+  roster: CaDkgV2Roster;
+}
+
+export interface VaultEkDerivationTranscript {
+  scheme: "vault_ek_derivation_v1";
+  dkgEpoch: string;
+  caDkgTranscriptHash: HexString;
+  selectedSlots: number[];
+  rosterHash: HexString;
+  contributions: VaultEkContribution[];
+}
+
+export type VaultEkDerivationCode =
+  | "UNDER_QUORUM"
+  | "DUPLICATE_SLOT"
+  | "UNKNOWN_SLOT"
+  | "STALE_DKG_EPOCH"
+  | "STALE_CA_DKG_TRANSCRIPT_HASH"
+  | "STALE_ROSTER_HASH"
+  | "INVALID_CONTRIBUTION_SHAPE";

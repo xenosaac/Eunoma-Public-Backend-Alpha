@@ -30,6 +30,10 @@ const FORBIDDEN_FIELD_NAMES = new Set([
   "nullifier_share",
   "rawnullifier",
   "raw_nullifier",
+  "dkinv",
+  "dkinverse",
+  "invshare",
+  "inverseshare",
 ]);
 
 export function assertNoForbiddenPlaintextFields(value: unknown): void {
