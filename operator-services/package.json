@@ -23,6 +23,7 @@
     "local:ca:registration": "node scripts/local_ca_registration.mjs",
     "local:online-frost-dkg-smoke": "node scripts/local_frost_dkg_v2.mjs",
     "local:frost-rotation-apply": "node scripts/local_frost_rotation_apply.mjs",
+    "local:frost-rotation-smoke": "node scripts/local_frost_rotation_smoke.mjs",
     "local:smoke": "node scripts/testnet_e2e.mjs",
     "mpc:bootstrap": "node scripts/mpc_spdz_bootstrap.mjs",
     "mpc:check": "node scripts/mpc_spdz_check.mjs",
@@ -32,6 +33,7 @@
     "privacy:scan": "node -e \"const {spawnSync}=require('node:child_process'); const terms=[['VAULT','_DECRYPTION','_KEY','_HEX'].join(''),['disclosed','_amount'].join(''),['deposit','_blind'].join(''),['withdraw','_blind'].join(''),['/','v1','/'].join(''),['main','_operator','_index'].join(''),['main','-operator'].join(''),['partner','-operator'].join('')].join('|'); const r=spawnSync('rg',['-n',terms,'shared','deop-protocol','crypto-worker-client','deoperator-node','coordinator','relayer'],{stdio:'inherit'}); process.exit(r.status===1?0:(r.status??1));\""
   },
   "devDependencies": {
+    "@noble/ed25519": "^3.1.0",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",

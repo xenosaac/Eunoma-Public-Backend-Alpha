@@ -23,58 +23,43 @@ export function spawnCluster(plan, opts = {}) {
     handle.workers.push(start(worker.name, cargoArgs(), rustEnv(worker.env), log, onExit, handle));
   }
   for (const node of plan.nodes) {
-    handle.nodes.push(
-      start(node.name, ["npm", "run", "-w", "@eunoma/deoperator-node", "start"], node.env, log, onExit, handle),
-    );
+    handle.nodes.push(start(node.name, tsxArgs("deoperator-node"), node.env, log, onExit, handle));
   }
-  handle.coordinator = start(
-    "coordinator",
-    ["npm", "run", "-w", "@eunoma/coordinator", "start"],
-    plan.coordinator.env,
-    log,
-    onExit,
-    handle,
-  );
-  handle.relayer = start(
-    "relayer",
-    ["npm", "run", "-w", "@eunoma/relayer", "start"],
-    plan.relayer.env,
-    log,
-    onExit,
-    handle,
-  );
+  handle.coordinator = start("coordinator", tsxArgs("coordinator"), plan.coordinator.env, log, onExit, handle);
+  handle.relayer = start("relayer", tsxArgs("relayer"), plan.relayer.env, log, onExit, handle);
 
   handle.kill = () => {
     if (handle.killed) return;
     handle.killed = true;
     const all = [...handle.workers, ...handle.nodes, handle.coordinator, handle.relayer];
     for (const child of all) {
-      if (child && !child.killed) child.kill("SIGTERM");
+      if (child && !child.killed) {
+        try {
+          child.kill("SIGTERM");
+        } catch (_) {
+          // ignore
+        }
+      }
     }
   };
 
-  handle.restartCoordinatorAndNodes = (nextPlan) => {
+  handle.restartCoordinatorAndNodes = async (nextPlan) => {
     const plan2 = nextPlan ?? handle.plan;
-    if (handle.coordinator && !handle.coordinator.killed) handle.coordinator.kill("SIGTERM");
-    for (const node of handle.nodes) {
-      if (node && !node.killed) node.kill("SIGTERM");
+    const stopped = [];
+    if (handle.coordinator && !handle.coordinator.killed) {
+      stopped.push(killAndWait(handle.coordinator));
     }
+    for (const node of handle.nodes) {
+      if (node && !node.killed) stopped.push(killAndWait(node));
+    }
+    await Promise.all(stopped);
     handle.nodes = [];
     handle.coordinator = null;
-    // Restart with fresh env files. Caller is responsible for waiting on health.
+    // Restart with fresh env files. Caller waits on health.
     for (const node of plan2.nodes) {
-      handle.nodes.push(
-        start(node.name, ["npm", "run", "-w", "@eunoma/deoperator-node", "start"], node.env, log, onExit, handle),
-      );
+      handle.nodes.push(start(node.name, tsxArgs("deoperator-node"), node.env, log, onExit, handle));
     }
-    handle.coordinator = start(
-      "coordinator",
-      ["npm", "run", "-w", "@eunoma/coordinator", "start"],
-      plan2.coordinator.env,
-      log,
-      onExit,
-      handle,
-    );
+    handle.coordinator = start("coordinator", tsxArgs("coordinator"), plan2.coordinator.env, log, onExit, handle);
     handle.plan = plan2;
   };
 
@@ -118,6 +103,42 @@ function cargoArgs() {
     "--bin",
     "eunoma-crypto-worker",
   ];
+}
+
+function tsxArgs(workspaceDir) {
+  // Invoke tsx directly so SIGTERM reaches the actual node process. Running
+  // through "npm run -w" wraps in an extra shell that swallows the signal.
+  return [
+    resolve(serviceRoot, "node_modules/.bin/tsx"),
+    resolve(serviceRoot, workspaceDir, "src/bin/start.ts"),
+  ];
+}
+
+function killAndWait(child) {
+  return new Promise((res) => {
+    if (child.killed || child.exitCode !== null) {
+      res();
+      return;
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      res();
+    };
+    child.once("exit", finish);
+    child.kill("SIGTERM");
+    setTimeout(() => {
+      if (!done) {
+        try {
+          child.kill("SIGKILL");
+        } catch (_) {
+          // already gone
+        }
+        finish();
+      }
+    }, 3000);
+  });
 }
 
 function rustEnv(env) {
