@@ -71,6 +71,31 @@ pub fn assert_quorum_slots5(slots: &[usize]) -> WorkerResult<[usize; DEOPERATOR_
     Ok(slots.try_into().expect("exactly five quorum slots"))
 }
 
+pub(crate) const H_RISTRETTO_HEX: &str =
+    "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+
+pub(crate) fn h_ristretto() -> WorkerResult<curve25519_dalek::ristretto::RistrettoPoint> {
+    let raw = H_RISTRETTO_HEX
+        .strip_prefix("0x")
+        .or_else(|| H_RISTRETTO_HEX.strip_prefix("0X"))
+        .unwrap_or(H_RISTRETTO_HEX);
+    if raw.len() != 64 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(WorkerError::InvalidRequest(
+            "H_RISTRETTO_HEX must be 32-byte hex".to_string(),
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    for idx in 0..32 {
+        bytes[idx] = u8::from_str_radix(&raw[idx * 2..idx * 2 + 2], 16)
+            .map_err(|err| WorkerError::InvalidRequest(err.to_string()))?;
+    }
+    curve25519_dalek::ristretto::CompressedRistretto(bytes)
+        .decompress()
+        .ok_or_else(|| {
+            WorkerError::Crypto("H_RISTRETTO_HEX is not a valid Ristretto point".to_string())
+        })
+}
+
 pub(crate) mod hpke_aead {
     use crate::{WorkerError, WorkerResult};
     use hpke::{
@@ -847,8 +872,7 @@ pub mod ca_local {
 
     const CA_DKG_SHARE_FILE: &str = "ca_dkg_share.json";
     const CA_REGISTRATION_NONCES_DIR: &str = "ca_registration_nonces";
-    const H_RISTRETTO_HEX: &str =
-        "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+    use crate::h_ristretto;
     const REGISTRATION_PROTOCOL_ID: &str = "AptosConfidentialAsset/RegistrationV1";
     const REGISTRATION_TYPE_NAME: &str = "0x1::sigma_protocol_registration::Registration";
 
@@ -1339,7 +1363,7 @@ pub mod ca_local {
         )
     }
 
-    fn registration_challenge_scalar(
+    pub fn registration_challenge_scalar(
         vault_ek_hex: &str,
         sender_address_hex: &str,
         asset_type_hex: &str,
@@ -1462,10 +1486,6 @@ pub mod ca_local {
     fn slot_scalar(slot: usize) -> WorkerResult<Scalar> {
         assert_slot(slot)?;
         Ok(Scalar::from((slot as u64) + 1))
-    }
-
-    fn h_ristretto() -> WorkerResult<RistrettoPoint> {
-        ristretto_from_hex(H_RISTRETTO_HEX)
     }
 
     fn ristretto_from_hex(hex: &str) -> WorkerResult<RistrettoPoint> {
@@ -1719,8 +1739,7 @@ pub mod ca_dkg_v2 {
     pub(crate) const CA_DKG_V2_SHARE_FILE: &str = "ca_dkg_share_v2.json";
     pub(crate) const HPKE_KEYPAIR_FILE: &str = "hpke_x25519_keypair_v2.json";
     const HPKE_INFO: &[u8] = b"EUNOMA_CA_DKG_V2_HPKE_INFO";
-    const H_RISTRETTO_HEX: &str =
-        "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+    use crate::h_ristretto;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -2576,10 +2595,6 @@ pub mod ca_dkg_v2 {
         Ok(Scalar::from((slot as u64) + 1))
     }
 
-    fn h_ristretto() -> WorkerResult<RistrettoPoint> {
-        ristretto_from_hex(H_RISTRETTO_HEX)
-    }
-
     fn ristretto_from_hex(hex: &str) -> WorkerResult<RistrettoPoint> {
         compressed_ristretto_from_hex(hex)?
             .decompress()
@@ -2779,10 +2794,10 @@ pub mod mpc_inverse_adapter {
 
 pub mod vault_ek_derivation_v2 {
     use crate::ca_dkg_v2::load_ca_dkg_v2_share;
+    use crate::h_ristretto;
     use crate::mpc_inverse_adapter::{AdapterError, InversionContext, MpcInverseAdapter};
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
     use curve25519_dalek::{
-        constants::RISTRETTO_BASEPOINT_POINT,
         ristretto::{CompressedRistretto, RistrettoPoint},
         scalar::Scalar,
     };
@@ -2894,7 +2909,8 @@ pub mod vault_ek_derivation_v2 {
             .compute_inverse_share(&dk_share, &ctx)
             .map_err(adapter_error_to_worker)?;
 
-        let h_contribution = RISTRETTO_BASEPOINT_POINT * inv_share;
+        let h = h_ristretto()?;
+        let h_contribution = h * inv_share;
         let h_contribution_hex = compressed_hex(&h_contribution);
         let worker_transcript_hash = worker_transcript_hash(
             &req.dkg_epoch,
@@ -2904,7 +2920,7 @@ pub mod vault_ek_derivation_v2 {
             req.self_slot,
             &h_contribution_hex,
         );
-        let proof = schnorr_pok(&inv_share, &h_contribution, &worker_transcript_hash);
+        let proof = schnorr_pok(&inv_share, &h_contribution, &worker_transcript_hash)?;
 
         Ok(Round1Result {
             slot: req.self_slot,
@@ -3004,16 +3020,17 @@ pub mod vault_ek_derivation_v2 {
         secret: &Scalar,
         h_contribution: &RistrettoPoint,
         worker_transcript_hash: &str,
-    ) -> SchnorrProof {
+    ) -> WorkerResult<SchnorrProof> {
+        let h = h_ristretto()?;
         let mut rng = OsRng;
         let r = Scalar::random(&mut rng);
-        let r_point = RISTRETTO_BASEPOINT_POINT * r;
+        let r_point = h * r;
         let challenge = schnorr_challenge(worker_transcript_hash, &r_point, h_contribution);
         let s = r + challenge * secret;
-        SchnorrProof {
+        Ok(SchnorrProof {
             r: compressed_hex(&r_point),
             s: hex_encode(s.to_bytes().as_slice()),
-        }
+        })
     }
 
     pub fn verify_schnorr_pok(
@@ -3021,10 +3038,11 @@ pub mod vault_ek_derivation_v2 {
         proof: &SchnorrProof,
         worker_transcript_hash: &str,
     ) -> WorkerResult<bool> {
+        let h = h_ristretto()?;
         let r_point = decompress_hex(&normalize_hex(&proof.r, 32)?)?;
         let s = scalar_from_hex(&proof.s)?;
         let challenge = schnorr_challenge(worker_transcript_hash, &r_point, h_contribution);
-        let lhs = RISTRETTO_BASEPOINT_POINT * s;
+        let lhs = h * s;
         let rhs = r_point + h_contribution * challenge;
         Ok(lhs == rhs)
     }
