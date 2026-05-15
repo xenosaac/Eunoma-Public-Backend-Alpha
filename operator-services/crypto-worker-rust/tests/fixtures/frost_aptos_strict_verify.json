@@ -1,0 +1,64 @@
+{
+  "scheme": "frost_ed25519_v1",
+  "rfc": "RFC 9591 + RFC 8032",
+  "threshold": 5,
+  "count": 7,
+  "seed": "4242424242424242424242424242424242424242424242424242424242424242",
+  "groupPublicKey": "0e09035c98f5370bd5f1213272984e7390e1ddf21066a44bdf9fd7bb2fc668fa",
+  "verifyingShares": [
+    {
+      "slot": 0,
+      "verifyingShare": "f66e4a4dab4d05774391db90607f3a1381b495d64cad801a66c660380ff47812"
+    },
+    {
+      "slot": 1,
+      "verifyingShare": "2a80595ee9d8156547af74509a980776f33c9e99f629d29588dd91224bf94f8b"
+    },
+    {
+      "slot": 2,
+      "verifyingShare": "b849d8b6d00913719957710d4adc0e541545360d6eb879e4a3f22f61555096ae"
+    },
+    {
+      "slot": 3,
+      "verifyingShare": "f42664afc15889ee492b9aa863b7d107d862de0ebc6693707704775b56b18e15"
+    },
+    {
+      "slot": 4,
+      "verifyingShare": "7475a08a42816f2b2398b84a3d5a15a880d66554d74dd22c04fb662f45e46f04"
+    },
+    {
+      "slot": 5,
+      "verifyingShare": "47408c9dac8de31db7bea41fa2c8b0aba655376c3e263105c3fd39fd6370fda0"
+    },
+    {
+      "slot": 6,
+      "verifyingShare": "daae3bf279f8598dcd320b7499daba88c2ba467b465432962fbec57a6ba40bd3"
+    }
+  ],
+  "quorumSlots": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "depositMessage": {
+    "domain": "EUNOMA_DEPOSIT_BIND_V2",
+    "chainId": 2,
+    "bridge": "00000000000000000000000000000000000000000000000000000000eeeeeee1",
+    "vault": "00000000000000000000000000000000000000000000000000000000eeeeeee2",
+    "assetType": "00000000000000000000000000000000000000000000000000000000eeeeeee3",
+    "operatorSetVersion": 1,
+    "dkgEpoch": 9,
+    "rosterHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "frostGroupPubkey": "0e09035c98f5370bd5f1213272984e7390e1ddf21066a44bdf9fd7bb2fc668fa",
+    "commitment": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "amountTag": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "caPayloadHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "depositNonce": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "expirySecs": 1800000000,
+    "circuitVersionsHash": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "messageBcs": "1645554e4f4d415f4445504f5349545f42494e445f56320200000000000000000000000000000000000000000000000000000000eeeeeee100000000000000000000000000000000000000000000000000000000eeeeeee200000000000000000000000000000000000000000000000000000000eeeeeee30100000000000000090000000000000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa200e09035c98f5370bd5f1213272984e7390e1ddf21066a44bdf9fd7bb2fc668fa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc20dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee00d2496b00000000201111111111111111111111111111111111111111111111111111111111111111",
+  "signature": "61ece7f596431a19b0a65cca8a03976ca1b81d6cf809a0a0441c3efecd98fa66484dcc282dba903e59ec8b7c52dbe8f97fa596dc943bb3b2bf56520228827401"
+}
