@@ -943,6 +943,13 @@ describe("coordinator", () => {
 
     // All 5 bodies must carry the new Phase 2 fields.
     expect(observedBodies).toHaveLength(5);
+    // Codex P1 #2: peer addresses must be derived from per-slot roster endpoint host,
+    // not a hardcoded 127.0.0.1. The fixture roster uses `http://node-<slot>.invalid` so
+    // the expected MASCOT peer address for each ordinal must be `node-<slot>.invalid:<port>`.
+    const portBase = Number(process.env.EUNOMA_MPC_PARTY_PORT_BASE ?? 14000);
+    const expectedPeerAddresses = expectedSelectedSlots.map(
+      (slot) => `node-${slot}.invalid:${portBase + slot}`,
+    );
     for (let i = 0; i < 5; i += 1) {
       const body = observedBodies[i];
       expect(body.requestId).toBe("vault-ek-concurrent");
@@ -950,8 +957,59 @@ describe("coordinator", () => {
       expect(typeof body.playerId).toBe("number");
       expect(Array.isArray(body.peerAddresses)).toBe(true);
       expect((body.peerAddresses as string[]).length).toBe(5);
+      expect(body.peerAddresses).toEqual(expectedPeerAddresses);
+      expect(
+        (body.peerAddresses as string[]).every((addr) => !addr.startsWith("127.0.0.1:")),
+      ).toBe(true);
       expect(Array.isArray(body.lagrangeCoefficients)).toBe(true);
       expect((body.lagrangeCoefficients as string[]).length).toBe(5);
+    }
+  });
+
+  it("rejects vault_ek round1 when roster endpoint has no parseable host and EUNOMA_LOCAL_CLUSTER!=1", async () => {
+    // Codex P1 #2: in production we must NEVER silently fall back to 127.0.0.1. If the
+    // roster endpoint is unparseable, the request fails closed.
+    const caDkgV2Roster: CaDkgV2Roster = {
+      operatorSetVersion: "1",
+      dkgEpoch: "1",
+      caDkgScheme: "ca_dkg_v2",
+      threshold: 5,
+      nodes: Array.from({ length: 7 }, (_, slot) => ({
+        slot,
+        nodeId: `node-${slot}`,
+        endpoint: ":::not-a-url:::",
+        hpkePublicKey: h32(String(slot + 1)),
+        transcriptPublicKey: h32("d"),
+      })),
+    };
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const prev = process.env.EUNOMA_LOCAL_CLUSTER;
+    delete process.env.EUNOMA_LOCAL_CLUSTER;
+    try {
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        singleNodeForwarder: async (_path, _body, _roster, slot) => ({
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {},
+        }),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/derive/vault_ek/start",
+        payload: {
+          requestId: "vault-ek-no-host",
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashHex,
+        },
+      });
+      // The throw inside the try/catch surfaces as 400 invalid_request (the generic catch).
+      expect(res.statusCode).toBe(400);
+      expect(JSON.stringify(res.json())).toContain("no parseable hostname");
+    } finally {
+      if (prev !== undefined) process.env.EUNOMA_LOCAL_CLUSTER = prev;
     }
   });
 

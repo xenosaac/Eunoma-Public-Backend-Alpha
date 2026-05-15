@@ -398,7 +398,14 @@ export function buildCoordinatorServer(
       const lambdas = lagrangeCoefficientsAtZero(sortedSelectedSlots);
       const lagrangeCoefficients = lambdas.map(scalarHexFromBigint);
       const portBase = Number(process.env.EUNOMA_MPC_PARTY_PORT_BASE ?? 14000);
-      const peerAddresses = sortedSelectedSlots.map((slot) => `127.0.0.1:${portBase + slot}`);
+      // Codex P1 #2: peer addresses MUST be derived from per-slot host (via dkgRoster.nodes
+      // endpoint), not a hardcoded 127.0.0.1. Real deoperators on separate hosts would
+      // otherwise connect back to themselves instead of peers. Fail closed for prod when
+      // the host can't be derived; allow 127.0.0.1 fallback only under EUNOMA_LOCAL_CLUSTER=1.
+      const allowLocalClusterFallback = process.env.EUNOMA_LOCAL_CLUSTER === "1";
+      const peerAddresses = sortedSelectedSlots.map((slot) =>
+        resolveMpcPeerAddress(dkgRoster, slot, portBase, allowLocalClusterFallback),
+      );
       const sessionId = requestId;
 
       // Acquire the single-session lock before issuing any worker calls. Without this guard
@@ -1213,6 +1220,42 @@ function lowestEligibleSlots(roster: CaDkgV2Roster, n: number): number[] {
     .map((node) => node.slot)
     .sort((a, b) => a - b)
     .slice(0, n);
+}
+
+/**
+ * Resolve the MASCOT peer `host:port` for `slot`. The port is always `portBase + slot`. The
+ * host is extracted from the roster node's `endpoint` URL (e.g. `http://10.0.0.5:8080` →
+ * `10.0.0.5`). If the endpoint is unparseable AND `EUNOMA_LOCAL_CLUSTER=1`, fall back to
+ * `127.0.0.1`. Otherwise throw — production must never silently send all peers to localhost.
+ */
+function resolveMpcPeerAddress(
+  roster: CaDkgV2Roster,
+  slot: number,
+  portBase: number,
+  allowLocalClusterFallback: boolean,
+): string {
+  const node = roster.nodes.find((entry) => entry.slot === slot);
+  if (!node) {
+    throw new Error(`vault_ek peer resolution: no roster node for slot ${slot}`);
+  }
+  let host: string | undefined;
+  try {
+    const parsed = new URL(node.endpoint);
+    host = parsed.hostname;
+  } catch {
+    host = undefined;
+  }
+  if (!host || host.length === 0) {
+    if (allowLocalClusterFallback) {
+      host = "127.0.0.1";
+    } else {
+      throw new Error(
+        `vault_ek peer resolution: roster slot ${slot} endpoint ${node.endpoint} has no parseable hostname; ` +
+          `set EUNOMA_LOCAL_CLUSTER=1 to allow the 127.0.0.1 fallback`,
+      );
+    }
+  }
+  return `${host}:${portBase + slot}`;
 }
 
 async function writeTranscriptArtifactAtomic(
