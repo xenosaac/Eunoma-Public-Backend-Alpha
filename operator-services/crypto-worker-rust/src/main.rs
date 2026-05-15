@@ -12,6 +12,10 @@ use eunoma_crypto_worker::ca_local::{
     init_ca_dkg_local, load_ca_share, registration_challenge, RegistrationCommitmentInput,
     RegistrationResponseInput,
 };
+use eunoma_crypto_worker::frost_dkg_v2::{
+    run_round as run_frost_dkg_v2_round, FrostDkgV2Roster, FrostDkgV2RoundRequest,
+    FrostRound1Broadcast, FrostRound2Envelope,
+};
 use eunoma_crypto_worker::local_state::{
     aggregate_frost_signature, create_frost_nonce_commitment, create_frost_partial_signature,
     default_state_dir, init_frost_local, state_summary, FrostCommitmentInput,
@@ -71,7 +75,7 @@ async fn main() {
         .route("/worker/v2/local/state", get(local_state))
         .route("/worker/v2/session-share", post(fail_closed))
         .route("/worker/v2/dkg/ca/start", post(ca_dkg_start))
-        .route("/worker/v2/dkg/frost/start", post(fail_closed))
+        .route("/worker/v2/dkg/frost/start", post(frost_dkg_start))
         .route(
             "/worker/v2/dkg/:protocol/:round",
             post(dkg_round),
@@ -327,6 +331,74 @@ async fn ca_dkg_start(
 }
 
 #[derive(Debug, Deserialize)]
+struct FrostDkgStartRequest {
+    #[serde(rename = "operatorSetVersion")]
+    operator_set_version: String,
+    #[serde(rename = "dkgEpoch")]
+    dkg_epoch: String,
+    #[serde(rename = "frostDkgV2RosterHash", default)]
+    frost_dkg_v2_roster_hash: Option<String>,
+}
+
+async fn frost_dkg_start(
+    State(state): State<AppState>,
+    Json(body): Json<FrostDkgStartRequest>,
+) -> impl IntoResponse {
+    let manifest_path = state.state_dir.join("frost_state_manifest.json");
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let kind = err.kind();
+            let mapped = if kind == std::io::ErrorKind::NotFound {
+                eunoma_crypto_worker::WorkerError::MissingLocalState(manifest_path.display().to_string())
+            } else {
+                eunoma_crypto_worker::WorkerError::Io(err.to_string())
+            };
+            return worker_error_response(mapped);
+        }
+    };
+    let manifest: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(err) => return worker_error_response(eunoma_crypto_worker::WorkerError::Serde(err.to_string())),
+    };
+    let group_public_key = manifest
+        .get("groupPublicKey")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let frost_verifying_share = manifest
+        .get("frostVerifyingShare")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let dkg_epoch = manifest
+        .get("dkgEpoch")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| body.dkg_epoch.clone());
+    let roster_hash = body
+        .frost_dkg_v2_roster_hash
+        .clone()
+        .unwrap_or_else(|| "".to_string());
+    let transcript_hash = hash_hex(&[
+        b"EUNOMA_FROST_DKG_START_V1".as_slice(),
+        body.operator_set_version.as_bytes(),
+        dkg_epoch.as_bytes(),
+        roster_hash.as_bytes(),
+        group_public_key.as_bytes(),
+    ]);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "dkgEpoch": dkg_epoch,
+            "frostVerifyingShare": frost_verifying_share,
+            "groupPublicKey": group_public_key,
+            "transcriptHash": transcript_hash,
+        })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
 struct FrostNonceCommitRequest {
     #[serde(rename = "requestId")]
     request_id: String,
@@ -400,8 +472,8 @@ struct DkgRoundBody {
     operator_set_version: String,
     #[serde(rename = "dkgEpoch")]
     dkg_epoch: String,
-    #[serde(rename = "rosterHash")]
-    roster_hash: String,
+    #[serde(rename = "rosterHash", default)]
+    roster_hash: Option<String>,
     slot: usize,
     threshold: usize,
     #[serde(rename = "participantSlots")]
@@ -416,6 +488,14 @@ struct DkgRoundBody {
     dealer_broadcasts: Vec<eunoma_crypto_worker::ca_dkg_v2::DealerBroadcast>,
     #[serde(default, rename = "encryptedShares")]
     encrypted_shares: Vec<eunoma_crypto_worker::ca_dkg_v2::EncryptedDkgShare>,
+    #[serde(rename = "frostDkgV2Roster")]
+    frost_dkg_v2_roster: Option<FrostDkgV2Roster>,
+    #[serde(rename = "frostDkgV2RosterHash")]
+    frost_dkg_v2_roster_hash: Option<String>,
+    #[serde(default, rename = "frostRound1Broadcasts")]
+    frost_round1_broadcasts: Vec<FrostRound1Broadcast>,
+    #[serde(default, rename = "frostRound2Envelopes")]
+    frost_round2_envelopes: Vec<FrostRound2Envelope>,
     complaint: Option<Value>,
 }
 
@@ -441,14 +521,14 @@ async fn dkg_round(
     Path((protocol, round)): Path<(String, String)>,
     Json(body): Json<DkgRoundBody>,
 ) -> impl IntoResponse {
-    if protocol != "ca" {
+    if protocol != "ca" && protocol != "frost" {
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
                 "error": "not_implemented",
                 "protocol": protocol,
                 "round": round,
-                "message": "FROST DKG transport is wired through local FROST initialization; online FROST DKG rounds are not enabled"
+                "message": "unsupported DKG protocol"
             })),
         );
     }
@@ -466,6 +546,30 @@ async fn dkg_round(
             Json(json!({ "error": "bad_threshold" })),
         );
     }
+    if protocol == "frost" {
+        let roster_hash = body.frost_dkg_v2_roster_hash.unwrap_or_default();
+        let request = FrostDkgV2RoundRequest {
+            request_id: body.request_id,
+            session_id: body.session_id,
+            round: round.clone(),
+            operator_set_version: body.operator_set_version,
+            dkg_epoch: body.dkg_epoch,
+            frost_dkg_v2_roster_hash: roster_hash,
+            threshold: body.threshold,
+            participant_slots: body.participant_slots,
+            slot: body.slot,
+            frost_dkg_v2_roster: body.frost_dkg_v2_roster,
+            frost_round1_broadcasts: body.frost_round1_broadcasts,
+            frost_round2_envelopes: body.frost_round2_envelopes,
+            transcript_hash: body.transcript_hash,
+            complaint: body.complaint,
+        };
+        return match run_frost_dkg_v2_round(&state.state_dir, request) {
+            Ok(result) => (StatusCode::ACCEPTED, Json(json!(result))),
+            Err(err) => worker_error_response(err),
+        };
+    }
+    let roster_hash = body.roster_hash.clone().unwrap_or_default();
     if body.ca_dkg_scheme.as_deref() == Some("ca_dkg_v2")
         || body.ca_dkg_v2_roster.is_some()
         || !body.dealer_broadcasts.is_empty()
@@ -476,7 +580,7 @@ async fn dkg_round(
             round: round.clone(),
             operator_set_version: body.operator_set_version,
             dkg_epoch: body.dkg_epoch,
-            roster_hash: body.roster_hash,
+            roster_hash,
             threshold: body.threshold,
             participant_slots: body.participant_slots,
             slot: body.slot,
