@@ -2859,6 +2859,9 @@ pub mod vault_ek_derivation_v2 {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct SchnorrProof {
+        /// JSON-serialized as `R` to match the TS `VaultEkContribution.schnorrProof` shape
+        /// (which the coordinator validates via `assembleVaultEkTranscript`).
+        #[serde(rename = "R")]
         pub r: String,
         pub s: String,
     }

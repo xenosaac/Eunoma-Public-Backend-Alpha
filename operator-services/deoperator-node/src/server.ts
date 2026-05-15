@@ -43,6 +43,13 @@ export interface DeoperatorNodeServerOptions {
   cryptoWorker: CryptoWorker;
   bearerToken?: string;
   store?: DeoperatorNodeStore;
+  /**
+   * Phase 2: URL of the local crypto worker for the vault_ek derive proxy routes
+   * (`/worker/v2/derive/vault_ek/{round1,verify}`). The coordinator hits the deop-node by
+   * `node.endpoint`; this option lets the deop-node forward those calls to its local worker.
+   * Falls back to `CRYPTO_WORKER_URL` env at start when not supplied.
+   */
+  cryptoWorkerUrl?: string;
 }
 
 export function buildDeoperatorNodeServer(
@@ -253,6 +260,45 @@ export function buildDeoperatorNodeServer(
     } catch (err) {
       return sendError(reply, err);
     }
+  });
+
+  // Phase 2: passthrough routes for the vault_ek derive HTTP fan-out. The coordinator hits
+  // `node.endpoint` (the deop-node), and the deop-node forwards verbatim to its local crypto
+  // worker. This sits in between because we keep worker URLs private to each node + we want
+  // the deop-node's bearer-auth hook to apply.
+  const forwardToWorker = async (
+    path: "/worker/v2/derive/vault_ek/round1" | "/worker/v2/derive/vault_ek/verify",
+    body: unknown,
+    reply: { code: (s: number) => { send: (body: unknown) => unknown } },
+  ) => {
+    if (!opts.cryptoWorkerUrl) {
+      return reply.code(503).send({ error: "crypto_worker_unavailable" });
+    }
+    try {
+      const res = await fetch(new URL(path, opts.cryptoWorkerUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      let parsed: unknown;
+      try {
+        parsed = await res.json();
+      } catch {
+        parsed = {};
+      }
+      return reply.code(res.status).send(parsed);
+    } catch (err) {
+      return reply.code(502).send({
+        error: "worker_forward_failed",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  };
+  server.post("/worker/v2/derive/vault_ek/round1", async (req, reply) => {
+    return forwardToWorker("/worker/v2/derive/vault_ek/round1", req.body, reply);
+  });
+  server.post("/worker/v2/derive/vault_ek/verify", async (req, reply) => {
+    return forwardToWorker("/worker/v2/derive/vault_ek/verify", req.body, reply);
   });
 
   return { server, store };

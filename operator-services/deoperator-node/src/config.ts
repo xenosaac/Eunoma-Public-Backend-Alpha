@@ -20,6 +20,8 @@ export interface DeoperatorNodeConfig {
   caDkgV2Roster?: CaDkgV2Roster;
   frostDkgV2Roster?: FrostDkgV2Roster;
   cryptoWorker: CryptoWorker;
+  /** Phase 2: passthrough target URL for the vault_ek derive routes. */
+  cryptoWorkerUrl?: string;
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): DeoperatorNodeConfig {
@@ -52,5 +54,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): DeoperatorN
     caDkgV2Roster,
     frostDkgV2Roster,
     cryptoWorker: workerUrl ? new HttpCryptoWorkerClient(workerUrl) : new FailClosedCryptoWorker(),
+    cryptoWorkerUrl: workerUrl,
   };
 }

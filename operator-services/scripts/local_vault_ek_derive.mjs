@@ -3,7 +3,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PHASE1_EXIT = 21;
+// Exit codes (distinct from default 1 for operator runbooks):
+//   0   success
+//   21  MP-SPDZ runtime unavailable (run `npm run mpc:bootstrap && npm run mpc:check`)
+//   22  another vault_ek derivation is in flight (retry shortly)
+const EXIT_MPC_UNAVAILABLE = 21;
+const PHASE2_EXIT_LOCK_CONTENTION = 22;
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -11,7 +16,6 @@ const serviceRoot = resolve(scriptDir, "..");
 const args = process.argv.slice(2);
 let coordinatorUrl;
 let dkgEpoch;
-let selectedSlots;
 let caDkgTranscriptHash;
 let requestId;
 let bearerToken;
@@ -25,9 +29,6 @@ for (let i = 0; i < args.length; i += 1) {
     case "--dkg-epoch":
       dkgEpoch = args[++i];
       break;
-    case "--selected-slots":
-      selectedSlots = args[++i].split(",").map((s) => Number.parseInt(s, 10));
-      break;
     case "--ca-dkg-transcript-hash":
       caDkgTranscriptHash = args[++i];
       break;
@@ -40,7 +41,13 @@ for (let i = 0; i < args.length; i += 1) {
     case "--help":
     case "-h":
       console.log(
-        "usage: local_vault_ek_derive --coordinator-url URL --dkg-epoch N [--selected-slots 0,1,2,3,4] [--ca-dkg-transcript-hash HEX] [--request-id ID] [--bearer-token TOKEN]",
+        "usage: local_vault_ek_derive --coordinator-url URL --dkg-epoch N " +
+          "[--ca-dkg-transcript-hash HEX] [--request-id ID] [--bearer-token TOKEN]\n" +
+          "\n" +
+          "Exit codes:\n" +
+          "  0   success — prints { vaultEk, finalTranscriptHash, requestId, selectedSlots, transcriptPath }\n" +
+          `  ${EXIT_MPC_UNAVAILABLE}  MP-SPDZ runtime unavailable — run \`npm run mpc:bootstrap && npm run mpc:check\`, then retry.\n` +
+          `  ${PHASE2_EXIT_LOCK_CONTENTION}  another vault_ek derivation is in progress; retry shortly\n`,
       );
       process.exit(0);
     default:
@@ -73,7 +80,6 @@ if (!coordinatorUrl) {
 
 const payload = { dkgEpoch };
 if (requestId) payload.requestId = requestId;
-if (selectedSlots) payload.selectedSlots = selectedSlots;
 if (caDkgTranscriptHash) payload.caDkgTranscriptHash = caDkgTranscriptHash;
 
 const headers = { "content-type": "application/json" };
@@ -100,10 +106,16 @@ try {
 
 if (res.status === 503 && body?.error === "mpc_inverse_unavailable") {
   console.error(
-    "Phase 1: MP-SPDZ adapter not available — this is expected. Phase 2 will make this command succeed.",
+    "MP-SPDZ runtime unavailable — run `npm run mpc:bootstrap && npm run mpc:check`, then retry.",
   );
   process.stdout.write(`${JSON.stringify(body)}\n`);
-  process.exit(PHASE1_EXIT);
+  process.exit(EXIT_MPC_UNAVAILABLE);
+}
+
+if (res.status === 409 && body?.error === "vault_ek_derivation_in_flight") {
+  console.error("another vault_ek derivation is in progress; retry shortly");
+  process.stdout.write(`${JSON.stringify(body)}\n`);
+  process.exit(PHASE2_EXIT_LOCK_CONTENTION);
 }
 
 if (!res.ok) {
@@ -112,4 +124,12 @@ if (!res.ok) {
   process.exit(1);
 }
 
-process.stdout.write(`${JSON.stringify(body, null, 2)}\n`);
+// Phase 2 success: print structured JSON that downstream scripts can parse.
+const successOut = {
+  vaultEk: body.vaultEk,
+  finalTranscriptHash: body.finalTranscriptHash,
+  requestId: body.requestId,
+  selectedSlots: body.selectedSlots,
+  transcriptPath: body.transcriptPath,
+};
+process.stdout.write(`${JSON.stringify(successOut, null, 2)}\n`);
