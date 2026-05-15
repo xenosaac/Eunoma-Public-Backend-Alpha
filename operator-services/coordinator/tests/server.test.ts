@@ -618,4 +618,107 @@ describe("coordinator", () => {
     expect(res.json().round).toBe("round2_receive");
     await expect(store.getStatus("frost-abort")).resolves.toMatchObject({ status: "aborted" });
   });
+
+  it("returns 503 mpc_inverse_unavailable when every selected slot reports it", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server, store } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round1")) {
+          return {
+            slot,
+            ok: false,
+            statusCode: 503,
+            body: { error: "mpc_inverse_unavailable" },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-503",
+        dkgEpoch: "1",
+        caDkgTranscriptHash: h32("a"),
+      },
+    });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toMatchObject({ error: "mpc_inverse_unavailable" });
+    await expect(store.getStatus("vault-ek-503")).resolves.toMatchObject({ status: "unknown" });
+  });
+
+  it("rejects caller-supplied selectedSlots with duplicates", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (_path, _body, _roster, slot) => ({
+        slot,
+        ok: true,
+        statusCode: 200,
+        body: {},
+      }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-dup",
+        dkgEpoch: "1",
+        caDkgTranscriptHash: h32("a"),
+        selectedSlots: [0, 0, 1, 2, 3],
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("DUPLICATE_SLOT");
+  });
+
+  it("rejects caller-supplied selectedSlots with under-quorum count", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (_path, _body, _roster, slot) => ({
+        slot,
+        ok: true,
+        statusCode: 200,
+        body: {},
+      }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-quorum",
+        dkgEpoch: "1",
+        caDkgTranscriptHash: h32("a"),
+        selectedSlots: [0, 1, 2, 3],
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("UNDER_QUORUM");
+  });
+
+  it("rejects missing caDkgTranscriptHash with no_ca_dkg_v2_record_for_dkg_epoch", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (_path, _body, _roster, slot) => ({
+        slot,
+        ok: true,
+        statusCode: 200,
+        body: {},
+      }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-missing-ca",
+        dkgEpoch: "1",
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("no_ca_dkg_v2_record_for_dkg_epoch");
+  });
 });

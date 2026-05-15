@@ -1,6 +1,8 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import {
+  assembleVaultEkTranscript,
   DEOPERATOR_COUNT,
+  DEOPERATOR_THRESHOLD,
   ForbiddenPlaintextFieldError,
   caDkgV2RosterHash,
   frostDkgV2RosterHash,
@@ -19,20 +21,25 @@ import {
   parseMpccaRoundRequest,
   parseMpccaRoundResult,
   parseSessionShareEnvelope,
+  parseVaultEkContributions,
   rosterHash,
   UnderQuorumError,
   validateCaDkgV2Roster,
   validateFrostDkgV2Roster,
   validateRoster,
+  VaultEkDerivationError,
   type CaDkgV2Roster,
   type DeoperatorRoster,
   type FrostDkgV2Roster,
   type FrostRound1Broadcast,
   type FrostRound2Envelope,
   type SessionShareEnvelope,
+  type VaultEkContribution,
 } from "@eunoma/deop-protocol";
 import { sha256, bytesToHex } from "@eunoma/shared";
 import { HttpError, requireBearer } from "@eunoma/shared";
+import { mkdir, rename, writeFile, chmod } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
 
 export interface ProxyForwardResult {
@@ -68,6 +75,7 @@ export interface CoordinatorServerOptions {
   store?: CoordinatorStore;
   forwarder?: SessionShareForwarder;
   singleNodeForwarder?: SingleNodeForwarder;
+  stateRoot?: string;
 }
 
 export function buildCoordinatorServer(
@@ -285,6 +293,203 @@ export function buildCoordinatorServer(
       await store.markAborted(typeof maybeRequestId === "string" ? maybeRequestId : "ca-dkg-v2-unknown");
       if (err instanceof ForbiddenPlaintextFieldError) {
         return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  server.post("/v2/derive/vault_ek/start", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+
+      const dkgEpoch = typeof raw.dkgEpoch === "string" && raw.dkgEpoch.length > 0
+        ? raw.dkgEpoch
+        : undefined;
+      if (!dkgEpoch || !/^[0-9]+$/.test(dkgEpoch)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "dkgEpoch must be a non-empty decimal string",
+        });
+      }
+      if (dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          message: `request.dkgEpoch ${dkgEpoch} does not match caDkgV2Roster.dkgEpoch ${dkgRoster.dkgEpoch}`,
+        });
+      }
+      const caDkgTranscriptHashInput = raw.caDkgTranscriptHash;
+      if (typeof caDkgTranscriptHashInput !== "string" || caDkgTranscriptHashInput.length === 0) {
+        return reply.code(400).send({
+          error: "no_ca_dkg_v2_record_for_dkg_epoch",
+          message:
+            "caDkgTranscriptHash is required for /v2/derive/vault_ek/start; supply the value from the CA DKG V2 artifact",
+        });
+      }
+
+      requestId =
+        typeof raw.requestId === "string" && raw.requestId.length > 0
+          ? raw.requestId
+          : `vault-ek-derive-${Date.now()}`;
+      const selectedSlots = resolveSelectedSlots(raw.selectedSlots);
+      const selectionRationale =
+        Array.isArray(raw.selectedSlots) ? "caller-supplied" : "lowest-5-active";
+
+      const roundResults: Array<{ slot: number; body: Record<string, unknown> }> = [];
+      for (const slot of selectedSlots) {
+        const forwarded = await singleNodeForwarder(
+          "/worker/v2/derive/vault_ek/round1",
+          {
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashInput,
+            rosterHash: dkgRosterHash,
+            selectedSlots,
+            selfSlot: slot,
+          },
+          dkgRoster,
+          slot,
+        );
+        if (
+          forwarded.statusCode === 503 &&
+          forwarded.body &&
+          typeof forwarded.body === "object" &&
+          (forwarded.body as Record<string, unknown>).error === "mpc_inverse_unavailable"
+        ) {
+          return reply
+            .code(503)
+            .send({ error: "mpc_inverse_unavailable", slot, requestId });
+        }
+        if (!forwarded.ok || !forwarded.body) {
+          return reply.code(502).send({
+            error: "round1_forward_failed",
+            slot,
+            statusCode: forwarded.statusCode,
+            requestId,
+          });
+        }
+        roundResults.push({
+          slot,
+          body: forwarded.body as Record<string, unknown>,
+        });
+      }
+
+      const contributions: VaultEkContribution[] = parseVaultEkContributions(
+        roundResults.map((item) => item.body),
+      );
+
+      const transcript = assembleVaultEkTranscript({
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashInput,
+        selectedSlots,
+        rosterHash: dkgRosterHash,
+        contributions,
+        roster: dkgRoster,
+      });
+
+      const verifierSlot = selectedSlots[0];
+      const verifyForwarded = await singleNodeForwarder(
+        "/worker/v2/derive/vault_ek/verify",
+        {
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          rosterHash: dkgRosterHash,
+          selectedSlots,
+          contributions: transcript.contributions,
+        },
+        dkgRoster,
+        verifierSlot,
+      );
+      if (
+        verifyForwarded.statusCode === 503 &&
+        verifyForwarded.body &&
+        typeof verifyForwarded.body === "object" &&
+        (verifyForwarded.body as Record<string, unknown>).error === "mpc_inverse_unavailable"
+      ) {
+        return reply
+          .code(503)
+          .send({ error: "mpc_inverse_unavailable", slot: verifierSlot, requestId });
+      }
+      if (!verifyForwarded.ok || !verifyForwarded.body) {
+        return reply.code(502).send({
+          error: "verify_forward_failed",
+          slot: verifierSlot,
+          statusCode: verifyForwarded.statusCode,
+          requestId,
+        });
+      }
+      const verifyBody = verifyForwarded.body as Record<string, unknown>;
+      const vaultEk = typeof verifyBody.vaultEk === "string" ? verifyBody.vaultEk : undefined;
+      const finalTranscriptHash =
+        typeof verifyBody.finalTranscriptHash === "string"
+          ? verifyBody.finalTranscriptHash
+          : undefined;
+      if (!vaultEk || !finalTranscriptHash) {
+        return reply.code(502).send({
+          error: "verify_returned_incomplete",
+          slot: verifierSlot,
+          requestId,
+        });
+      }
+
+      const transcriptArtifact = {
+        scheme: "vault_ek_derivation_v1" as const,
+        dkgEpoch,
+        caDkgTranscriptHash: transcript.caDkgTranscriptHash,
+        selectedSlots,
+        selectionRationale,
+        rosterHash: dkgRosterHash,
+        verifierSlot,
+        perSlotContributions: transcript.contributions,
+        vaultEk,
+        finalTranscriptHash,
+        createdAtUnixMs: Date.now(),
+      };
+
+      let transcriptPath: string | undefined;
+      if (opts.stateRoot) {
+        const dir = join(opts.stateRoot, "coordinator", "vault_ek_derivation");
+        transcriptPath = join(dir, `${dkgEpoch}__${requestId}.json`);
+        await writeTranscriptArtifactAtomic(transcriptPath, transcriptArtifact);
+      }
+      await store.recordPartialArtifact({
+        requestId,
+        sessionId: requestId,
+        rosterHash: dkgRosterHash,
+        slot: verifierSlot,
+        artifactKind: "ca-registration",
+        artifactHash: finalTranscriptHash,
+        transcriptHash: finalTranscriptHash,
+      });
+      await store.markComplete(requestId);
+
+      return reply.code(200).send({
+        accepted: true,
+        requestId,
+        dkgEpoch,
+        rosterHash: dkgRosterHash,
+        selectedSlots,
+        selectionRationale,
+        verifierSlot,
+        vaultEk,
+        finalTranscriptHash,
+        transcriptHash: finalTranscriptHash,
+        transcriptPath,
+      });
+    } catch (err) {
+      if (requestId) await store.markAborted(requestId);
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof VaultEkDerivationError) {
+        return reply.code(400).send({ error: err.code, message: err.message });
       }
       return reply.code(400).send({
         error: "invalid_request",
@@ -902,4 +1107,54 @@ function assertRosterVaultEk(actual: string, expected: string): void {
   if (actual.replace(/^0x/i, "").toLowerCase() !== expected.replace(/^0x/i, "").toLowerCase()) {
     throw new Error("vaultEk mismatch");
   }
+}
+
+function resolveSelectedSlots(value: unknown): number[] {
+  if (value === undefined || value === null) {
+    return Array.from({ length: DEOPERATOR_THRESHOLD }, (_, slot) => slot);
+  }
+  if (!Array.isArray(value)) {
+    throw new VaultEkDerivationError(
+      "INVALID_CONTRIBUTION_SHAPE",
+      "selectedSlots must be an array of slot numbers",
+    );
+  }
+  if (value.length !== DEOPERATOR_THRESHOLD) {
+    throw new VaultEkDerivationError(
+      "UNDER_QUORUM",
+      `selectedSlots must contain exactly ${DEOPERATOR_THRESHOLD} entries, got ${value.length}`,
+    );
+  }
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (const entry of value) {
+    if (!Number.isInteger(entry) || (entry as number) < 0 || (entry as number) >= DEOPERATOR_COUNT) {
+      throw new VaultEkDerivationError(
+        "UNKNOWN_SLOT",
+        `selectedSlots entry ${entry} is not a deoperator slot`,
+      );
+    }
+    if (seen.has(entry as number)) {
+      throw new VaultEkDerivationError(
+        "DUPLICATE_SLOT",
+        `duplicate selectedSlots entry ${entry}`,
+      );
+    }
+    seen.add(entry as number);
+    out.push(entry as number);
+  }
+  out.sort((a, b) => a - b);
+  return out;
+}
+
+async function writeTranscriptArtifactAtomic(
+  path: string,
+  value: unknown,
+): Promise<void> {
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, path);
 }
