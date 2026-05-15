@@ -118,17 +118,34 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
             ));
         }
 
-        // Defense in depth: recompute λ_i for our player ordinal and reject mismatches.
+        // Defense in depth: recompute ALL N λ values locally from sorted_slots (which is
+        // already cross-checked against rosterHash and selected_slots binding upstream). Reject
+        // if any supplied value differs from the locally-recomputed one. The MPC public input
+        // file is written from the LOCAL values regardless — so even if the comparison logic
+        // has a bug, MASCOT never opens a value driven by attacker-supplied coefficients.
+        //
+        // Also verify the player's own slot/ordinal binding: sorted_slots[player_id] must
+        // equal self_slot. Otherwise a malicious coordinator could give us an `selected_slots`
+        // permutation where our ordinal corresponds to someone else's lambda.
         let mut sorted_slots = ctx.selected_slots.clone();
         sorted_slots.sort_unstable();
-        let expected_lambda = compute_lagrange_coefficient_at_zero(ctx.player_id, &sorted_slots)?;
-        let supplied_lambda = scalar_from_hex(&ctx.lagrange_coefficients_hex[ctx.player_id])?;
-        if expected_lambda != supplied_lambda {
-            return Err(AdapterError::InvalidInput(
-                "lagrange_coefficient_mismatch".to_string(),
-            ));
+        if sorted_slots[ctx.player_id] != ctx.self_slot {
+            return Err(AdapterError::InvalidInput(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                ctx.player_id, sorted_slots[ctx.player_id], ctx.self_slot
+            )));
         }
-        let self_lambda_decimal = scalar_to_decimal(&supplied_lambda);
+        let mut local_lambdas: Vec<Scalar> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for ordinal in 0..DEOPERATOR_THRESHOLD {
+            let lambda = compute_lagrange_coefficient_at_zero(ordinal, &sorted_slots)?;
+            let supplied = scalar_from_hex(&ctx.lagrange_coefficients_hex[ordinal])?;
+            if supplied != lambda {
+                return Err(AdapterError::InvalidInput(
+                    "lagrange_coefficient_mismatch".to_string(),
+                ));
+            }
+            local_lambdas.push(lambda);
+        }
 
         // Allocate session directory. Combining request_id and session_id namespaces the
         // workspace so that two concurrent calls — even sharing a session_id — get distinct
@@ -151,17 +168,19 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         set_dir_mode_700(&player_data_dir)?;
 
         // Write Programs/Public-Input/<program> with the 5 λ values in player-ordinal order.
+        // CRITICAL: feed MP-SPDZ the LOCALLY-RECOMPUTED lambdas, not the coordinator-supplied
+        // ones. The comparison loop above is defense-in-depth; this is the actual gate.
         let public_input_dir = session_dir.join("Programs").join("Public-Input");
         fs::create_dir_all(&public_input_dir)
             .map_err(|e| AdapterError::Internal(format!("create Public-Input: {e}")))?;
         let mut public_input = String::new();
-        for hex in &ctx.lagrange_coefficients_hex {
-            let s = scalar_from_hex(hex)?;
-            public_input.push_str(&scalar_to_decimal(&s));
+        for lambda in &local_lambdas {
+            public_input.push_str(&scalar_to_decimal(lambda));
             public_input.push('\n');
         }
         fs::write(public_input_dir.join(&self.program_name), public_input.as_bytes())
             .map_err(|e| AdapterError::Internal(format!("write Public-Input: {e}")))?;
+        let self_lambda_decimal = scalar_to_decimal(&local_lambdas[ctx.player_id]);
 
         // Symlink the compiled bytecode + schedule + compiled-VAR file into the session dir so
         // mascot-party.x finds them under cwd = session_dir.

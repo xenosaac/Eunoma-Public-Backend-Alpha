@@ -112,6 +112,88 @@ fn lagrange_coefficient_recompute_mismatch_rejected() {
 }
 
 #[test]
+fn lagrange_other_player_mismatch_also_rejected() {
+    // Codex P1 #1: it is not enough to validate only OUR lambda. A malicious coordinator
+    // could fabricate matching `lagrange_coefficients[player_id]` for THIS worker while
+    // supplying garbage for the OTHER ordinals, then drive MASCOT to open a forged `m`. The
+    // adapter must recompute ALL N lambdas locally and reject if ANY supplied value differs.
+    let home = temp_dir("lagrange-other-mismatch-home");
+    let adapter = dummy_adapter_for_validation(home);
+    let work_dir = temp_dir("lagrange-other-mismatch-work");
+    let sorted_slots: Vec<usize> = vec![0, 1, 2, 3, 4];
+    let truth: Vec<Scalar> = (0..5)
+        .map(|i| lagrange_coefficient_at_zero(i, &sorted_slots))
+        .collect();
+    let mut supplied: Vec<String> = truth.iter().map(scalar_hex).collect();
+    // Our own lambda (player_id=2) stays correct; flip a single byte on ordinal 4's.
+    let mut tampered_bytes = truth[4].to_bytes();
+    tampered_bytes[0] ^= 0x01;
+    supplied[4] = tampered_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    let ctx = InversionContext {
+        dkg_epoch: "1".to_string(),
+        ca_dkg_transcript_hash: "00".repeat(32),
+        selected_slots: sorted_slots.clone(),
+        self_slot: 2,
+        roster_hash: "00".repeat(32),
+        request_id: "req".to_string(),
+        session_id: "sess".to_string(),
+        work_dir,
+        peer_addresses: sorted_slots
+            .iter()
+            .map(|s| format!("127.0.0.1:{}", 14000 + s))
+            .collect(),
+        player_id: 2,
+        lagrange_coefficients_hex: supplied,
+    };
+    let err = adapter
+        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .expect_err("other-player lagrange tampering must reject");
+    assert!(
+        matches!(&err, AdapterError::InvalidInput(msg) if msg == "lagrange_coefficient_mismatch"),
+        "expected lagrange_coefficient_mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn player_id_self_slot_mismatch_rejected() {
+    // Codex P1 #1: sorted_slots[player_id] MUST equal self_slot. Otherwise a coordinator
+    // could give worker slot=2 a request claiming player_id=4 (pointing at slot 4's lambda)
+    // and the adapter would happily run MASCOT under the wrong ordinal.
+    let home = temp_dir("self-slot-mismatch-home");
+    let adapter = dummy_adapter_for_validation(home);
+    let work_dir = temp_dir("self-slot-mismatch-work");
+    let sorted_slots: Vec<usize> = vec![0, 1, 2, 3, 4];
+    let lagrange: Vec<String> = (0..5)
+        .map(|i| scalar_hex(&lagrange_coefficient_at_zero(i, &sorted_slots)))
+        .collect();
+    // Player_id=4 but self_slot=2: sorted_slots[4]=4 ≠ 2 → must reject.
+    let ctx = InversionContext {
+        dkg_epoch: "1".to_string(),
+        ca_dkg_transcript_hash: "00".repeat(32),
+        selected_slots: sorted_slots.clone(),
+        self_slot: 2,
+        roster_hash: "00".repeat(32),
+        request_id: "req".to_string(),
+        session_id: "sess".to_string(),
+        work_dir,
+        peer_addresses: sorted_slots
+            .iter()
+            .map(|s| format!("127.0.0.1:{}", 14000 + s))
+            .collect(),
+        player_id: 4,
+        lagrange_coefficients_hex: lagrange,
+    };
+    let err = adapter
+        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .expect_err("player_id/self_slot mismatch must reject");
+    assert!(
+        matches!(&err, AdapterError::InvalidInput(msg) if msg.contains("self_slot_player_id_mismatch")),
+        "expected self_slot_player_id_mismatch, got {err:?}"
+    );
+}
+
+#[test]
 fn session_dir_collision_resolved_by_request_id() {
     // Two contexts with the SAME session_id but DIFFERENT request_id must allocate distinct
     // work dirs under work_dir/mpc-sessions/. The check is constructive: we run the adapter
