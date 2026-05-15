@@ -2,24 +2,38 @@
   "name": "eunoma-operator-services",
   "private": true,
   "version": "0.1.0",
-  "description": "Off-chain operator services (main + partner) for the Eunoma shielded bridge on Aptos.",
+  "description": "V2 off-chain deoperator services for the Eunoma shielded bridge on Aptos.",
   "workspaces": [
     "shared",
-    "main-operator",
-    "partner-operator"
+    "deop-protocol",
+    "crypto-worker-client",
+    "deoperator-node",
+    "coordinator",
+    "relayer"
   ],
   "scripts": {
-    "build": "npm run -w @eunoma/shared build && npm run -w @eunoma/main-operator build && npm run -w @eunoma/partner-operator build",
-    "test": "npm run -w @eunoma/shared test && npm run -w @eunoma/main-operator test && npm run -w @eunoma/partner-operator test",
-    "tsc": "npm run -w @eunoma/shared tsc && npm run -w @eunoma/main-operator tsc && npm run -w @eunoma/partner-operator tsc"
+    "build": "npm run -w @eunoma/shared build && npm run -w @eunoma/deop-protocol build && npm run -w @eunoma/crypto-worker-client build && npm run -w @eunoma/deoperator-node build && npm run -w @eunoma/coordinator build && npm run -w @eunoma/relayer build",
+    "test": "npm run build && npm run -w @eunoma/shared test && npm run -w @eunoma/deop-protocol test && npm run -w @eunoma/crypto-worker-client test && npm run -w @eunoma/deoperator-node test && npm run -w @eunoma/coordinator test && npm run -w @eunoma/relayer test",
+    "tsc": "npm run build",
+    "local:cluster:config": "npm run build && node scripts/local_cluster_config.mjs",
+    "local:cluster:start": "node scripts/local_cluster_start.mjs",
+    "local:dkg:init": "npm run local:cluster:config",
+    "local:hpke:init": "node scripts/local_ca_dkg_v2_hpke_init.mjs",
+    "local:ca-dkg:v2": "node scripts/local_ca_dkg_v2.mjs",
+    "local:ca:registration": "node scripts/local_ca_registration.mjs",
+    "local:online-frost-dkg-smoke": "node scripts/local_frost_dkg_v2.mjs",
+    "local:smoke": "node scripts/testnet_e2e.mjs",
+    "mpc:bootstrap": "node scripts/mpc_spdz_bootstrap.mjs",
+    "mpc:check": "node scripts/mpc_spdz_check.mjs",
+    "testnet:smoke": "node scripts/testnet_e2e_fail_closed.mjs",
+    "testnet:vault:init": "node scripts/testnet_vault_init.mjs",
+    "testnet:e2e": "node scripts/testnet_e2e_fail_closed.mjs",
+    "privacy:scan": "node -e \"const {spawnSync}=require('node:child_process'); const terms=[['VAULT','_DECRYPTION','_KEY','_HEX'].join(''),['disclosed','_amount'].join(''),['deposit','_blind'].join(''),['withdraw','_blind'].join(''),['/','v1','/'].join(''),['main','_operator','_index'].join(''),['main','-operator'].join(''),['partner','-operator'].join('')].join('|'); const r=spawnSync('rg',['-n',terms,'shared','deop-protocol','crypto-worker-client','deoperator-node','coordinator','relayer'],{stdio:'inherit'}); process.exit(r.status===1?0:(r.status??1));\""
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
-  },
-  "dependencies": {
-    "ajv": "^8.17.1"
   }
 }
