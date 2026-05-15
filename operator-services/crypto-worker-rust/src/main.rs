@@ -21,6 +21,11 @@ use eunoma_crypto_worker::local_state::{
     default_state_dir, init_frost_local, state_summary, FrostCommitmentInput,
     FrostSignatureShareInput,
 };
+use eunoma_crypto_worker::mpc_inverse_adapter::UnavailableMpcInverseAdapter;
+use eunoma_crypto_worker::vault_ek_derivation_v2::{
+    run_round1 as run_vault_ek_round1, run_verify as run_vault_ek_verify, Round1Request,
+    VerifyRequest,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -109,6 +114,8 @@ async fn main() {
         )
         .route("/worker/v2/frost/sign/partial", post(frost_partial_sign))
         .route("/worker/v2/frost/sign/aggregate", post(frost_aggregate))
+        .route("/worker/v2/derive/vault_ek/round1", post(vault_ek_round1))
+        .route("/worker/v2/derive/vault_ek/verify", post(vault_ek_verify))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -811,6 +818,37 @@ async fn ca_registration_aggregate(
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => worker_error_response(err),
     }
+}
+
+async fn vault_ek_round1(
+    State(state): State<AppState>,
+    Json(body): Json<Round1Request>,
+) -> (StatusCode, Json<Value>) {
+    match run_vault_ek_round1(&state.state_dir, &body, &UnavailableMpcInverseAdapter) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => vault_ek_error_response(err),
+    }
+}
+
+async fn vault_ek_verify(Json(body): Json<VerifyRequest>) -> (StatusCode, Json<Value>) {
+    match run_vault_ek_verify(&body) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => vault_ek_error_response(err),
+    }
+}
+
+fn vault_ek_error_response(
+    err: eunoma_crypto_worker::WorkerError,
+) -> (StatusCode, Json<Value>) {
+    if let eunoma_crypto_worker::WorkerError::NotImplemented(msg) = &err {
+        if *msg == "mpc_inverse_unavailable" {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "mpc_inverse_unavailable" })),
+            );
+        }
+    }
+    worker_error_response(err)
 }
 
 fn worker_error_response(

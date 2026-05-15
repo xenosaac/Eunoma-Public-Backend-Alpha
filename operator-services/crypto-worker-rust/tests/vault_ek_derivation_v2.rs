@@ -218,7 +218,95 @@ fn round1_with_unavailable_adapter_returns_not_implemented() {
         self_slot: 0,
     };
     let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
-    assert!(matches!(err, WorkerError::NotImplemented(msg) if msg == "mpc_inverse_unavailable"));
+    assert!(matches!(&err, WorkerError::NotImplemented(msg) if *msg == "mpc_inverse_unavailable"));
+}
+
+/// Subprocess-level integration test: builds the binary, launches it on a free port with
+/// CRYPTO_WORKER_STATE_DIR pointing at a synthetic share, POSTs /worker/v2/derive/vault_ek/round1,
+/// asserts HTTP 503 + body { "error": "mpc_inverse_unavailable" }.
+#[test]
+fn http_round1_returns_503_with_default_adapter() {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let bin_status = std::process::Command::new(&cargo)
+        .current_dir(manifest)
+        .args(["build", "--bin", "eunoma-crypto-worker"])
+        .status()
+        .expect("cargo build");
+    assert!(bin_status.success(), "cargo build failed");
+
+    let exe = manifest
+        .join("target")
+        .join("debug")
+        .join("eunoma-crypto-worker");
+    assert!(exe.exists(), "binary not found at {}", exe.display());
+
+    let state_dir = temp_state_dir("http-round1");
+    write_synthetic_share(&state_dir, 0);
+
+    // pick an ephemeral port
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut child = std::process::Command::new(&exe)
+        .env("CRYPTO_WORKER_HOST", "127.0.0.1")
+        .env("CRYPTO_WORKER_PORT", port.to_string())
+        .env("CRYPTO_WORKER_SLOT", "0")
+        .env("CRYPTO_WORKER_STATE_DIR", state_dir.to_string_lossy().to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn worker");
+
+    // Wait up to 5 s for the listener to come up.
+    let mut ready = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !ready {
+        let _ = child.kill();
+        panic!("worker did not bind on port {port}");
+    }
+
+    let body = serde_json::json!({
+        "dkgEpoch": DKG_EPOCH,
+        "caDkgTranscriptHash": ca_dkg_transcript_hex(),
+        "rosterHash": roster_hash_hex(),
+        "selectedSlots": [0, 1, 2, 3, 4],
+        "selfSlot": 0,
+    });
+    let result = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "-X",
+            "POST",
+            "-H",
+            "content-type: application/json",
+            "-w",
+            "\nHTTPSTATUS:%{http_code}",
+            "-d",
+            &serde_json::to_string(&body).unwrap(),
+            &format!("http://127.0.0.1:{port}/worker/v2/derive/vault_ek/round1"),
+        ])
+        .output()
+        .expect("curl");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+    let (body_str, status_line) = stdout
+        .rsplit_once("HTTPSTATUS:")
+        .unwrap_or((stdout.as_str(), ""));
+    let status: u16 = status_line.trim().parse().unwrap_or(0);
+    assert_eq!(status, 503, "expected 503, got {status}; body={body_str}");
+    let parsed: serde_json::Value = serde_json::from_str(body_str.trim()).expect("json body");
+    assert_eq!(parsed["error"], "mpc_inverse_unavailable");
 }
 
 #[test]
