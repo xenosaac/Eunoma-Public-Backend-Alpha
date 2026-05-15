@@ -3352,6 +3352,11 @@ pub mod vault_ek_derivation_v2 {
             .ok_or_else(|| WorkerError::InvalidRequest("invalid Ristretto point".to_string()))
     }
 
+    /// Codex P2 #9: parse a 32-byte hex scalar and REJECT non-canonical encodings
+    /// (bytes >= q). Schnorr `s`, mpc_open_m, and on-disk dk_share values are all serialized
+    /// via `Scalar::to_bytes()` which is always canonical; any input that fails the canonical
+    /// check is malformed or tampered. Use `Scalar::from_canonical_bytes(...).into_option()`
+    /// rather than the silently-reducing `from_bytes_mod_order`.
     fn scalar_from_hex(hex: &str) -> WorkerResult<Scalar> {
         let bytes = hex_decode(hex)?;
         if bytes.len() != 32 {
@@ -3362,7 +3367,11 @@ pub mod vault_ek_derivation_v2 {
         }
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&bytes);
-        Ok(Scalar::from_bytes_mod_order(buf))
+        Scalar::from_canonical_bytes(buf)
+            .into_option()
+            .ok_or_else(|| {
+                WorkerError::InvalidRequest("scalar bytes are not canonical (>= Q)".to_string())
+            })
     }
 
     fn normalize_hex(hex: &str, expected_bytes: usize) -> WorkerResult<String> {

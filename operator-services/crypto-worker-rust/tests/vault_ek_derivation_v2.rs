@@ -1064,6 +1064,59 @@ fn vault_ek_passes_registration_sigma() {
     .expect("verify_registration_proof must return Ok(()) — this is the killer assertion");
 }
 
+#[test]
+fn verify_rejects_non_canonical_schnorr_s() {
+    // Codex P2 #9: Schnorr `s` MUST decode canonically — Scalar::from_canonical_bytes
+    // returns None for bytes >= q, so silently mod-reducing (the old behavior) would accept
+    // a non-canonical s that has a different effective value than what the signer published.
+    let fixed = det_scalar(0x5C5C);
+    let sorted_slots = vec![0_usize, 1, 2, 3, 4];
+    let mut contributions = Vec::new();
+    let h = h_point();
+    let m_hex = mock_mpc_open_m_hex();
+    let h_r_hex = mock_h_r_for_q(&fixed);
+    for (idx, slot) in sorted_slots.iter().enumerate() {
+        let point = h * fixed;
+        let h_contribution_hex = compressed_hex(&point);
+        let worker_hash = worker_transcript_hash(
+            DKG_EPOCH,
+            &ca_dkg_transcript_hex(),
+            &roster_hash_hex(),
+            &sorted_slots,
+            *slot,
+            &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
+        );
+        let mut proof = schnorr_pok(&fixed, &point, &worker_hash).expect("schnorr_pok");
+        if idx == 2 {
+            // Replace `s` with all-0xFF — well above q in little-endian.
+            proof.s = "ff".repeat(32);
+        }
+        contributions.push(ContributionInput {
+            slot: *slot,
+            h_contribution: h_contribution_hex,
+            schnorr_proof: proof,
+            worker_transcript_hash: worker_hash,
+            h_r: h_r_hex.clone(),
+            mpc_open_m: m_hex.clone(),
+        });
+    }
+    let request = VerifyRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: sorted_slots,
+        contributions,
+    };
+    let err = run_verify(&request).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::InvalidRequest(msg) if msg.contains("not canonical"))
+            || matches!(&err, WorkerError::Crypto(msg) if msg.contains("schnorr")),
+        "expected non-canonical scalar rejection, got {err:?}"
+    );
+}
+
 // === Codex P1 #4 tests: bind h_q_i to (h_r_i, mpc_open_m) ===
 
 #[test]
