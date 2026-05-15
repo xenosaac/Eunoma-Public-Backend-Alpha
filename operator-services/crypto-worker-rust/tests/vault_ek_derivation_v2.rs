@@ -175,6 +175,26 @@ fn temp_state_dir(label: &str) -> PathBuf {
     path
 }
 
+/// Phase 2 extension fields for `Round1Request`. The Mock adapters in this test file do not
+/// consume them, but the new struct shape requires non-defaulted values, so tests use this
+/// helper to keep the round1 construction concise. Real production callers always supply
+/// fully-populated values via the coordinator's TS encoder.
+fn phase2_round1_extras(
+    selected_slots: &[usize],
+    self_slot: usize,
+) -> (usize, Vec<String>, Vec<String>) {
+    let mut sorted = selected_slots.to_vec();
+    sorted.sort_unstable();
+    let player_id = sorted.iter().position(|s| *s == self_slot).unwrap_or(0);
+    // Dummy peers + lagrange coefs — adapters in this file do not consume them.
+    let peers: Vec<String> = sorted
+        .iter()
+        .map(|s| format!("127.0.0.1:{}", 14000 + s))
+        .collect();
+    let lagrange: Vec<String> = sorted.iter().map(|_| "00".repeat(32)).collect();
+    (player_id, peers, lagrange)
+}
+
 #[test]
 fn schnorr_pok_roundtrip_with_arbitrary_scalar() {
     let secret = det_scalar(42);
@@ -212,12 +232,19 @@ fn schnorr_pok_rejects_tampered_worker_hash() {
 #[test]
 fn unavailable_adapter_returns_mp_spdz_unavailable() {
     let adapter = UnavailableMpcInverseAdapter;
+    let (player_id, peers, lagrange) = phase2_round1_extras(&[0, 1, 2, 3, 4], 0);
     let ctx = InversionContext {
         dkg_epoch: DKG_EPOCH.to_string(),
         ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
         selected_slots: vec![0, 1, 2, 3, 4],
         self_slot: 0,
         roster_hash: roster_hash_hex(),
+        request_id: "req".to_string(),
+        session_id: "sess".to_string(),
+        work_dir: PathBuf::from("/tmp"),
+        peer_addresses: peers,
+        player_id,
+        lagrange_coefficients_hex: lagrange,
     };
     let result = adapter.compute_inverse_share(&Scalar::ONE, &ctx);
     assert_eq!(result, Err(AdapterError::McpSpdzNotAvailable));
@@ -227,12 +254,18 @@ fn unavailable_adapter_returns_mp_spdz_unavailable() {
 fn round1_with_unavailable_adapter_returns_not_implemented() {
     let state_dir = temp_state_dir("unavailable");
     write_synthetic_share(&state_dir, 0);
+    let (player_id, peers, lagrange) = phase2_round1_extras(&[0, 1, 2, 3, 4], 0);
     let req = Round1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
         ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
         roster_hash: roster_hash_hex(),
         selected_slots: vec![0, 1, 2, 3, 4],
         self_slot: 0,
+        request_id: "req-unavail".to_string(),
+        session_id: "sess-unavail".to_string(),
+        peer_addresses: peers,
+        player_id,
+        lagrange_coefficients: lagrange,
     };
     let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
     assert!(matches!(&err, WorkerError::NotImplemented(msg) if *msg == "mpc_inverse_unavailable"));
@@ -333,12 +366,18 @@ fn round1_with_mock_adapter_succeeds_and_contribution_matches_h_mul() {
     write_synthetic_share(&state_dir, 2);
     let inv_share = det_scalar(0xABCD);
     let adapter = MockFixedScalarAdapter { scalar: inv_share };
+    let (player_id, peers, lagrange) = phase2_round1_extras(&[0, 1, 2, 3, 4], 2);
     let req = Round1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
         ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
         roster_hash: roster_hash_hex(),
         selected_slots: vec![0, 1, 2, 3, 4],
         self_slot: 2,
+        request_id: "req-mock".to_string(),
+        session_id: "sess-mock".to_string(),
+        peer_addresses: peers,
+        player_id,
+        lagrange_coefficients: lagrange,
     };
     let result = run_round1(&state_dir, &req, &adapter).expect("round1 succeeds");
     assert_eq!(result.slot, 2);
@@ -564,12 +603,18 @@ fn verify_rejects_invalid_schnorr_proof() {
 #[test]
 fn round1_rejects_missing_share() {
     let state_dir = temp_state_dir("missing-share");
+    let (player_id, peers, lagrange) = phase2_round1_extras(&[0, 1, 2, 3, 4], 0);
     let req = Round1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
         ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
         roster_hash: roster_hash_hex(),
         selected_slots: vec![0, 1, 2, 3, 4],
         self_slot: 0,
+        request_id: "req-missing-share".to_string(),
+        session_id: "sess-missing-share".to_string(),
+        peer_addresses: peers,
+        player_id,
+        lagrange_coefficients: lagrange,
     };
     let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
     assert!(matches!(err, WorkerError::MissingLocalState(_)));
@@ -579,12 +624,21 @@ fn round1_rejects_missing_share() {
 fn round1_rejects_bad_quorum() {
     let state_dir = temp_state_dir("bad-quorum");
     write_synthetic_share(&state_dir, 0);
+    // For an under-quorum selected_slots, the helper would return mismatching shape — call
+    // through with a 4-entry placeholder anyway since validate_selected_slots fires first.
+    let peers: Vec<String> = (0..4).map(|i| format!("127.0.0.1:{}", 14000 + i)).collect();
+    let lagrange: Vec<String> = (0..4).map(|_| "00".repeat(32)).collect();
     let req = Round1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
         ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
         roster_hash: roster_hash_hex(),
         selected_slots: vec![0, 1, 2, 3],
         self_slot: 0,
+        request_id: "req-bad-quorum".to_string(),
+        session_id: "sess-bad-quorum".to_string(),
+        peer_addresses: peers,
+        player_id: 0,
+        lagrange_coefficients: lagrange,
     };
     let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
     assert!(matches!(err, WorkerError::InvalidRequest(_)));
@@ -789,15 +843,24 @@ fn vault_ek_passes_registration_sigma() {
     }
     let adapter = MockAdditiveInverseAdapter { by_slot };
 
-    // 6. Run round1 for each of the 5 selected slots.
+    // 6. Run round1 for each of the 5 selected slots. The MockAdditiveInverseAdapter ignores
+    // the Phase 2 fields; pass placeholder peer/lagrange values so the Round1Request shape is
+    // satisfied. Production lagrange-validation lives in MpcSpdzInverseAdapter (not the mock),
+    // so the validation logic does not gate this test.
     let mut contributions: Vec<ContributionInput> = Vec::with_capacity(5);
-    for slot in &selected {
+    for (ordinal, slot) in selected.iter().enumerate() {
+        let (_player_id, peers, lagrange) = phase2_round1_extras(&selected, *slot);
         let req = Round1Request {
             dkg_epoch: dkg_epoch.to_string(),
             ca_dkg_transcript_hash: ca_dkg_transcript.clone(),
             roster_hash: roster_hash.clone(),
             selected_slots: selected.to_vec(),
             self_slot: *slot,
+            request_id: format!("req-reg-sigma-{slot}"),
+            session_id: format!("sess-reg-sigma-{slot}"),
+            peer_addresses: peers,
+            player_id: ordinal,
+            lagrange_coefficients: lagrange,
         };
         let res = run_round1(&slot_dirs[*slot], &req, &adapter).expect("round1 succeeds");
         contributions.push(ContributionInput {

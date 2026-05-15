@@ -2742,6 +2742,7 @@ pub mod ca_dkg_v2 {
 
 pub mod mpc_inverse_adapter {
     use curve25519_dalek::scalar::Scalar;
+    use std::path::PathBuf;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum AdapterError {
@@ -2769,6 +2770,24 @@ pub mod mpc_inverse_adapter {
         pub selected_slots: Vec<usize>,
         pub self_slot: usize,
         pub roster_hash: String,
+        /// Phase 2: round1 request identifier. Combined with `session_id` to namespace the
+        /// per-call MP-SPDZ work directory.
+        pub request_id: String,
+        /// Phase 2: outer coordination session identifier. Equal to `request_id` while only
+        /// one vault_ek derivation runs at a time (see plan §"Concurrent vault_ek derivations").
+        pub session_id: String,
+        /// Phase 2: root under which the adapter creates `mpc-sessions/<request_id>__<session_id>/`.
+        /// Worker's state_dir is the natural choice.
+        pub work_dir: PathBuf,
+        /// Phase 2: ordered `host:port` for the 5 MASCOT parties — index = player ordinal
+        /// among selected_slots (sorted). Same content on every party for a given derivation.
+        pub peer_addresses: Vec<String>,
+        /// Phase 2: this party's ordinal among `selected_slots` (sorted ascending). 0..N-1.
+        /// Distinct from `self_slot`, which is the deoperator slot identity in 0..DEOPERATOR_COUNT-1.
+        pub player_id: usize,
+        /// Phase 2: hex-encoded public Lagrange coefficients at x=0 for `sorted(selected_slots)`,
+        /// in player-ordinal order. The adapter recomputes locally and rejects on mismatch.
+        pub lagrange_coefficients_hex: Vec<String>,
     }
 
     pub trait MpcInverseAdapter: Send + Sync {
@@ -2791,6 +2810,8 @@ pub mod mpc_inverse_adapter {
         }
     }
 }
+
+pub mod mpc_spdz_adapter;
 
 pub mod vault_ek_derivation_v2 {
     use crate::ca_dkg_v2::load_ca_dkg_v2_share;
@@ -2818,6 +2839,21 @@ pub mod vault_ek_derivation_v2 {
         pub roster_hash: String,
         pub selected_slots: Vec<usize>,
         pub self_slot: usize,
+        /// Phase 2: see plan §"Coordinator delta"; identifies this derivation request.
+        #[serde(default)]
+        pub request_id: String,
+        /// Phase 2: outer coordination session identifier. Coordinator sets `sessionId = requestId`.
+        #[serde(default)]
+        pub session_id: String,
+        /// Phase 2: `host:port` for each MASCOT peer (player-ordinal order).
+        #[serde(default)]
+        pub peer_addresses: Vec<String>,
+        /// Phase 2: this party's ordinal among `sorted(selected_slots)`.
+        #[serde(default)]
+        pub player_id: usize,
+        /// Phase 2: hex-encoded public Lagrange coefficients at x=0 for sorted(selected_slots).
+        #[serde(default)]
+        pub lagrange_coefficients: Vec<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2898,12 +2934,24 @@ pub mod vault_ek_derivation_v2 {
         }
 
         let dk_share = scalar_from_hex(&share.dk_share)?;
+
+        // Phase 2: derive the per-session work directory from request_id + session_id.
+        // Coordinator chooses these (both non-empty in production). For tests that omit them
+        // (e.g., MockFixedScalarAdapter / MockAdditiveInverseAdapter), the empty defaults are
+        // fine — only MpcSpdzInverseAdapter actually touches the work_dir.
+        let work_dir = state_dir.to_path_buf();
         let ctx = InversionContext {
             dkg_epoch: req.dkg_epoch.clone(),
             ca_dkg_transcript_hash: ca_dkg_transcript_hash.clone(),
             selected_slots: req.selected_slots.clone(),
             self_slot: req.self_slot,
             roster_hash: roster_hash.clone(),
+            request_id: req.request_id.clone(),
+            session_id: req.session_id.clone(),
+            work_dir,
+            peer_addresses: req.peer_addresses.clone(),
+            player_id: req.player_id,
+            lagrange_coefficients_hex: req.lagrange_coefficients.clone(),
         };
         let inv_share = adapter
             .compute_inverse_share(&dk_share, &ctx)

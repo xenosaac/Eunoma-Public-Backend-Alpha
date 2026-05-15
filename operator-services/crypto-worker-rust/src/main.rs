@@ -21,7 +21,8 @@ use eunoma_crypto_worker::local_state::{
     default_state_dir, init_frost_local, state_summary, FrostCommitmentInput,
     FrostSignatureShareInput,
 };
-use eunoma_crypto_worker::mpc_inverse_adapter::UnavailableMpcInverseAdapter;
+use eunoma_crypto_worker::mpc_inverse_adapter::{MpcInverseAdapter, UnavailableMpcInverseAdapter};
+use eunoma_crypto_worker::mpc_spdz_adapter::MpcSpdzInverseAdapter;
 use eunoma_crypto_worker::vault_ek_derivation_v2::{
     run_round1 as run_vault_ek_round1, run_verify as run_vault_ek_verify, Round1Request,
     VerifyRequest,
@@ -824,7 +825,14 @@ async fn vault_ek_round1(
     State(state): State<AppState>,
     Json(body): Json<Round1Request>,
 ) -> (StatusCode, Json<Value>) {
-    match run_vault_ek_round1(&state.state_dir, &body, &UnavailableMpcInverseAdapter) {
+    // Runtime adapter selection: when MP-SPDZ is bootstrapped (MP_SPDZ_HOME set and the
+    // vault_ek_inversion_v1 bytecode is on disk), use the real MASCOT adapter. Otherwise fail
+    // closed to the 503 path so callers know to bootstrap the runtime.
+    let adapter: Box<dyn MpcInverseAdapter> = match MpcSpdzInverseAdapter::from_env() {
+        Some(real) => Box::new(real),
+        None => Box::new(UnavailableMpcInverseAdapter),
+    };
+    match run_vault_ek_round1(&state.state_dir, &body, &*adapter) {
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => vault_ek_error_response(err),
     }

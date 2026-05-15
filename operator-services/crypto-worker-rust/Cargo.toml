@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
-curve25519-dalek = { version = "4", features = ["rand_core"] }
+curve25519-dalek = { version = "4", features = ["rand_core", "zeroize"] }
 frost-ed25519 = "3"
 hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
 rand = "0.8"
@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 rand_chacha = "0.3"
