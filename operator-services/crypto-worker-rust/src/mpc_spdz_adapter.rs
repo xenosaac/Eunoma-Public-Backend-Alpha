@@ -372,6 +372,8 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
                         let _ = fs::write(&log_stderr, &se);
                         let _ = stdout_handle.join();
                         let _ = stderr_handle.join();
+                        // Codex P2 #6: zero plaintext input file even on timeout.
+                        let _ = zeroize_file_inplace(&input_path);
                         cleanup_or_keep(&session_dir, self.keep_session_dirs);
                         r_i.zeroize();
                         return Err(AdapterError::Internal(format!(
@@ -386,6 +388,8 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
                     let _ = child.wait();
                     let _ = stdout_handle.join();
                     let _ = stderr_handle.join();
+                    // Codex P2 #6: zero plaintext input file even on try_wait error.
+                    let _ = zeroize_file_inplace(&input_path);
                     cleanup_or_keep(&session_dir, self.keep_session_dirs);
                     r_i.zeroize();
                     return Err(AdapterError::Internal(format!("try_wait: {e}")));
@@ -400,6 +404,13 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         let _ = stderr_handle.join();
         let _ = fs::write(&log_stdout, &stdout_bytes);
         let _ = fs::write(&log_stderr, &stderr_bytes);
+
+        // Codex P2 #6: overwrite the plaintext input file (containing dk_share + r_i in
+        // decimal) with zeros IMMEDIATELY after the subprocess exits, regardless of whether
+        // we keep the session dir. This prevents operators who set
+        // EUNOMA_MPC_KEEP_SESSION_DIRS=1 for debugging from accidentally preserving plaintext
+        // secrets on disk.
+        let _ = zeroize_file_inplace(&input_path);
 
         if !status.success() {
             let trail = String::from_utf8_lossy(&stderr_bytes);
@@ -570,6 +581,29 @@ fn find_open_m(stdout: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Codex P2 #6: overwrite a file's contents with zero bytes of the same length, then
+/// truncate. Used to scrub the plaintext MPC input file (dk_share + r_i decimal) after the
+/// subprocess exits — guarantees no plaintext secret survives on disk even if the operator
+/// kept the session dir for debugging.
+fn zeroize_file_inplace(path: &Path) -> Result<(), std::io::Error> {
+    use std::fs::OpenOptions;
+    let metadata = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => return Err(e),
+    };
+    let len = metadata.len() as usize;
+    let zeros = vec![0u8; len];
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.write_all(&zeros)?;
+    file.sync_all()?;
+    // Now truncate (defensive: in case the file grew, we still wrote `len` bytes of zeros).
+    let _ = OpenOptions::new().write(true).truncate(true).open(path);
+    Ok(())
 }
 
 fn write_secret_file(path: &Path, contents: &str) -> Result<(), AdapterError> {
