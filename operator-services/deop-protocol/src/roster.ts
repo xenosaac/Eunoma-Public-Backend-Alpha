@@ -1,3 +1,4 @@
+import type { HexString } from "@eunoma/shared";
 import { bytesToHex, hexToBytes, sha256, sha3_256, stableStringify } from "@eunoma/shared";
 import {
   CA_DKG_SCHEME_LOCAL,
@@ -15,6 +16,7 @@ import type {
   CaDkgV2Roster,
   DeoperatorRoster,
   FrostDkgV2Roster,
+  FrostDkgV2WorkerArtifact,
   RequestPhase,
 } from "./types.js";
 
@@ -158,6 +160,98 @@ export function frostDkgV2RosterHash(roster: FrostDkgV2Roster): string {
       })),
   };
   return bytesToHex(sha256(new TextEncoder().encode(stableStringify(canonical))));
+}
+
+export interface FrostRotationInput {
+  groupPublicKey: HexString;
+  dkgEpoch: string;
+  workerArtifacts: FrostDkgV2WorkerArtifact[];
+}
+
+export interface FrostRotationOutput {
+  roster: DeoperatorRoster;
+  rosterHash: HexString;
+  previousRosterHash: HexString;
+  previousDkgEpoch: string;
+  previousGroupPublicKey: HexString;
+}
+
+export function applyFrostRotationToRoster(
+  roster: DeoperatorRoster,
+  input: FrostRotationInput,
+): FrostRotationOutput {
+  validateRoster(roster);
+  const previousRosterHash = rosterHash(roster);
+  const previousDkgEpoch = roster.dkgEpoch;
+  const previousGroupPublicKey = normalizeHex(roster.frostGroupPubkey);
+
+  assertHexBytes("groupPublicKey", input.groupPublicKey, ED25519_PUBLIC_KEY_BYTES);
+  if (!/^[0-9]+$/.test(input.dkgEpoch)) {
+    throw new Error(`dkgEpoch must be a decimal string: ${input.dkgEpoch}`);
+  }
+  if (!/^[0-9]+$/.test(roster.dkgEpoch)) {
+    throw new Error(`existing roster.dkgEpoch must be a decimal string: ${roster.dkgEpoch}`);
+  }
+  if (Number(input.dkgEpoch) <= Number(roster.dkgEpoch)) {
+    throw new Error(
+      `new dkgEpoch ${input.dkgEpoch} must be strictly greater than current ${roster.dkgEpoch}`,
+    );
+  }
+  if (input.workerArtifacts.length !== DEOPERATOR_COUNT) {
+    throw new Error(
+      `workerArtifacts must contain ${DEOPERATOR_COUNT} entries, got ${input.workerArtifacts.length}`,
+    );
+  }
+  const sharesBySlot = new Map<number, string>();
+  for (const artifact of input.workerArtifacts) {
+    if (!Number.isInteger(artifact.slot) || artifact.slot < 0 || artifact.slot >= DEOPERATOR_COUNT) {
+      throw new Error(`invalid workerArtifacts slot: ${artifact.slot}`);
+    }
+    if (sharesBySlot.has(artifact.slot)) {
+      throw new Error(`duplicate workerArtifacts slot: ${artifact.slot}`);
+    }
+    assertHexBytes(
+      `workerArtifacts[slot=${artifact.slot}].frostVerifyingShare`,
+      artifact.frostVerifyingShare,
+      ED25519_PUBLIC_KEY_BYTES,
+    );
+    sharesBySlot.set(artifact.slot, normalizeHex(artifact.frostVerifyingShare));
+  }
+  for (let slot = 0; slot < DEOPERATOR_COUNT; slot += 1) {
+    if (!sharesBySlot.has(slot)) {
+      throw new Error(`workerArtifacts missing slot ${slot}`);
+    }
+  }
+
+  const rotated: DeoperatorRoster = {
+    operatorSetVersion: roster.operatorSetVersion,
+    dkgEpoch: input.dkgEpoch,
+    caDkgScheme: roster.caDkgScheme,
+    threshold: roster.threshold,
+    nodes: roster.nodes.map((node) => ({
+      slot: node.slot,
+      nodeId: node.nodeId,
+      endpoint: node.endpoint,
+      hpkePublicKey: node.hpkePublicKey,
+      transcriptPublicKey: node.transcriptPublicKey,
+      frostVerifyingShare:
+        sharesBySlot.get(node.slot) ??
+        (() => {
+          throw new Error(`missing rotated share for slot ${node.slot}`);
+        })(),
+    })),
+    frostGroupPubkey: normalizeHex(input.groupPublicKey),
+    vaultEk: roster.vaultEk,
+    circuitVersions: { ...roster.circuitVersions },
+  };
+  validateRoster(rotated);
+  return {
+    roster: rotated,
+    rosterHash: rosterHash(rotated),
+    previousRosterHash,
+    previousDkgEpoch,
+    previousGroupPublicKey,
+  };
 }
 
 export function assertProductionCaDkgScheme(roster: DeoperatorRoster): void {
