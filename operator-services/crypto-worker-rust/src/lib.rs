@@ -2997,11 +2997,10 @@ pub mod frost_dkg_v2 {
 
         let round1_secret_json = to_json_value(&round1_secret)?;
         let round1_package_json = to_json_value(&round1_package)?;
-        let package_hex = json_string_field(&round1_package_json, |v| {
-            v.as_str().map(ToString::to_string)
-        })
-        .unwrap_or_else(|| canonical_json_string(&round1_package_json).unwrap_or_default());
-        let package_hash = package_hash_for(&round1_package_json)?;
+        let package_bytes =
+            serde_json::to_vec(&round1_package_json).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let package_hex = hex_encode(&package_bytes);
+        let package_hash = sha256_hex(&package_bytes);
 
         let round1_self = Round1Self {
             slot: req.slot,
@@ -3488,7 +3487,10 @@ pub mod frost_dkg_v2 {
             assert_slot(broadcast.slot)?;
             expect_hex_len(&broadcast.package_hash, 32)?;
             expect_hex_len(&broadcast.transcript_hash, 32)?;
-            let computed_hash = package_hash_for(&parse_round1_package_value(&broadcast.package_hex)?)?;
+            let package_bytes = hex_decode(&broadcast.package_hex)?;
+            let _value: Value = serde_json::from_slice(&package_bytes)
+                .map_err(|err| WorkerError::Serde(err.to_string()))?;
+            let computed_hash = sha256_hex(&package_bytes);
             if computed_hash != normalize_hex(&broadcast.package_hash)? {
                 return Err(WorkerError::InvalidRequest(format!(
                     "round1 broadcast packageHash mismatch for slot {}",
@@ -3682,18 +3684,9 @@ pub mod frost_dkg_v2 {
             .join(format!("{}-{}", req.operator_set_version, req.dkg_epoch)))
     }
 
-    fn package_hash_for(value: &Value) -> WorkerResult<String> {
-        let bytes = canonical_json_bytes(value)?;
-        Ok(sha256_hex(&bytes))
-    }
-
     fn parse_round1_package_value(package_hex: &str) -> WorkerResult<Value> {
-        if let Ok(bytes) = hex_decode(package_hex) {
-            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                return Ok(value);
-            }
-        }
-        serde_json::from_str::<Value>(package_hex).map_err(|err| WorkerError::Serde(err.to_string()))
+        let bytes = hex_decode(package_hex)?;
+        serde_json::from_slice::<Value>(&bytes).map_err(|err| WorkerError::Serde(err.to_string()))
     }
 
     fn key_str_or_canonical(value: &Value, field: &str) -> WorkerResult<String> {
@@ -3704,13 +3697,6 @@ pub mod frost_dkg_v2 {
             return Ok(s.to_string());
         }
         canonical_json_string(inner)
-    }
-
-    fn json_string_field<F>(value: &Value, picker: F) -> Option<String>
-    where
-        F: Fn(&Value) -> Option<String>,
-    {
-        picker(value)
     }
 
     fn atomic_replace_private_json(path: &Path, value: &Value) -> WorkerResult<()> {
@@ -4788,5 +4774,392 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn frost_dkg_v2_online_roundtrip() {
+        use crate::ca_dkg_v2::init_hpke_local;
+        use crate::frost_dkg_v2::{
+            frost_dkg_v2_roster_hash, run_round, FrostDkgV2Roster, FrostDkgV2RosterNode,
+            FrostDkgV2RoundRequest, FROST_DKG_V2_DIR, FROST_KEY_PACKAGE_FILE,
+            FROST_MANIFEST_FILE, FROST_PUBLIC_PACKAGE_FILE, HPKE_KEYPAIR_FILE,
+            ROUND1_BROADCASTS_FILE, ROUND1_SELF_FILE, ROUND2_RECEIVED_DIR, ROUND2_SECRET_FILE,
+            STATE_FILE,
+        };
+        use crate::local_state::{
+            aggregate_frost_signature, create_frost_nonce_commitment, create_frost_partial_signature,
+            FrostCommitmentInput, FrostSignatureShareInput,
+        };
+        use std::collections::{BTreeMap, HashSet};
+
+        let root = std::env::temp_dir().join(format!(
+            "eunoma-frost-dkg-v2-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let hpke = init_hpke_local(&root, false).expect("init HPKE keys");
+        let operator_set_version = "1".to_string();
+        let dkg_epoch = "9".to_string();
+        let request_id = "frost-dkg-v2-test".to_string();
+        let session_id = "frost-dkg-v2-session".to_string();
+        let participant_slots = (0..DEOPERATOR_COUNT).collect::<Vec<_>>();
+        let roster = FrostDkgV2Roster {
+            operator_set_version: operator_set_version.clone(),
+            dkg_epoch: dkg_epoch.clone(),
+            ca_dkg_scheme: "frost_dkg_v2".to_string(),
+            threshold: DEOPERATOR_THRESHOLD,
+            nodes: hpke
+                .slots
+                .iter()
+                .map(|slot| FrostDkgV2RosterNode {
+                    slot: slot.slot,
+                    node_id: format!("node-{}", slot.slot),
+                    endpoint: format!("http://127.0.0.1:{}", 4100 + slot.slot),
+                    hpke_public_key: slot.hpke_public_key.clone(),
+                    transcript_public_key: "77".repeat(32),
+                })
+                .collect(),
+        };
+        let roster_hash = frost_dkg_v2_roster_hash(&roster).expect("roster hash");
+
+        let mut round1_results = Vec::new();
+        for slot in 0..DEOPERATOR_COUNT {
+            let result = run_round(
+                &root.join(format!("slot-{slot}")),
+                FrostDkgV2RoundRequest {
+                    request_id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    round: "round1".to_string(),
+                    operator_set_version: operator_set_version.clone(),
+                    dkg_epoch: dkg_epoch.clone(),
+                    frost_dkg_v2_roster_hash: roster_hash.clone(),
+                    threshold: DEOPERATOR_THRESHOLD,
+                    participant_slots: participant_slots.clone(),
+                    slot,
+                    frost_dkg_v2_roster: Some(roster.clone()),
+                    frost_round1_broadcasts: Vec::new(),
+                    frost_round2_envelopes: Vec::new(),
+                    transcript_hash: None,
+                    complaint: None,
+                },
+            )
+            .expect("round1");
+            round1_results.push(result);
+        }
+        let round1_broadcasts: Vec<_> = round1_results
+            .iter()
+            .map(|r| r.frost_round1_broadcast.clone().expect("broadcast"))
+            .collect();
+
+        let mut round2_send_envelopes = Vec::new();
+        for slot in 0..DEOPERATOR_COUNT {
+            let result = run_round(
+                &root.join(format!("slot-{slot}")),
+                FrostDkgV2RoundRequest {
+                    request_id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    round: "round2_send".to_string(),
+                    operator_set_version: operator_set_version.clone(),
+                    dkg_epoch: dkg_epoch.clone(),
+                    frost_dkg_v2_roster_hash: roster_hash.clone(),
+                    threshold: DEOPERATOR_THRESHOLD,
+                    participant_slots: participant_slots.clone(),
+                    slot,
+                    frost_dkg_v2_roster: None,
+                    frost_round1_broadcasts: round1_broadcasts.clone(),
+                    frost_round2_envelopes: Vec::new(),
+                    transcript_hash: None,
+                    complaint: None,
+                },
+            )
+            .expect("round2_send");
+            assert_eq!(result.frost_round2_envelopes.len(), DEOPERATOR_COUNT - 1);
+            assert!(!root
+                .join(format!("slot-{slot}"))
+                .join(FROST_DKG_V2_DIR)
+                .join(format!("{operator_set_version}-{dkg_epoch}"))
+                .join(ROUND1_SELF_FILE)
+                .exists());
+            round2_send_envelopes.push(result.frost_round2_envelopes);
+        }
+
+        let mut envelopes_by_receiver: BTreeMap<usize, Vec<_>> = BTreeMap::new();
+        for env_list in &round2_send_envelopes {
+            for env in env_list {
+                envelopes_by_receiver
+                    .entry(env.to_slot)
+                    .or_default()
+                    .push(env.clone());
+            }
+        }
+        let mut round2_receive_transcripts: Vec<String> = Vec::new();
+        for slot in 0..DEOPERATOR_COUNT {
+            let envelopes = envelopes_by_receiver.get(&slot).cloned().unwrap_or_default();
+            let result = run_round(
+                &root.join(format!("slot-{slot}")),
+                FrostDkgV2RoundRequest {
+                    request_id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    round: "round2_receive".to_string(),
+                    operator_set_version: operator_set_version.clone(),
+                    dkg_epoch: dkg_epoch.clone(),
+                    frost_dkg_v2_roster_hash: roster_hash.clone(),
+                    threshold: DEOPERATOR_THRESHOLD,
+                    participant_slots: participant_slots.clone(),
+                    slot,
+                    frost_dkg_v2_roster: None,
+                    frost_round1_broadcasts: round1_broadcasts.clone(),
+                    frost_round2_envelopes: envelopes,
+                    transcript_hash: None,
+                    complaint: None,
+                },
+            )
+            .expect("round2_receive");
+            assert!(result.complaints.is_empty());
+            round2_receive_transcripts.push(result.transcript_hash);
+        }
+        let mut sorted_transcripts = round2_receive_transcripts.clone();
+        sorted_transcripts.sort();
+        let dkg_transcript_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            for transcript in &sorted_transcripts {
+                hasher.update(transcript.as_bytes());
+            }
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+
+        let mut finalize_group_keys = Vec::new();
+        for slot in 0..DEOPERATOR_COUNT {
+            let result = run_round(
+                &root.join(format!("slot-{slot}")),
+                FrostDkgV2RoundRequest {
+                    request_id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    round: "finalize".to_string(),
+                    operator_set_version: operator_set_version.clone(),
+                    dkg_epoch: dkg_epoch.clone(),
+                    frost_dkg_v2_roster_hash: roster_hash.clone(),
+                    threshold: DEOPERATOR_THRESHOLD,
+                    participant_slots: participant_slots.clone(),
+                    slot,
+                    frost_dkg_v2_roster: None,
+                    frost_round1_broadcasts: Vec::new(),
+                    frost_round2_envelopes: Vec::new(),
+                    transcript_hash: Some(dkg_transcript_hash.clone()),
+                    complaint: None,
+                },
+            )
+            .expect("finalize");
+            assert_eq!(result.finalized, Some(true));
+            finalize_group_keys.push(result.group_public_key.expect("group public key"));
+        }
+        let first_group_key = finalize_group_keys[0].clone();
+        for key in &finalize_group_keys {
+            assert_eq!(key, &first_group_key);
+        }
+
+        let expected_files: HashSet<&str> = [
+            HPKE_KEYPAIR_FILE,
+            FROST_KEY_PACKAGE_FILE,
+            FROST_PUBLIC_PACKAGE_FILE,
+            FROST_MANIFEST_FILE,
+            FROST_DKG_V2_DIR,
+        ]
+        .into_iter()
+        .collect();
+        for slot in 0..DEOPERATOR_COUNT {
+            let slot_dir = root.join(format!("slot-{slot}"));
+            let entries: HashSet<String> = std::fs::read_dir(&slot_dir)
+                .expect("read slot dir")
+                .map(|entry| entry.expect("entry").file_name().into_string().expect("utf8"))
+                .collect();
+            for name in &expected_files {
+                assert!(entries.contains(*name), "slot {slot} missing {name}");
+            }
+            for entry in &entries {
+                assert!(
+                    expected_files.contains(entry.as_str()),
+                    "slot {slot} has unexpected entry {entry}"
+                );
+            }
+            let epoch_dir = slot_dir
+                .join(FROST_DKG_V2_DIR)
+                .join(format!("{operator_set_version}-{dkg_epoch}"));
+            assert!(epoch_dir.join(STATE_FILE).exists());
+            assert!(!epoch_dir.join(ROUND1_SELF_FILE).exists());
+            assert!(!epoch_dir.join(ROUND2_SECRET_FILE).exists());
+            assert!(!epoch_dir.join(ROUND2_RECEIVED_DIR).exists());
+            assert!(epoch_dir.join(ROUND1_BROADCASTS_FILE).exists());
+        }
+
+        let mut nonce_results = Vec::new();
+        for slot in 0..DEOPERATOR_THRESHOLD {
+            let state_dir = root.join(format!("slot-{slot}"));
+            let nonce =
+                create_frost_nonce_commitment(&state_dir, "rotated-sign").expect("nonce commit");
+            nonce_results.push((slot, nonce));
+        }
+        let commitments: Vec<FrostCommitmentInput> = nonce_results
+            .iter()
+            .map(|(slot, result)| FrostCommitmentInput {
+                slot: *slot,
+                commitments: result.commitments.clone(),
+            })
+            .collect();
+        let mut signature_shares = Vec::new();
+        for (slot, nonce_result) in &nonce_results {
+            let partial = create_frost_partial_signature(
+                &root.join(format!("slot-{slot}")),
+                &nonce_result.nonce_id,
+                "deadbeef",
+                commitments.clone(),
+            )
+            .expect("partial");
+            signature_shares.push(FrostSignatureShareInput {
+                slot: *slot,
+                signature_share: partial.signature_share,
+            });
+        }
+        let aggregate = aggregate_frost_signature(
+            &root.join("slot-0"),
+            "deadbeef",
+            commitments.clone(),
+            signature_shares.clone(),
+        )
+        .expect("aggregate rotated signature");
+        assert_eq!(aggregate.signature.len(), 128);
+
+        let corrupted_root = std::env::temp_dir().join(format!(
+            "eunoma-frost-dkg-v2-test-corrupt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let hpke = init_hpke_local(&corrupted_root, false).expect("init HPKE keys");
+        let corrupted_roster = FrostDkgV2Roster {
+            operator_set_version: operator_set_version.clone(),
+            dkg_epoch: dkg_epoch.clone(),
+            ca_dkg_scheme: "frost_dkg_v2".to_string(),
+            threshold: DEOPERATOR_THRESHOLD,
+            nodes: hpke
+                .slots
+                .iter()
+                .map(|slot| FrostDkgV2RosterNode {
+                    slot: slot.slot,
+                    node_id: format!("node-{}", slot.slot),
+                    endpoint: format!("http://127.0.0.1:{}", 4100 + slot.slot),
+                    hpke_public_key: slot.hpke_public_key.clone(),
+                    transcript_public_key: "77".repeat(32),
+                })
+                .collect(),
+        };
+        let corrupted_roster_hash =
+            frost_dkg_v2_roster_hash(&corrupted_roster).expect("roster hash");
+
+        let mut corrupted_round1 = Vec::new();
+        for slot in 0..DEOPERATOR_COUNT {
+            let result = run_round(
+                &corrupted_root.join(format!("slot-{slot}")),
+                FrostDkgV2RoundRequest {
+                    request_id: "corrupt-frost".to_string(),
+                    session_id: "corrupt-session".to_string(),
+                    round: "round1".to_string(),
+                    operator_set_version: operator_set_version.clone(),
+                    dkg_epoch: dkg_epoch.clone(),
+                    frost_dkg_v2_roster_hash: corrupted_roster_hash.clone(),
+                    threshold: DEOPERATOR_THRESHOLD,
+                    participant_slots: participant_slots.clone(),
+                    slot,
+                    frost_dkg_v2_roster: Some(corrupted_roster.clone()),
+                    frost_round1_broadcasts: Vec::new(),
+                    frost_round2_envelopes: Vec::new(),
+                    transcript_hash: None,
+                    complaint: None,
+                },
+            )
+            .expect("round1");
+            corrupted_round1.push(result);
+        }
+        let corrupted_round1_broadcasts: Vec<_> = corrupted_round1
+            .iter()
+            .map(|r| r.frost_round1_broadcast.clone().expect("broadcast"))
+            .collect();
+        let mut corrupted_envelopes = Vec::new();
+        for slot in 0..DEOPERATOR_COUNT {
+            let result = run_round(
+                &corrupted_root.join(format!("slot-{slot}")),
+                FrostDkgV2RoundRequest {
+                    request_id: "corrupt-frost".to_string(),
+                    session_id: "corrupt-session".to_string(),
+                    round: "round2_send".to_string(),
+                    operator_set_version: operator_set_version.clone(),
+                    dkg_epoch: dkg_epoch.clone(),
+                    frost_dkg_v2_roster_hash: corrupted_roster_hash.clone(),
+                    threshold: DEOPERATOR_THRESHOLD,
+                    participant_slots: participant_slots.clone(),
+                    slot,
+                    frost_dkg_v2_roster: None,
+                    frost_round1_broadcasts: corrupted_round1_broadcasts.clone(),
+                    frost_round2_envelopes: Vec::new(),
+                    transcript_hash: None,
+                    complaint: None,
+                },
+            )
+            .expect("round2_send");
+            corrupted_envelopes.push(result.frost_round2_envelopes);
+        }
+        let mut corrupted_by_receiver: BTreeMap<usize, Vec<_>> = BTreeMap::new();
+        for env_list in &corrupted_envelopes {
+            for env in env_list {
+                corrupted_by_receiver
+                    .entry(env.to_slot)
+                    .or_default()
+                    .push(env.clone());
+            }
+        }
+        let target = corrupted_by_receiver.get_mut(&0).expect("envelopes for slot 0");
+        let original_first_byte = target[0]
+            .hpke
+            .ciphertext
+            .chars()
+            .next()
+            .expect("ciphertext non-empty");
+        let mut bytes: Vec<char> = target[0].hpke.ciphertext.chars().collect();
+        bytes[0] = if original_first_byte == 'a' { 'b' } else { 'a' };
+        target[0].hpke.ciphertext = bytes.into_iter().collect();
+
+        let corrupt_result = run_round(
+            &corrupted_root.join("slot-0"),
+            FrostDkgV2RoundRequest {
+                request_id: "corrupt-frost".to_string(),
+                session_id: "corrupt-session".to_string(),
+                round: "round2_receive".to_string(),
+                operator_set_version: operator_set_version.clone(),
+                dkg_epoch: dkg_epoch.clone(),
+                frost_dkg_v2_roster_hash: corrupted_roster_hash.clone(),
+                threshold: DEOPERATOR_THRESHOLD,
+                participant_slots: participant_slots.clone(),
+                slot: 0,
+                frost_dkg_v2_roster: None,
+                frost_round1_broadcasts: corrupted_round1_broadcasts.clone(),
+                frost_round2_envelopes: corrupted_by_receiver.remove(&0).unwrap_or_default(),
+                transcript_hash: None,
+                complaint: None,
+            },
+        )
+        .expect("complaint round runs");
+        assert!(!corrupt_result.complaints.is_empty());
+        assert!(corrupt_result.abort_evidence_hash.is_some());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(corrupted_root);
     }
 }
