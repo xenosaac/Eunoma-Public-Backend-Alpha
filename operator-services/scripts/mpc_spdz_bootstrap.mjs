@@ -13,7 +13,31 @@ import {
 } from "./_lib/mpc_spdz_constants.mjs";
 
 const MP_SPDZ_REPO = "https://github.com/data61/MP-SPDZ.git";
-const MP_SPDZ_COMMIT = process.env.MP_SPDZ_COMMIT ?? MP_SPDZ_COMMIT_DEFAULT;
+// Codex P3 #10: refuse to silently honor an MP_SPDZ_COMMIT override. The default is the
+// audited commit; overriding it requires explicit operator consent via
+// EUNOMA_ALLOW_MP_SPDZ_COMMIT_OVERRIDE=1 (with a loud stderr warning), otherwise we fail
+// closed.
+const MP_SPDZ_COMMIT_OVERRIDE = process.env.MP_SPDZ_COMMIT;
+let MP_SPDZ_COMMIT;
+if (MP_SPDZ_COMMIT_OVERRIDE && MP_SPDZ_COMMIT_OVERRIDE !== MP_SPDZ_COMMIT_DEFAULT) {
+  if (process.env.EUNOMA_ALLOW_MP_SPDZ_COMMIT_OVERRIDE !== "1") {
+    console.error(
+      `MP_SPDZ_COMMIT override (${MP_SPDZ_COMMIT_OVERRIDE}) differs from the audited default ` +
+        `(${MP_SPDZ_COMMIT_DEFAULT}); refuse to proceed. Set ` +
+        `EUNOMA_ALLOW_MP_SPDZ_COMMIT_OVERRIDE=1 to bypass — this is an audit-bypass and should ` +
+        `only happen in research/staging hosts.`,
+    );
+    process.exit(2);
+  }
+  console.error(
+    `WARNING: MP_SPDZ_COMMIT is overridden to ${MP_SPDZ_COMMIT_OVERRIDE} (audited default ` +
+      `is ${MP_SPDZ_COMMIT_DEFAULT}). EUNOMA_ALLOW_MP_SPDZ_COMMIT_OVERRIDE=1 was set so the ` +
+      `bootstrap will proceed, but the result will NOT be the audited Phase 2 MP-SPDZ runtime.`,
+  );
+  MP_SPDZ_COMMIT = MP_SPDZ_COMMIT_OVERRIDE;
+} else {
+  MP_SPDZ_COMMIT = MP_SPDZ_COMMIT_DEFAULT;
+}
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");

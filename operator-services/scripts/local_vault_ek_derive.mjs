@@ -3,10 +3,26 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Exit codes (distinct from default 1 for operator runbooks):
-//   0   success
-//   21  MP-SPDZ runtime unavailable (run `npm run mpc:bootstrap && npm run mpc:check`)
-//   22  another vault_ek derivation is in flight (retry shortly)
+// =============================================================================================
+// Exit codes — codex P3 #11. This contract is part of the operator runbook; consumers
+// (operator-services/scripts/testnet_e2e_fail_closed.mjs, alerting, etc.) parse these.
+//
+//   0   success — wrote { vaultEk, finalTranscriptHash, requestId, selectedSlots,
+//                          transcriptPath } JSON to stdout.
+//   1   generic request/parse failure (network error, coordinator returned non-success
+//        status that doesn't match the structured codes below, malformed JSON).
+//   2   usage error (unknown arg, missing required arg, etc.). Operator misconfiguration.
+//   21  mpc_inverse_unavailable — coordinator returned 503 because at least one selected
+//        worker lacks the MP-SPDZ runtime. Operator action: `npm run mpc:bootstrap && npm
+//        run mpc:check` on each affected worker.
+//   22  vault_ek_derivation_in_flight — coordinator returned 409 because another vault_ek
+//        derivation is in progress. Operator action: retry after the previous one settles.
+//
+// No other exit codes. If a new failure mode appears, add it here AND update operator runbooks.
+// =============================================================================================
+const EXIT_SUCCESS = 0;
+const EXIT_GENERIC_FAILURE = 1;
+const EXIT_USAGE_ERROR = 2;
 const EXIT_MPC_UNAVAILABLE = 21;
 const PHASE2_EXIT_LOCK_CONTENTION = 22;
 
@@ -44,21 +60,23 @@ for (let i = 0; i < args.length; i += 1) {
         "usage: local_vault_ek_derive --coordinator-url URL --dkg-epoch N " +
           "[--ca-dkg-transcript-hash HEX] [--request-id ID] [--bearer-token TOKEN]\n" +
           "\n" +
-          "Exit codes:\n" +
-          "  0   success — prints { vaultEk, finalTranscriptHash, requestId, selectedSlots, transcriptPath }\n" +
+          "Exit codes (codex P3 #11 — operator runbook contract):\n" +
+          `  ${EXIT_SUCCESS}   success — prints { vaultEk, finalTranscriptHash, requestId, selectedSlots, transcriptPath }\n` +
+          `  ${EXIT_GENERIC_FAILURE}   generic request/parse failure (network, non-503/409 HTTP error, malformed JSON)\n` +
+          `  ${EXIT_USAGE_ERROR}   usage error (unknown arg, missing required arg)\n` +
           `  ${EXIT_MPC_UNAVAILABLE}  MP-SPDZ runtime unavailable — run \`npm run mpc:bootstrap && npm run mpc:check\`, then retry.\n` +
           `  ${PHASE2_EXIT_LOCK_CONTENTION}  another vault_ek derivation is in progress; retry shortly\n`,
       );
-      process.exit(0);
+      process.exit(EXIT_SUCCESS);
     default:
       console.error(`unknown arg: ${arg}`);
-      process.exit(2);
+      process.exit(EXIT_USAGE_ERROR);
   }
 }
 
 if (!dkgEpoch || !/^[0-9]+$/.test(dkgEpoch)) {
   console.error("--dkg-epoch is required and must be a decimal string");
-  process.exit(2);
+  process.exit(EXIT_USAGE_ERROR);
 }
 
 const planPath = resolve(
@@ -75,7 +93,7 @@ if (existsSync(planPath)) {
 
 if (!coordinatorUrl) {
   console.error("--coordinator-url is required when no local cluster plan is found");
-  process.exit(2);
+  process.exit(EXIT_USAGE_ERROR);
 }
 
 const payload = { dkgEpoch };
@@ -94,7 +112,7 @@ try {
   });
 } catch (err) {
   console.error(`coordinator request failed: ${err?.message ?? err}`);
-  process.exit(1);
+  process.exit(EXIT_GENERIC_FAILURE);
 }
 
 let body;
@@ -121,7 +139,7 @@ if (res.status === 409 && body?.error === "vault_ek_derivation_in_flight") {
 if (!res.ok) {
   console.error(`coordinator returned ${res.status}`);
   process.stdout.write(`${JSON.stringify(body, null, 2)}\n`);
-  process.exit(1);
+  process.exit(EXIT_GENERIC_FAILURE);
 }
 
 // Phase 2 success: print structured JSON that downstream scripts can parse.
