@@ -2807,9 +2807,18 @@ pub mod mpc_inverse_adapter {
     }
 
     pub trait MpcInverseAdapter: Send + Sync {
+        /// Run the MASCOT inversion subprocess (or its mock) using `r_i` as this party's
+        /// fresh random scalar. The adapter does NOT generate r_i — that responsibility now
+        /// lives in `run_round0`, which commits `h_r_i = H * r_i` to disk BEFORE the MPC
+        /// runs and BEFORE any party sees `m`. This is the codex P1 #4 round0 fix.
+        ///
+        /// Returns the MPC-opened m, q_i = r_i * m^-1, and the committed h_r_i (which the
+        /// adapter recomputes from the supplied r_i so the caller can compare against the
+        /// round0 commitment).
         fn compute_inverse_share(
             &self,
             dk_share: &Scalar,
+            r_i: &Scalar,
             ctx: &InversionContext,
         ) -> Result<InversionShare, AdapterError>;
     }
@@ -2820,6 +2829,7 @@ pub mod mpc_inverse_adapter {
         fn compute_inverse_share(
             &self,
             _dk_share: &Scalar,
+            _r_i: &Scalar,
             _ctx: &InversionContext,
         ) -> Result<InversionShare, AdapterError> {
             Err(AdapterError::McpSpdzNotAvailable)
@@ -2848,6 +2858,7 @@ pub mod vault_ek_derivation_v2 {
     use crate::ca_dkg_v2::load_ca_dkg_v2_share;
     use crate::h_ristretto;
     use crate::mpc_inverse_adapter::{AdapterError, InversionContext, MpcInverseAdapter};
+    use crate::mpc_spdz_adapter::{is_safe_id, random_scalar};
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
     use curve25519_dalek::{
         ristretto::{CompressedRistretto, RistrettoPoint},
@@ -2856,12 +2867,61 @@ pub mod vault_ek_derivation_v2 {
     use rand::rngs::OsRng;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256, Sha512};
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use zeroize::Zeroize;
 
     pub(crate) const WORKER_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_V1";
     pub(crate) const FINAL_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_FINAL_V1";
     pub(crate) const SCHNORR_CHALLENGE_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_SCHNORR_V1";
+    pub(crate) const ROUND0_HASH_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_ROUND0_V1";
+
+    // Codex P1 #4 round0: file basenames + on-disk shape for the per-session r_i + h_r_i
+    // commitment. The file lives under `state_dir/mpc-sessions/<request_id>__<session_id>/round0.json`
+    // with mode 0o600. The session-namespaced path prevents two parallel derivations from
+    // clobbering each other (Phase 2 only runs one at a time via the coordinator lock, but
+    // defense in depth: a bug there shouldn't let workers cross-pollinate state).
+    pub(crate) const ROUND0_FILE_NAME: &str = "round0.json";
+
+    /// Codex P1 #4 round0: pre-MPC h_r_i commitment endpoint.
+    ///
+    /// Workers must publish a commitment to `h_r_i = H * r_i` BEFORE the MPC opens `m`.
+    /// Otherwise a malicious party can wait for `m`, pick any scalar `y`, publish
+    /// `h_r' = H*y` and `h_q' = H*(y*m_inv)` and produce a Schnorr POK on `y*m_inv` — the
+    /// per-party `h_q * m == h_r` and aggregate `vault_ek * m == sum(h_r)` checks both
+    /// pass trivially, and the registration sigma is fooled into accepting a malicious
+    /// `vault_ek`. Committing h_r_i pre-MPC forces every party to fix r_i before seeing
+    /// m, breaking the adaptive choice.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round0Request {
+        pub dkg_epoch: String,
+        pub ca_dkg_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub request_id: String,
+        pub session_id: String,
+        /// Round0 still receives `peerAddresses` and `lagrangeCoefficients` so the
+        /// adapter's validation pipeline (slot-binding + lambda recompute) can fire
+        /// before any r_i is persisted. Mirrors round1's request shape for symmetry.
+        pub peer_addresses: Vec<String>,
+        pub player_id: usize,
+        pub lagrange_coefficients: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round0Result {
+        pub slot: usize,
+        /// `h_r_i = H * r_i` in compressed Ristretto (lowercase hex). The coordinator
+        /// collects all 5 and broadcasts them as `allHRoundZero` in round1.
+        pub h_r: String,
+        /// `sha256(canonical(sessionId, rosterHash, selectedSlots, selfSlot, h_r_hex))`.
+        /// Coordinator can cross-check this (defense in depth) against locally-recomputed
+        /// hash from the body.
+        pub worker_round0_hash: String,
+    }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -2886,6 +2946,12 @@ pub mod vault_ek_derivation_v2 {
         /// Phase 2: hex-encoded public Lagrange coefficients at x=0 for sorted(selected_slots).
         #[serde(default)]
         pub lagrange_coefficients: Vec<String>,
+        /// Codex P1 #4 round0: the coordinator-broadcast vector of all 5 parties'
+        /// `h_r_i` commitments published in round0. Length 5, ordered by player ordinal.
+        /// This party asserts `allHRoundZero[playerId]` byte-matches its own persisted
+        /// `h_r_i` before running MPC.
+        #[serde(default)]
+        pub all_h_round_zero: Vec<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2905,9 +2971,6 @@ pub mod vault_ek_derivation_v2 {
         pub h_contribution: String,
         pub schnorr_proof: SchnorrProof,
         pub worker_transcript_hash: String,
-        /// Codex P1 #4: h * r_i (Ristretto point, compressed lowercase hex). Verifier checks
-        /// `h_contribution * mpc_open_m == h_r_i`.
-        pub h_r: String,
         /// Codex P1 #4: MPC-opened m (Scalar, lowercase little-endian hex). All 5 parties
         /// in a session MUST report the same value.
         pub mpc_open_m: String,
@@ -2920,8 +2983,6 @@ pub mod vault_ek_derivation_v2 {
         pub h_contribution: String,
         pub schnorr_proof: SchnorrProof,
         pub worker_transcript_hash: String,
-        /// Codex P1 #4: see Round1Result::h_r.
-        pub h_r: String,
         /// Codex P1 #4: see Round1Result::mpc_open_m.
         pub mpc_open_m: String,
     }
@@ -2934,6 +2995,10 @@ pub mod vault_ek_derivation_v2 {
         pub roster_hash: String,
         pub selected_slots: Vec<usize>,
         pub contributions: Vec<ContributionInput>,
+        /// Codex P1 #4 round0: the coordinator-broadcast vector of all 5 parties'
+        /// h_r_i commitments published in round0, in player-ordinal (sorted slot) order.
+        /// Verify uses these instead of a per-contribution `hR` field — that field is gone.
+        pub all_h_round_zero: Vec<String>,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -2941,6 +3006,315 @@ pub mod vault_ek_derivation_v2 {
     pub struct VerifyResult {
         pub vault_ek: String,
         pub final_transcript_hash: String,
+    }
+
+    /// On-disk shape for the round0 commitment file. Mode 0o600. Lives at
+    /// `state_dir/mpc-sessions/<request_id>__<session_id>/round0.json`.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) struct Round0FileLayout {
+        pub session_id: String,
+        pub request_id: String,
+        pub self_slot: usize,
+        pub player_id: usize,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        /// Canonical 32-byte little-endian Scalar, hex. Sensitive.
+        pub r_i_hex: String,
+        /// 32-byte compressed Ristretto point, hex. Public commitment.
+        pub h_r_i_hex: String,
+        pub created_at_unix_ms: u128,
+    }
+
+    fn round0_session_dir(state_dir: &Path, request_id: &str, session_id: &str) -> PathBuf {
+        state_dir
+            .join("mpc-sessions")
+            .join(format!("{}__{}", request_id, session_id))
+    }
+
+    fn round0_file_path(state_dir: &Path, request_id: &str, session_id: &str) -> PathBuf {
+        round0_session_dir(state_dir, request_id, session_id).join(ROUND0_FILE_NAME)
+    }
+
+    /// Codex P1 #4 round0: hash the locally-committed `h_r_i` together with the binding
+    /// fields. Returned to the coordinator as `workerRound0Hash` for defense-in-depth
+    /// cross-check; not security-critical (the file persists the canonical r_i + h_r_i),
+    /// but a useful sanity hook for the orchestrator.
+    pub fn worker_round0_hash(
+        session_id: &str,
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        self_slot: usize,
+        h_r_hex: &str,
+    ) -> String {
+        let joined_slots = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(ROUND0_HASH_DOMAIN.as_bytes());
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(roster_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined_slots.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(self_slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(h_r_hex.as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    /// Codex P1 #4 round0: hash the full ordered round0 commitment vector. Binds this
+    /// party's view of WHAT all 5 parties' h_r_i values are into its Schnorr proof's
+    /// transcript hash. A malicious worker can't alter its view of allHRoundZero between
+    /// rounds without invalidating the transcript signature.
+    pub fn round0_commit_hash(all_h_round_zero: &[String]) -> String {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(ROUND0_HASH_DOMAIN.as_bytes());
+        bytes.extend_from_slice(b"AGG:");
+        for (idx, h_r) in all_h_round_zero.iter().enumerate() {
+            if idx > 0 {
+                bytes.push(b',');
+            }
+            bytes.extend_from_slice(h_r.to_lowercase().as_bytes());
+        }
+        sha256_hex(&bytes)
+    }
+
+    /// Round0 endpoint handler. Validates request shape (mirrors run_round1 validation),
+    /// generates a fresh random `r_i`, computes `h_r_i = H * r_i`, persists the
+    /// commitment file under `state_dir/mpc-sessions/<request_id>__<session_id>/round0.json`
+    /// with mode 0o600. Idempotency: if the file already exists with the same sessionId
+    /// (same selected_slots, same self_slot), return the persisted h_r_i — never
+    /// regenerate r_i (that would break the commit-reveal). If sessionId clashes with a
+    /// DIFFERENT request_id-session_id pair the path differs by construction, so this
+    /// only matters for true replays.
+    pub fn run_round0(state_dir: &Path, req: &Round0Request) -> WorkerResult<Round0Result> {
+        validate_selected_slots(&req.selected_slots)?;
+        assert_slot(req.self_slot)?;
+        if !req.selected_slots.contains(&req.self_slot) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot {} not in selected_slots",
+                req.self_slot
+            )));
+        }
+        if req.peer_addresses.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "peer_addresses must have {DEOPERATOR_THRESHOLD} entries"
+            )));
+        }
+        if req.lagrange_coefficients.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "lagrange_coefficients must have {DEOPERATOR_THRESHOLD} entries"
+            )));
+        }
+        if req.player_id >= DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "player_id {} out of range 0..{}",
+                req.player_id, DEOPERATOR_THRESHOLD
+            )));
+        }
+        let sorted_slots = sorted_unique_slots(&req.selected_slots)?;
+        if sorted_slots[req.player_id] != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                req.player_id, sorted_slots[req.player_id], req.self_slot
+            )));
+        }
+        if req.request_id.is_empty() || !is_safe_id(&req.request_id) {
+            return Err(WorkerError::InvalidRequest(
+                "request_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.session_id.is_empty() || !is_safe_id(&req.session_id) {
+            return Err(WorkerError::InvalidRequest(
+                "session_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        let ca_dkg_transcript_hash = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
+        let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        // Cross-check: this party MUST already have a matching share file on disk so we
+        // don't write a round0 commitment for a session we can't actually complete in
+        // round1. Failing here surfaces missing-share early.
+        let share = load_ca_dkg_v2_share(state_dir)?;
+        if share.slot != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 slot {} does not match self_slot {}",
+                share.slot, req.self_slot
+            )));
+        }
+        if share.dkg_epoch != req.dkg_epoch {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 dkg_epoch {} does not match request {}",
+                share.dkg_epoch, req.dkg_epoch
+            )));
+        }
+        if share.transcript_hash.to_lowercase() != ca_dkg_transcript_hash {
+            return Err(WorkerError::InvalidRequest(
+                "ca_dkg_transcript_hash does not match local share".to_string(),
+            ));
+        }
+        // Idempotency / replay handling. If a round0 file already exists for this
+        // request_id+session_id, return the persisted h_r_i instead of re-generating
+        // r_i. Regenerating would break the commit (the originally-committed h_r_i is
+        // still in the broadcast vector). If the persisted file's sessionId disagrees
+        // with the request, treat as a collision and refuse.
+        let file_path = round0_file_path(state_dir, &req.request_id, &req.session_id);
+        if file_path.exists() {
+            let raw = fs::read(&file_path).map_err(|err| {
+                WorkerError::Crypto(format!("read existing round0 file: {err}"))
+            })?;
+            let layout: Round0FileLayout = serde_json::from_slice(&raw)
+                .map_err(|err| WorkerError::Crypto(format!("parse round0 file: {err}")))?;
+            if layout.session_id != req.session_id || layout.request_id != req.request_id {
+                return Err(WorkerError::InvalidDkgState(
+                    "round0_session_collision".to_string(),
+                ));
+            }
+            if layout.self_slot != req.self_slot || layout.player_id != req.player_id {
+                return Err(WorkerError::InvalidDkgState(
+                    "round0_self_slot_mismatch".to_string(),
+                ));
+            }
+            // Return the previously-committed h_r_i. r_i is NOT touched.
+            let h_r_hex = normalize_hex(&layout.h_r_i_hex, 32)?;
+            let worker_round0_hash = worker_round0_hash(
+                &req.session_id,
+                &roster_hash,
+                &sorted_slots,
+                req.self_slot,
+                &h_r_hex,
+            );
+            return Ok(Round0Result {
+                slot: req.self_slot,
+                h_r: h_r_hex,
+                worker_round0_hash,
+            });
+        }
+
+        // Fresh round0. Generate r_i, compute h_r_i, persist with 0o600 mode.
+        let mut r_i = random_scalar();
+        let h = h_ristretto()?;
+        let h_r_point = h * r_i;
+        let h_r_hex = compressed_hex(&h_r_point);
+        let r_i_hex = hex_encode(r_i.to_bytes().as_slice());
+        let layout = Round0FileLayout {
+            session_id: req.session_id.clone(),
+            request_id: req.request_id.clone(),
+            self_slot: req.self_slot,
+            player_id: req.player_id,
+            roster_hash: roster_hash.clone(),
+            selected_slots: sorted_slots.clone(),
+            r_i_hex,
+            h_r_i_hex: h_r_hex.clone(),
+            created_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        };
+        let session_dir = round0_session_dir(state_dir, &req.request_id, &req.session_id);
+        fs::create_dir_all(&session_dir)
+            .map_err(|err| WorkerError::Crypto(format!("create session_dir: {err}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(0o700);
+            if let Err(err) = fs::set_permissions(&session_dir, perm) {
+                // Not fatal; surface a clear error if we couldn't lock down the dir.
+                return Err(WorkerError::Crypto(format!(
+                    "chmod 700 {}: {err}",
+                    session_dir.display()
+                )));
+            }
+        }
+        let bytes = serde_json::to_vec(&layout)
+            .map_err(|err| WorkerError::Crypto(format!("encode round0 file: {err}")))?;
+        write_secret_file(&file_path, &bytes)?;
+        // After persisting, scrub r_i from this stack frame — the next read happens via
+        // load_round0_file.
+        r_i.zeroize();
+        let worker_round0_hash = worker_round0_hash(
+            &req.session_id,
+            &roster_hash,
+            &sorted_slots,
+            req.self_slot,
+            &h_r_hex,
+        );
+        Ok(Round0Result {
+            slot: req.self_slot,
+            h_r: h_r_hex,
+            worker_round0_hash,
+        })
+    }
+
+    /// Codex P1 #4 round0: writes the round0 commitment file with mode 0o600 (Unix). On
+    /// non-Unix it falls back to a plain write — Phase 2 is Unix-only in production.
+    fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
+        use std::io::Write as _;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(path)
+            .map_err(|err| WorkerError::Crypto(format!("open {}: {err}", path.display())))?;
+        file.write_all(contents)
+            .map_err(|err| WorkerError::Crypto(format!("write {}: {err}", path.display())))?;
+        Ok(())
+    }
+
+    /// Codex P1 #4 round0: read + parse + validate the round0 commitment file. Loaded by
+    /// `run_round1` to fetch the persisted `r_i` and to assert that
+    /// `allHRoundZero[playerId]` matches the locally-committed `h_r_i` byte-for-byte.
+    fn load_round0_file(
+        state_dir: &Path,
+        request_id: &str,
+        session_id: &str,
+    ) -> WorkerResult<Round0FileLayout> {
+        let path = round0_file_path(state_dir, request_id, session_id);
+        if !path.exists() {
+            return Err(WorkerError::InvalidDkgState(
+                "round0_file_missing".to_string(),
+            ));
+        }
+        let raw = fs::read(&path)
+            .map_err(|err| WorkerError::Crypto(format!("read round0 file: {err}")))?;
+        let layout: Round0FileLayout = serde_json::from_slice(&raw)
+            .map_err(|err| WorkerError::Crypto(format!("parse round0 file: {err}")))?;
+        if layout.session_id != session_id || layout.request_id != request_id {
+            return Err(WorkerError::InvalidDkgState(
+                "round0_session_mismatch".to_string(),
+            ));
+        }
+        Ok(layout)
+    }
+
+    /// Codex P1 #4 round0: scrub + delete the round0 commitment file. Called from
+    /// `run_round1` after a successful (or failed) round1 so `r_i` doesn't linger.
+    fn drop_round0_file(state_dir: &Path, request_id: &str, session_id: &str) {
+        let path = round0_file_path(state_dir, request_id, session_id);
+        if !path.exists() {
+            return;
+        }
+        // Best-effort scrub.
+        if let Ok(metadata) = fs::metadata(&path) {
+            let len = metadata.len() as usize;
+            let zeros = vec![0u8; len];
+            if let Ok(mut file) = fs::OpenOptions::new().write(true).truncate(false).open(&path) {
+                use std::io::Write as _;
+                let _ = file.write_all(&zeros);
+                let _ = file.sync_all();
+            }
+        }
+        let _ = fs::remove_file(&path);
+        let parent = round0_session_dir(state_dir, request_id, session_id);
+        // Don't fail on cleanup; if the dir is empty after the file is gone, remove it.
+        let _ = fs::remove_dir(parent);
     }
 
     pub fn run_round1(
@@ -2956,8 +3330,25 @@ pub mod vault_ek_derivation_v2 {
                 req.self_slot
             )));
         }
+        // Codex P1 #4 round0: round1 MUST receive the coordinator-broadcast
+        // `allHRoundZero` vector and assert that the entry at this party's ordinal
+        // byte-matches the locally-persisted commitment. Without this binding the
+        // post-m bias attack is open.
+        if req.all_h_round_zero.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "all_h_round_zero must have {DEOPERATOR_THRESHOLD} entries, got {}",
+                req.all_h_round_zero.len()
+            )));
+        }
         let ca_dkg_transcript_hash = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
         let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        let sorted_slots = sorted_unique_slots(&req.selected_slots)?;
+        if sorted_slots[req.player_id] != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                req.player_id, sorted_slots[req.player_id], req.self_slot
+            )));
+        }
 
         let share = load_ca_dkg_v2_share(state_dir)?;
         if share.slot != req.self_slot {
@@ -2980,10 +3371,35 @@ pub mod vault_ek_derivation_v2 {
 
         let dk_share = scalar_from_hex(&share.dk_share)?;
 
+        // Codex P1 #4 round0: load persisted (r_i, h_r_i). Reject if missing or if the
+        // sessionId doesn't match. Then assert this party's h_r_i matches the
+        // coordinator's `all_h_round_zero[player_id]` byte-for-byte. If they disagree,
+        // the coordinator forwarded a tampered vector — fail closed.
+        let round0 = load_round0_file(state_dir, &req.request_id, &req.session_id)?;
+        let persisted_h_r = normalize_hex(&round0.h_r_i_hex, 32)?;
+        let claimed_h_r = normalize_hex(&req.all_h_round_zero[req.player_id], 32)?;
+        if persisted_h_r != claimed_h_r {
+            // Defense in depth — clean up the round0 file so a stale commit doesn't
+            // hang around.
+            drop_round0_file(state_dir, &req.request_id, &req.session_id);
+            return Err(WorkerError::Crypto(format!(
+                "round0_commitment_mismatch: persisted h_r_i differs from allHRoundZero[{}]",
+                req.player_id
+            )));
+        }
+        // Normalize the entire all_h_round_zero vector so the hash binding is byte-stable.
+        let mut all_h_normalized: Vec<String> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for entry in &req.all_h_round_zero {
+            all_h_normalized.push(normalize_hex(entry, 32)?);
+        }
+        let round0_commit_hash_hex = round0_commit_hash(&all_h_normalized);
+
+        let mut r_i = scalar_from_hex(&round0.r_i_hex).map_err(|_| {
+            WorkerError::Crypto("round0_file_r_i_not_canonical".to_string())
+        })?;
+
         // Phase 2: derive the per-session work directory from request_id + session_id.
-        // Coordinator chooses these (both non-empty in production). For tests that omit them
-        // (e.g., MockFixedScalarAdapter / MockAdditiveInverseAdapter), the empty defaults are
-        // fine — only MpcSpdzInverseAdapter actually touches the work_dir.
+        // Coordinator chooses these (both non-empty in production).
         let work_dir = state_dir.to_path_buf();
         let ctx = InversionContext {
             dkg_epoch: req.dkg_epoch.clone(),
@@ -2998,27 +3414,50 @@ pub mod vault_ek_derivation_v2 {
             player_id: req.player_id,
             lagrange_coefficients_hex: req.lagrange_coefficients.clone(),
         };
-        let inversion = adapter
-            .compute_inverse_share(&dk_share, &ctx)
-            .map_err(adapter_error_to_worker)?;
+        let inversion_result = adapter.compute_inverse_share(&dk_share, &r_i, &ctx);
+        // Whether MPC succeeded or failed, scrub the round0 file and our local r_i copy.
+        // The persisted r_i is now redundant (MPC consumed it) and must not leak.
+        drop_round0_file(state_dir, &req.request_id, &req.session_id);
+        let inversion = match inversion_result {
+            Ok(share) => share,
+            Err(err) => {
+                r_i.zeroize();
+                return Err(adapter_error_to_worker(err));
+            }
+        };
+        // Defense in depth: the adapter recomputes h_r_i = h * r_i internally and
+        // returns it. Assert it matches what we just persisted in round0 — otherwise
+        // either the adapter is buggy or r_i changed mid-flight.
+        let h = h_ristretto()?;
+        let expected_h_r_point = h * r_i;
+        r_i.zeroize();
+        if expected_h_r_point != inversion.h_r_i {
+            return Err(WorkerError::Crypto(
+                "adapter_h_r_disagrees_with_round0".to_string(),
+            ));
+        }
+        let h_r_hex_from_adapter = compressed_hex(&inversion.h_r_i);
+        if normalize_hex(&h_r_hex_from_adapter, 32)? != persisted_h_r {
+            return Err(WorkerError::Crypto(
+                "adapter_h_r_hex_disagrees_with_round0".to_string(),
+            ));
+        }
         let mut inv_share = inversion.q_i;
-        let h_r_point = inversion.h_r_i;
         let mpc_open_m = inversion.mpc_open_m;
 
-        let h = h_ristretto()?;
         let h_contribution = h * inv_share;
         let h_contribution_hex = compressed_hex(&h_contribution);
-        let h_r_hex = compressed_hex(&h_r_point);
         let mpc_open_m_hex = hex_encode(mpc_open_m.to_bytes().as_slice());
         let worker_transcript_hash = worker_transcript_hash(
             &req.dkg_epoch,
             &ca_dkg_transcript_hash,
             &roster_hash,
-            &sorted_unique_slots(&req.selected_slots)?,
+            &sorted_slots,
             req.self_slot,
             &h_contribution_hex,
-            &h_r_hex,
+            &persisted_h_r,
             &mpc_open_m_hex,
+            &round0_commit_hash_hex,
         );
         let proof = schnorr_pok(&inv_share, &h_contribution, &worker_transcript_hash)?;
         // Codex P2 #7: zeroize q_i after producing the public artifacts.
@@ -3029,7 +3468,6 @@ pub mod vault_ek_derivation_v2 {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash,
-            h_r: h_r_hex,
             mpc_open_m: mpc_open_m_hex,
         })
     }
@@ -3042,15 +3480,35 @@ pub mod vault_ek_derivation_v2 {
                 req.contributions.len()
             )));
         }
+        // Codex P1 #4 round0: verify takes the full allHRoundZero vector. Per-party
+        // check `h_q_i * m == h_r_i` now uses the round0-committed h_r_i (NOT a
+        // round1-supplied value, which would let a malicious worker post-hoc-pick).
+        if req.all_h_round_zero.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "all_h_round_zero must have {DEOPERATOR_THRESHOLD} entries, got {}",
+                req.all_h_round_zero.len()
+            )));
+        }
         let ca_dkg_transcript_hash = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
         let roster_hash = normalize_hex(&req.roster_hash, 32)?;
         let sorted_slots = sorted_unique_slots(&req.selected_slots)?;
         let selected_set: std::collections::BTreeSet<usize> = sorted_slots.iter().copied().collect();
 
+        // Normalize the allHRoundZero vector and decompress for the aggregate check.
+        let mut all_h_normalized: Vec<String> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        let mut all_h_points: Vec<RistrettoPoint> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for entry in &req.all_h_round_zero {
+            let norm = normalize_hex(entry, 32)?;
+            all_h_points.push(decompress_hex(&norm)?);
+            all_h_normalized.push(norm);
+        }
+        let round0_commit_hash_hex = round0_commit_hash(&all_h_normalized);
+
         let mut seen = [false; DEOPERATOR_COUNT];
         let mut points: Vec<RistrettoPoint> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
-        let mut h_r_points: Vec<RistrettoPoint> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
-        let mut ordered: Vec<(usize, String, SchnorrProof, String, String)> =
+        // ordered (slot, h_contribution_hex, proof, mpc_open_m_hex); h_r dropped — it's
+        // bound by allHRoundZero now.
+        let mut ordered: Vec<(usize, String, SchnorrProof, String)> =
             Vec::with_capacity(DEOPERATOR_THRESHOLD);
         // Codex P1 #4: cross-party consistency. All 5 workers must report the same MPC-
         // opened m (MAC-checked by MASCOT). Reject if any disagrees.
@@ -3072,8 +3530,19 @@ pub mod vault_ek_derivation_v2 {
             seen[contribution.slot] = true;
 
             let h_contribution_norm = normalize_hex(&contribution.h_contribution, 32)?;
-            let h_r_norm = normalize_hex(&contribution.h_r, 32)?;
             let mpc_open_m_norm = normalize_hex(&contribution.mpc_open_m, 32)?;
+            // Codex P1 #4 round0: locate this party's ordinal within sorted_slots so we
+            // can fetch the round0-committed h_r_i for this contribution.
+            let player_ordinal = sorted_slots
+                .iter()
+                .position(|s| *s == contribution.slot)
+                .ok_or_else(|| {
+                    WorkerError::InvalidRequest(format!(
+                        "contribution slot {} not in sorted selected_slots",
+                        contribution.slot
+                    ))
+                })?;
+            let h_r_norm = all_h_normalized[player_ordinal].clone();
             let expected_worker_hash = worker_transcript_hash(
                 &req.dkg_epoch,
                 &ca_dkg_transcript_hash,
@@ -3083,6 +3552,7 @@ pub mod vault_ek_derivation_v2 {
                 &h_contribution_norm,
                 &h_r_norm,
                 &mpc_open_m_norm,
+                &round0_commit_hash_hex,
             );
             let supplied = normalize_hex(&contribution.worker_transcript_hash, 32)?;
             if supplied != expected_worker_hash {
@@ -3093,7 +3563,7 @@ pub mod vault_ek_derivation_v2 {
             }
 
             let point = decompress_hex(&h_contribution_norm)?;
-            let h_r_point = decompress_hex(&h_r_norm)?;
+            let h_r_point = all_h_points[player_ordinal];
             let m_scalar = scalar_from_hex(&mpc_open_m_norm)?;
             if m_scalar == Scalar::ZERO {
                 return Err(WorkerError::InvalidRequest(format!(
@@ -3101,12 +3571,14 @@ pub mod vault_ek_derivation_v2 {
                     contribution.slot
                 )));
             }
-            // Codex P1 #4: per-party check `h_q_i * m == h_r_i` binds the published
-            // h_contribution to the MPC-opened m and the worker's r_i commitment.
+            // Codex P1 #4 round0: per-party check `h_q_i * m == allHRoundZero[i]`. The
+            // h_r_i value comes from the round0 commitment vector, NOT from a
+            // round1-supplied field — so a malicious worker can't pick (h_q', h_r') as a
+            // matched pair after seeing m.
             if point * m_scalar != h_r_point {
                 return Err(WorkerError::Crypto(format!(
-                    "h_q_i * m != h_r_i for slot {}",
-                    contribution.slot
+                    "h_q_i * m != allHRoundZero[{}] for slot {}",
+                    player_ordinal, contribution.slot
                 )));
             }
             // All 5 parties must report the same m.
@@ -3128,12 +3600,10 @@ pub mod vault_ek_derivation_v2 {
                 )));
             }
             points.push(point);
-            h_r_points.push(h_r_point);
             ordered.push((
                 contribution.slot,
                 h_contribution_norm,
                 contribution.schnorr_proof.clone(),
-                h_r_norm,
                 mpc_open_m_norm,
             ));
         }
@@ -3143,15 +3613,16 @@ pub mod vault_ek_derivation_v2 {
             vault_ek += point;
         }
         let mut h_r_sum = RistrettoPoint::default();
-        for point in &h_r_points {
+        for point in &all_h_points {
             h_r_sum += point;
         }
-        // Cross-aggregate sanity check: vault_ek * m == sum(h_r_i). Implied by the per-party
-        // check but cheap to verify (codex P1 #4).
+        // Cross-aggregate sanity check: vault_ek * m == sum(allHRoundZero). Implied by
+        // the per-party check but cheap to verify (codex P1 #4 round0).
         let m_final = shared_m.expect("at least one contribution sets shared_m");
         if vault_ek * m_final != h_r_sum {
             return Err(WorkerError::Crypto(
-                "vault_ek * m != sum(h_r_i) — aggregate consistency check failed".to_string(),
+                "vault_ek * m != sum(allHRoundZero) — aggregate consistency check failed"
+                    .to_string(),
             ));
         }
         let vault_ek_hex = compressed_hex(&vault_ek);
@@ -3163,6 +3634,7 @@ pub mod vault_ek_derivation_v2 {
             &sorted_slots,
             &vault_ek_hex,
             &ordered,
+            &all_h_normalized,
         );
 
         Ok(VerifyResult {
@@ -3211,6 +3683,7 @@ pub mod vault_ek_derivation_v2 {
         h_contribution_hex: &str,
         h_r_hex: &str,
         mpc_open_m_hex: &str,
+        round0_commit_hash: &str,
     ) -> String {
         let joined_slots = sorted_selected_slots
             .iter()
@@ -3237,6 +3710,14 @@ pub mod vault_ek_derivation_v2 {
         bytes.extend_from_slice(h_r_hex.as_bytes());
         bytes.push(b':');
         bytes.extend_from_slice(mpc_open_m_hex.as_bytes());
+        // Codex P1 #4 round0: also bind this party's view of ALL 5 parties'
+        // round0-committed h_r_i values via `round0_commit_hash`. Without this binding a
+        // malicious party could see m, derive an adversarial (h_q, h_r) pair locally, and
+        // produce a Schnorr POK that satisfies the per-party and aggregate checks. With
+        // it, the Schnorr challenge depends on the agreed-upon vector of pre-MPC h_r_i
+        // commitments — the party cannot retroactively choose a different r_i.
+        bytes.push(b':');
+        bytes.extend_from_slice(round0_commit_hash.as_bytes());
         sha256_hex(&bytes)
     }
 
@@ -3246,7 +3727,8 @@ pub mod vault_ek_derivation_v2 {
         roster_hash: &str,
         sorted_selected_slots: &[usize],
         vault_ek_hex: &str,
-        ordered_contributions: &[(usize, String, SchnorrProof, String, String)],
+        ordered_contributions: &[(usize, String, SchnorrProof, String)],
+        all_h_round_zero: &[String],
     ) -> String {
         let joined_slots = sorted_selected_slots
             .iter()
@@ -3264,7 +3746,13 @@ pub mod vault_ek_derivation_v2 {
         bytes.extend_from_slice(joined_slots.as_bytes());
         bytes.push(b':');
         bytes.extend_from_slice(vault_ek_hex.as_bytes());
-        for (slot, h_contribution_hex, proof, h_r_hex, mpc_open_m_hex) in ordered_contributions {
+        // Codex P1 #4 round0: bind the round0 commitment vector into the final transcript
+        // so audit trails record the pre-MPC commitment values (the per-contribution h_r
+        // field is gone — the canonical h_r_i lives in allHRoundZero).
+        bytes.push(b':');
+        bytes.extend_from_slice(b"R0:");
+        bytes.extend_from_slice(round0_commit_hash(all_h_round_zero).as_bytes());
+        for (slot, h_contribution_hex, proof, mpc_open_m_hex) in ordered_contributions {
             bytes.push(b':');
             bytes.extend_from_slice(slot.to_string().as_bytes());
             bytes.push(b'|');
@@ -3273,8 +3761,6 @@ pub mod vault_ek_derivation_v2 {
             bytes.extend_from_slice(proof.r.to_lowercase().as_bytes());
             bytes.push(b'|');
             bytes.extend_from_slice(proof.s.to_lowercase().as_bytes());
-            bytes.push(b'|');
-            bytes.extend_from_slice(h_r_hex.to_lowercase().as_bytes());
             bytes.push(b'|');
             bytes.extend_from_slice(mpc_open_m_hex.to_lowercase().as_bytes());
         }

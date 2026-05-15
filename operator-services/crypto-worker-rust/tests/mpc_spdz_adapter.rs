@@ -103,7 +103,7 @@ fn lagrange_coefficient_recompute_mismatch_rejected() {
         lagrange_coefficients_hex: bogus_lagrange,
     };
     let err = adapter
-        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .compute_inverse_share(&Scalar::ONE, &Scalar::ONE, &ctx)
         .expect_err("lagrange mismatch must reject");
     assert!(
         matches!(&err, AdapterError::InvalidInput(msg) if msg == "lagrange_coefficient_mismatch"),
@@ -147,7 +147,7 @@ fn lagrange_other_player_mismatch_also_rejected() {
         lagrange_coefficients_hex: supplied,
     };
     let err = adapter
-        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .compute_inverse_share(&Scalar::ONE, &Scalar::ONE, &ctx)
         .expect_err("other-player lagrange tampering must reject");
     assert!(
         matches!(&err, AdapterError::InvalidInput(msg) if msg == "lagrange_coefficient_mismatch"),
@@ -185,7 +185,7 @@ fn player_id_self_slot_mismatch_rejected() {
         lagrange_coefficients_hex: lagrange,
     };
     let err = adapter
-        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .compute_inverse_share(&Scalar::ONE, &Scalar::ONE, &ctx)
         .expect_err("player_id/self_slot mismatch must reject");
     assert!(
         matches!(&err, AdapterError::InvalidInput(msg) if msg.contains("self_slot_player_id_mismatch")),
@@ -225,7 +225,7 @@ fn shifted_selection_rejected_without_opt_in() {
     let prev = std::env::var("EUNOMA_MPC_ALLOW_SHIFTED_SELECTION").ok();
     std::env::remove_var("EUNOMA_MPC_ALLOW_SHIFTED_SELECTION");
     let err = adapter
-        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .compute_inverse_share(&Scalar::ONE, &Scalar::ONE, &ctx)
         .expect_err("shifted selection without opt-in must reject");
     if let Some(prev) = prev {
         std::env::set_var("EUNOMA_MPC_ALLOW_SHIFTED_SELECTION", prev);
@@ -266,7 +266,7 @@ fn missing_peer_cert_fails_closed() {
         lagrange_coefficients_hex: lagrange,
     };
     let err = adapter
-        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .compute_inverse_share(&Scalar::ONE, &Scalar::ONE, &ctx)
         .expect_err("missing peer cert must fail closed");
     assert!(
         matches!(&err, AdapterError::Internal(msg) if msg.contains("missing own private key") || msg.contains("missing peer cert")),
@@ -382,6 +382,13 @@ fn real_mp_spdz_inversion_passes_registration_sigma() {
         handles.push(thread::spawn(move || {
             // Each thread sets MP_SPDZ_HOME for its own adapter clone (idempotent).
             let adapter = MpcSpdzInverseAdapter::from_home(home_for_thread).expect("home");
+            // Codex P1 #4 round0: in production each party calls /worker/v2/derive/vault_ek/round0
+            // first, which generates r_i, persists (r_i, h_r_i) under state_dir, and returns
+            // h_r_i for the coordinator to fan out to all 5 parties as `allHRoundZero`. The
+            // killer test drives the adapter directly so we generate r_i here and pass it in;
+            // the round0/round1 commit-reveal logic is exercised by the run_round0 + run_round1
+            // crate-level unit tests instead.
+            let r_i = eunoma_crypto_worker::mpc_spdz_adapter::random_scalar();
             let ctx = InversionContext {
                 dkg_epoch,
                 ca_dkg_transcript_hash: ca,
@@ -395,7 +402,7 @@ fn real_mp_spdz_inversion_passes_registration_sigma() {
                 player_id: ordinal,
                 lagrange_coefficients_hex: lagrange_for_thread,
             };
-            match adapter.compute_inverse_share(&dk_share, &ctx) {
+            match adapter.compute_inverse_share(&dk_share, &r_i, &ctx) {
                 Ok(share) => {
                     let _ = tx.send(Ok((ordinal, share.q_i)));
                 }

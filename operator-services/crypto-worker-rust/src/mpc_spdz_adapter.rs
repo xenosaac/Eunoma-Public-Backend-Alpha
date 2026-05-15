@@ -86,6 +86,7 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
     fn compute_inverse_share(
         &self,
         dk_share: &Scalar,
+        r_i: &Scalar,
         ctx: &InversionContext,
     ) -> Result<InversionShare, AdapterError> {
         // Defense in depth: validate the context shape.
@@ -260,15 +261,18 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         // (true for ssl_sockets.h's add_verify_path).
         let _ = run_c_rehash(&player_data_dir);
 
-        // Generate a fresh per-session r_i. Never logged, never leaves this process.
-        let mut r_i = random_scalar();
+        // Codex P1 #4 round0 fix: r_i is now supplied externally by `run_round0`, which
+        // persisted (sessionId, r_i, h_r_i) to disk BEFORE MPC ran. The caller has already
+        // verified that `all_h_r_zero[player_id]` equals the locally-committed h_r_i. We
+        // hold a local mutable copy so we can zeroize it at the end of this call.
+        let mut r_i_local = *r_i;
 
         // Write our two per-party sint inputs: dk_share, r_i. (lambda_i is read as
         // public_input, handled by the Public-Input file above.)
         let input_path = player_data_dir.join(format!("Input-P{}-0", ctx.player_id));
         let mut input_text = String::new();
         let dk_decimal = scalar_to_decimal(dk_share);
-        let r_decimal = scalar_to_decimal(&r_i);
+        let r_decimal = scalar_to_decimal(&r_i_local);
         input_text.push_str(&dk_decimal);
         input_text.push('\n');
         input_text.push_str(&r_decimal);
@@ -385,7 +389,7 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
                         let _ = zeroize_file_inplace(&input_path);
                         input_guard.disarm();
                         cleanup_or_keep(&session_dir, self.keep_session_dirs);
-                        r_i.zeroize();
+                        r_i_local.zeroize();
                         return Err(AdapterError::Internal(format!(
                             "mascot-party.x timeout after {}s",
                             self.timeout.as_secs()
@@ -402,7 +406,7 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
                     let _ = zeroize_file_inplace(&input_path);
                     input_guard.disarm();
                     cleanup_or_keep(&session_dir, self.keep_session_dirs);
-                    r_i.zeroize();
+                    r_i_local.zeroize();
                     return Err(AdapterError::Internal(format!("try_wait: {e}")));
                 }
             }
@@ -430,7 +434,7 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
             excerpt.iter().rev().for_each(|_| ());
             let last_lines = trail.lines().rev().take(5).collect::<Vec<_>>().join(" | ");
             cleanup_or_keep(&session_dir, self.keep_session_dirs);
-            r_i.zeroize();
+            r_i_local.zeroize();
             return Err(AdapterError::Internal(format!(
                 "mascot-party.x exited {} — stderr tail: {}",
                 status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
@@ -444,7 +448,7 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
             Some(s) => s,
             None => {
                 cleanup_or_keep(&session_dir, self.keep_session_dirs);
-                r_i.zeroize();
+                r_i_local.zeroize();
                 return Err(AdapterError::Internal(
                     "mascot stdout missing EUNOMA_VAULT_EK_M= line".to_string(),
                 ));
@@ -455,13 +459,13 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         // r == 0 — should not happen with OsRng). Defense in depth.
         if m == Scalar::ZERO {
             cleanup_or_keep(&session_dir, self.keep_session_dirs);
-            r_i.zeroize();
+            r_i_local.zeroize();
             return Err(AdapterError::Internal(
                 "opened m is zero — refusing to invert".to_string(),
             ));
         }
         let m_inv = m.invert();
-        let q_i = r_i * m_inv;
+        let q_i = r_i_local * m_inv;
 
         // Compute h * r_i for the public artifact (codex P1 #4). The verifier checks
         // h_q_i * m == h_r_i, which binds q_i to the MPC-opened m and prevents a malicious
@@ -469,14 +473,14 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         // round1 + verify code paths use to make h_q_i. After this scalar-mult, r_i is no
         // longer needed and is zeroized.
         let h = h_ristretto().map_err(|e| AdapterError::Internal(format!("h_ristretto: {e:?}")))?;
-        let h_r_i = h * r_i;
+        let h_r_i = h * r_i_local;
 
         // Hide the unused-by-name placeholder.
         let _self_lambda_unused = self_lambda_decimal;
 
         // Wipe sensitive material. q_i is still secret — caller is responsible for zeroizing
         // it after producing h_q_i + Schnorr proof.
-        r_i.zeroize();
+        r_i_local.zeroize();
 
         cleanup_or_keep(&session_dir, self.keep_session_dirs);
         Ok(InversionShare {
@@ -499,7 +503,7 @@ fn ed25519_scalar_prime_biguint() -> BigUint {
 }
 
 /// Returns true iff `s` is non-empty and contains only `[A-Za-z0-9._-]`.
-fn is_safe_id(s: &str) -> bool {
+pub(crate) fn is_safe_id(s: &str) -> bool {
     !s.is_empty()
         && s.bytes().all(|b| {
             b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-'
@@ -546,7 +550,10 @@ impl Drop for SecretFileGuard {
     }
 }
 
-fn random_scalar() -> Scalar {
+/// Public helper for round0 + tests: draw a uniform random scalar via OsRng. Bytes are
+/// zeroized after consumption. Codex P1 #4: r_i must be unpredictable to peers BEFORE the
+/// commit happens, otherwise the commit-reveal is trivially defeated.
+pub fn random_scalar() -> Scalar {
     let mut rng = OsRng;
     let mut bytes = [0u8; 64];
     rng.fill_bytes(&mut bytes);

@@ -172,6 +172,7 @@ impl MpcInverseAdapter for MockFixedScalarAdapter {
     fn compute_inverse_share(
         &self,
         _dk_share: &Scalar,
+        _r_i: &Scalar,
         _ctx: &InversionContext,
     ) -> Result<InversionShare, AdapterError> {
         mock_inversion_share_from_q(self.scalar)
@@ -207,6 +208,69 @@ fn phase2_round1_extras(
         .collect();
     let lagrange: Vec<String> = sorted.iter().map(|_| "00".repeat(32)).collect();
     (player_id, peers, lagrange)
+}
+
+/// Codex P1 #4 round0: write a fake round0.json under `state_dir/mpc-sessions/...` for
+/// tests that need to drive `run_round1` directly without going through `run_round0`. The
+/// (r_i, h_r_i) pair must be self-consistent (h_r_i = h * r_i). Returns h_r_i_hex for
+/// later use in the test's allHRoundZero vector.
+fn write_round0_file(
+    state_dir: &Path,
+    request_id: &str,
+    session_id: &str,
+    self_slot: usize,
+    player_id: usize,
+    selected_slots: &[usize],
+    r_i: &Scalar,
+) -> String {
+    write_round0_file_with_roster(
+        state_dir,
+        request_id,
+        session_id,
+        self_slot,
+        player_id,
+        selected_slots,
+        r_i,
+        &roster_hash_hex(),
+    )
+}
+
+/// Like `write_round0_file` but lets the caller specify the rosterHash recorded in the
+/// file (so the killer test, which uses a non-default roster_hash, can write a file the
+/// real `run_round1` won't reject).
+fn write_round0_file_with_roster(
+    state_dir: &Path,
+    request_id: &str,
+    session_id: &str,
+    self_slot: usize,
+    player_id: usize,
+    selected_slots: &[usize],
+    r_i: &Scalar,
+    roster_hash: &str,
+) -> String {
+    let h_r_point = h_point() * r_i;
+    let h_r_hex = compressed_hex(&h_r_point);
+    let r_i_hex = scalar_hex(r_i);
+    let mut sorted = selected_slots.to_vec();
+    sorted.sort_unstable();
+    let layout = serde_json::json!({
+        "session_id": session_id,
+        "request_id": request_id,
+        "self_slot": self_slot,
+        "player_id": player_id,
+        "roster_hash": roster_hash,
+        "selected_slots": sorted,
+        "r_i_hex": r_i_hex,
+        "h_r_i_hex": h_r_hex,
+        "created_at_unix_ms": 1u128,
+    });
+    let dir = state_dir
+        .join("mpc-sessions")
+        .join(format!("{request_id}__{session_id}"));
+    fs::create_dir_all(&dir).expect("create round0 dir");
+    let path = dir.join("round0.json");
+    fs::write(&path, serde_json::to_vec(&layout).unwrap()).expect("write round0 file");
+    h_r_hex
 }
 
 #[test]
@@ -260,7 +324,7 @@ fn unavailable_adapter_returns_mp_spdz_unavailable() {
         player_id,
         lagrange_coefficients_hex: lagrange,
     };
-    let result = adapter.compute_inverse_share(&Scalar::ONE, &ctx);
+    let result = adapter.compute_inverse_share(&Scalar::ONE, &Scalar::ONE, &ctx);
     assert!(matches!(result, Err(AdapterError::McpSpdzNotAvailable)));
 }
 
@@ -269,6 +333,21 @@ fn round1_with_unavailable_adapter_returns_not_implemented() {
     let state_dir = temp_state_dir("unavailable");
     write_synthetic_share(&state_dir, 0);
     let (player_id, peers, lagrange) = phase2_round1_extras(&[0, 1, 2, 3, 4], 0);
+    // Codex P1 #4 round0: round1 now requires a persisted round0 file. Write one so the
+    // adapter call is reached (the unavailable adapter still returns 503 — that's what
+    // this test asserts).
+    let r_i = det_scalar(0x6e1);
+    let h_r = write_round0_file(
+        &state_dir,
+        "req-unavail",
+        "sess-unavail",
+        0,
+        player_id,
+        &[0, 1, 2, 3, 4],
+        &r_i,
+    );
+    let mut all_h = vec![h_r.clone(); 5];
+    all_h[player_id] = h_r;
     let req = Round1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
         ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
@@ -280,6 +359,7 @@ fn round1_with_unavailable_adapter_returns_not_implemented() {
         peer_addresses: peers,
         player_id,
         lagrange_coefficients: lagrange,
+        all_h_round_zero: all_h,
     };
     let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
     assert!(matches!(&err, WorkerError::NotImplemented(msg) if *msg == "mpc_inverse_unavailable"));
@@ -307,6 +387,18 @@ fn http_round1_returns_503_with_default_adapter() {
 
     let state_dir = temp_state_dir("http-round1");
     write_synthetic_share(&state_dir, 0);
+    // Codex P1 #4 round0: write a valid round0 file so round1 reaches the adapter (which
+    // is UnavailableMpcInverseAdapter for this test) and returns 503.
+    let r_i = det_scalar(0x4747);
+    let h_r_hex = write_round0_file(
+        &state_dir,
+        "http-test-req",
+        "http-test-sess",
+        0,
+        0,
+        &[0, 1, 2, 3, 4],
+        &r_i,
+    );
 
     // pick an ephemeral port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral");
@@ -338,12 +430,30 @@ fn http_round1_returns_503_with_default_adapter() {
         panic!("worker did not bind on port {port}");
     }
 
+    // Codex P1 #4 round0: build allHRoundZero with the locally-persisted h_r_i at this
+    // party's ordinal (player_id == self_slot == 0 for the lowest5 selection). Other
+    // entries can be any 32-byte hex; round1's adapter-call gate fires before any per-
+    // party check against other ordinals.
+    let mut all_h: Vec<String> = vec![h_r_hex.clone(); 5];
+    all_h[0] = h_r_hex;
     let body = serde_json::json!({
         "dkgEpoch": DKG_EPOCH,
         "caDkgTranscriptHash": ca_dkg_transcript_hex(),
         "rosterHash": roster_hash_hex(),
         "selectedSlots": [0, 1, 2, 3, 4],
         "selfSlot": 0,
+        "requestId": "http-test-req",
+        "sessionId": "http-test-sess",
+        "playerId": 0,
+        "peerAddresses": vec![
+            "127.0.0.1:14000".to_string(),
+            "127.0.0.1:14001".to_string(),
+            "127.0.0.1:14002".to_string(),
+            "127.0.0.1:14003".to_string(),
+            "127.0.0.1:14004".to_string(),
+        ],
+        "lagrangeCoefficients": vec!["00".repeat(32); 5],
+        "allHRoundZero": all_h,
     });
     let result = std::process::Command::new("curl")
         .args([
@@ -381,6 +491,22 @@ fn round1_with_mock_adapter_succeeds_and_contribution_matches_h_mul() {
     let inv_share = det_scalar(0xABCD);
     let adapter = MockFixedScalarAdapter { scalar: inv_share };
     let (player_id, peers, lagrange) = phase2_round1_extras(&[0, 1, 2, 3, 4], 2);
+    // Codex P1 #4 round0: mock adapter returns h_r_i = h * q_i (with m=1). For run_round1
+    // to pass the "adapter h_r matches persisted h_r" check, the persisted r_i in the
+    // round0 file must satisfy h * r_i == h * q_i, i.e. r_i = q_i. Persist r_i = q_i.
+    let r_i = inv_share;
+    let h_r = write_round0_file(
+        &state_dir,
+        "req-mock",
+        "sess-mock",
+        2,
+        player_id,
+        &[0, 1, 2, 3, 4],
+        &r_i,
+    );
+    // All 5 entries in allHRoundZero must be h * q_i for this mock — same value at each
+    // ordinal because the mock returns the same fixed q.
+    let all_h = vec![h_r.clone(); 5];
     let req = Round1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
         ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
@@ -392,14 +518,15 @@ fn round1_with_mock_adapter_succeeds_and_contribution_matches_h_mul() {
         peer_addresses: peers,
         player_id,
         lagrange_coefficients: lagrange,
+        all_h_round_zero: all_h.clone(),
     };
     let result = run_round1(&state_dir, &req, &adapter).expect("round1 succeeds");
     assert_eq!(result.slot, 2);
     let expected_point = h_point() * inv_share;
     assert_eq!(result.h_contribution, compressed_hex(&expected_point));
-    // Codex P1 #4: mock adapter uses m=1 and h_r = h * q_i; result must echo those.
+    // Codex P1 #4: mock adapter uses m=1; result must echo that.
     assert_eq!(result.mpc_open_m, mock_mpc_open_m_hex());
-    assert_eq!(result.h_r, mock_h_r_for_q(&inv_share));
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     let expected_hash = worker_transcript_hash(
         DKG_EPOCH,
         &ca_dkg_transcript_hex(),
@@ -407,8 +534,9 @@ fn round1_with_mock_adapter_succeeds_and_contribution_matches_h_mul() {
         &[0, 1, 2, 3, 4],
         2,
         &result.h_contribution,
-        &result.h_r,
+        &h_r,
         &result.mpc_open_m,
+        &r0_hash,
     );
     assert_eq!(result.worker_transcript_hash, expected_hash);
 }
@@ -424,6 +552,10 @@ fn verify_aggregates_five_contributions() {
     let h = h_point();
     let m_hex = mock_mpc_open_m_hex();
     let h_r_hex = mock_h_r_for_q(&fixed);
+    // Codex P1 #4 round0: allHRoundZero is supplied at verify time. With m=1 and q=fixed,
+    // each party's h_r_i = h * fixed.
+    let all_h: Vec<String> = vec![h_r_hex.clone(); 5];
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     for slot in &sorted_slots {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -436,6 +568,7 @@ fn verify_aggregates_five_contributions() {
             &h_contribution_hex,
             &h_r_hex,
             &m_hex,
+            &r0_hash,
         );
         let proof = schnorr_pok(&fixed, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -443,7 +576,6 @@ fn verify_aggregates_five_contributions() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
-            h_r: h_r_hex.clone(),
             mpc_open_m: m_hex.clone(),
         });
         expected_sum += point;
@@ -459,18 +591,18 @@ fn verify_aggregates_five_contributions() {
         roster_hash: roster_hash_hex(),
         selected_slots: sorted_slots,
         contributions,
+        all_h_round_zero: all_h.clone(),
     };
     let result = run_verify(&request).expect("verify succeeds");
     assert_eq!(result.vault_ek, compressed_hex(&expected_sum));
     // sanity: re-verify final hash matches recomputation
-    let ordered: Vec<(usize, String, SchnorrProof, String, String)> = request
+    let ordered: Vec<(usize, String, SchnorrProof, String)> = request
         .contributions
         .iter()
         .map(|c| (
             c.slot,
             c.h_contribution.clone(),
             c.schnorr_proof.clone(),
-            c.h_r.clone(),
             c.mpc_open_m.clone(),
         ))
         .collect();
@@ -481,6 +613,7 @@ fn verify_aggregates_five_contributions() {
         &request.selected_slots,
         &result.vault_ek,
         &ordered,
+        &all_h,
     );
     assert_eq!(result.final_transcript_hash, recomputed);
 }
@@ -501,10 +634,10 @@ fn verify_rejects_under_quorum() {
                     s: "00".repeat(32),
                 },
                 worker_transcript_hash: "00".repeat(32),
-                h_r: "00".repeat(32),
                 mpc_open_m: "00".repeat(32),
             })
             .collect(),
+        all_h_round_zero: vec!["00".repeat(32); 5],
     };
     let err = run_verify(&request).unwrap_err();
     assert!(matches!(err, WorkerError::InvalidRequest(msg) if msg.contains("contributions")));
@@ -518,6 +651,8 @@ fn verify_rejects_duplicate_slot() {
     let h = h_point();
     let m_hex = mock_mpc_open_m_hex();
     let h_r_hex = mock_h_r_for_q(&fixed);
+    let all_h = vec![h_r_hex.clone(); 5];
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     for _ in 0..5 {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -531,6 +666,7 @@ fn verify_rejects_duplicate_slot() {
             &h_contribution_hex,
             &h_r_hex,
             &m_hex,
+            &r0_hash,
         );
         let proof = schnorr_pok(&fixed, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -538,7 +674,6 @@ fn verify_rejects_duplicate_slot() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
-            h_r: h_r_hex.clone(),
             mpc_open_m: m_hex.clone(),
         });
     }
@@ -548,6 +683,7 @@ fn verify_rejects_duplicate_slot() {
         roster_hash: roster_hash_hex(),
         selected_slots: sorted_slots,
         contributions,
+        all_h_round_zero: all_h,
     };
     let err = run_verify(&request).unwrap_err();
     assert!(matches!(err, WorkerError::InvalidRequest(msg) if msg.contains("duplicate")));
@@ -561,6 +697,8 @@ fn verify_rejects_worker_transcript_hash_mismatch() {
     let h = h_point();
     let m_hex = mock_mpc_open_m_hex();
     let h_r_hex = mock_h_r_for_q(&fixed);
+    let all_h = vec![h_r_hex.clone(); 5];
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     for (idx, slot) in sorted_slots.iter().enumerate() {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -580,6 +718,7 @@ fn verify_rejects_worker_transcript_hash_mismatch() {
             &h_contribution_hex,
             &h_r_hex,
             &m_hex,
+            &r0_hash,
         );
         let proof = schnorr_pok(&fixed, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -587,7 +726,6 @@ fn verify_rejects_worker_transcript_hash_mismatch() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
-            h_r: h_r_hex.clone(),
             mpc_open_m: m_hex.clone(),
         });
     }
@@ -597,6 +735,7 @@ fn verify_rejects_worker_transcript_hash_mismatch() {
         roster_hash: roster_hash_hex(),
         selected_slots: sorted_slots,
         contributions,
+        all_h_round_zero: all_h,
     };
     let err = run_verify(&request).unwrap_err();
     assert!(
@@ -614,6 +753,8 @@ fn verify_rejects_invalid_schnorr_proof() {
     let h = h_point();
     let m_hex = mock_mpc_open_m_hex();
     let h_r_hex = mock_h_r_for_q(&fixed);
+    let all_h = vec![h_r_hex.clone(); 5];
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     for (idx, slot) in sorted_slots.iter().enumerate() {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -626,6 +767,7 @@ fn verify_rejects_invalid_schnorr_proof() {
             &h_contribution_hex,
             &h_r_hex,
             &m_hex,
+            &r0_hash,
         );
         // For the third entry, prove knowledge of the WRONG secret (bogus): the schnorr will
         // fail verification.
@@ -636,7 +778,6 @@ fn verify_rejects_invalid_schnorr_proof() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
-            h_r: h_r_hex.clone(),
             mpc_open_m: m_hex.clone(),
         });
     }
@@ -646,6 +787,7 @@ fn verify_rejects_invalid_schnorr_proof() {
         roster_hash: roster_hash_hex(),
         selected_slots: sorted_slots,
         contributions,
+        all_h_round_zero: all_h,
     };
     let err = run_verify(&request).unwrap_err();
     assert!(matches!(&err, WorkerError::Crypto(msg) if msg.contains("schnorr")), "got {err:?}");
@@ -666,6 +808,7 @@ fn round1_rejects_missing_share() {
         peer_addresses: peers,
         player_id,
         lagrange_coefficients: lagrange,
+        all_h_round_zero: vec!["00".repeat(32); 5],
     };
     let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
     assert!(matches!(err, WorkerError::MissingLocalState(_)));
@@ -690,6 +833,7 @@ fn round1_rejects_bad_quorum() {
         peer_addresses: peers,
         player_id: 0,
         lagrange_coefficients: lagrange,
+        all_h_round_zero: vec!["00".repeat(32); 4],
     };
     let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
     assert!(matches!(err, WorkerError::InvalidRequest(_)));
@@ -706,8 +850,9 @@ fn worker_transcript_hash_is_deterministic_and_layout_documented() {
     let h_hex = "cc".repeat(32);
     let h_r_hex = "dd".repeat(32);
     let m_hex = "ee".repeat(32);
+    let r0_commit = "ff".repeat(32);
     let observed = worker_transcript_hash(
-        dkg_epoch, &ca, &roster, &slots, slot, &h_hex, &h_r_hex, &m_hex,
+        dkg_epoch, &ca, &roster, &slots, slot, &h_hex, &h_r_hex, &m_hex, &r0_commit,
     );
     let mut expected_input = Vec::new();
     expected_input.extend_from_slice(b"EUNOMA_VAULT_EK_DERIVATION_V1");
@@ -726,6 +871,8 @@ fn worker_transcript_hash_is_deterministic_and_layout_documented() {
     expected_input.extend_from_slice(h_r_hex.as_bytes());
     expected_input.extend_from_slice(b":");
     expected_input.extend_from_slice(m_hex.as_bytes());
+    expected_input.extend_from_slice(b":");
+    expected_input.extend_from_slice(r0_commit.as_bytes());
     let mut hasher = Sha256::new();
     hasher.update(&expected_input);
     let manual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -746,8 +893,19 @@ fn emit_worker_transcript_hash_parity_fixture() {
     let h_hex = "0c".repeat(32);
     let h_r_hex = "0d".repeat(32);
     let m_hex = "0e".repeat(32);
+    // Codex P1 #4 round0: parity fixture includes round0_commit_hash so the TS
+    // implementation can mirror the same 9-arg layout.
+    let all_h_round_zero = vec![
+        "1a".repeat(32),
+        "1b".repeat(32),
+        "1c".repeat(32),
+        "1d".repeat(32),
+        "1e".repeat(32),
+    ];
+    let r0_commit_hash =
+        eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h_round_zero);
     let hash = worker_transcript_hash(
-        dkg_epoch, &ca, &roster, &slots, slot, &h_hex, &h_r_hex, &m_hex,
+        dkg_epoch, &ca, &roster, &slots, slot, &h_hex, &h_r_hex, &m_hex, &r0_commit_hash,
     );
     let value = serde_json::json!({
         "dkgEpoch": dkg_epoch,
@@ -758,10 +916,13 @@ fn emit_worker_transcript_hash_parity_fixture() {
         "hContribution": h_hex,
         "hR": h_r_hex,
         "mpcOpenM": m_hex,
+        "allHRoundZero": all_h_round_zero,
+        "round0CommitHash": r0_commit_hash,
         "workerTranscriptHash": hash,
         "schnorrChallengeDomain": "EUNOMA_VAULT_EK_DERIVATION_SCHNORR_V1",
         "workerTranscriptDomain": "EUNOMA_VAULT_EK_DERIVATION_V1",
         "finalTranscriptDomain": "EUNOMA_VAULT_EK_DERIVATION_FINAL_V1",
+        "round0HashDomain": "EUNOMA_VAULT_EK_DERIVATION_ROUND0_V1",
     });
     fs::write(
         fixture_dir.join("vault_ek_derivation_parity.json"),
@@ -876,6 +1037,7 @@ impl MpcInverseAdapter for MockAdditiveInverseAdapter {
     fn compute_inverse_share(
         &self,
         _dk_share: &Scalar,
+        _r_i: &Scalar,
         ctx: &InversionContext,
     ) -> Result<InversionShare, AdapterError> {
         let q = self
@@ -966,7 +1128,27 @@ fn vault_ek_passes_registration_sigma() {
     }
     let adapter = MockAdditiveInverseAdapter { by_slot };
 
-    // 6. Run round1 for each of the 5 selected slots. The MockAdditiveInverseAdapter ignores
+    // 6. Codex P1 #4 round0: pre-write round0 files for each slot. The mock adapter
+    // returns h_r_i = h * q_i (with m=1), so the persisted r_i in each party's round0
+    // file must equal q_i for the post-MPC `adapter h_r matches persisted h_r` check
+    // to pass. Build allHRoundZero from the same q values.
+    let mut all_h_round_zero: Vec<String> = Vec::with_capacity(5);
+    for (ordinal, slot) in selected.iter().enumerate() {
+        let q = additive_shares[ordinal];
+        let h_r_hex = write_round0_file_with_roster(
+            &slot_dirs[*slot],
+            &format!("req-reg-sigma-{slot}"),
+            &format!("sess-reg-sigma-{slot}"),
+            *slot,
+            ordinal,
+            &selected,
+            &q,
+            &roster_hash,
+        );
+        all_h_round_zero.push(h_r_hex);
+    }
+
+    // 7. Run round1 for each of the 5 selected slots. The MockAdditiveInverseAdapter ignores
     // the Phase 2 fields; pass placeholder peer/lagrange values so the Round1Request shape is
     // satisfied. Production lagrange-validation lives in MpcSpdzInverseAdapter (not the mock),
     // so the validation logic does not gate this test.
@@ -984,6 +1166,7 @@ fn vault_ek_passes_registration_sigma() {
             peer_addresses: peers,
             player_id: ordinal,
             lagrange_coefficients: lagrange,
+            all_h_round_zero: all_h_round_zero.clone(),
         };
         let res = run_round1(&slot_dirs[*slot], &req, &adapter).expect("round1 succeeds");
         contributions.push(ContributionInput {
@@ -991,18 +1174,18 @@ fn vault_ek_passes_registration_sigma() {
             h_contribution: res.h_contribution,
             schnorr_proof: res.schnorr_proof,
             worker_transcript_hash: res.worker_transcript_hash,
-            h_r: res.h_r,
             mpc_open_m: res.mpc_open_m,
         });
     }
 
-    // 7. Run verify.
+    // 8. Run verify.
     let verify_req = VerifyRequest {
         dkg_epoch: dkg_epoch.to_string(),
         ca_dkg_transcript_hash: ca_dkg_transcript.clone(),
         roster_hash: roster_hash.clone(),
         selected_slots: selected.to_vec(),
         contributions,
+        all_h_round_zero,
     };
     let verify_res = run_verify(&verify_req).expect("verify succeeds");
 
@@ -1075,6 +1258,8 @@ fn verify_rejects_non_canonical_schnorr_s() {
     let h = h_point();
     let m_hex = mock_mpc_open_m_hex();
     let h_r_hex = mock_h_r_for_q(&fixed);
+    let all_h = vec![h_r_hex.clone(); 5];
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     for (idx, slot) in sorted_slots.iter().enumerate() {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -1087,6 +1272,7 @@ fn verify_rejects_non_canonical_schnorr_s() {
             &h_contribution_hex,
             &h_r_hex,
             &m_hex,
+            &r0_hash,
         );
         let mut proof = schnorr_pok(&fixed, &point, &worker_hash).expect("schnorr_pok");
         if idx == 2 {
@@ -1098,7 +1284,6 @@ fn verify_rejects_non_canonical_schnorr_s() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
-            h_r: h_r_hex.clone(),
             mpc_open_m: m_hex.clone(),
         });
     }
@@ -1108,6 +1293,7 @@ fn verify_rejects_non_canonical_schnorr_s() {
         roster_hash: roster_hash_hex(),
         selected_slots: sorted_slots,
         contributions,
+        all_h_round_zero: all_h,
     };
     let err = run_verify(&request).unwrap_err();
     assert!(
@@ -1121,27 +1307,31 @@ fn verify_rejects_non_canonical_schnorr_s() {
 
 #[test]
 fn verify_rejects_malicious_h_contribution_unbacked_by_h_r() {
-    // Codex P1 #4: a malicious worker publishes h_q_i' = h * arbitrary, h_r_i still equal to
-    // the honest h * r_i. The check `h_q_i * m == h_r_i` must fail because the malicious
-    // h_q_i is not tied to the honest r_i.
+    // Codex P1 #4 round0: with allHRoundZero coming from the coordinator-broadcast round0
+    // vector, a malicious worker can't supply a different h_r_i in its contribution. But
+    // it can still publish a malicious h_q_i that doesn't satisfy `h_q_i * m == h_r_i`
+    // where h_r_i is the entry from allHRoundZero at this party's ordinal. Verifier MUST
+    // catch that.
     let honest_q = det_scalar(0xDADA);
     let evil_x = det_scalar(0xEEEE);
     let sorted_slots = vec![0_usize, 1, 2, 3, 4];
     let h = h_point();
     let m_hex = mock_mpc_open_m_hex();
-    let h_r_honest = compressed_hex(&(h * honest_q)); // valid h_r for honest_q
+    let all_h: Vec<String> = sorted_slots
+        .iter()
+        .map(|_| compressed_hex(&(h * honest_q)))
+        .collect();
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     let mut contributions = Vec::new();
     for (idx, slot) in sorted_slots.iter().enumerate() {
         // For slot 2, publish a malicious h_q_i = h * evil_x that does NOT satisfy
-        // h_q_i * 1 == h_r_honest. The Schnorr POK is still valid (evil_x is known).
+        // h_q_i * 1 == allHRoundZero[2]. The Schnorr POK is still valid (evil_x is known).
         let secret = if idx == 2 { evil_x } else { honest_q };
         let point = h * secret;
         let h_contribution_hex = compressed_hex(&point);
-        let h_r_hex = if idx == 2 {
-            h_r_honest.clone() // attacker re-uses honest h_r but publishes evil h_q
-        } else {
-            mock_h_r_for_q(&honest_q)
-        };
+        // h_r in the transcript hash comes from allHRoundZero[ordinal] — verifier
+        // recomputes the same hash using the same source.
+        let h_r_hex = all_h[idx].clone();
         let worker_hash = worker_transcript_hash(
             DKG_EPOCH,
             &ca_dkg_transcript_hex(),
@@ -1151,6 +1341,7 @@ fn verify_rejects_malicious_h_contribution_unbacked_by_h_r() {
             &h_contribution_hex,
             &h_r_hex,
             &m_hex,
+            &r0_hash,
         );
         let proof = schnorr_pok(&secret, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -1158,7 +1349,6 @@ fn verify_rejects_malicious_h_contribution_unbacked_by_h_r() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
-            h_r: h_r_hex,
             mpc_open_m: m_hex.clone(),
         });
     }
@@ -1168,11 +1358,12 @@ fn verify_rejects_malicious_h_contribution_unbacked_by_h_r() {
         roster_hash: roster_hash_hex(),
         selected_slots: sorted_slots,
         contributions,
+        all_h_round_zero: all_h,
     };
     let err = run_verify(&request).unwrap_err();
     assert!(
-        matches!(&err, WorkerError::Crypto(msg) if msg.contains("h_q_i * m != h_r_i")),
-        "expected h_q_i * m mismatch, got {err:?}"
+        matches!(&err, WorkerError::Crypto(msg) if msg.contains("h_q_i * m != allHRoundZero")),
+        "expected h_q_i * m mismatch against round0 commitment, got {err:?}"
     );
 }
 
@@ -1186,18 +1377,27 @@ fn verify_rejects_disagreeing_mpc_open_m() {
     let m_honest_hex = mock_mpc_open_m_hex(); // = Scalar::ONE
     let m_evil = Scalar::from(2_u64);
     let m_evil_hex = scalar_hex(&m_evil);
+    // Build allHRoundZero so each party's h_r_i corresponds to the per-party (m, q) pair
+    // that this test crafts. For idx == 2: h_r_i = h * (m_evil * honest_q); else h_r_i =
+    // h * honest_q (with m=1).
+    let all_h: Vec<String> = sorted_slots
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| {
+            if idx == 2 {
+                compressed_hex(&(h * (m_evil * honest_q)))
+            } else {
+                mock_h_r_for_q(&honest_q)
+            }
+        })
+        .collect();
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     let mut contributions = Vec::new();
     for (idx, slot) in sorted_slots.iter().enumerate() {
         let point = h * honest_q;
         let h_contribution_hex = compressed_hex(&point);
-        // To pass the per-party `h_q_i * m == h_r_i` check at slot 2 with m=2: h_r_i must be
-        // h * (2 * honest_q). For honest slots: m=1 and h_r = h * honest_q.
         let m_hex = if idx == 2 { m_evil_hex.clone() } else { m_honest_hex.clone() };
-        let h_r_hex = if idx == 2 {
-            compressed_hex(&(h * (m_evil * honest_q)))
-        } else {
-            mock_h_r_for_q(&honest_q)
-        };
+        let h_r_hex = all_h[idx].clone();
         let worker_hash = worker_transcript_hash(
             DKG_EPOCH,
             &ca_dkg_transcript_hex(),
@@ -1207,6 +1407,7 @@ fn verify_rejects_disagreeing_mpc_open_m() {
             &h_contribution_hex,
             &h_r_hex,
             &m_hex,
+            &r0_hash,
         );
         let proof = schnorr_pok(&honest_q, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -1214,7 +1415,6 @@ fn verify_rejects_disagreeing_mpc_open_m() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
-            h_r: h_r_hex,
             mpc_open_m: m_hex,
         });
     }
@@ -1224,6 +1424,7 @@ fn verify_rejects_disagreeing_mpc_open_m() {
         roster_hash: roster_hash_hex(),
         selected_slots: sorted_slots,
         contributions,
+        all_h_round_zero: all_h,
     };
     let err = run_verify(&request).unwrap_err();
     assert!(
@@ -1240,11 +1441,14 @@ fn verify_rejects_zero_mpc_open_m() {
     let h = h_point();
     let m_hex = "00".repeat(32); // m = 0
     let mut contributions = Vec::new();
+    // With m=0: h_q_i * 0 = identity. allHRoundZero entries must each be identity too.
+    let h_r_hex_identity =
+        compressed_hex(&curve25519_dalek::ristretto::RistrettoPoint::default());
+    let all_h: Vec<String> = (0..5).map(|_| h_r_hex_identity.clone()).collect();
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     for slot in &sorted_slots {
         let point = h * honest_q;
         let h_contribution_hex = compressed_hex(&point);
-        // With m=0: h_q_i * 0 = identity. h_r_i must be identity too.
-        let h_r_hex = compressed_hex(&curve25519_dalek::ristretto::RistrettoPoint::default());
         let worker_hash = worker_transcript_hash(
             DKG_EPOCH,
             &ca_dkg_transcript_hex(),
@@ -1252,8 +1456,9 @@ fn verify_rejects_zero_mpc_open_m() {
             &sorted_slots,
             *slot,
             &h_contribution_hex,
-            &h_r_hex,
+            &h_r_hex_identity,
             &m_hex,
+            &r0_hash,
         );
         let proof = schnorr_pok(&honest_q, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -1261,7 +1466,6 @@ fn verify_rejects_zero_mpc_open_m() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
-            h_r: h_r_hex,
             mpc_open_m: m_hex.clone(),
         });
     }
@@ -1271,12 +1475,288 @@ fn verify_rejects_zero_mpc_open_m() {
         roster_hash: roster_hash_hex(),
         selected_slots: sorted_slots,
         contributions,
+        all_h_round_zero: all_h,
     };
     let err = run_verify(&request).unwrap_err();
     assert!(
         matches!(&err, WorkerError::InvalidRequest(msg) if msg.contains("mpc_open_m is zero")),
         "expected zero m rejection, got {err:?}"
     );
+}
+
+// === Codex P1 #4 round0 tests: post-m bias attack & round0 file management ===
+
+/// The Phase 2 attack codex P1 #4 was originally about. Without the round0 commitment,
+/// a malicious worker waits for the MPC to open `m`, picks any scalar `y`, publishes
+/// `h_r_i' = H*y` and `h_q_i' = H*(y*m_inv)`, and produces a Schnorr POK on `y*m_inv`.
+/// Per-party `h_q_i' * m == h_r_i'` is trivially satisfied. Aggregate
+/// `vault_ek * m == sum(h_r_i)` passes too. The registration sigma accepts a malicious
+/// `vault_ek`.
+///
+/// With the round0 fix, h_r_i is committed BEFORE the MPC reveals m, and the verifier
+/// uses `allHRoundZero[i]` (the committed value) rather than a round1-supplied one. A
+/// malicious worker can no longer pick (h_q', h_r') as a matched pair after seeing m —
+/// they're forced to pick h_r FIRST.
+///
+/// This test simulates the adversary: it builds the round0 commitment honestly (so the
+/// commit-reveal binding looks legitimate), then in round1's contribution publishes a
+/// malicious h_q_i' that doesn't actually equal `r_i * m^-1`. The verifier MUST reject
+/// because `h_q_i' * m != allHRoundZero[i]`.
+#[test]
+fn post_m_bias_attack_rejected() {
+    let honest_r_i = det_scalar(0x1230_0001);
+    let m = Scalar::from(7_u64); // any non-trivial m
+    let sorted_slots = vec![0_usize, 1, 2, 3, 4];
+    let h = h_point();
+
+    // Honest h_r_i commitments published in round0.
+    let all_h: Vec<String> = sorted_slots
+        .iter()
+        .map(|_| compressed_hex(&(h * honest_r_i)))
+        .collect();
+    let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
+    let m_hex = scalar_hex(&m);
+
+    let mut contributions = Vec::new();
+    for (idx, slot) in sorted_slots.iter().enumerate() {
+        // Honest contribution = h * (r_i * m_inv).
+        let m_inv = m.invert();
+        let honest_q_i = honest_r_i * m_inv;
+        let honest_h_q = h * honest_q_i;
+        // Malicious slot 2: publish an arbitrary h_q' that doesn't match the round0
+        // commitment. Use y = some unrelated scalar.
+        let evil = det_scalar(0xBADBAD);
+        let point = if idx == 2 { h * evil } else { honest_h_q };
+        let h_contribution_hex = compressed_hex(&point);
+        let h_r_hex = all_h[idx].clone();
+        let worker_hash = worker_transcript_hash(
+            DKG_EPOCH,
+            &ca_dkg_transcript_hex(),
+            &roster_hash_hex(),
+            &sorted_slots,
+            *slot,
+            &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
+            &r0_hash,
+        );
+        // Adversary's Schnorr proof is over `evil` (its known secret); this is valid POK
+        // for h_q' BUT h_q' * m != allHRoundZero[2].
+        let secret = if idx == 2 { evil } else { honest_q_i };
+        let proof = schnorr_pok(&secret, &point, &worker_hash).expect("schnorr_pok");
+        contributions.push(ContributionInput {
+            slot: *slot,
+            h_contribution: h_contribution_hex,
+            schnorr_proof: proof,
+            worker_transcript_hash: worker_hash,
+            mpc_open_m: m_hex.clone(),
+        });
+    }
+    let request = VerifyRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: sorted_slots,
+        contributions,
+        all_h_round_zero: all_h,
+    };
+    let err = run_verify(&request).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::Crypto(msg) if msg.contains("h_q_i * m != allHRoundZero")),
+        "expected post-m bias attack to be rejected via round0 binding, got {err:?}"
+    );
+}
+
+/// Variant of the post-m bias attack: malicious worker tries to swap the WHOLE round0
+/// commitment vector — supplying a different `allHRoundZero` than what the coordinator
+/// broadcast. round1 catches this when the persisted h_r_i in this party's round0 file
+/// doesn't match `allHRoundZero[playerId]`. The check fires before MPC runs.
+#[test]
+fn round0_commitment_mismatch_rejected_in_round1() {
+    let state_dir = temp_state_dir("round0-commit-mismatch");
+    write_synthetic_share(&state_dir, 0);
+    let (player_id, peers, lagrange) = phase2_round1_extras(&[0, 1, 2, 3, 4], 0);
+    // Persist round0 with a fixed r_i.
+    let r_i = det_scalar(0xC0FFEE);
+    let persisted_h_r = write_round0_file(
+        &state_dir,
+        "req-collide",
+        "sess-collide",
+        0,
+        player_id,
+        &[0, 1, 2, 3, 4],
+        &r_i,
+    );
+    // But the coordinator broadcasts a DIFFERENT h_r_i for player 0.
+    let evil_h_r = compressed_hex(&(h_point() * det_scalar(0xDEADBEEF)));
+    assert_ne!(evil_h_r, persisted_h_r);
+    let mut all_h = vec![persisted_h_r.clone(); 5];
+    all_h[player_id] = evil_h_r;
+    let req = Round1Request {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: vec![0, 1, 2, 3, 4],
+        self_slot: 0,
+        request_id: "req-collide".to_string(),
+        session_id: "sess-collide".to_string(),
+        peer_addresses: peers,
+        player_id,
+        lagrange_coefficients: lagrange,
+        all_h_round_zero: all_h,
+    };
+    // Even with the UnavailableMpcInverseAdapter the round0 mismatch check fires first.
+    let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::Crypto(msg) if msg.contains("round0_commitment_mismatch")),
+        "expected round0_commitment_mismatch, got {err:?}"
+    );
+}
+
+/// round1 without a persisted round0 file MUST be rejected before MPC. This catches the
+/// case where round1 is invoked directly (e.g., a buggy coordinator that skipped round0).
+#[test]
+fn missing_round0_file_rejected_in_round1() {
+    let state_dir = temp_state_dir("round0-missing");
+    write_synthetic_share(&state_dir, 0);
+    let (player_id, peers, lagrange) = phase2_round1_extras(&[0, 1, 2, 3, 4], 0);
+    let req = Round1Request {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: vec![0, 1, 2, 3, 4],
+        self_slot: 0,
+        request_id: "req-no-r0".to_string(),
+        session_id: "sess-no-r0".to_string(),
+        peer_addresses: peers,
+        player_id,
+        lagrange_coefficients: lagrange,
+        all_h_round_zero: vec!["00".repeat(32); 5],
+    };
+    let err = run_round1(&state_dir, &req, &UnavailableMpcInverseAdapter).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::InvalidDkgState(msg) if msg.contains("round0_file_missing")),
+        "expected round0_file_missing, got {err:?}"
+    );
+}
+
+/// run_round0 is idempotent for matching (request_id, session_id) — returns the same
+/// committed h_r_i. Defense in depth against a coordinator retry that would otherwise
+/// regenerate r_i and break the commit.
+#[test]
+fn round0_idempotent_same_request() {
+    use eunoma_crypto_worker::vault_ek_derivation_v2::{run_round0, Round0Request};
+    let state_dir = temp_state_dir("round0-idempotent");
+    write_synthetic_share(&state_dir, 0);
+    let req = Round0Request {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: vec![0, 1, 2, 3, 4],
+        self_slot: 0,
+        request_id: "req-idem".to_string(),
+        session_id: "sess-idem".to_string(),
+        peer_addresses: (0..5)
+            .map(|i| format!("127.0.0.1:{}", 14000 + i))
+            .collect(),
+        player_id: 0,
+        lagrange_coefficients: (0..5)
+            .map(|i| scalar_hex(&compute_lagrange_for_test(i, &[0, 1, 2, 3, 4])))
+            .collect(),
+    };
+    let first = run_round0(&state_dir, &req).expect("first round0");
+    let second = run_round0(&state_dir, &req).expect("second round0 must succeed");
+    // h_r_i and worker_round0_hash must be identical (same r_i underneath).
+    assert_eq!(first.h_r, second.h_r);
+    assert_eq!(first.worker_round0_hash, second.worker_round0_hash);
+}
+
+/// run_round0 with a session-id collision (same path, different sessionId) is rejected.
+/// Mirrors what would happen if two requests with different sessionIds hit the same file
+/// — should never happen in practice but defense in depth.
+#[test]
+fn round0_session_collision_rejected() {
+    use eunoma_crypto_worker::vault_ek_derivation_v2::{run_round0, Round0Request};
+    let state_dir = temp_state_dir("round0-collide");
+    write_synthetic_share(&state_dir, 0);
+    // Stage 1: legit round0 for (req-A, sess-A).
+    let lagrange_hex: Vec<String> = (0..5)
+        .map(|i| scalar_hex(&compute_lagrange_for_test(i, &[0, 1, 2, 3, 4])))
+        .collect();
+    let peers: Vec<String> = (0..5).map(|i| format!("127.0.0.1:{}", 14000 + i)).collect();
+    let first = Round0Request {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: vec![0, 1, 2, 3, 4],
+        self_slot: 0,
+        request_id: "req-A".to_string(),
+        session_id: "sess-A".to_string(),
+        peer_addresses: peers.clone(),
+        player_id: 0,
+        lagrange_coefficients: lagrange_hex.clone(),
+    };
+    run_round0(&state_dir, &first).expect("first round0");
+    // Stage 2: manually corrupt the file's sessionId to simulate a path collision
+    // (two distinct request_id/session_id values pointing at the same on-disk shape).
+    // The session_dir layout namespaces by request_id__session_id, so this only matters
+    // if the file was opened wrong. We test the resulting `round0_session_collision`
+    // path by hand-crafting a file under req-B/sess-B that claims to be req-A/sess-A.
+    let bad_dir = state_dir
+        .join("mpc-sessions")
+        .join("req-B__sess-B");
+    fs::create_dir_all(&bad_dir).unwrap();
+    let bad_layout = serde_json::json!({
+        "session_id": "sess-A",      // mismatch — file claims A but request says B
+        "request_id": "req-A",
+        "self_slot": 0,
+        "player_id": 0,
+        "roster_hash": roster_hash_hex(),
+        "selected_slots": [0, 1, 2, 3, 4],
+        "r_i_hex": scalar_hex(&det_scalar(0x999)),
+        "h_r_i_hex": compressed_hex(&(h_point() * det_scalar(0x999))),
+        "created_at_unix_ms": 1u128,
+    });
+    fs::write(
+        bad_dir.join("round0.json"),
+        serde_json::to_vec(&bad_layout).unwrap(),
+    )
+    .unwrap();
+    let collide = Round0Request {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: vec![0, 1, 2, 3, 4],
+        self_slot: 0,
+        request_id: "req-B".to_string(),
+        session_id: "sess-B".to_string(),
+        peer_addresses: peers,
+        player_id: 0,
+        lagrange_coefficients: lagrange_hex,
+    };
+    let err = run_round0(&state_dir, &collide).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::InvalidDkgState(msg) if msg.contains("round0_session_collision")),
+        "expected round0_session_collision, got {err:?}"
+    );
+}
+
+/// Helper to compute a Lagrange coefficient for tests that need to populate
+/// `lagrange_coefficients` with valid values (run_round0 doesn't actually consume them,
+/// but validates length/shape).
+fn compute_lagrange_for_test(player_id: usize, sorted_slots: &[usize]) -> Scalar {
+    let x_i = Scalar::from((sorted_slots[player_id] as u64) + 1);
+    let mut num = Scalar::ONE;
+    let mut den = Scalar::ONE;
+    for (j, slot) in sorted_slots.iter().enumerate() {
+        if j == player_id {
+            continue;
+        }
+        let x_j = Scalar::from((*slot as u64) + 1);
+        num *= -x_j;
+        den *= x_i - x_j;
+    }
+    num * den.invert()
 }
 
 /// If a malicious or buggy implementation builds a Schnorr proof against G instead of H,

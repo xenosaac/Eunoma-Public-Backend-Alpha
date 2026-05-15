@@ -1,4 +1,11 @@
 {
+  "allHRoundZero": [
+    "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+    "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b",
+    "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
+    "1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d",
+    "1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e"
+  ],
   "caDkgTranscriptHash": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
   "dkgEpoch": "7",
   "finalTranscriptDomain": "EUNOMA_VAULT_EK_DERIVATION_FINAL_V1",
@@ -6,6 +13,8 @@
   "hR": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
   "mpcOpenM": "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e",
   "rosterHash": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+  "round0CommitHash": "21e370e2ca0b739b0236b8af03792bdf56241af86b94abf73ea50b62e1123ada",
+  "round0HashDomain": "EUNOMA_VAULT_EK_DERIVATION_ROUND0_V1",
   "schnorrChallengeDomain": "EUNOMA_VAULT_EK_DERIVATION_SCHNORR_V1",
   "slot": 4,
   "sortedSelectedSlots": [
@@ -16,5 +25,5 @@
     5
   ],
   "workerTranscriptDomain": "EUNOMA_VAULT_EK_DERIVATION_V1",
-  "workerTranscriptHash": "c23d9064bc1df8f48313499b6444e5382b671ca30a2fdb097f038368c6671c3a"
+  "workerTranscriptHash": "095c3e9ab2f838a22fb560877a74a8602905e19513bc1ac677ca066df3dc050d"
 }
