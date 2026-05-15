@@ -274,6 +274,13 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         input_text.push_str(&r_decimal);
         input_text.push('\n');
         write_secret_file(&input_path, &input_text)?;
+        // Codex P2 #6: RAII guard. From this point forward, if any `?` returns early or
+        // any panic unwinds the stack, Drop will scrub the input file with zeros and
+        // remove it. The guard is disarmed only after the explicit `zeroize_file_inplace`
+        // on the happy paths below (success and known-error paths). This closes the
+        // residual leak where a `spawn` or stdio-setup failure left dk_share + r_i on
+        // disk in plaintext.
+        let mut input_guard = SecretFileGuard::new(input_path.clone());
 
         // Spawn mascot-party.x. Per `--help`:
         //   -p <player>          (this player's ordinal)
@@ -372,8 +379,11 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
                         let _ = fs::write(&log_stderr, &se);
                         let _ = stdout_handle.join();
                         let _ = stderr_handle.join();
-                        // Codex P2 #6: zero plaintext input file even on timeout.
+                        // Codex P2 #6: zero plaintext input file even on timeout. The guard
+                        // would also run via Drop, but doing it eagerly preserves the
+                        // legible error path; disarm after to avoid double-scrub.
                         let _ = zeroize_file_inplace(&input_path);
+                        input_guard.disarm();
                         cleanup_or_keep(&session_dir, self.keep_session_dirs);
                         r_i.zeroize();
                         return Err(AdapterError::Internal(format!(
@@ -390,6 +400,7 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
                     let _ = stderr_handle.join();
                     // Codex P2 #6: zero plaintext input file even on try_wait error.
                     let _ = zeroize_file_inplace(&input_path);
+                    input_guard.disarm();
                     cleanup_or_keep(&session_dir, self.keep_session_dirs);
                     r_i.zeroize();
                     return Err(AdapterError::Internal(format!("try_wait: {e}")));
@@ -409,8 +420,9 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         // decimal) with zeros IMMEDIATELY after the subprocess exits, regardless of whether
         // we keep the session dir. This prevents operators who set
         // EUNOMA_MPC_KEEP_SESSION_DIRS=1 for debugging from accidentally preserving plaintext
-        // secrets on disk.
+        // secrets on disk. Disarm the RAII guard so Drop is a no-op.
         let _ = zeroize_file_inplace(&input_path);
+        input_guard.disarm();
 
         if !status.success() {
             let trail = String::from_utf8_lossy(&stderr_bytes);
@@ -492,6 +504,46 @@ fn is_safe_id(s: &str) -> bool {
         && s.bytes().all(|b| {
             b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-'
         })
+}
+
+/// Codex P2 #6: RAII scrubber for plaintext on-disk secrets.
+///
+/// Wraps a path written via `write_secret_file` (containing dk_share + r_i in decimal). The
+/// guard is "armed" by default; if it is dropped while still armed, Drop overwrites the file
+/// with zeros and removes it. Call `disarm` only after an explicit zeroize + truncate has
+/// already run on a known-safe code path, so the guard becomes a no-op.
+///
+/// This closes the residual leak codex P2 #6 (PARTIALLY_CLOSED): previously the explicit
+/// zeroize ran on the happy path, the timeout path, and the `try_wait` error path — but a
+/// `?` return from any of:
+///   - `child.stdout.take()` / `child.stderr.take()` (after spawn, before wait loop)
+///   - any other `?` that surfaces after `write_secret_file` but before `zeroize_file_inplace`
+/// left the plaintext file on disk. With the guard armed at write time and disarmed only on
+/// known-safe paths, every early return — including panics — now scrubs.
+pub(crate) struct SecretFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl SecretFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SecretFileGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort scrub + remove. Errors are swallowed because Drop cannot panic, and the
+        // guard is already a defense-in-depth layer over the explicit zeroize calls.
+        let _ = zeroize_file_inplace(&self.path);
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn random_scalar() -> Scalar {
@@ -1107,4 +1159,79 @@ mod inner_tests {
         let stdout = "no marker here\n";
         assert!(find_open_m(stdout).is_none());
     }
+
+    #[test]
+    fn secret_file_guard_scrubs_on_drop_when_armed() {
+        // Codex P2 #6 RAII: an armed guard going out of scope must zero + remove the file.
+        let dir = std::env::temp_dir().join(format!(
+            "eunoma-guard-armed-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Input-P0-0");
+        let plaintext = b"123456789\n123456789\n";
+        fs::write(&path, plaintext).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), plaintext);
+        {
+            let _guard = SecretFileGuard::new(path.clone());
+            // guard is armed; drop will scrub
+        }
+        // After drop, the file must be gone.
+        assert!(!path.exists(), "armed guard must remove file on drop");
+    }
+
+    #[test]
+    fn secret_file_guard_disarmed_leaves_file() {
+        // Codex P2 #6: a disarmed guard MUST be a no-op so the explicit zeroize on the
+        // happy/known-error paths doesn't double-scrub or remove something it shouldn't.
+        let dir = std::env::temp_dir().join(format!(
+            "eunoma-guard-disarmed-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Input-P0-0");
+        let plaintext = b"abc\n";
+        fs::write(&path, plaintext).unwrap();
+        {
+            let mut guard = SecretFileGuard::new(path.clone());
+            guard.disarm();
+        }
+        // File must still exist (the caller already explicitly handled scrubbing).
+        assert!(path.exists(), "disarmed guard must not delete file");
+        // Clean up.
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn secret_file_guard_panic_safety_scrubs_anyway() {
+        // Codex P2 #6: if a panic unwinds the stack between `write_secret_file` and the
+        // explicit zeroize, Drop still scrubs. Use catch_unwind to capture the unwinding
+        // safely inside the test.
+        let dir = std::env::temp_dir().join(format!(
+            "eunoma-guard-panic-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Input-P0-0");
+        let plaintext = b"42\n";
+        fs::write(&path, plaintext).unwrap();
+        let path_clone = path.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = SecretFileGuard::new(path_clone);
+            panic!("simulated mid-flow failure");
+        }));
+        assert!(result.is_err(), "test scenario must panic");
+        assert!(!path.exists(), "Drop must scrub even when panic unwinds");
+    }
+
 }
