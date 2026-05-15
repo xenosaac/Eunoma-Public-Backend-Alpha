@@ -2725,6 +2725,1120 @@ pub mod ca_dkg_v2 {
     }
 }
 
+pub mod frost_dkg_v2 {
+    use crate::hpke_aead::{self, HpkeEnvelope};
+    use crate::local_state::slot_to_identifier;
+    use crate::{
+        assert_slot, assert_v2_threshold, validate_decimal_segment, WorkerError, WorkerResult,
+        DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD,
+    };
+    use frost_ed25519 as frost;
+    use rand::rngs::OsRng;
+    use serde::{Deserialize, Serialize};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    pub(crate) const FROST_KEY_PACKAGE_FILE: &str = "frost_key_package.json";
+    pub(crate) const FROST_PUBLIC_PACKAGE_FILE: &str = "frost_public_package.json";
+    pub(crate) const FROST_MANIFEST_FILE: &str = "frost_state_manifest.json";
+    pub(crate) const HPKE_KEYPAIR_FILE: &str = "hpke_x25519_keypair_v2.json";
+    pub(crate) const FROST_DKG_V2_DIR: &str = "frost_dkg_v2";
+    pub(crate) const ROUND1_SELF_FILE: &str = "round1_self.json";
+    pub(crate) const ROUND1_BROADCASTS_FILE: &str = "round1_broadcasts.json";
+    pub(crate) const ROUND2_SECRET_FILE: &str = "round2_secret.json";
+    pub(crate) const ROUND2_RECEIVED_DIR: &str = "round2_received";
+    pub(crate) const STATE_FILE: &str = "state.json";
+
+    // Cross-protocol replay safety: distinct HPKE info string vs. CA DKG V2.
+    pub(crate) const HPKE_INFO: &[u8] = b"EUNOMA_FROST_DKG_V2_HPKE_INFO_V1";
+    pub(crate) const HPKE_AAD_DOMAIN: &[u8] = b"EUNOMA_FROST_DKG_V2_HPKE_AAD_V1";
+    pub(crate) const ROUND1_DOMAIN: &[u8] = b"EUNOMA_FROST_DKG_V2_R1";
+    pub(crate) const ROUND2_SEND_DOMAIN: &[u8] = b"EUNOMA_FROST_DKG_V2_R2_SEND";
+    pub(crate) const ROUND2_RECEIVE_DOMAIN: &[u8] = b"EUNOMA_FROST_DKG_V2_R2_RECEIVE";
+    pub(crate) const FINALIZE_DOMAIN: &[u8] = b"EUNOMA_FROST_DKG_V2_FINALIZE";
+    pub(crate) const ROSTER_DOMAIN: &str = "EUNOMA_FROST_DKG_V2_ROSTER_V1";
+    pub(crate) const COMPLAINT_DOMAIN: &[u8] = b"EUNOMA_FROST_DKG_V2_COMPLAINT";
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FrostDkgV2Roster {
+        pub operator_set_version: String,
+        pub dkg_epoch: String,
+        pub ca_dkg_scheme: String,
+        pub threshold: usize,
+        pub nodes: Vec<FrostDkgV2RosterNode>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FrostDkgV2RosterNode {
+        pub slot: usize,
+        pub node_id: String,
+        pub endpoint: String,
+        pub hpke_public_key: String,
+        pub transcript_public_key: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FrostRound1Broadcast {
+        pub slot: usize,
+        pub package_hex: String,
+        pub package_hash: String,
+        pub transcript_hash: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FrostRound2Envelope {
+        pub dealer_slot: usize,
+        pub to_slot: usize,
+        pub package_commitment: String,
+        pub hpke: HpkeEnvelope,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FrostDkgV2Complaint {
+        pub accused_slot: usize,
+        pub evidence_kind: String,
+        pub evidence_hash: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FrostDkgV2RoundRequest {
+        pub request_id: String,
+        pub session_id: String,
+        pub round: String,
+        pub operator_set_version: String,
+        pub dkg_epoch: String,
+        pub frost_dkg_v2_roster_hash: String,
+        pub threshold: usize,
+        pub participant_slots: Vec<usize>,
+        pub slot: usize,
+        pub frost_dkg_v2_roster: Option<FrostDkgV2Roster>,
+        #[serde(default)]
+        pub frost_round1_broadcasts: Vec<FrostRound1Broadcast>,
+        #[serde(default)]
+        pub frost_round2_envelopes: Vec<FrostRound2Envelope>,
+        pub transcript_hash: Option<String>,
+        pub complaint: Option<Value>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FrostDkgV2RoundResult {
+        pub request_id: String,
+        pub session_id: String,
+        pub protocol: String,
+        pub round: String,
+        pub operator_set_version: String,
+        pub dkg_epoch: String,
+        pub slot: usize,
+        pub accepted: bool,
+        pub transcript_hash: String,
+        pub artifact_hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub frost_round1_broadcast: Option<FrostRound1Broadcast>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub frost_round2_envelopes: Vec<FrostRound2Envelope>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub group_public_key: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub frost_verifying_share: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub frost_key_package_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub frost_public_package_hash: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub complaints: Vec<FrostDkgV2Complaint>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub abort_evidence_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub finalized: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HpkeKeypairFile {
+        pub scheme: String,
+        pub slot: usize,
+        pub public_key: String,
+        pub private_key: String,
+        pub created_at_unix_ms: u128,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Round1Self {
+        slot: usize,
+        round1_secret: Value,
+        round1_package: Value,
+        package_hash: String,
+    }
+
+    pub fn run_round(
+        state_dir: &Path,
+        req: FrostDkgV2RoundRequest,
+    ) -> WorkerResult<FrostDkgV2RoundResult> {
+        validate_round_request(&req)?;
+        match req.round.as_str() {
+            "round1" => run_round1(state_dir, &req),
+            "round2_send" => run_round2_send(state_dir, &req),
+            "round2_receive" => run_round2_receive(state_dir, &req),
+            "finalize" => run_finalize(state_dir, &req),
+            "complaint" => run_complaint(&req),
+            _ => Err(WorkerError::InvalidRequest(
+                "invalid FROST DKG V2 round".to_string(),
+            )),
+        }
+    }
+
+    fn validate_round_request(req: &FrostDkgV2RoundRequest) -> WorkerResult<()> {
+        assert_v2_threshold(req.threshold, req.participant_slots.len())?;
+        assert_slot(req.slot)?;
+        let expected = (0..DEOPERATOR_COUNT).collect::<Vec<_>>();
+        if req.participant_slots != expected {
+            return Err(WorkerError::InvalidRequest(
+                "participantSlots must be [0,1,2,3,4,5,6]".to_string(),
+            ));
+        }
+        validate_decimal_segment(&req.operator_set_version)?;
+        validate_decimal_segment(&req.dkg_epoch)?;
+        expect_hex_len(&req.frost_dkg_v2_roster_hash, 32)?;
+        Ok(())
+    }
+
+    fn validate_roster(roster: &FrostDkgV2Roster) -> WorkerResult<()> {
+        if roster.ca_dkg_scheme != "frost_dkg_v2" {
+            return Err(WorkerError::InvalidRequest(
+                "FROST DKG V2 roster scheme must be frost_dkg_v2".to_string(),
+            ));
+        }
+        assert_v2_threshold(roster.threshold, roster.nodes.len())?;
+        validate_decimal_segment(&roster.operator_set_version)?;
+        validate_decimal_segment(&roster.dkg_epoch)?;
+        let mut seen = BTreeSet::new();
+        for node in &roster.nodes {
+            assert_slot(node.slot)?;
+            if !seen.insert(node.slot) {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate FROST DKG V2 roster slot {}",
+                    node.slot
+                )));
+            }
+            expect_hex_len(&node.hpke_public_key, 32)?;
+            expect_hex_len(&node.transcript_public_key, 32)?;
+        }
+        Ok(())
+    }
+
+    pub fn frost_dkg_v2_roster_hash(roster: &FrostDkgV2Roster) -> WorkerResult<String> {
+        validate_roster(roster)?;
+        let mut sorted = roster.nodes.clone();
+        sorted.sort_by_key(|node| node.slot);
+        let canonical = json!({
+            "domain": ROSTER_DOMAIN,
+            "operatorSetVersion": roster.operator_set_version,
+            "dkgEpoch": roster.dkg_epoch,
+            "caDkgScheme": roster.ca_dkg_scheme,
+            "threshold": roster.threshold,
+            "nodes": sorted.iter().map(|node| json!({
+                "slot": node.slot,
+                "nodeId": node.node_id,
+                "endpoint": node.endpoint,
+                "hpkePublicKey": normalize_hex(&node.hpke_public_key).unwrap_or_default(),
+                "transcriptPublicKey": normalize_hex(&node.transcript_public_key).unwrap_or_default(),
+            })).collect::<Vec<_>>(),
+        });
+        let bytes = canonical_json_bytes(&canonical)?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    fn run_round1(
+        state_dir: &Path,
+        req: &FrostDkgV2RoundRequest,
+    ) -> WorkerResult<FrostDkgV2RoundResult> {
+        let roster = req.frost_dkg_v2_roster.as_ref().ok_or_else(|| {
+            WorkerError::InvalidRequest(
+                "frostDkgV2Roster is required for FROST DKG V2 round1".to_string(),
+            )
+        })?;
+        let computed_hash = frost_dkg_v2_roster_hash(roster)?;
+        if computed_hash != normalize_hex(&req.frost_dkg_v2_roster_hash)? {
+            return Err(WorkerError::InvalidRequest(
+                "frostDkgV2RosterHash mismatch".to_string(),
+            ));
+        }
+        if roster.operator_set_version != req.operator_set_version
+            || roster.dkg_epoch != req.dkg_epoch
+        {
+            return Err(WorkerError::InvalidRequest(
+                "roster operatorSetVersion/dkgEpoch must match request".to_string(),
+            ));
+        }
+
+        let mut rng = OsRng;
+        let identifier = slot_to_identifier(req.slot)?;
+        let (round1_secret, round1_package) = frost::keys::dkg::part1(
+            identifier,
+            DEOPERATOR_COUNT as u16,
+            DEOPERATOR_THRESHOLD as u16,
+            &mut rng,
+        )
+        .map_err(|err| WorkerError::Crypto(err.to_string()))?;
+
+        let round1_secret_json = to_json_value(&round1_secret)?;
+        let round1_package_json = to_json_value(&round1_package)?;
+        let package_hex = json_string_field(&round1_package_json, |v| {
+            v.as_str().map(ToString::to_string)
+        })
+        .unwrap_or_else(|| canonical_json_string(&round1_package_json).unwrap_or_default());
+        let package_hash = package_hash_for(&round1_package_json)?;
+
+        let round1_self = Round1Self {
+            slot: req.slot,
+            round1_secret: round1_secret_json,
+            round1_package: round1_package_json,
+            package_hash: package_hash.clone(),
+        };
+        let epoch_dir = epoch_dir(state_dir, req)?;
+        create_private_dir(&epoch_dir)?;
+        write_private_json(&epoch_dir.join(ROUND1_SELF_FILE), &to_json_value(&round1_self)?)?;
+        write_state_json(&epoch_dir, req, "round1", &computed_hash)?;
+
+        let transcript_hash = round1_transcript_hash(req, &package_hash)?;
+        let artifact_hash = artifact_hash(req, &transcript_hash, &[b"round1", package_hash.as_bytes()]);
+        let broadcast = FrostRound1Broadcast {
+            slot: req.slot,
+            package_hex,
+            package_hash,
+            transcript_hash: transcript_hash.clone(),
+        };
+        Ok(FrostDkgV2RoundResult {
+            request_id: req.request_id.clone(),
+            session_id: req.session_id.clone(),
+            protocol: "frost".to_string(),
+            round: "round1".to_string(),
+            operator_set_version: req.operator_set_version.clone(),
+            dkg_epoch: req.dkg_epoch.clone(),
+            slot: req.slot,
+            accepted: true,
+            transcript_hash,
+            artifact_hash,
+            frost_round1_broadcast: Some(broadcast),
+            frost_round2_envelopes: Vec::new(),
+            group_public_key: None,
+            frost_verifying_share: None,
+            frost_key_package_hash: None,
+            frost_public_package_hash: None,
+            complaints: Vec::new(),
+            abort_evidence_hash: None,
+            finalized: None,
+        })
+    }
+
+    fn run_round2_send(
+        state_dir: &Path,
+        req: &FrostDkgV2RoundRequest,
+    ) -> WorkerResult<FrostDkgV2RoundResult> {
+        let broadcasts = validate_round1_broadcasts(req)?;
+        let epoch_dir = epoch_dir(state_dir, req)?;
+        let round1_self_path = epoch_dir.join(ROUND1_SELF_FILE);
+        let round1_self_value = read_json(&round1_self_path)?;
+        let round1_self: Round1Self = from_json_value(round1_self_value)?;
+        if round1_self.slot != req.slot {
+            return Err(WorkerError::InvalidDkgState(
+                "round1_self.json slot mismatch".to_string(),
+            ));
+        }
+        let self_broadcast = broadcasts.get(&req.slot).ok_or_else(|| {
+            WorkerError::InvalidRequest(
+                "round2_send broadcasts must include this slot's round1 package".to_string(),
+            )
+        })?;
+        if self_broadcast.package_hash != round1_self.package_hash {
+            return Err(WorkerError::InvalidDkgState(
+                "round1 broadcast for self does not match local round1_self".to_string(),
+            ));
+        }
+
+        let round1_secret: frost::keys::dkg::round1::SecretPackage =
+            from_json_value(round1_self.round1_secret.clone())?;
+        let mut round1_packages_from_others: BTreeMap<
+            frost::Identifier,
+            frost::keys::dkg::round1::Package,
+        > = BTreeMap::new();
+        for (slot, broadcast) in broadcasts.iter() {
+            if *slot == req.slot {
+                continue;
+            }
+            let value = parse_round1_package_value(&broadcast.package_hex)?;
+            let pkg: frost::keys::dkg::round1::Package = from_json_value(value)?;
+            round1_packages_from_others.insert(slot_to_identifier(*slot)?, pkg);
+        }
+
+        let roster = load_roster_from_state(&epoch_dir)?;
+        let (round2_secret, round2_packages) =
+            frost::keys::dkg::part2(round1_secret, &round1_packages_from_others)
+                .map_err(|err| WorkerError::Crypto(err.to_string()))?;
+
+        let mut envelopes = Vec::with_capacity(DEOPERATOR_COUNT - 1);
+        let mut envelope_commitments: Vec<String> = Vec::with_capacity(DEOPERATOR_COUNT - 1);
+        for slot in 0..DEOPERATOR_COUNT {
+            if slot == req.slot {
+                continue;
+            }
+            let identifier = slot_to_identifier(slot)?;
+            let package = round2_packages.get(&identifier).ok_or_else(|| {
+                WorkerError::Crypto(format!("missing round2 package for slot {slot}"))
+            })?;
+            let plaintext = serde_json::to_vec(package)
+                .map_err(|err| WorkerError::Serde(err.to_string()))?;
+            let package_commitment = sha256_hex(&plaintext);
+            let recipient_pk = roster
+                .nodes
+                .iter()
+                .find(|node| node.slot == slot)
+                .ok_or_else(|| {
+                    WorkerError::InvalidDkgState(format!("missing roster node for slot {slot}"))
+                })?
+                .hpke_public_key
+                .clone();
+            let aad = build_hpke_aad(req, req.slot, slot)?;
+            let hpke = hpke_aead::seal(&recipient_pk, HPKE_INFO, &aad, &plaintext)?;
+            envelope_commitments.push(package_commitment.clone());
+            envelopes.push(FrostRound2Envelope {
+                dealer_slot: req.slot,
+                to_slot: slot,
+                package_commitment,
+                hpke,
+            });
+        }
+
+        let round2_secret_json = to_json_value(&round2_secret)?;
+        write_private_json(
+            &epoch_dir.join(ROUND2_SECRET_FILE),
+            &round2_secret_json,
+        )?;
+        let broadcasts_json = to_json_value(&req.frost_round1_broadcasts)?;
+        write_private_json(&epoch_dir.join(ROUND1_BROADCASTS_FILE), &broadcasts_json)?;
+        // Cleanup: round1 secret has been consumed by part2.
+        let _ = fs::remove_file(&round1_self_path);
+        write_state_json(&epoch_dir, req, "round2_send", &normalize_hex(&req.frost_dkg_v2_roster_hash)?)?;
+
+        let mut sorted_round1 = broadcasts.values().cloned().collect::<Vec<_>>();
+        sorted_round1.sort_by_key(|b| b.slot);
+        let mut sorted_envelopes = envelope_commitments.clone();
+        sorted_envelopes.sort();
+        let transcript_hash =
+            round2_send_transcript_hash(req, &sorted_round1, &sorted_envelopes)?;
+        let artifact_hash =
+            artifact_hash(req, &transcript_hash, &[b"round2_send"]);
+
+        Ok(FrostDkgV2RoundResult {
+            request_id: req.request_id.clone(),
+            session_id: req.session_id.clone(),
+            protocol: "frost".to_string(),
+            round: "round2_send".to_string(),
+            operator_set_version: req.operator_set_version.clone(),
+            dkg_epoch: req.dkg_epoch.clone(),
+            slot: req.slot,
+            accepted: true,
+            transcript_hash,
+            artifact_hash,
+            frost_round1_broadcast: None,
+            frost_round2_envelopes: envelopes,
+            group_public_key: None,
+            frost_verifying_share: None,
+            frost_key_package_hash: None,
+            frost_public_package_hash: None,
+            complaints: Vec::new(),
+            abort_evidence_hash: None,
+            finalized: None,
+        })
+    }
+
+    fn run_round2_receive(
+        state_dir: &Path,
+        req: &FrostDkgV2RoundRequest,
+    ) -> WorkerResult<FrostDkgV2RoundResult> {
+        let broadcasts = validate_round1_broadcasts(req)?;
+        if req.frost_round2_envelopes.len() != DEOPERATOR_COUNT - 1 {
+            return Err(WorkerError::InvalidRequest(format!(
+                "round2_receive requires {} envelopes",
+                DEOPERATOR_COUNT - 1
+            )));
+        }
+        let mut seen_dealers = BTreeSet::new();
+        for envelope in &req.frost_round2_envelopes {
+            assert_slot(envelope.dealer_slot)?;
+            assert_slot(envelope.to_slot)?;
+            if envelope.to_slot != req.slot {
+                return Err(WorkerError::InvalidRequest(
+                    "round2 envelope receiver slot mismatch".to_string(),
+                ));
+            }
+            if envelope.dealer_slot == req.slot {
+                return Err(WorkerError::InvalidRequest(
+                    "round2 envelope dealer must not equal receiver".to_string(),
+                ));
+            }
+            if !seen_dealers.insert(envelope.dealer_slot) {
+                return Err(WorkerError::InvalidRequest(
+                    "duplicate round2 envelope dealer".to_string(),
+                ));
+            }
+            hpke_aead::validate(&envelope.hpke)?;
+            expect_hex_len(&envelope.package_commitment, 32)?;
+        }
+        for slot in 0..DEOPERATOR_COUNT {
+            if slot == req.slot {
+                continue;
+            }
+            if !seen_dealers.contains(&slot) {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "round2_receive missing envelope from dealer slot {slot}"
+                )));
+            }
+        }
+
+        let epoch_dir = epoch_dir(state_dir, req)?;
+        let keypair_path = state_dir.join(HPKE_KEYPAIR_FILE);
+        let keypair_value = read_json(&keypair_path)?;
+        let keypair: HpkeKeypairFile = from_json_value(keypair_value)?;
+        if keypair.slot != req.slot {
+            return Err(WorkerError::InvalidDkgState(
+                "HPKE keypair slot mismatch".to_string(),
+            ));
+        }
+
+        create_private_dir(&epoch_dir.join(ROUND2_RECEIVED_DIR))?;
+
+        let mut complaints: Vec<FrostDkgV2Complaint> = Vec::new();
+        let mut envelope_commitments: Vec<String> = Vec::new();
+        for envelope in &req.frost_round2_envelopes {
+            let aad = build_hpke_aad(req, envelope.dealer_slot, req.slot)?;
+            if envelope.hpke.aad_hash != hpke_aead::sha256_hex(&aad) {
+                complaints.push(complaint_at(envelope.dealer_slot, "bad-aad-hash"));
+                continue;
+            }
+            let plaintext = match hpke_aead::open(&keypair.private_key, HPKE_INFO, &aad, &envelope.hpke) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    complaints.push(complaint_at(envelope.dealer_slot, "hpke-open-failed"));
+                    continue;
+                }
+            };
+            if sha256_hex(&plaintext) != normalize_hex(&envelope.package_commitment)? {
+                complaints.push(complaint_at(envelope.dealer_slot, "commitment-mismatch"));
+                continue;
+            }
+            let value: Value = match serde_json::from_slice(&plaintext) {
+                Ok(value) => value,
+                Err(_) => {
+                    complaints.push(complaint_at(envelope.dealer_slot, "bad-plaintext"));
+                    continue;
+                }
+            };
+            if serde_json::from_value::<frost::keys::dkg::round2::Package>(value.clone()).is_err() {
+                complaints.push(complaint_at(envelope.dealer_slot, "bad-round2-package"));
+                continue;
+            }
+            let received_path = epoch_dir
+                .join(ROUND2_RECEIVED_DIR)
+                .join(format!("{}.json", envelope.dealer_slot));
+            write_private_json(&received_path, &value)?;
+            envelope_commitments.push(envelope.package_commitment.clone());
+        }
+
+        if !complaints.is_empty() {
+            let abort_evidence = sha256_hex(
+                serde_json::to_vec(&complaints)
+                    .map_err(|err| WorkerError::Serde(err.to_string()))?
+                    .as_slice(),
+            );
+            let transcript_hash = sha256_hex(abort_evidence.as_bytes());
+            let artifact_hash = artifact_hash(req, &transcript_hash, &[b"round2_receive-abort"]);
+            return Ok(FrostDkgV2RoundResult {
+                request_id: req.request_id.clone(),
+                session_id: req.session_id.clone(),
+                protocol: "frost".to_string(),
+                round: "round2_receive".to_string(),
+                operator_set_version: req.operator_set_version.clone(),
+                dkg_epoch: req.dkg_epoch.clone(),
+                slot: req.slot,
+                accepted: true,
+                transcript_hash,
+                artifact_hash,
+                frost_round1_broadcast: None,
+                frost_round2_envelopes: Vec::new(),
+                group_public_key: None,
+                frost_verifying_share: None,
+                frost_key_package_hash: None,
+                frost_public_package_hash: None,
+                complaints,
+                abort_evidence_hash: Some(abort_evidence),
+                finalized: None,
+            });
+        }
+
+        write_private_json(
+            &epoch_dir.join(ROUND1_BROADCASTS_FILE),
+            &to_json_value(&req.frost_round1_broadcasts)?,
+        )?;
+        write_state_json(
+            &epoch_dir,
+            req,
+            "round2_receive",
+            &normalize_hex(&req.frost_dkg_v2_roster_hash)?,
+        )?;
+
+        let mut sorted_round1 = broadcasts.values().cloned().collect::<Vec<_>>();
+        sorted_round1.sort_by_key(|b| b.slot);
+        envelope_commitments.sort();
+        let transcript_hash =
+            round2_receive_transcript_hash(req, &sorted_round1, &envelope_commitments)?;
+        let artifact_hash = artifact_hash(req, &transcript_hash, &[b"round2_receive"]);
+
+        Ok(FrostDkgV2RoundResult {
+            request_id: req.request_id.clone(),
+            session_id: req.session_id.clone(),
+            protocol: "frost".to_string(),
+            round: "round2_receive".to_string(),
+            operator_set_version: req.operator_set_version.clone(),
+            dkg_epoch: req.dkg_epoch.clone(),
+            slot: req.slot,
+            accepted: true,
+            transcript_hash,
+            artifact_hash,
+            frost_round1_broadcast: None,
+            frost_round2_envelopes: Vec::new(),
+            group_public_key: None,
+            frost_verifying_share: None,
+            frost_key_package_hash: None,
+            frost_public_package_hash: None,
+            complaints: Vec::new(),
+            abort_evidence_hash: None,
+            finalized: None,
+        })
+    }
+
+    fn run_finalize(
+        state_dir: &Path,
+        req: &FrostDkgV2RoundRequest,
+    ) -> WorkerResult<FrostDkgV2RoundResult> {
+        let request_transcript = req.transcript_hash.as_ref().ok_or_else(|| {
+            WorkerError::InvalidRequest("finalize requires transcriptHash".to_string())
+        })?;
+        expect_hex_len(request_transcript, 32)?;
+        let epoch_dir = epoch_dir(state_dir, req)?;
+        let round2_secret_value = read_json(&epoch_dir.join(ROUND2_SECRET_FILE))?;
+        let round2_secret: frost::keys::dkg::round2::SecretPackage =
+            from_json_value(round2_secret_value)?;
+        let broadcasts_value = read_json(&epoch_dir.join(ROUND1_BROADCASTS_FILE))?;
+        let broadcasts: Vec<FrostRound1Broadcast> = from_json_value(broadcasts_value)?;
+        if broadcasts.len() != DEOPERATOR_COUNT {
+            return Err(WorkerError::InvalidDkgState(
+                "round1_broadcasts.json must contain 7 entries".to_string(),
+            ));
+        }
+
+        let mut round1_packages_from_others: BTreeMap<
+            frost::Identifier,
+            frost::keys::dkg::round1::Package,
+        > = BTreeMap::new();
+        for broadcast in &broadcasts {
+            if broadcast.slot == req.slot {
+                continue;
+            }
+            let value = parse_round1_package_value(&broadcast.package_hex)?;
+            let pkg: frost::keys::dkg::round1::Package = from_json_value(value)?;
+            round1_packages_from_others.insert(slot_to_identifier(broadcast.slot)?, pkg);
+        }
+
+        let mut round2_packages_from_others: BTreeMap<
+            frost::Identifier,
+            frost::keys::dkg::round2::Package,
+        > = BTreeMap::new();
+        for slot in 0..DEOPERATOR_COUNT {
+            if slot == req.slot {
+                continue;
+            }
+            let path = epoch_dir
+                .join(ROUND2_RECEIVED_DIR)
+                .join(format!("{slot}.json"));
+            let value = read_json(&path)?;
+            let pkg: frost::keys::dkg::round2::Package = from_json_value(value)?;
+            round2_packages_from_others.insert(slot_to_identifier(slot)?, pkg);
+        }
+
+        let (key_package, public_package) = frost::keys::dkg::part3(
+            &round2_secret,
+            &round1_packages_from_others,
+            &round2_packages_from_others,
+        )
+        .map_err(|err| WorkerError::Crypto(err.to_string()))?;
+
+        let key_package_json = to_json_value(&key_package)?;
+        let public_package_json = to_json_value(&public_package)?;
+        let group_public_key = key_str_or_canonical(&public_package_json, "verifying_key")?;
+        let frost_verifying_share = key_str_or_canonical(&key_package_json, "verifying_share")?;
+
+        let key_path = state_dir.join(FROST_KEY_PACKAGE_FILE);
+        let public_path = state_dir.join(FROST_PUBLIC_PACKAGE_FILE);
+        atomic_replace_private_json(&key_path, &key_package_json)?;
+        atomic_replace_private_json(&public_path, &public_package_json)?;
+
+        let key_hash = sha256_hex(&fs::read(&key_path).map_err(|err| WorkerError::Io(err.to_string()))?);
+        let public_hash =
+            sha256_hex(&fs::read(&public_path).map_err(|err| WorkerError::Io(err.to_string()))?);
+        let manifest = json!({
+            "slot": req.slot,
+            "threshold": DEOPERATOR_THRESHOLD,
+            "count": DEOPERATOR_COUNT,
+            "dkgEpoch": req.dkg_epoch,
+            "groupPublicKey": group_public_key,
+            "frostVerifyingShare": frost_verifying_share,
+            "frostKeyPackageHash": key_hash,
+            "frostPublicPackageHash": public_hash,
+            "createdAtUnixMs": now_millis(),
+        });
+        atomic_replace_private_json(&state_dir.join(FROST_MANIFEST_FILE), &manifest)?;
+
+        // Cleanup: secrets consumed by part3.
+        let _ = fs::remove_file(epoch_dir.join(ROUND2_SECRET_FILE));
+        let _ = fs::remove_dir_all(epoch_dir.join(ROUND2_RECEIVED_DIR));
+        write_state_json(
+            &epoch_dir,
+            req,
+            "finalize",
+            &normalize_hex(&req.frost_dkg_v2_roster_hash)?,
+        )?;
+
+        let transcript_hash = normalize_hex(request_transcript)?;
+        let artifact_hash = artifact_hash(
+            req,
+            &transcript_hash,
+            &[b"finalize", key_hash.as_bytes(), public_hash.as_bytes()],
+        );
+
+        Ok(FrostDkgV2RoundResult {
+            request_id: req.request_id.clone(),
+            session_id: req.session_id.clone(),
+            protocol: "frost".to_string(),
+            round: "finalize".to_string(),
+            operator_set_version: req.operator_set_version.clone(),
+            dkg_epoch: req.dkg_epoch.clone(),
+            slot: req.slot,
+            accepted: true,
+            transcript_hash,
+            artifact_hash,
+            frost_round1_broadcast: None,
+            frost_round2_envelopes: Vec::new(),
+            group_public_key: Some(group_public_key),
+            frost_verifying_share: Some(frost_verifying_share),
+            frost_key_package_hash: Some(key_hash),
+            frost_public_package_hash: Some(public_hash),
+            complaints: Vec::new(),
+            abort_evidence_hash: None,
+            finalized: Some(true),
+        })
+    }
+
+    fn run_complaint(req: &FrostDkgV2RoundRequest) -> WorkerResult<FrostDkgV2RoundResult> {
+        let complaint = req.complaint.as_ref().ok_or_else(|| {
+            WorkerError::InvalidRequest("complaint round requires complaint payload".to_string())
+        })?;
+        let evidence_hash = sha256_hex(
+            serde_json::to_vec(complaint)
+                .map_err(|err| WorkerError::Serde(err.to_string()))?
+                .as_slice(),
+        );
+        let transcript_hash = sha256_hex(evidence_hash.as_bytes());
+        let artifact_hash = artifact_hash(req, &transcript_hash, &[b"complaint"]);
+        Err(WorkerError::Complaint(serde_json::to_string(&json!({
+            "requestId": req.request_id,
+            "sessionId": req.session_id,
+            "slot": req.slot,
+            "transcriptHash": transcript_hash,
+            "artifactHash": artifact_hash,
+            "evidenceHash": evidence_hash,
+        }))
+        .unwrap_or_default()))
+    }
+
+    fn validate_round1_broadcasts(
+        req: &FrostDkgV2RoundRequest,
+    ) -> WorkerResult<BTreeMap<usize, FrostRound1Broadcast>> {
+        if req.frost_round1_broadcasts.len() != DEOPERATOR_COUNT {
+            return Err(WorkerError::InvalidRequest(format!(
+                "FROST DKG V2 round requires {DEOPERATOR_COUNT} round1 broadcasts"
+            )));
+        }
+        let mut out: BTreeMap<usize, FrostRound1Broadcast> = BTreeMap::new();
+        for broadcast in &req.frost_round1_broadcasts {
+            assert_slot(broadcast.slot)?;
+            expect_hex_len(&broadcast.package_hash, 32)?;
+            expect_hex_len(&broadcast.transcript_hash, 32)?;
+            let computed_hash = package_hash_for(&parse_round1_package_value(&broadcast.package_hex)?)?;
+            if computed_hash != normalize_hex(&broadcast.package_hash)? {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "round1 broadcast packageHash mismatch for slot {}",
+                    broadcast.slot
+                )));
+            }
+            let expected_transcript = round1_transcript_hash_for_slot(req, broadcast.slot, &computed_hash)?;
+            if expected_transcript != broadcast.transcript_hash {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "round1 broadcast transcriptHash mismatch for slot {}",
+                    broadcast.slot
+                )));
+            }
+            if out.insert(broadcast.slot, broadcast.clone()).is_some() {
+                return Err(WorkerError::InvalidRequest(
+                    "duplicate round1 broadcast slot".to_string(),
+                ));
+            }
+        }
+        for slot in 0..DEOPERATOR_COUNT {
+            if !out.contains_key(&slot) {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "missing round1 broadcast for slot {slot}"
+                )));
+            }
+        }
+        Ok(out)
+    }
+
+    fn load_roster_from_state(epoch_dir: &Path) -> WorkerResult<FrostDkgV2Roster> {
+        let state_value = read_json(&epoch_dir.join(STATE_FILE))?;
+        let roster_value = state_value
+            .get("roster")
+            .cloned()
+            .ok_or_else(|| WorkerError::InvalidDkgState("state.json missing roster".to_string()))?;
+        from_json_value(roster_value)
+    }
+
+    fn write_state_json(
+        epoch_dir: &Path,
+        req: &FrostDkgV2RoundRequest,
+        status: &str,
+        roster_hash: &str,
+    ) -> WorkerResult<()> {
+        let mut value = if epoch_dir.join(STATE_FILE).exists() {
+            read_json(&epoch_dir.join(STATE_FILE))?
+        } else {
+            json!({})
+        };
+        let obj = value.as_object_mut().ok_or_else(|| {
+            WorkerError::Serde("state.json must be a JSON object".to_string())
+        })?;
+        obj.insert("operatorSetVersion".to_string(), json!(req.operator_set_version));
+        obj.insert("dkgEpoch".to_string(), json!(req.dkg_epoch));
+        obj.insert(
+            "frostDkgV2RosterHash".to_string(),
+            json!(normalize_hex(roster_hash)?),
+        );
+        obj.insert("status".to_string(), json!(status));
+        obj.insert("slot".to_string(), json!(req.slot));
+        obj.insert(
+            "participantSet".to_string(),
+            json!(req.participant_slots.clone()),
+        );
+        if !obj.contains_key("roster") {
+            if let Some(roster) = req.frost_dkg_v2_roster.as_ref() {
+                obj.insert("roster".to_string(), to_json_value(roster)?);
+            }
+        }
+        if !obj.contains_key("complaintLog") {
+            obj.insert("complaintLog".to_string(), json!([]));
+        }
+        write_private_json(&epoch_dir.join(STATE_FILE), &value)
+    }
+
+    fn build_hpke_aad(
+        req: &FrostDkgV2RoundRequest,
+        dealer_slot: usize,
+        to_slot: usize,
+    ) -> WorkerResult<Vec<u8>> {
+        let mut hasher = Sha256::new();
+        hasher.update(HPKE_AAD_DOMAIN);
+        hasher.update(req.request_id.as_bytes());
+        hasher.update(req.session_id.as_bytes());
+        hasher.update(req.operator_set_version.as_bytes());
+        hasher.update(req.dkg_epoch.as_bytes());
+        hasher.update(normalize_hex(&req.frost_dkg_v2_roster_hash)?.as_bytes());
+        hasher.update(&[dealer_slot as u8, to_slot as u8]);
+        Ok(hasher.finalize().to_vec())
+    }
+
+    fn round1_transcript_hash(
+        req: &FrostDkgV2RoundRequest,
+        package_hash: &str,
+    ) -> WorkerResult<String> {
+        round1_transcript_hash_for_slot(req, req.slot, package_hash)
+    }
+
+    fn round1_transcript_hash_for_slot(
+        req: &FrostDkgV2RoundRequest,
+        slot: usize,
+        package_hash: &str,
+    ) -> WorkerResult<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(ROUND1_DOMAIN);
+        hasher.update(req.request_id.as_bytes());
+        hasher.update(req.session_id.as_bytes());
+        hasher.update(req.operator_set_version.as_bytes());
+        hasher.update(req.dkg_epoch.as_bytes());
+        hasher.update(normalize_hex(&req.frost_dkg_v2_roster_hash)?.as_bytes());
+        hasher.update(&[slot as u8]);
+        hasher.update(normalize_hex(package_hash)?.as_bytes());
+        Ok(hex_encode(&hasher.finalize()))
+    }
+
+    fn round2_send_transcript_hash(
+        req: &FrostDkgV2RoundRequest,
+        sorted_round1: &[FrostRound1Broadcast],
+        sorted_envelope_commitments: &[String],
+    ) -> WorkerResult<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(ROUND2_SEND_DOMAIN);
+        hasher.update(req.request_id.as_bytes());
+        hasher.update(req.session_id.as_bytes());
+        hasher.update(req.operator_set_version.as_bytes());
+        hasher.update(req.dkg_epoch.as_bytes());
+        hasher.update(normalize_hex(&req.frost_dkg_v2_roster_hash)?.as_bytes());
+        for broadcast in sorted_round1 {
+            hasher.update(normalize_hex(&broadcast.package_hash)?.as_bytes());
+        }
+        for commitment in sorted_envelope_commitments {
+            hasher.update(normalize_hex(commitment)?.as_bytes());
+        }
+        Ok(hex_encode(&hasher.finalize()))
+    }
+
+    fn round2_receive_transcript_hash(
+        req: &FrostDkgV2RoundRequest,
+        sorted_round1: &[FrostRound1Broadcast],
+        sorted_envelope_commitments_received: &[String],
+    ) -> WorkerResult<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(ROUND2_RECEIVE_DOMAIN);
+        hasher.update(req.request_id.as_bytes());
+        hasher.update(req.session_id.as_bytes());
+        hasher.update(req.operator_set_version.as_bytes());
+        hasher.update(req.dkg_epoch.as_bytes());
+        hasher.update(normalize_hex(&req.frost_dkg_v2_roster_hash)?.as_bytes());
+        for broadcast in sorted_round1 {
+            hasher.update(normalize_hex(&broadcast.package_hash)?.as_bytes());
+        }
+        for commitment in sorted_envelope_commitments_received {
+            hasher.update(normalize_hex(commitment)?.as_bytes());
+        }
+        Ok(hex_encode(&hasher.finalize()))
+    }
+
+    fn artifact_hash(req: &FrostDkgV2RoundRequest, transcript_hash: &str, parts: &[&[u8]]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(FINALIZE_DOMAIN);
+        hasher.update(req.request_id.as_bytes());
+        hasher.update(req.session_id.as_bytes());
+        hasher.update(req.operator_set_version.as_bytes());
+        hasher.update(req.dkg_epoch.as_bytes());
+        hasher.update(&[req.slot as u8]);
+        hasher.update(req.round.as_bytes());
+        hasher.update(transcript_hash.as_bytes());
+        for part in parts {
+            hasher.update(part);
+        }
+        hex_encode(&hasher.finalize())
+    }
+
+    fn complaint_at(slot: usize, kind: &str) -> FrostDkgV2Complaint {
+        let mut hasher = Sha256::new();
+        hasher.update(COMPLAINT_DOMAIN);
+        hasher.update(&[slot as u8]);
+        hasher.update(kind.as_bytes());
+        FrostDkgV2Complaint {
+            accused_slot: slot,
+            evidence_kind: kind.to_string(),
+            evidence_hash: hex_encode(&hasher.finalize()),
+        }
+    }
+
+    fn epoch_dir(state_dir: &Path, req: &FrostDkgV2RoundRequest) -> WorkerResult<PathBuf> {
+        validate_decimal_segment(&req.operator_set_version)?;
+        validate_decimal_segment(&req.dkg_epoch)?;
+        Ok(state_dir
+            .join(FROST_DKG_V2_DIR)
+            .join(format!("{}-{}", req.operator_set_version, req.dkg_epoch)))
+    }
+
+    fn package_hash_for(value: &Value) -> WorkerResult<String> {
+        let bytes = canonical_json_bytes(value)?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    fn parse_round1_package_value(package_hex: &str) -> WorkerResult<Value> {
+        if let Ok(bytes) = hex_decode(package_hex) {
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                return Ok(value);
+            }
+        }
+        serde_json::from_str::<Value>(package_hex).map_err(|err| WorkerError::Serde(err.to_string()))
+    }
+
+    fn key_str_or_canonical(value: &Value, field: &str) -> WorkerResult<String> {
+        let inner = value
+            .get(field)
+            .ok_or_else(|| WorkerError::Serde(format!("missing field {field}")))?;
+        if let Some(s) = inner.as_str() {
+            return Ok(s.to_string());
+        }
+        canonical_json_string(inner)
+    }
+
+    fn json_string_field<F>(value: &Value, picker: F) -> Option<String>
+    where
+        F: Fn(&Value) -> Option<String>,
+    {
+        picker(value)
+    }
+
+    fn atomic_replace_private_json(path: &Path, value: &Value) -> WorkerResult<()> {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp_path = PathBuf::from(tmp);
+        write_private_json(&tmp_path, value)?;
+        fs::rename(&tmp_path, path).map_err(|err| WorkerError::Io(err.to_string()))
+    }
+
+    fn write_private_json(path: &Path, value: &Value) -> WorkerResult<()> {
+        let bytes = serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        if let Some(parent) = path.parent() {
+            create_private_dir(parent)?;
+        }
+        fs::write(path, bytes).map_err(|err| WorkerError::Io(err.to_string()))?;
+        set_private_file_permissions(path)
+    }
+
+    fn create_private_dir(path: &Path) -> WorkerResult<()> {
+        fs::create_dir_all(path).map_err(|err| WorkerError::Io(err.to_string()))?;
+        set_private_dir_permissions(path)
+    }
+
+    fn read_json(path: &Path) -> WorkerResult<Value> {
+        let bytes = fs::read(path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                WorkerError::MissingLocalState(path.display().to_string())
+            } else {
+                WorkerError::Io(err.to_string())
+            }
+        })?;
+        serde_json::from_slice(&bytes).map_err(|err| WorkerError::Serde(err.to_string()))
+    }
+
+    fn to_json_value<T: Serialize>(value: &T) -> WorkerResult<Value> {
+        serde_json::to_value(value).map_err(|err| WorkerError::Serde(err.to_string()))
+    }
+
+    fn from_json_value<T>(value: Value) -> WorkerResult<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        serde_json::from_value(value).map_err(|err| WorkerError::Serde(err.to_string()))
+    }
+
+    fn canonical_json_bytes(value: &Value) -> WorkerResult<Vec<u8>> {
+        serde_json::to_vec(value).map_err(|err| WorkerError::Serde(err.to_string()))
+    }
+
+    fn canonical_json_string(value: &Value) -> WorkerResult<String> {
+        serde_json::to_string(value).map_err(|err| WorkerError::Serde(err.to_string()))
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex_encode(Sha256::digest(bytes).as_slice())
+    }
+
+    fn expect_hex_len(hex: &str, bytes: usize) -> WorkerResult<()> {
+        let parsed = hex_decode(hex)?;
+        if parsed.len() != bytes {
+            return Err(WorkerError::InvalidRequest(format!(
+                "expected {bytes}-byte hex, got {}",
+                parsed.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn normalize_hex(hex: &str) -> WorkerResult<String> {
+        Ok(hex_encode(&hex_decode(hex)?))
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
+        }
+        (0..raw.len())
+            .step_by(2)
+            .map(|idx| {
+                u8::from_str_radix(&raw[idx..idx + 2], 16)
+                    .map_err(|err| WorkerError::InvalidRequest(err.to_string()))
+            })
+            .collect()
+    }
+
+    fn now_millis() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_millis()
+    }
+
+    #[cfg(unix)]
+    fn set_private_file_permissions(path: &Path) -> WorkerResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| WorkerError::Io(err.to_string()))
+    }
+
+    #[cfg(not(unix))]
+    fn set_private_file_permissions(_path: &Path) -> WorkerResult<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn set_private_dir_permissions(path: &Path) -> WorkerResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|err| WorkerError::Io(err.to_string()))
+    }
+
+    #[cfg(not(unix))]
+    fn set_private_dir_permissions(_path: &Path) -> WorkerResult<()> {
+        Ok(())
+    }
+}
+
 pub mod dkg_ca {
     use crate::{
         assert_v2_threshold, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD,
@@ -2774,29 +3888,6 @@ pub mod dkg_ca {
         validate_round_context(&ctx)?;
         Err(WorkerError::NotImplemented(
             "malicious-secure CA DKG round execution is not enabled",
-        ))
-    }
-}
-
-pub mod frost_attestation {
-    use crate::{dkg_ca::DkgRoundContext, WorkerError, WorkerResult};
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct FrostShare {
-        pub slot: u8,
-        pub signature_share: [u8; 32],
-    }
-
-    pub fn sign_partial(_message: &[u8]) -> WorkerResult<FrostShare> {
-        Err(WorkerError::NotImplemented(
-            "FROST Ed25519 RFC 9591 signing is not implemented in this skeleton",
-        ))
-    }
-
-    pub fn run_dkg_round(ctx: DkgRoundContext) -> WorkerResult<[u8; 32]> {
-        crate::dkg_ca::validate_round_context(&ctx)?;
-        Err(WorkerError::NotImplemented(
-            "FROST Ed25519 DKG round execution is not enabled",
         ))
     }
 }
@@ -3057,10 +4148,6 @@ mod tests {
     fn crypto_modules_fail_closed_until_real_implementations_land() {
         assert!(matches!(
             dkg_ca::run_pedersen_gjkr_round(),
-            Err(WorkerError::NotImplemented(_))
-        ));
-        assert!(matches!(
-            frost_attestation::sign_partial(b"msg"),
             Err(WorkerError::NotImplemented(_))
         ));
         assert!(matches!(
