@@ -570,7 +570,21 @@ fn scalar_from_hex(hex: &str) -> Result<Scalar, AdapterError> {
         bytes[i] = u8::from_str_radix(&raw[i * 2..i * 2 + 2], 16)
             .map_err(|e| AdapterError::InvalidInput(format!("hex parse: {e}")))?;
     }
-    Ok(Scalar::from_bytes_mod_order(bytes))
+    // Codex P3 (lambda byte-for-byte canonical comparison): use canonical parsing.
+    // `from_bytes_mod_order` silently reduces any 32-byte input modulo q. That means a
+    // non-canonical encoding (e.g. all-0xFF, which encodes a value >= q) would still
+    // satisfy `supplied != lambda` after the silent reduction, even though the wire
+    // bytes differ from the canonical serialization the coordinator actually produces
+    // via `scalarHexFromBigint`. Reject non-canonical inputs to make the comparison
+    // genuinely byte-for-byte. Mirrors the P2 #9 fix (commit f3fcda0) on the verifier
+    // path for Schnorr `s` and `mpc_open_m`.
+    Scalar::from_canonical_bytes(bytes)
+        .into_option()
+        .ok_or_else(|| {
+            AdapterError::InvalidInput(
+                "lagrange coefficient bytes are not canonical (>= Q)".to_string(),
+            )
+        })
 }
 
 fn scalar_from_decimal(s: &str) -> Result<Scalar, AdapterError> {
@@ -1207,6 +1221,33 @@ mod inner_tests {
         // Clean up.
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn scalar_from_hex_rejects_non_canonical_lambda_bytes() {
+        // Codex P3: lambda comparison must reject non-canonical encodings. The honest
+        // coordinator never produces a >= q encoding (scalarHexFromBigint reduces and
+        // emits the canonical 32 bytes); accepting them would let a malicious wire
+        // value pass `supplied != lambda` only because of a silent reduction.
+        let bad = "ff".repeat(32);
+        let err = scalar_from_hex(&bad).expect_err("non-canonical lambda must reject");
+        assert!(
+            matches!(&err, AdapterError::InvalidInput(msg) if msg.contains("not canonical")),
+            "expected canonical-bytes rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_from_hex_accepts_canonical_lambda_bytes() {
+        // Sanity: canonical bytes for a small scalar still parse cleanly.
+        let s = Scalar::from(42_u64);
+        let hex: String = s
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let parsed = scalar_from_hex(&hex).expect("canonical 42");
+        assert_eq!(parsed, s);
     }
 
     #[test]
