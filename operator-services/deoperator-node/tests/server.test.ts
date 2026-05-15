@@ -503,4 +503,120 @@ describe("deoperator node", () => {
       "frost/finalize",
     ]);
   });
+
+  it("vault_ek round1 passthrough rejects mismatched rosterHash before forwarding", async () => {
+    // Codex P1 #5: the new /worker/v2/derive/vault_ek/round1 + /verify passthroughs must
+    // validate rosterHash (against CA_DKG_V2_ROSTER_JSON) and selfSlot before forwarding to
+    // the local crypto worker. Otherwise stale or wrong-roster contexts reach MP-SPDZ.
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/vault_ek/round1",
+        payload: {
+          dkgEpoch: "1",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: h32("d"), // bogus — not the configured CA DKG V2 roster hash
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 0,
+          requestId: "vault-ek-bogus",
+          sessionId: "vault-ek-bogus",
+          playerId: 0,
+          peerAddresses: Array.from({ length: 5 }, (_, i) => `127.0.0.1:${14000 + i}`),
+          lagrangeCoefficients: Array.from({ length: 5 }, () => h32("0")),
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_ek round1 passthrough rejects wrong selfSlot before forwarding", async () => {
+    // Codex P1 #5: selfSlot must equal the node's configured slot.
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/vault_ek/round1",
+        payload: {
+          dkgEpoch: "1",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: caDkgV2RosterHash(caDkgV2Roster),
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 2, // wrong: this node is slot 0
+          requestId: "vault-ek-wrong-slot",
+          sessionId: "vault-ek-wrong-slot",
+          playerId: 2,
+          peerAddresses: Array.from({ length: 5 }, (_, i) => `127.0.0.1:${14000 + i}`),
+          lagrangeCoefficients: Array.from({ length: 5 }, () => h32("0")),
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_ek verify passthrough rejects mismatched rosterHash", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/vault_ek/verify",
+        payload: {
+          dkgEpoch: "1",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: h32("d"),
+          selectedSlots: [0, 1, 2, 3, 4],
+          contributions: [],
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
 });
