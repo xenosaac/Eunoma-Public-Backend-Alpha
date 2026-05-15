@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { chmodSync, writeFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { bytesToHex, hexToBytes } from "@eunoma/shared";
 import {
   CA_DKG_SCHEME_LOCAL,
@@ -217,6 +219,47 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
       },
     })),
   };
+}
+
+export interface RenderEnvFilesResult {
+  paths: {
+    coordinatorEnv: string;
+    relayerEnv: string;
+    nodeEnv: Record<number, string>;
+    workerEnv: Record<number, string>;
+  };
+}
+
+export function renderEnvFiles(plan: LocalClusterPlan, clusterDir: string): RenderEnvFilesResult {
+  const coordinatorPath = resolvePath(clusterDir, "coordinator.env");
+  const relayerPath = resolvePath(clusterDir, "relayer.env");
+  writeEnvFile(coordinatorPath, plan.coordinator.env);
+  writeEnvFile(relayerPath, plan.relayer.env);
+  const nodeEnv: Record<number, string> = {};
+  for (const node of plan.nodes) {
+    const path = resolvePath(clusterDir, `node-${node.slot}.env`);
+    writeEnvFile(path, node.env);
+    nodeEnv[node.slot] = path;
+  }
+  const workerEnv: Record<number, string> = {};
+  for (const worker of plan.workers) {
+    const path = resolvePath(clusterDir, `worker-${worker.slot}.env`);
+    writeEnvFile(path, worker.env);
+    workerEnv[worker.slot] = path;
+  }
+  return {
+    paths: { coordinatorEnv: coordinatorPath, relayerEnv: relayerPath, nodeEnv, workerEnv },
+  };
+}
+
+function writeEnvFile(path: string, env: Record<string, string>): void {
+  const lines = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`);
+  writeFileSync(path, `${lines.join("\n")}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
+function shellQuote(value: string): string {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function buildCaDkgV2Roster(
