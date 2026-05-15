@@ -421,40 +421,75 @@ export function buildCoordinatorServer(
         });
       }
       try {
-      // Concurrent fan-out via Promise.allSettled — each worker spawns its own MASCOT party
-      // and blocks waiting for peers, so sequential await would deadlock (plan §"Coordinator
-      // delta"). The mocked FROST DKG path (server.ts:548) is the established pattern.
-      const settled = await Promise.allSettled(
-        sortedSelectedSlots.map((slot, ordinalIndex) =>
-          singleNodeForwarder(
-            "/worker/v2/derive/vault_ek/round1",
-            {
-              dkgEpoch,
-              caDkgTranscriptHash: caDkgTranscriptHashInput,
-              rosterHash: dkgRosterHash,
-              selectedSlots: sortedSelectedSlots,
-              selfSlot: slot,
-              requestId,
-              sessionId,
-              playerId: ordinalIndex,
-              peerAddresses,
-              lagrangeCoefficients,
-            },
-            dkgRoster,
-            slot,
-          ),
+      // Concurrent fan-out — each worker spawns its own MASCOT party and blocks waiting
+      // for peers, so sequential await would deadlock (plan §"Coordinator delta").
+      //
+      // Codex P2 #8: when ANY worker returns 503 mpc_inverse_unavailable, return 503
+      // immediately rather than waiting for the others to finish (MASCOT peers will block
+      // until their TLS timeout — typically 60s — because the 503-returning party never
+      // connects). We race the per-slot promises: the first 503-detector resolution wins,
+      // otherwise wait for all to settle.
+      const round1Promises = sortedSelectedSlots.map((slot, ordinalIndex) =>
+        singleNodeForwarder(
+          "/worker/v2/derive/vault_ek/round1",
+          {
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashInput,
+            rosterHash: dkgRosterHash,
+            selectedSlots: sortedSelectedSlots,
+            selfSlot: slot,
+            requestId,
+            sessionId,
+            playerId: ordinalIndex,
+            peerAddresses,
+            lagrangeCoefficients,
+          },
+          dkgRoster,
+          slot,
+        ).then(
+          (value) => ({ kind: "value" as const, slot, value }),
+          (reason) => ({ kind: "rejected" as const, slot, reason }),
         ),
       );
-      // Propagate 503 first if any worker reports adapter-unavailable; otherwise propagate
-      // the first 4xx/5xx or rejection.
+      type Resolved =
+        | { kind: "value"; slot: number; value: ProxyForwardResult }
+        | { kind: "rejected"; slot: number; reason: unknown };
+      const detector: Promise<Resolved | "all_done"> = Promise.race(
+        round1Promises.map((p) =>
+          p.then((res) => {
+            if (
+              res.kind === "value" &&
+              res.value.statusCode === 503 &&
+              res.value.body &&
+              typeof res.value.body === "object" &&
+              (res.value.body as Record<string, unknown>).error === "mpc_inverse_unavailable"
+            ) {
+              return res; // 503 winner
+            }
+            // Not a 503; emit a sentinel that loses the race vs a real 503 by deferring.
+            return new Promise<Resolved | "all_done">((resolve) => {
+              // Wait for the all-settled outcome to resolve all_done — but only if no
+              // promise has emitted 503 yet. Achieved via a separate `Promise.all`.
+              void Promise.all(round1Promises).then(() => resolve("all_done"));
+            });
+          }),
+        ),
+      );
+      const winner = await detector;
+      if (winner !== "all_done" && winner.kind === "value") {
+        // A 503 short-circuit.
+        return reply
+          .code(503)
+          .send({ error: "mpc_inverse_unavailable", slot: winner.slot, requestId });
+      }
+      // No 503 short-circuit; collect all results.
+      const settledList: Resolved[] = await Promise.all(round1Promises);
       const roundResults: Array<{ slot: number; body: Record<string, unknown> }> = [];
-      for (let i = 0; i < settled.length; i += 1) {
-        const slot = sortedSelectedSlots[i];
-        const res = settled[i];
-        if (res.status === "rejected") {
+      for (const res of settledList) {
+        if (res.kind === "rejected") {
           return reply.code(502).send({
             error: "round1_forward_rejected",
-            slot,
+            slot: res.slot,
             requestId,
             reason: res.reason instanceof Error ? res.reason.message : String(res.reason),
           });
@@ -466,19 +501,20 @@ export function buildCoordinatorServer(
           typeof forwarded.body === "object" &&
           (forwarded.body as Record<string, unknown>).error === "mpc_inverse_unavailable"
         ) {
+          // Belt-and-suspenders: if the detector somehow missed a 503, catch it here.
           return reply
             .code(503)
-            .send({ error: "mpc_inverse_unavailable", slot, requestId });
+            .send({ error: "mpc_inverse_unavailable", slot: res.slot, requestId });
         }
         if (!forwarded.ok || !forwarded.body) {
           return reply.code(502).send({
             error: "round1_forward_failed",
-            slot,
+            slot: res.slot,
             statusCode: forwarded.statusCode,
             requestId,
           });
         }
-        roundResults.push({ slot, body: forwarded.body as Record<string, unknown> });
+        roundResults.push({ slot: res.slot, body: forwarded.body as Record<string, unknown> });
       }
 
       const contributions: VaultEkContribution[] = parseVaultEkContributions(

@@ -1105,6 +1105,54 @@ describe("coordinator", () => {
     expect(res.json().error).toBe("mpc_open_m_disagreement");
   });
 
+  it("short-circuits round1 fan-out when one worker returns 503 (codex P2 #8)", async () => {
+    // Codex P2 #8: when one worker is fast-503'd (MP-SPDZ unavailable on that slot), the
+    // coordinator must NOT wait for the other 4 to settle — they'll block in MASCOT
+    // preprocessing for up to 60s. Expected: 503 returned within ~tens of ms.
+    const caDkgV2Roster = dkgRoster();
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    let neverResolveCount = 0;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round1")) {
+          if (slot === 2) {
+            // Fast 503 from one slot.
+            return {
+              slot,
+              ok: false,
+              statusCode: 503,
+              body: { error: "mpc_inverse_unavailable" },
+            };
+          }
+          // Other slots hang forever (simulate MASCOT waiting for peer connect).
+          neverResolveCount += 1;
+          return new Promise<never>(() => {});
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+    const start = Date.now();
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-503-fast",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    const elapsed = Date.now() - start;
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error).toBe("mpc_inverse_unavailable");
+    // Killer assertion: must complete well before any sensible MASCOT timeout. 2 seconds is
+    // comfortably below the 60s MASCOT default timeout but generous enough for CI jitter.
+    expect(elapsed).toBeLessThan(2000);
+    // Sanity: the other 4 slots WERE dispatched (so we proved concurrency, not lazy eval).
+    expect(neverResolveCount).toBe(4);
+  });
+
   it("returns 409 vault_ek_derivation_in_flight when a second request arrives during one", async () => {
     // Lock-contention test: the first request hangs at the round1 mock until we release a
     // deferred; a concurrent second request must get 409 quickly because the in-flight lock
