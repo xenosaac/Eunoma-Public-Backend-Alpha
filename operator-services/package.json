@@ -22,6 +22,7 @@
     "local:ca-dkg:v2": "node scripts/local_ca_dkg_v2.mjs",
     "local:ca:registration": "node scripts/local_ca_registration.mjs",
     "local:online-frost-dkg-smoke": "node scripts/local_frost_dkg_v2.mjs",
+    "local:frost-rotation-apply": "node scripts/local_frost_rotation_apply.mjs",
     "local:smoke": "node scripts/testnet_e2e.mjs",
     "mpc:bootstrap": "node scripts/mpc_spdz_bootstrap.mjs",
     "mpc:check": "node scripts/mpc_spdz_check.mjs",

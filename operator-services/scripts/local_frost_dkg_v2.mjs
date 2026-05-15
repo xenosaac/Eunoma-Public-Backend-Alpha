@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+// Drives the four-phase RFC 9591 FROST DKG via coordinator orchestration.
+// Saves the finalize response to cluster/frost_dkg/{requestId}.json. The saved
+// artifact carries operatorSetVersion, dkgEpoch, groupPublicKey, and per-slot
+// workerArtifactHashes (each with frostVerifyingShare). Downstream rotation
+// scripts (local_frost_rotation_apply.mjs, testnet_rotate_frost_config.mjs)
+// consume this file shape directly.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
