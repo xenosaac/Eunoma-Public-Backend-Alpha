@@ -5,31 +5,58 @@
 // Tested against Aptos CLI 3.5+. Env vars required:
 //   APTOS_NODE_URL        e.g. https://fullnode.testnet.aptoslabs.com/v1
 //   BRIDGE_PACKAGE_ADDRESS the eunoma module address on chain
-//   ADMIN_PROFILE         aptos CLI profile name with admin signer
+//   ADMIN_PROFILE         aptos CLI profile name with admin signer (only for --submit)
 //
-// Snapshot file format (cluster/deoperator-config-snapshot.json):
-//   {
-//     "operatorSetVersion": "1",
-//     "dkgEpoch": "1",
-//     "vaultEk": "<hex32>",
-//     "depositCircuitVersion": "<hex32>",
-//     "withdrawCircuitVersion": "<hex32>",
-//     "caPayloadCircuitVersion": "<hex32>",
-//     "fallbackPubkeys": ["<hex32>", ... 7 entries]
-//   }
+// Inputs:
+//   --dkg-artifact <path>  FROST DKG-A artifact (groupPublicKey + 7 worker artifact hashes).
+//   --snapshot <path>      Operator-maintained snapshot of immutable config fields:
+//     {
+//       "operatorSetVersion": "1",
+//       "dkgEpoch": "1",
+//       "vaultEk": "<hex32>",
+//       "depositCircuitVersion": "<hex32>",
+//       "withdrawCircuitVersion": "<hex32>",
+//       "caPayloadCircuitVersion": "<hex32>",
+//       "fallbackPubkeys": ["<hex32>", ... 7 entries]
+//     }
+//   --roster <path>        Full DeoperatorRoster JSON (the file written by
+//                          local_cluster_config.mjs to cluster/roster.json). Required:
+//                          rosterHash(currentRoster) must equal chain.roster_hash, otherwise
+//                          rotate_deoperator_config_v2 would commit to a roster digest that
+//                          the operator can't actually verify off-chain. See prepareFrostRotationTx.
 //
 // CLI:
-//   testnet_rotate_frost_config.mjs --dkg-artifact <path> --snapshot <path> [--submit]
+//   testnet_rotate_frost_config.mjs --dkg-artifact <path> --snapshot <path> --roster <path> \
+//     [--new-dkg-epoch <decimal>] [--submit]
 //
-// Default mode is --simulate (no --submit). Submission is operator-driven and
-// out of CI scope; --submit is supported but exercised manually.
+// Default mode is --simulate (no --submit). Submission is operator-driven and out of CI scope.
+// On --submit confirmation, the script atomically rewrites --roster and --snapshot to the
+// rotated state. Operators then run scripts/local_frost_rotation_apply.mjs --dkg-artifact <path>
+// to propagate rotated keys to local env files + cluster JSON.
 import { spawnSync } from "node:child_process";
 import { chmodSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyFrostRotationToRoster } from "@eunoma/deop-protocol";
+import {
+  prepareFrostRotationTx,
+  StaleRotationStateError,
+  validateRoster,
+} from "@eunoma/deop-protocol";
 import { aptosView } from "./_lib/aptos_view.mjs";
 import { hexArg, hexVectorArg, u64Arg } from "./_lib/format_aptos_args.mjs";
+
+const STALE_EXIT_CODE = {
+  STALE_ROSTER_HASH: 10,
+  STALE_CHAIN_OPERATOR_SET_VERSION: 11,
+  STALE_CHAIN_DKG_EPOCH: 12,
+  STALE_CHAIN_VAULT_EK: 13,
+  STALE_CHAIN_FROST_GROUP_PUBKEY: 14,
+  STALE_SNAPSHOT_OPERATOR_SET_VERSION: 15,
+  STALE_SNAPSHOT_DKG_EPOCH: 16,
+  STALE_SNAPSHOT_VAULT_EK: 17,
+  INVALID_FALLBACK_PUBKEYS: 18,
+  INVALID_DKG_ARTIFACT: 19,
+};
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -37,6 +64,7 @@ const serviceRoot = resolve(scriptDir, "..");
 const args = process.argv.slice(2);
 let artifactPath = null;
 let snapshotPath = null;
+let rosterPath = null;
 let newDkgEpochOverride = null;
 let submit = false;
 for (let i = 0; i < args.length; i += 1) {
@@ -46,6 +74,9 @@ for (let i = 0; i < args.length; i += 1) {
     i += 1;
   } else if (arg === "--snapshot") {
     snapshotPath = args[i + 1];
+    i += 1;
+  } else if (arg === "--roster") {
+    rosterPath = args[i + 1];
     i += 1;
   } else if (arg === "--new-dkg-epoch") {
     newDkgEpochOverride = args[i + 1];
@@ -57,9 +88,9 @@ for (let i = 0; i < args.length; i += 1) {
     process.exit(2);
   }
 }
-if (!artifactPath || !snapshotPath) {
+if (!artifactPath || !snapshotPath || !rosterPath) {
   console.error(
-    "usage: testnet_rotate_frost_config.mjs --dkg-artifact <path> --snapshot <path> [--new-dkg-epoch <decimal>] [--submit]",
+    "usage: testnet_rotate_frost_config.mjs --dkg-artifact <path> --snapshot <path> --roster <path> [--new-dkg-epoch <decimal>] [--submit]",
   );
   process.exit(2);
 }
@@ -80,20 +111,18 @@ if (submit && !adminProfile) {
   process.exit(2);
 }
 
-const artifact = JSON.parse(readFileSync(resolve(artifactPath), "utf8"));
-const snapshot = JSON.parse(readFileSync(resolve(snapshotPath), "utf8"));
+const artifact = parseJsonFile(artifactPath, "dkg-artifact");
+const snapshot = parseJsonFile(snapshotPath, "snapshot");
+const currentRoster = parseJsonFile(rosterPath, "roster");
 
 assertSnapshotShape(snapshot);
-if (!Array.isArray(artifact.workerArtifactHashes) || artifact.workerArtifactHashes.length !== 7) {
-  console.error("DKG artifact missing 7-slot workerArtifactHashes");
-  process.exit(2);
-}
-if (typeof artifact.groupPublicKey !== "string") {
-  console.error("DKG artifact missing groupPublicKey");
+try {
+  validateRoster(currentRoster);
+} catch (err) {
+  console.error(`roster validation failed: ${(err instanceof Error ? err.message : String(err))}`);
   process.exit(2);
 }
 
-// 1. View on-chain config and assert snapshot is fresh.
 console.log(`view: ${bridgePackage}::eunoma_bridge::get_deoperator_config_v2`);
 const view = await aptosView(
   aptosNodeUrl,
@@ -113,69 +142,52 @@ const [
   chainVaultEk,
 ] = view.map(stringify);
 
-if (String(snapshot.operatorSetVersion) !== String(chainOperatorSetVersion)) {
-  throw new Error(
-    `snapshot.operatorSetVersion=${snapshot.operatorSetVersion} != chain=${chainOperatorSetVersion} — snapshot stale`,
-  );
-}
-if (String(snapshot.dkgEpoch) !== String(chainDkgEpoch)) {
-  throw new Error(`snapshot.dkgEpoch=${snapshot.dkgEpoch} != chain=${chainDkgEpoch} — snapshot stale`);
-}
-if (normalizeHex(snapshot.vaultEk) !== normalizeHex(chainVaultEk)) {
-  throw new Error(`snapshot.vaultEk mismatch vs chain — snapshot stale`);
-}
 console.log(
   `chain: operatorSetVersion=${chainOperatorSetVersion} dkgEpoch=${chainDkgEpoch} rosterHash=${chainRosterHash} frostGroupPubkey=${chainFrostGroupPubkey}`,
 );
 
-// 2. Reconstruct DeoperatorRoster from snapshot + chain view, then rotate.
-const baseRoster = {
-  operatorSetVersion: String(chainOperatorSetVersion),
-  dkgEpoch: String(chainDkgEpoch),
-  caDkgScheme: "ca_dkg_v2",
-  threshold: 5,
-  nodes: artifact.workerArtifactHashes.map((entry) => ({
-    slot: entry.slot,
-    // Identity fields below are NOT verified on-chain; rotation only mutates frostVerifyingShare,
-    // frostGroupPubkey, and dkgEpoch in the canonical roster digest. The chain only checks rosterHash.
-    nodeId: `chain-deop-${entry.slot}`,
-    endpoint: `chain://deop-${entry.slot}`,
-    hpkePublicKey: "00".repeat(32),
-    transcriptPublicKey: "00".repeat(32),
-    frostVerifyingShare: "00".repeat(32),
-  })),
-  frostGroupPubkey: normalizeHex(chainFrostGroupPubkey),
-  vaultEk: normalizeHex(chainVaultEk),
-  circuitVersions: {
-    depositBinding: normalizeHex(snapshot.depositCircuitVersion),
-    withdraw: normalizeHex(snapshot.withdrawCircuitVersion),
-    caPayload: normalizeHex(snapshot.caPayloadCircuitVersion),
-  },
-};
-
-const newDkgEpoch = newDkgEpochOverride ?? String(Number(baseRoster.dkgEpoch) + 1);
-const rotation = applyFrostRotationToRoster(baseRoster, {
-  groupPublicKey: artifact.groupPublicKey,
-  dkgEpoch: newDkgEpoch,
-  workerArtifacts: artifact.workerArtifactHashes,
-});
+let output;
+try {
+  output = prepareFrostRotationTx({
+    currentRoster,
+    chainView: {
+      operatorSetVersion: String(chainOperatorSetVersion),
+      dkgEpoch: String(chainDkgEpoch),
+      rosterHash: String(chainRosterHash),
+      frostGroupPubkey: String(chainFrostGroupPubkey),
+      vaultEk: String(chainVaultEk),
+    },
+    snapshot,
+    dkgArtifact: {
+      groupPublicKey: artifact.groupPublicKey,
+      workerArtifactHashes: artifact.workerArtifactHashes,
+    },
+    ...(newDkgEpochOverride ? { newDkgEpoch: newDkgEpochOverride } : {}),
+  });
+} catch (err) {
+  if (err instanceof StaleRotationStateError) {
+    console.error(`rotation refused: ${err.code} — ${err.message}`);
+    const exit = STALE_EXIT_CODE[err.code] ?? 1;
+    process.exit(exit);
+  }
+  throw err;
+}
 
 console.log(
-  `rotation: newDkgEpoch=${rotation.roster.dkgEpoch} newGroupPubkey=${rotation.roster.frostGroupPubkey} newRosterHash=${rotation.rosterHash}`,
+  `rotation: newDkgEpoch=${output.rotatedRoster.dkgEpoch} newGroupPubkey=${output.rotatedRoster.frostGroupPubkey} newRosterHash=${output.rotatedRosterHash}`,
 );
 
-// 3. Build aptos move run invocation.
-const fallback = snapshot.fallbackPubkeys.map(normalizeHex);
+const { moveCallArgs } = output;
 const moveArgs = [
-  u64Arg(baseRoster.operatorSetVersion),
-  u64Arg(rotation.roster.dkgEpoch),
-  hexArg(rotation.rosterHash),
-  hexArg(rotation.roster.frostGroupPubkey),
-  hexArg(baseRoster.vaultEk),
-  hexArg(snapshot.depositCircuitVersion),
-  hexArg(snapshot.withdrawCircuitVersion),
-  hexArg(snapshot.caPayloadCircuitVersion),
-  hexVectorArg(fallback),
+  u64Arg(moveCallArgs.operatorSetVersion),
+  u64Arg(moveCallArgs.newDkgEpoch),
+  hexArg(moveCallArgs.rotatedRosterHash),
+  hexArg(moveCallArgs.rotatedFrostGroupPubkey),
+  hexArg(moveCallArgs.vaultEk),
+  hexArg(moveCallArgs.depositCircuitVersion),
+  hexArg(moveCallArgs.withdrawCircuitVersion),
+  hexArg(moveCallArgs.caPayloadCircuitVersion),
+  hexVectorArg(moveCallArgs.fallbackPubkeys),
 ];
 
 const cliArgs = [
@@ -215,12 +227,10 @@ if (run.status !== 0) {
 if (!submit) {
   console.log("");
   console.log("simulate complete. Re-run with --submit to actually rotate the on-chain frost_group_pubkey.");
-  console.log(`Expected post-submit: dkgEpoch=${rotation.roster.dkgEpoch} rosterHash=${rotation.rosterHash}`);
+  console.log(`Expected post-submit: dkgEpoch=${output.rotatedRoster.dkgEpoch} rosterHash=${output.rotatedRosterHash}`);
   process.exit(0);
 }
 
-// --submit branch: parse tx hash, wait for confirmation, re-view chain state,
-// and update the snapshot. Failure modes are loud; partial state is not silently accepted.
 const txHash = extractTxHash(run.stdout || "");
 if (!txHash) {
   console.error("submit: unable to parse tx hash from aptos CLI output. Re-view manually before re-submitting.");
@@ -246,19 +256,21 @@ const [
   _postThreshold,
   postRosterHash,
   postFrostGroupPubkey,
-  postVaultEk,
+  _postVaultEk,
 ] = postView.map(stringify);
 
 const mismatches = [];
-if (String(postDkgEpoch) !== rotation.roster.dkgEpoch) {
-  mismatches.push(`dkgEpoch: chain=${postDkgEpoch} local=${rotation.roster.dkgEpoch}`);
+if (String(postDkgEpoch) !== output.rotatedRoster.dkgEpoch) {
+  mismatches.push(`dkgEpoch: chain=${postDkgEpoch} local=${output.rotatedRoster.dkgEpoch}`);
 }
-if (normalizeHex(postRosterHash) !== normalizeHex(rotation.rosterHash)) {
-  mismatches.push(`rosterHash: chain=${normalizeHex(postRosterHash)} local=${normalizeHex(rotation.rosterHash)}`);
-}
-if (normalizeHex(postFrostGroupPubkey) !== normalizeHex(rotation.roster.frostGroupPubkey)) {
+if (normalizeHex(postRosterHash) !== normalizeHex(output.rotatedRosterHash)) {
   mismatches.push(
-    `frostGroupPubkey: chain=${normalizeHex(postFrostGroupPubkey)} local=${normalizeHex(rotation.roster.frostGroupPubkey)}`,
+    `rosterHash: chain=${normalizeHex(postRosterHash)} local=${normalizeHex(output.rotatedRosterHash)}`,
+  );
+}
+if (normalizeHex(postFrostGroupPubkey) !== normalizeHex(output.rotatedRoster.frostGroupPubkey)) {
+  mismatches.push(
+    `frostGroupPubkey: chain=${normalizeHex(postFrostGroupPubkey)} local=${normalizeHex(output.rotatedRoster.frostGroupPubkey)}`,
   );
 }
 if (mismatches.length > 0) {
@@ -268,21 +280,48 @@ if (mismatches.length > 0) {
 }
 console.log("submit: chain state matches local computation");
 
-// Atomic snapshot update: only dkgEpoch changes; immutable fields untouched.
+const rosterResolved = resolve(rosterPath);
+atomicWriteJson(rosterResolved, output.rotatedRoster);
+console.log(`submit: roster at ${rosterResolved} updated to dkgEpoch=${output.rotatedRoster.dkgEpoch}`);
+
 const updatedSnapshot = {
   ...snapshot,
-  dkgEpoch: rotation.roster.dkgEpoch,
+  dkgEpoch: output.rotatedRoster.dkgEpoch,
 };
 const snapshotResolved = resolve(snapshotPath);
-const tmpPath = `${snapshotResolved}.tmp`;
-writeFileSync(tmpPath, `${JSON.stringify(updatedSnapshot, null, 2)}\n`, { mode: 0o600 });
-chmodSync(tmpPath, 0o600);
-renameSync(tmpPath, snapshotResolved);
-console.log(`submit: snapshot at ${snapshotResolved} updated to dkgEpoch=${rotation.roster.dkgEpoch}`);
+atomicWriteJson(snapshotResolved, updatedSnapshot);
+console.log(`submit: snapshot at ${snapshotResolved} updated to dkgEpoch=${output.rotatedRoster.dkgEpoch}`);
+
 console.log(`submit: rotation complete. operatorSetVersion=${postOperatorSetVersion} dkgEpoch=${postDkgEpoch}`);
+console.log("");
+console.log("submit: chain rotated. To propagate rotated keys to local services (env files, cluster JSON):");
+console.log(`  node scripts/local_frost_rotation_apply.mjs --dkg-artifact ${resolve(artifactPath)}`);
+console.log("Then restart coordinator + nodes (workers stay alive).");
+
+function parseJsonFile(path, label) {
+  let raw;
+  try {
+    raw = readFileSync(resolve(path), "utf8");
+  } catch (err) {
+    console.error(`${label}: cannot read ${path}: ${(err instanceof Error ? err.message : String(err))}`);
+    process.exit(2);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error(`${label}: cannot parse JSON at ${path}: ${(err instanceof Error ? err.message : String(err))}`);
+    process.exit(2);
+  }
+}
+
+function atomicWriteJson(path, value) {
+  const tmpPath = `${path}.tmp`;
+  writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(tmpPath, 0o600);
+  renameSync(tmpPath, path);
+}
 
 function extractTxHash(text) {
-  // Aptos CLI typically emits a "transaction_hash" field in JSON output, or "Hash: 0x..." in plain.
   const jsonMatch = text.match(/"transaction_hash"\s*:\s*"(0x[0-9a-fA-F]+)"/);
   if (jsonMatch) return jsonMatch[1];
   const plainMatch = text.match(/(?:hash|Hash)[^0-9a-fA-Fx]*?(0x[0-9a-fA-F]{64})/);
@@ -309,7 +348,6 @@ async function waitForTx(nodeUrl, txHash, timeoutMs) {
       }
     } catch (err) {
       if (!(err instanceof TypeError)) throw err;
-      // network blip — retry
     }
     await new Promise((r) => setTimeout(r, 1000));
   }
