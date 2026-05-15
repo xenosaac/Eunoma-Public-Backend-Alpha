@@ -150,6 +150,48 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
             local_lambdas.push(lambda);
         }
 
+        // Codex P1 #3: only the identity selection (sorted_slots == 0..N-1) keeps the
+        // MASCOT cert CN binding intact (CN is "P<slot>" but MASCOT expects "P<ordinal>").
+        // Fail closed for any non-identity selection unless the operator opts in.
+        let identity_selection = sorted_slots
+            .iter()
+            .enumerate()
+            .all(|(ordinal, slot)| ordinal == *slot);
+        if !identity_selection {
+            let allow_shifted = std::env::var("EUNOMA_MPC_ALLOW_SHIFTED_SELECTION")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if !allow_shifted {
+                return Err(AdapterError::InvalidInput(format!(
+                    "selected_slots {sorted_slots:?} != 0..{DEOPERATOR_THRESHOLD}; MASCOT cert CN \
+                     binding (P<slot>) does not match the player ordinal. Phase 2 supports only \
+                     the canonical lowest-N selection in single-host local-cluster mode. Set \
+                     EUNOMA_MPC_ALLOW_SHIFTED_SELECTION=1 only if you have provisioned per-ordinal \
+                     certs out-of-band."
+                )));
+            }
+        }
+        // Check own private key and peer cert presence BEFORE any filesystem allocation —
+        // failing closed early gives a better error than a deep TLS handshake failure later.
+        let host_player_data_check = self.mp_spdz_home.join("Player-Data");
+        let own_key = host_player_data_check.join(format!("P{}.key", ctx.self_slot));
+        if !own_key.exists() {
+            return Err(AdapterError::Internal(format!(
+                "missing own private key {} — run `npm run mpc:bootstrap`",
+                own_key.display()
+            )));
+        }
+        for slot in &sorted_slots {
+            let pem = host_player_data_check.join(format!("P{slot}.pem"));
+            if !pem.exists() {
+                return Err(AdapterError::Internal(format!(
+                    "missing peer cert {} (slot {slot}); single-host local-cluster setup \
+                     requires all 5 peer certs on this host. Run `npm run mpc:bootstrap`.",
+                    pem.display()
+                )));
+            }
+        }
+
         // Allocate session directory. Combining request_id and session_id namespaces the
         // workspace so that two concurrent calls — even sharing a session_id — get distinct
         // dirs. Mode 0o700.
@@ -190,34 +232,24 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         let host_programs = self.mp_spdz_home.join("Programs");
         link_programs(&host_programs, &session_dir.join("Programs"), &self.program_name)?;
 
-        // Symlink each peer's P{player_id}.pem/.key from the slot-specific cert in MP_SPDZ_HOME.
-        // MASCOT validates the peer's hostname matches "P<peer_player_id>" — the CN of P<slot>.pem
-        // is "P<slot>" in our setup-ssl.sh, so we must alias each player ordinal to the slot
-        // that ordinal corresponds to (see plan Risk 5).
+        // Codex P1 #3: we used to copy every peer's PRIVATE key into our session dir, which
+        // means a compromised worker would have peer parties' private keys locally. Fix:
+        //   - Only symlink our OWN private key (P{ordinal}.key ← P{self_slot}.key).
+        //   - Symlink each peer's PUBLIC cert (P{ordinal}.pem ← P{peer_slot}.pem).
+        // The shifted-selection guard + cert/key existence checks ran at the top of the
+        // function; here we just wire up the session dir.
         let host_player_data = self.mp_spdz_home.join("Player-Data");
+        // OWN private key.
+        symlink_or_copy(
+            &host_player_data.join(format!("P{}.key", ctx.self_slot)),
+            &player_data_dir.join(format!("P{}.key", ctx.player_id)),
+        )?;
+        // Peer PUBLIC certs (no private keys).
         for (ordinal, slot) in sorted_slots.iter().enumerate() {
-            // The MASCOT peer at ordinal `ordinal` will present a cert signed for "P<slot>"
-            // (because cert files were created per-slot during bootstrap setup-ssl.sh 7).
-            // We must rename it locally to "P<ordinal>.pem" so MASCOT's verify_peer_with
-            // host_name_verification("P<ordinal>") matches.
-            //
-            // For this to work, the cert CN must be "P<ordinal>" — but setup-ssl.sh wrote
-            // CN="P<slot>". The fix in plan Risk 5 anticipated this: we regenerate the certs
-            // per-ordinal in a session-local Player-Data, OR (alternative) we rely on
-            // setup-ssl.sh producing CN=P<i>=P<slot> AND we keep player ordinal == slot for
-            // the simple case of selected_slots == 0..4. The failure path (selected != 0..4)
-            // would be caught by the killer integration test when it runs. For local cluster
-            // (single host) the plan accepts this constraint.
-            //
-            // Phase 2 mitigation: when selected_slots == 0..N-1 (the default lowest-N choice),
-            // ordinal == slot and the CN matches. We still copy the cert so the session dir
-            // is fully self-contained.
-            let src_pem = host_player_data.join(format!("P{slot}.pem"));
-            let src_key = host_player_data.join(format!("P{slot}.key"));
-            let dst_pem = player_data_dir.join(format!("P{ordinal}.pem"));
-            let dst_key = player_data_dir.join(format!("P{ordinal}.key"));
-            symlink_or_copy(&src_pem, &dst_pem)?;
-            symlink_or_copy(&src_key, &dst_key)?;
+            symlink_or_copy(
+                &host_player_data.join(format!("P{slot}.pem")),
+                &player_data_dir.join(format!("P{ordinal}.pem")),
+            )?;
         }
         // c_rehash creates SSL_DIR/<hash>.0 -> P<i>.pem links so OpenSSL's verify path can
         // find the trust anchors. The host already has these, but in our session-local dir we

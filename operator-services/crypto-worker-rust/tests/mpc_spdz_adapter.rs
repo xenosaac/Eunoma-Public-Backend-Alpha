@@ -194,6 +194,87 @@ fn player_id_self_slot_mismatch_rejected() {
 }
 
 #[test]
+fn shifted_selection_rejected_without_opt_in() {
+    // Codex P1 #3: a non-`0..N-1` selection breaks the MASCOT cert CN binding (cert CN is
+    // "P<slot>" but MASCOT expects "P<ordinal>"). Adapter must fail closed unless the
+    // operator explicitly sets EUNOMA_MPC_ALLOW_SHIFTED_SELECTION=1.
+    let home = temp_dir("shifted-selection-home");
+    let adapter = dummy_adapter_for_validation(home);
+    let work_dir = temp_dir("shifted-selection-work");
+    let sorted_slots: Vec<usize> = vec![0, 1, 3, 5, 6]; // != 0..4
+    let lagrange: Vec<String> = (0..5)
+        .map(|i| scalar_hex(&lagrange_coefficient_at_zero(i, &sorted_slots)))
+        .collect();
+    let ctx = InversionContext {
+        dkg_epoch: "1".to_string(),
+        ca_dkg_transcript_hash: "00".repeat(32),
+        selected_slots: sorted_slots.clone(),
+        self_slot: 0,
+        roster_hash: "00".repeat(32),
+        request_id: "req".to_string(),
+        session_id: "sess".to_string(),
+        work_dir,
+        peer_addresses: sorted_slots
+            .iter()
+            .map(|s| format!("127.0.0.1:{}", 14000 + s))
+            .collect(),
+        player_id: 0,
+        lagrange_coefficients_hex: lagrange,
+    };
+    // Pre-test: ensure no env var is set.
+    let prev = std::env::var("EUNOMA_MPC_ALLOW_SHIFTED_SELECTION").ok();
+    std::env::remove_var("EUNOMA_MPC_ALLOW_SHIFTED_SELECTION");
+    let err = adapter
+        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .expect_err("shifted selection without opt-in must reject");
+    if let Some(prev) = prev {
+        std::env::set_var("EUNOMA_MPC_ALLOW_SHIFTED_SELECTION", prev);
+    }
+    assert!(
+        matches!(&err, AdapterError::InvalidInput(msg) if msg.contains("EUNOMA_MPC_ALLOW_SHIFTED_SELECTION")),
+        "expected shifted-selection rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn missing_peer_cert_fails_closed() {
+    // Codex P1 #3: when a peer's public cert is missing from MP_SPDZ_HOME/Player-Data the
+    // adapter must surface a clear error rather than silently proceeding (which would
+    // produce an opaque MASCOT TLS handshake failure deep in the subprocess). The dummy
+    // adapter uses an empty MP_SPDZ_HOME so the first `Pn.pem` lookup fails.
+    let home = temp_dir("missing-peer-cert-home");
+    let adapter = dummy_adapter_for_validation(home);
+    let work_dir = temp_dir("missing-peer-cert-work");
+    let sorted_slots: Vec<usize> = vec![0, 1, 2, 3, 4];
+    let lagrange: Vec<String> = (0..5)
+        .map(|i| scalar_hex(&lagrange_coefficient_at_zero(i, &sorted_slots)))
+        .collect();
+    let ctx = InversionContext {
+        dkg_epoch: "1".to_string(),
+        ca_dkg_transcript_hash: "00".repeat(32),
+        selected_slots: sorted_slots.clone(),
+        self_slot: 0,
+        roster_hash: "00".repeat(32),
+        request_id: "req".to_string(),
+        session_id: "sess".to_string(),
+        work_dir,
+        peer_addresses: sorted_slots
+            .iter()
+            .map(|s| format!("127.0.0.1:{}", 14000 + s))
+            .collect(),
+        player_id: 0,
+        lagrange_coefficients_hex: lagrange,
+    };
+    let err = adapter
+        .compute_inverse_share(&Scalar::ONE, &ctx)
+        .expect_err("missing peer cert must fail closed");
+    assert!(
+        matches!(&err, AdapterError::Internal(msg) if msg.contains("missing own private key") || msg.contains("missing peer cert")),
+        "expected missing-cert/key error, got {err:?}"
+    );
+}
+
+#[test]
 fn session_dir_collision_resolved_by_request_id() {
     // Two contexts with the SAME session_id but DIFFERENT request_id must allocate distinct
     // work dirs under work_dir/mpc-sessions/. The check is constructive: we run the adapter
