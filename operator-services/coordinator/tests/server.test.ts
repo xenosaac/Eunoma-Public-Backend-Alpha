@@ -649,7 +649,7 @@ describe("coordinator", () => {
     await expect(store.getStatus("vault-ek-503")).resolves.toMatchObject({ status: "unknown" });
   });
 
-  it("rejects caller-supplied selectedSlots with duplicates", async () => {
+  it("rejects caller-supplied selectedSlots (with duplicates) as not-overridable", async () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
@@ -671,10 +671,10 @@ describe("coordinator", () => {
       },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("DUPLICATE_SLOT");
+    expect(res.json().error).toBe("selected_slots_not_overridable");
   });
 
-  it("rejects caller-supplied selectedSlots with under-quorum count", async () => {
+  it("rejects caller-supplied selectedSlots (under-quorum count) as not-overridable", async () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
@@ -696,7 +696,126 @@ describe("coordinator", () => {
       },
     });
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe("UNDER_QUORUM");
+    expect(res.json().error).toBe("selected_slots_not_overridable");
+  });
+
+  it("derives vault_ek with coordinator-chosen lowest-5 slots and vault-ek-derivation artifact kind", async () => {
+    const { sha256 } = await import("@noble/hashes/sha256");
+    const { bytesToHex } = await import("@noble/hashes/utils");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+
+    // Mock H_RISTRETTO-shaped contribution: byte content is irrelevant to the coordinator
+    // as long as the contribution-worker hash recomputes correctly and the verify response
+    // gives a final transcript hash. The TS assembleVaultEkTranscript validates
+    // workerTranscriptHash against canonical recomputation, so we must compute it the same
+    // way the worker would.
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const hContributionPerSlot: Record<number, string> = {};
+    const workerHashPerSlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      hContributionPerSlot[slot] = h32(String((slot % 9) + 1));
+      const enc = new TextEncoder();
+      const sortedSlotsJoined = expectedSelectedSlots.join(",");
+      const bytes = new Uint8Array([
+        ...enc.encode("EUNOMA_VAULT_EK_DERIVATION_V1"),
+        ...enc.encode(dkgEpoch),
+        ...enc.encode(":"),
+        ...enc.encode(caDkgTranscriptHashHex),
+        ...enc.encode(":"),
+        ...enc.encode(rosterHashHex),
+        ...enc.encode(":"),
+        ...enc.encode(sortedSlotsJoined),
+        ...enc.encode(":"),
+        ...enc.encode(slot.toString()),
+        ...enc.encode(":"),
+        ...enc.encode(hContributionPerSlot[slot]),
+      ]);
+      workerHashPerSlot[slot] = bytesToHex(sha256(bytes));
+    }
+    const finalTranscriptHash = h32("e");
+    const vaultEk = h32("f");
+
+    type CapturedRecord = {
+      requestId: string;
+      sessionId: string;
+      rosterHash?: string;
+      slot: number;
+      artifactKind: string;
+      artifactHash: string;
+      transcriptHash: string;
+    };
+    const recorded: CapturedRecord[] = [];
+    const captureStore = {
+      recordSessionShare: async () => {},
+      recordPartialArtifact: async (input: CapturedRecord) => {
+        recorded.push(input);
+      },
+      getStatus: async () => ({
+        requestId: "x",
+        status: "unknown" as const,
+        transcriptHashes: [],
+        updatedAt: new Date(0).toISOString(),
+      }),
+      markComplete: async () => {},
+      markAborted: async () => {},
+    };
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      store: captureStore,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round1")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              hContribution: hContributionPerSlot[slot],
+              schnorrProof: { R: h32("3"), s: h32("4") },
+              workerTranscriptHash: workerHashPerSlot[slot],
+            },
+          };
+        }
+        if (path.endsWith("/verify")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              vaultEk,
+              finalTranscriptHash,
+            },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-happy",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.selectedSlots).toEqual(expectedSelectedSlots);
+    expect(body.selectionRationale).toBe("coordinator-chosen");
+    expect(body.vaultEk).toBe(vaultEk);
+    expect(body.finalTranscriptHash).toBe(finalTranscriptHash);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({
+      requestId: "vault-ek-happy",
+      artifactKind: "vault-ek-derivation",
+      artifactHash: finalTranscriptHash,
+      transcriptHash: finalTranscriptHash,
+    });
   });
 
   it("rejects missing caDkgTranscriptHash with no_ca_dkg_v2_record_for_dkg_epoch", async () => {

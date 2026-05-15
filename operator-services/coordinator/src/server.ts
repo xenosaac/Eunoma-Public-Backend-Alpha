@@ -339,9 +339,16 @@ export function buildCoordinatorServer(
         typeof raw.requestId === "string" && raw.requestId.length > 0
           ? raw.requestId
           : `vault-ek-derive-${Date.now()}`;
-      const selectedSlots = resolveSelectedSlots(raw.selectedSlots);
-      const selectionRationale =
-        Array.isArray(raw.selectedSlots) ? "caller-supplied" : "lowest-5-active";
+      if (raw.selectedSlots !== undefined) {
+        return reply.code(400).send({
+          error: "selected_slots_not_overridable",
+          message:
+            "selectedSlots is coordinator-chosen; do not supply in request body. " +
+            "If Phase 2 needs failover, add a separate admin-gated endpoint.",
+        });
+      }
+      const selectedSlots = lowestEligibleSlots(dkgRoster, DEOPERATOR_THRESHOLD);
+      const selectionRationale = "coordinator-chosen" as const;
 
       const roundResults: Array<{ slot: number; body: Record<string, unknown> }> = [];
       for (const slot of selectedSlots) {
@@ -464,7 +471,7 @@ export function buildCoordinatorServer(
         sessionId: requestId,
         rosterHash: dkgRosterHash,
         slot: verifierSlot,
-        artifactKind: "ca-registration",
+        artifactKind: "vault-ek-derivation",
         artifactHash: finalTranscriptHash,
         transcriptHash: finalTranscriptHash,
       });
@@ -1109,42 +1116,11 @@ function assertRosterVaultEk(actual: string, expected: string): void {
   }
 }
 
-function resolveSelectedSlots(value: unknown): number[] {
-  if (value === undefined || value === null) {
-    return Array.from({ length: DEOPERATOR_THRESHOLD }, (_, slot) => slot);
-  }
-  if (!Array.isArray(value)) {
-    throw new VaultEkDerivationError(
-      "INVALID_CONTRIBUTION_SHAPE",
-      "selectedSlots must be an array of slot numbers",
-    );
-  }
-  if (value.length !== DEOPERATOR_THRESHOLD) {
-    throw new VaultEkDerivationError(
-      "UNDER_QUORUM",
-      `selectedSlots must contain exactly ${DEOPERATOR_THRESHOLD} entries, got ${value.length}`,
-    );
-  }
-  const seen = new Set<number>();
-  const out: number[] = [];
-  for (const entry of value) {
-    if (!Number.isInteger(entry) || (entry as number) < 0 || (entry as number) >= DEOPERATOR_COUNT) {
-      throw new VaultEkDerivationError(
-        "UNKNOWN_SLOT",
-        `selectedSlots entry ${entry} is not a deoperator slot`,
-      );
-    }
-    if (seen.has(entry as number)) {
-      throw new VaultEkDerivationError(
-        "DUPLICATE_SLOT",
-        `duplicate selectedSlots entry ${entry}`,
-      );
-    }
-    seen.add(entry as number);
-    out.push(entry as number);
-  }
-  out.sort((a, b) => a - b);
-  return out;
+function lowestEligibleSlots(roster: CaDkgV2Roster, n: number): number[] {
+  return roster.nodes
+    .map((node) => node.slot)
+    .sort((a, b) => a - b)
+    .slice(0, n);
 }
 
 async function writeTranscriptArtifactAtomic(
