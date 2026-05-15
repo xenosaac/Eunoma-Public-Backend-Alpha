@@ -24,7 +24,7 @@
 // Default mode is --simulate (no --submit). Submission is operator-driven and
 // out of CI scope; --submit is supported but exercised manually.
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyFrostRotationToRoster } from "@eunoma/deop-protocol";
@@ -219,9 +219,102 @@ if (!submit) {
   process.exit(0);
 }
 
-// --submit branch handled in step 8.
-console.error("--submit path is implemented but verification of post-submit state is deferred to step 8.");
-process.exit(0);
+// --submit branch: parse tx hash, wait for confirmation, re-view chain state,
+// and update the snapshot. Failure modes are loud; partial state is not silently accepted.
+const txHash = extractTxHash(run.stdout || "");
+if (!txHash) {
+  console.error("submit: unable to parse tx hash from aptos CLI output. Re-view manually before re-submitting.");
+  process.exit(4);
+}
+console.log(`submit: tx hash ${txHash}; polling for confirmation`);
+const confirmation = await waitForTx(aptosNodeUrl, txHash, 120_000);
+if (!confirmation.success) {
+  console.error(`submit: tx ${txHash} reverted: ${confirmation.vmStatus ?? "unknown"}`);
+  process.exit(5);
+}
+console.log(`submit: tx ${txHash} confirmed; re-viewing chain state`);
+
+const postView = await aptosView(
+  aptosNodeUrl,
+  `${bridgePackage}::eunoma_bridge::get_deoperator_config_v2`,
+  [],
+  [],
+);
+const [
+  postOperatorSetVersion,
+  postDkgEpoch,
+  _postThreshold,
+  postRosterHash,
+  postFrostGroupPubkey,
+  postVaultEk,
+] = postView.map(stringify);
+
+const mismatches = [];
+if (String(postDkgEpoch) !== rotation.roster.dkgEpoch) {
+  mismatches.push(`dkgEpoch: chain=${postDkgEpoch} local=${rotation.roster.dkgEpoch}`);
+}
+if (normalizeHex(postRosterHash) !== normalizeHex(rotation.rosterHash)) {
+  mismatches.push(`rosterHash: chain=${normalizeHex(postRosterHash)} local=${normalizeHex(rotation.rosterHash)}`);
+}
+if (normalizeHex(postFrostGroupPubkey) !== normalizeHex(rotation.roster.frostGroupPubkey)) {
+  mismatches.push(
+    `frostGroupPubkey: chain=${normalizeHex(postFrostGroupPubkey)} local=${normalizeHex(rotation.roster.frostGroupPubkey)}`,
+  );
+}
+if (mismatches.length > 0) {
+  console.error("submit: chain state diverged from local expectation after tx confirmation:");
+  for (const m of mismatches) console.error(`  ${m}`);
+  process.exit(6);
+}
+console.log("submit: chain state matches local computation");
+
+// Atomic snapshot update: only dkgEpoch changes; immutable fields untouched.
+const updatedSnapshot = {
+  ...snapshot,
+  dkgEpoch: rotation.roster.dkgEpoch,
+};
+const snapshotResolved = resolve(snapshotPath);
+const tmpPath = `${snapshotResolved}.tmp`;
+writeFileSync(tmpPath, `${JSON.stringify(updatedSnapshot, null, 2)}\n`, { mode: 0o600 });
+chmodSync(tmpPath, 0o600);
+renameSync(tmpPath, snapshotResolved);
+console.log(`submit: snapshot at ${snapshotResolved} updated to dkgEpoch=${rotation.roster.dkgEpoch}`);
+console.log(`submit: rotation complete. operatorSetVersion=${postOperatorSetVersion} dkgEpoch=${postDkgEpoch}`);
+
+function extractTxHash(text) {
+  // Aptos CLI typically emits a "transaction_hash" field in JSON output, or "Hash: 0x..." in plain.
+  const jsonMatch = text.match(/"transaction_hash"\s*:\s*"(0x[0-9a-fA-F]+)"/);
+  if (jsonMatch) return jsonMatch[1];
+  const plainMatch = text.match(/(?:hash|Hash)[^0-9a-fA-Fx]*?(0x[0-9a-fA-F]{64})/);
+  if (plainMatch) return plainMatch[1];
+  return null;
+}
+
+async function waitForTx(nodeUrl, txHash, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const url = new URL(`/v1/transactions/by_hash/${txHash}`, nodeUrl).toString();
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        const body = await res.json();
+        if (body && body.type === "pending_transaction") {
+          // keep polling
+        } else if (body && typeof body.success === "boolean") {
+          return { success: body.success, vmStatus: body.vm_status };
+        }
+      } else if (res.status !== 404) {
+        const text = await res.text();
+        throw new Error(`tx poll ${url} -> ${res.status}: ${text}`);
+      }
+    } catch (err) {
+      if (!(err instanceof TypeError)) throw err;
+      // network blip — retry
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error(`tx ${txHash} did not confirm within ${timeoutMs}ms`);
+}
 
 function assertSnapshotShape(snap) {
   const required = [
