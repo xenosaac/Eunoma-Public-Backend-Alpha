@@ -63,4 +63,39 @@ describe("local cluster planning", () => {
       }),
     ).toThrow(/vaultEk/);
   });
+
+  it("assembles caDkgV2Roster and frostDkgV2Roster from the same HPKE keys", () => {
+    const plan = buildLocalClusterPlan({
+      vaultEk: h32("a"),
+      frost: {
+        groupPublicKey: h32("b"),
+        verifyingShares: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({
+          slot,
+          frostVerifyingShare: String(slot + 1).repeat(64),
+        })),
+      },
+      caDkgV2: {
+        hpkePublicKeys: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({
+          slot,
+          hpkePublicKey: (slot + 9).toString(16).padStart(64, "0"),
+        })),
+      },
+      randomHex: deterministicHex(),
+    });
+    expect(plan.caDkgV2Roster).toBeDefined();
+    expect(plan.frostDkgV2Roster).toBeDefined();
+    expect(plan.caDkgV2Roster!.caDkgScheme).toBe("ca_dkg_v2");
+    expect(plan.frostDkgV2Roster!.caDkgScheme).toBe("frost_dkg_v2");
+    for (let slot = 0; slot < DEOPERATOR_COUNT; slot += 1) {
+      expect(plan.frostDkgV2Roster!.nodes[slot].hpkePublicKey).toBe(
+        plan.caDkgV2Roster!.nodes[slot].hpkePublicKey,
+      );
+    }
+    expect(plan.frostDkgV2RosterHash).toBeDefined();
+    expect(plan.frostDkgV2RosterHash).not.toBe(plan.caDkgV2RosterHash);
+    expect(plan.coordinator.env.FROST_DKG_V2_ROSTER_JSON).toBeDefined();
+    for (const node of plan.nodes) {
+      expect(node.env.FROST_DKG_V2_ROSTER_JSON).toBeDefined();
+    }
+  });
 });

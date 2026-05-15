@@ -1,8 +1,26 @@
 import { randomBytes } from "node:crypto";
 import { bytesToHex, hexToBytes } from "@eunoma/shared";
-import { CA_DKG_SCHEME_LOCAL, CA_DKG_SCHEME_V2, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD } from "./constants.js";
-import { caDkgV2RosterHash, rosterHash, validateCaDkgV2Roster, validateRoster } from "./roster.js";
-import type { CaDkgScheme, CaDkgV2Roster, DeoperatorRoster } from "./types.js";
+import {
+  CA_DKG_SCHEME_LOCAL,
+  CA_DKG_SCHEME_V2,
+  DEOPERATOR_COUNT,
+  DEOPERATOR_THRESHOLD,
+  FROST_DKG_SCHEME_V2,
+} from "./constants.js";
+import {
+  caDkgV2RosterHash,
+  frostDkgV2RosterHash,
+  rosterHash,
+  validateCaDkgV2Roster,
+  validateFrostDkgV2Roster,
+  validateRoster,
+} from "./roster.js";
+import type {
+  CaDkgScheme,
+  CaDkgV2Roster,
+  DeoperatorRoster,
+  FrostDkgV2Roster,
+} from "./types.js";
 
 export interface LocalFrostMaterial {
   groupPublicKey: string;
@@ -47,6 +65,8 @@ export interface LocalClusterPlan {
   rosterHash: string;
   caDkgV2Roster?: CaDkgV2Roster;
   caDkgV2RosterHash?: string;
+  frostDkgV2Roster?: FrostDkgV2Roster;
+  frostDkgV2RosterHash?: string;
   nodeBearerTokens: Record<string, string>;
   coordinator: LocalServiceEnv & { port: number };
   relayer: LocalServiceEnv & { port: number };
@@ -99,6 +119,14 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
   if (caDkgV2Roster) validateCaDkgV2Roster(caDkgV2Roster);
   const currentCaDkgV2RosterHash = caDkgV2Roster ? caDkgV2RosterHash(caDkgV2Roster) : undefined;
 
+  const frostDkgV2Roster = opts.caDkgV2
+    ? buildFrostDkgV2Roster(opts, host, nodePortBase)
+    : undefined;
+  if (frostDkgV2Roster) validateFrostDkgV2Roster(frostDkgV2Roster);
+  const currentFrostDkgV2RosterHash = frostDkgV2Roster
+    ? frostDkgV2RosterHash(frostDkgV2Roster)
+    : undefined;
+
   const roster: DeoperatorRoster = {
     operatorSetVersion: opts.operatorSetVersion ?? "1",
     dkgEpoch: opts.dkgEpoch ?? "1",
@@ -125,12 +153,16 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
   const relayerBearer = randomHex(32, "relayer-bearer");
   const rosterJson = JSON.stringify(roster);
 
+  const caDkgV2RosterJson = caDkgV2Roster ? JSON.stringify(caDkgV2Roster) : undefined;
+  const frostDkgV2RosterJson = frostDkgV2Roster ? JSON.stringify(frostDkgV2Roster) : undefined;
   return {
     stateRoot,
     roster,
     rosterHash: currentRosterHash,
     caDkgV2Roster,
     caDkgV2RosterHash: currentCaDkgV2RosterHash,
+    frostDkgV2Roster,
+    frostDkgV2RosterHash: currentFrostDkgV2RosterHash,
     nodeBearerTokens,
     coordinator: {
       name: "coordinator",
@@ -140,7 +172,8 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         COORDINATOR_PORT: String(coordinatorPort),
         COORDINATOR_BEARER_TOKEN: coordinatorBearer,
         DEOPERATOR_ROSTER_JSON: rosterJson,
-        ...(caDkgV2Roster ? { CA_DKG_V2_ROSTER_JSON: JSON.stringify(caDkgV2Roster) } : {}),
+        ...(caDkgV2RosterJson ? { CA_DKG_V2_ROSTER_JSON: caDkgV2RosterJson } : {}),
+        ...(frostDkgV2RosterJson ? { FROST_DKG_V2_ROSTER_JSON: frostDkgV2RosterJson } : {}),
         DEOPERATOR_NODE_BEARER_TOKENS_JSON: JSON.stringify(nodeBearerTokens),
       },
     },
@@ -165,7 +198,8 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         DEOPERATOR_PORT: String(nodePortBase + slot),
         DEOPERATOR_BEARER_TOKEN: nodeBearerTokens[String(slot)],
         DEOPERATOR_ROSTER_JSON: rosterJson,
-        ...(caDkgV2Roster ? { CA_DKG_V2_ROSTER_JSON: JSON.stringify(caDkgV2Roster) } : {}),
+        ...(caDkgV2RosterJson ? { CA_DKG_V2_ROSTER_JSON: caDkgV2RosterJson } : {}),
+        ...(frostDkgV2RosterJson ? { FROST_DKG_V2_ROSTER_JSON: frostDkgV2RosterJson } : {}),
         CRYPTO_WORKER_URL: `http://${host}:${workerPortBase + slot}`,
       },
     })),
@@ -217,6 +251,35 @@ function buildCaDkgV2Roster(
       endpoint: `http://${host}:${nodePortBase + slot}`,
       hpkePublicKey: hpkeBySlot.get(slot) ?? unreachable(`missing HPKE slot ${slot}`),
       transcriptPublicKey: randomHex(32, `slot-${slot}-ca-dkg-v2-transcript-public`),
+    })),
+  };
+}
+
+function buildFrostDkgV2Roster(
+  opts: LocalClusterPlanOptions,
+  host: string,
+  nodePortBase: number,
+): FrostDkgV2Roster {
+  if (!opts.caDkgV2 || opts.caDkgV2.hpkePublicKeys.length !== DEOPERATOR_COUNT) {
+    throw new Error(`FROST DKG V2 material must contain ${DEOPERATOR_COUNT} HPKE public keys`);
+  }
+  const hpkeBySlot = new Map<number, string>();
+  for (const key of opts.caDkgV2.hpkePublicKeys) {
+    assertHexBytes(`frostDkgV2.hpkePublicKeys[${key.slot}]`, key.hpkePublicKey, 32);
+    hpkeBySlot.set(key.slot, bytesToHex(hexToBytes(key.hpkePublicKey)));
+  }
+  const randomHex = opts.randomHex ?? ((bytes: number) => bytesToHex(randomBytes(bytes)));
+  return {
+    operatorSetVersion: opts.operatorSetVersion ?? "1",
+    dkgEpoch: opts.dkgEpoch ?? "1",
+    caDkgScheme: FROST_DKG_SCHEME_V2,
+    threshold: DEOPERATOR_THRESHOLD,
+    nodes: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({
+      slot,
+      nodeId: `local-deop-${slot}`,
+      endpoint: `http://${host}:${nodePortBase + slot}`,
+      hpkePublicKey: hpkeBySlot.get(slot) ?? unreachable(`missing HPKE slot ${slot}`),
+      transcriptPublicKey: randomHex(32, `slot-${slot}-frost-dkg-v2-transcript-public`),
     })),
   };
 }
