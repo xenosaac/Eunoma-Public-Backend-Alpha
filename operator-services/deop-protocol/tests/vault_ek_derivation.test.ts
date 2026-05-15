@@ -11,6 +11,7 @@ import {
   assembleVaultEkTranscript,
   ED25519_SCALAR_Q,
   lagrangeCoefficientsAtZero,
+  round0CommitHash,
   scalarHexFromBigint,
   VaultEkDerivationError,
   workerTranscriptHashCanonical,
@@ -45,9 +46,14 @@ function buildContribution(args: {
   caDkgTranscriptHash: string;
   rosterHash: string;
   sortedSelectedSlots: number[];
+  allHRoundZero: string[];
 }): VaultEkContribution {
-  const hR = args.hContribution; // h * q_i — same as hContribution under m=1 mock
+  const ordinal = args.sortedSelectedSlots.indexOf(args.slot);
+  // h_r_i for this party comes from allHRoundZero at its ordinal. Under the mock
+  // semantics (m=1, h_r = h_contribution) the vector entry should equal hContribution.
+  const hR = args.allHRoundZero[ordinal];
   const mpcOpenM = MOCK_M_HEX;
+  const r0Hash = round0CommitHash(args.allHRoundZero);
   const workerTranscriptHash = workerTranscriptHashCanonical({
     dkgEpoch: args.dkgEpoch,
     caDkgTranscriptHash: args.caDkgTranscriptHash,
@@ -57,15 +63,50 @@ function buildContribution(args: {
     hContribution: args.hContribution,
     hR,
     mpcOpenM,
+    round0CommitHash: r0Hash,
   });
   return {
     slot: args.slot,
     hContribution: args.hContribution,
     schnorrProof: { R: h32(args.slot.toString(16)), s: h32("a") },
     workerTranscriptHash,
-    hR,
     mpcOpenM,
   };
+}
+
+/// Helper: build a 5-entry allHRoundZero vector from the hContribution values used in
+/// the test. Under the mock m=1 semantics, h_r_i = h_contribution for each party.
+function makeAllHRoundZero(hContributions: string[]): string[] {
+  return [...hContributions];
+}
+
+/// Helper to build a happy-path set of (contributions, allHRoundZero) bound to `slots`
+/// and `rosterHash`. Tests that exercise validation failures override one slice and
+/// reuse the rest unchanged.
+function buildHappyContributions(args: {
+  slots: number[];
+  dkgEpoch: string;
+  caDkgTranscriptHash: string;
+  rosterHash: string;
+  hashForSorted?: number[];
+}): { contributions: VaultEkContribution[]; allHRoundZero: string[] } {
+  const sorted = args.hashForSorted ?? args.slots;
+  const hContributions = args.slots.map((_, idx) =>
+    h32((idx + 1).toString(16)),
+  );
+  const allHRoundZero = makeAllHRoundZero(hContributions);
+  const contributions = args.slots.map((slot, idx) =>
+    buildContribution({
+      slot,
+      hContribution: hContributions[idx],
+      dkgEpoch: args.dkgEpoch,
+      caDkgTranscriptHash: args.caDkgTranscriptHash,
+      rosterHash: args.rosterHash,
+      sortedSelectedSlots: sorted,
+      allHRoundZero,
+    }),
+  );
+  return { contributions, allHRoundZero };
 }
 
 const CA = h32("a");
@@ -76,22 +117,19 @@ describe("assembleVaultEkTranscript", () => {
   it("returns a normalized transcript on the happy path", () => {
     const roster = caDkgRoster(DKG_EPOCH);
     const rosterHash = caDkgV2RosterHash(roster);
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
     const out = assembleVaultEkTranscript({
       dkgEpoch: DKG_EPOCH,
       caDkgTranscriptHash: CA,
       selectedSlots: SLOTS,
       rosterHash,
       contributions,
+      allHRoundZero,
       roster,
     });
     expect(out.scheme).toBe("vault_ek_derivation_v1");
@@ -100,27 +138,25 @@ describe("assembleVaultEkTranscript", () => {
     expect(out.caDkgTranscriptHash).toBe(CA);
     expect(out.rosterHash).toBe(rosterHash);
     expect(out.contributions).toHaveLength(5);
+    expect(out.allHRoundZero).toHaveLength(5);
   });
 
   it("preserves byte-identity for dkgEpoch / caDkgTranscriptHash / rosterHash", () => {
     const roster = caDkgRoster(DKG_EPOCH);
     const rosterHash = caDkgV2RosterHash(roster);
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
     const out = assembleVaultEkTranscript({
       dkgEpoch: DKG_EPOCH,
       caDkgTranscriptHash: CA,
       selectedSlots: SLOTS,
       rosterHash,
       contributions,
+      allHRoundZero,
       roster,
     });
     expect(out.dkgEpoch).toBe(DKG_EPOCH);
@@ -138,6 +174,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: SLOTS,
         rosterHash,
         contributions: [],
+        allHRoundZero: Array(5).fill(h32("0")),
         roster,
       }),
     ).toThrow(VaultEkDerivationError);
@@ -148,6 +185,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: SLOTS,
         rosterHash,
         contributions: [],
+        allHRoundZero: Array(5).fill(h32("0")),
         roster,
       });
     } catch (err) {
@@ -158,16 +196,12 @@ describe("assembleVaultEkTranscript", () => {
   it("UNDER_QUORUM when selectedSlots length != 5", () => {
     const roster = caDkgRoster();
     const rosterHash = caDkgV2RosterHash(roster);
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
     try {
       assembleVaultEkTranscript({
         dkgEpoch: DKG_EPOCH,
@@ -175,6 +209,32 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: [0, 1, 2, 3],
         rosterHash,
         contributions,
+        allHRoundZero,
+        roster,
+      });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect((err as VaultEkDerivationError).code).toBe("UNDER_QUORUM");
+    }
+  });
+
+  it("UNDER_QUORUM when allHRoundZero length != 5", () => {
+    const roster = caDkgRoster();
+    const rosterHash = caDkgV2RosterHash(roster);
+    const { contributions } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
+    try {
+      assembleVaultEkTranscript({
+        dkgEpoch: DKG_EPOCH,
+        caDkgTranscriptHash: CA,
+        selectedSlots: SLOTS,
+        rosterHash,
+        contributions,
+        allHRoundZero: [h32("1"), h32("2")], // only 2 entries
         roster,
       });
       throw new Error("expected throw");
@@ -186,16 +246,12 @@ describe("assembleVaultEkTranscript", () => {
   it("DUPLICATE_SLOT when selectedSlots has duplicates", () => {
     const roster = caDkgRoster();
     const rosterHash = caDkgV2RosterHash(roster);
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
     try {
       assembleVaultEkTranscript({
         dkgEpoch: DKG_EPOCH,
@@ -203,6 +259,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: [0, 0, 1, 2, 3],
         rosterHash,
         contributions,
+        allHRoundZero,
         roster,
       });
       throw new Error("expected throw");
@@ -214,14 +271,17 @@ describe("assembleVaultEkTranscript", () => {
   it("DUPLICATE_SLOT when contributions repeat a slot", () => {
     const roster = caDkgRoster();
     const rosterHash = caDkgV2RosterHash(roster);
+    const hContributions = SLOTS.map((_, idx) => h32((idx + 1).toString(16)));
+    const allHRoundZero = makeAllHRoundZero(hContributions);
     const contributions = SLOTS.map((_, idx) =>
       buildContribution({
         slot: 0,
-        hContribution: h32((idx + 1).toString(16)),
+        hContribution: hContributions[idx],
         dkgEpoch: DKG_EPOCH,
         caDkgTranscriptHash: CA,
         rosterHash,
         sortedSelectedSlots: SLOTS,
+        allHRoundZero,
       }),
     );
     try {
@@ -231,6 +291,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: SLOTS,
         rosterHash,
         contributions,
+        allHRoundZero,
         roster,
       });
       throw new Error("expected throw");
@@ -242,16 +303,12 @@ describe("assembleVaultEkTranscript", () => {
   it("UNKNOWN_SLOT when selectedSlots entry is out of range", () => {
     const roster = caDkgRoster();
     const rosterHash = caDkgV2RosterHash(roster);
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
     try {
       assembleVaultEkTranscript({
         dkgEpoch: DKG_EPOCH,
@@ -259,6 +316,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: [0, 1, 2, 3, 9],
         rosterHash,
         contributions,
+        allHRoundZero,
         roster,
       });
       throw new Error("expected throw");
@@ -270,16 +328,12 @@ describe("assembleVaultEkTranscript", () => {
   it("STALE_DKG_EPOCH when roster.dkgEpoch differs from input.dkgEpoch", () => {
     const roster = caDkgRoster("4");
     const rosterHash = caDkgV2RosterHash(roster);
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
     try {
       assembleVaultEkTranscript({
         dkgEpoch: DKG_EPOCH,
@@ -287,6 +341,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: SLOTS,
         rosterHash,
         contributions,
+        allHRoundZero,
         roster,
       });
       throw new Error("expected throw");
@@ -297,16 +352,12 @@ describe("assembleVaultEkTranscript", () => {
 
   it("STALE_ROSTER_HASH when input.rosterHash != caDkgV2RosterHash(roster)", () => {
     const roster = caDkgRoster();
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash: h32("f"),
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash: h32("f"),
+    });
     try {
       assembleVaultEkTranscript({
         dkgEpoch: DKG_EPOCH,
@@ -314,6 +365,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: SLOTS,
         rosterHash: h32("f"),
         contributions,
+        allHRoundZero,
         roster,
       });
       throw new Error("expected throw");
@@ -325,16 +377,12 @@ describe("assembleVaultEkTranscript", () => {
   it("STALE_CA_DKG_TRANSCRIPT_HASH when caDkgTranscriptHash is not 32 bytes", () => {
     const roster = caDkgRoster();
     const rosterHash = caDkgV2RosterHash(roster);
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
     try {
       assembleVaultEkTranscript({
         dkgEpoch: DKG_EPOCH,
@@ -342,6 +390,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: SLOTS,
         rosterHash,
         contributions,
+        allHRoundZero,
         roster,
       });
       throw new Error("expected throw");
@@ -353,16 +402,12 @@ describe("assembleVaultEkTranscript", () => {
   it("INVALID_CONTRIBUTION_SHAPE when a contribution's worker_transcript_hash diverges", () => {
     const roster = caDkgRoster();
     const rosterHash = caDkgV2RosterHash(roster);
-    const contributions = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
     // Corrupt the 3rd contribution's workerTranscriptHash
     contributions[2] = {
       ...contributions[2],
@@ -375,6 +420,7 @@ describe("assembleVaultEkTranscript", () => {
         selectedSlots: SLOTS,
         rosterHash,
         contributions,
+        allHRoundZero,
         roster,
       });
       throw new Error("expected throw");
@@ -386,24 +432,21 @@ describe("assembleVaultEkTranscript", () => {
   it("INVALID_CONTRIBUTION_SHAPE when hContribution is not 32 bytes", () => {
     const roster = caDkgRoster();
     const rosterHash = caDkgV2RosterHash(roster);
-    const valid = SLOTS.map((slot, idx) =>
-      buildContribution({
-        slot,
-        hContribution: h32((idx + 1).toString(16)),
-        dkgEpoch: DKG_EPOCH,
-        caDkgTranscriptHash: CA,
-        rosterHash,
-        sortedSelectedSlots: SLOTS,
-      }),
-    );
-    valid[1] = { ...valid[1], hContribution: "abcd" };
+    const { contributions, allHRoundZero } = buildHappyContributions({
+      slots: SLOTS,
+      dkgEpoch: DKG_EPOCH,
+      caDkgTranscriptHash: CA,
+      rosterHash,
+    });
+    contributions[1] = { ...contributions[1], hContribution: "abcd" };
     try {
       assembleVaultEkTranscript({
         dkgEpoch: DKG_EPOCH,
         caDkgTranscriptHash: CA,
         selectedSlots: SLOTS,
         rosterHash,
-        contributions: valid,
+        contributions,
+        allHRoundZero,
         roster,
       });
       throw new Error("expected throw");
@@ -432,9 +475,16 @@ describe("assembleVaultEkTranscript", () => {
       hContribution: string;
       hR: string;
       mpcOpenM: string;
+      allHRoundZero: string[];
+      round0CommitHash: string;
       workerTranscriptHash: string;
       workerTranscriptDomain: string;
+      round0HashDomain: string;
     };
+    // Codex P1 #4 round0: the parity fixture now binds round0CommitHash. Verify both
+    // the canonical hash and that the TS-computed round0CommitHash matches the Rust
+    // value byte-for-byte.
+    expect(round0CommitHash(fixture.allHRoundZero)).toBe(fixture.round0CommitHash);
     const observed = workerTranscriptHashCanonical({
       dkgEpoch: fixture.dkgEpoch,
       caDkgTranscriptHash: fixture.caDkgTranscriptHash,
@@ -444,9 +494,11 @@ describe("assembleVaultEkTranscript", () => {
       hContribution: fixture.hContribution,
       hR: fixture.hR,
       mpcOpenM: fixture.mpcOpenM,
+      round0CommitHash: fixture.round0CommitHash,
     });
     expect(observed).toBe(fixture.workerTranscriptHash);
     expect(fixture.workerTranscriptDomain).toBe("EUNOMA_VAULT_EK_DERIVATION_V1");
+    expect(fixture.round0HashDomain).toBe("EUNOMA_VAULT_EK_DERIVATION_ROUND0_V1");
   });
 
   it("Lagrange coefficients match the Rust parity fixture", () => {

@@ -39,9 +39,15 @@ export const ED25519_SCALAR_Q =
  *   || h_r_normalized_lowercase_hex_bytes          (codex P1 #4)
  *   || ":"
  *   || mpc_open_m_normalized_lowercase_hex_bytes   (codex P1 #4)
+ *   || ":"
+ *   || round0_commit_hash_normalized_lowercase_hex_bytes  (codex P1 #4 round0)
  *   -> SHA256 -> lowercase hex
+ *
+ * The round0_commit_hash binds this party's view of ALL parties' pre-MPC h_r_i
+ * commitments. See `round0CommitHash` below.
  */
 export const VAULT_EK_DERIVATION_WORKER_DOMAIN = "EUNOMA_VAULT_EK_DERIVATION_V1";
+export const VAULT_EK_DERIVATION_ROUND0_DOMAIN = "EUNOMA_VAULT_EK_DERIVATION_ROUND0_V1";
 
 export class VaultEkDerivationError extends Error {
   constructor(public readonly code: VaultEkDerivationCode, message: string) {
@@ -68,6 +74,14 @@ export function assembleVaultEkTranscript(
       "UNDER_QUORUM",
       `selectedSlots must have ${DEOPERATOR_THRESHOLD} entries, got ${
         Array.isArray(input.selectedSlots) ? input.selectedSlots.length : "non-array"
+      }`,
+    );
+  }
+  if (!Array.isArray(input.allHRoundZero) || input.allHRoundZero.length !== DEOPERATOR_THRESHOLD) {
+    throw new VaultEkDerivationError(
+      "UNDER_QUORUM",
+      `allHRoundZero must have ${DEOPERATOR_THRESHOLD} entries, got ${
+        Array.isArray(input.allHRoundZero) ? input.allHRoundZero.length : "non-array"
       }`,
     );
   }
@@ -139,6 +153,21 @@ export function assembleVaultEkTranscript(
   const selectedSet = new Set(sortedSlots);
   const seenContribution = new Set<number>();
 
+  // Normalize allHRoundZero up front; the per-contribution hash check below uses the
+  // ordinal-indexed entry from this vector.
+  const allHRoundZeroNorm: string[] = [];
+  for (const hR of input.allHRoundZero) {
+    try {
+      allHRoundZeroNorm.push(normalizeHexBytes(hR, 32));
+    } catch {
+      throw new VaultEkDerivationError(
+        "INVALID_CONTRIBUTION_SHAPE",
+        `allHRoundZero entry is not a 32-byte hex string`,
+      );
+    }
+  }
+  const round0CommitHashNorm = round0CommitHash(allHRoundZeroNorm);
+
   for (const contribution of input.contributions) {
     if (!Number.isInteger(contribution.slot) || contribution.slot < 0 || contribution.slot >= DEOPERATOR_COUNT) {
       throw new VaultEkDerivationError(
@@ -162,14 +191,12 @@ export function assembleVaultEkTranscript(
 
     let hContributionNorm: string;
     let workerHashNorm: string;
-    let hRNorm: string;
     let mpcOpenMNorm: string;
     try {
       hContributionNorm = normalizeHexBytes(contribution.hContribution, 32);
       normalizeHexBytes(contribution.schnorrProof?.R, 32);
       normalizeHexBytes(contribution.schnorrProof?.s, 32);
       workerHashNorm = normalizeHexBytes(contribution.workerTranscriptHash, 32);
-      hRNorm = normalizeHexBytes(contribution.hR, 32);
       mpcOpenMNorm = normalizeHexBytes(contribution.mpcOpenM, 32);
     } catch (err) {
       throw new VaultEkDerivationError(
@@ -180,6 +207,17 @@ export function assembleVaultEkTranscript(
       );
     }
 
+    // Codex P1 #4 round0: h_r_i for this party comes from allHRoundZero at the ordinal
+    // matching this contribution's slot, NOT from a round1-supplied field.
+    const ordinal = sortedSlots.indexOf(contribution.slot);
+    if (ordinal < 0) {
+      throw new VaultEkDerivationError(
+        "INVALID_CONTRIBUTION_SHAPE",
+        `contribution slot ${contribution.slot} has no ordinal in sortedSelectedSlots`,
+      );
+    }
+    const hRNorm = allHRoundZeroNorm[ordinal];
+
     const expectedHash = workerTranscriptHashCanonical({
       dkgEpoch: String(input.dkgEpoch),
       caDkgTranscriptHash: caDkgTranscriptHashNorm,
@@ -189,6 +227,7 @@ export function assembleVaultEkTranscript(
       hContribution: hContributionNorm,
       hR: hRNorm,
       mpcOpenM: mpcOpenMNorm,
+      round0CommitHash: round0CommitHashNorm,
     });
     if (workerHashNorm !== expectedHash) {
       throw new VaultEkDerivationError(
@@ -206,7 +245,6 @@ export function assembleVaultEkTranscript(
       s: normalizeHexBytes(contribution.schnorrProof.s, 32),
     },
     workerTranscriptHash: normalizeHexBytes(contribution.workerTranscriptHash, 32),
-    hR: normalizeHexBytes(contribution.hR, 32),
     mpcOpenM: normalizeHexBytes(contribution.mpcOpenM, 32),
   }));
 
@@ -217,7 +255,37 @@ export function assembleVaultEkTranscript(
     selectedSlots: sortedSlots,
     rosterHash: rosterHashNorm,
     contributions: normalizedContributions,
+    allHRoundZero: allHRoundZeroNorm,
   };
+}
+
+/**
+ * Codex P1 #4 round0: hash the full ordered round0 commitment vector. Mirrors
+ * `crypto-worker-rust::vault_ek_derivation_v2::round0_commit_hash`.
+ *
+ *   "EUNOMA_VAULT_EK_DERIVATION_ROUND0_V1"
+ *   || "AGG:"
+ *   || allHRoundZero.map(lower).join(",")
+ *   -> SHA256 -> lowercase hex
+ */
+export function round0CommitHash(allHRoundZero: HexString[]): HexString {
+  const enc = new TextEncoder();
+  const parts: Uint8Array[] = [
+    enc.encode(VAULT_EK_DERIVATION_ROUND0_DOMAIN),
+    enc.encode("AGG:"),
+    enc.encode(
+      allHRoundZero.map((h) => normalizeHex(h).toLowerCase()).join(","),
+    ),
+  ];
+  let total = 0;
+  for (const part of parts) total += part.byteLength;
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    buf.set(part, offset);
+    offset += part.byteLength;
+  }
+  return bytesToHex(sha256(buf));
 }
 
 export function workerTranscriptHashCanonical(args: {
@@ -229,12 +297,15 @@ export function workerTranscriptHashCanonical(args: {
   hContribution: string;
   hR: string;
   mpcOpenM: string;
+  /** Codex P1 #4 round0: binds this party's view of all 5 pre-MPC h_r_i commitments. */
+  round0CommitHash: string;
 }): string {
   const ca = normalizeHex(args.caDkgTranscriptHash);
   const roster = normalizeHex(args.rosterHash);
   const h = normalizeHex(args.hContribution);
   const hR = normalizeHex(args.hR);
   const mpcOpenM = normalizeHex(args.mpcOpenM);
+  const r0 = normalizeHex(args.round0CommitHash);
   const slotsJoined = args.sortedSelectedSlots.map((slot) => slot.toString()).join(",");
 
   const parts: Uint8Array[] = [
@@ -254,6 +325,8 @@ export function workerTranscriptHashCanonical(args: {
     new TextEncoder().encode(hR),
     new TextEncoder().encode(":"),
     new TextEncoder().encode(mpcOpenM),
+    new TextEncoder().encode(":"),
+    new TextEncoder().encode(r0),
   ];
   let total = 0;
   for (const part of parts) total += part.byteLength;
@@ -299,14 +372,12 @@ export function parseVaultEkContribution(value: unknown): VaultEkContribution {
   let proofR: string;
   let proofS: string;
   let workerTranscriptHash: string;
-  let hR: string;
   let mpcOpenM: string;
   try {
     hContribution = normalizeHexBytes(obj.hContribution, 32);
     proofR = normalizeHexBytes(proofObj?.R, 32);
     proofS = normalizeHexBytes(proofObj?.s, 32);
     workerTranscriptHash = normalizeHexBytes(obj.workerTranscriptHash, 32);
-    hR = normalizeHexBytes(obj.hR, 32);
     mpcOpenM = normalizeHexBytes(obj.mpcOpenM, 32);
   } catch (err) {
     throw new VaultEkDerivationError(
@@ -319,7 +390,6 @@ export function parseVaultEkContribution(value: unknown): VaultEkContribution {
     hContribution,
     schnorrProof: { R: proofR, s: proofS },
     workerTranscriptHash,
-    hR,
     mpcOpenM,
   };
 }

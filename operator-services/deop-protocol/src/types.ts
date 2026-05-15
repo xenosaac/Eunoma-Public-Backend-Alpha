@@ -482,8 +482,6 @@ export interface VaultEkContribution {
   hContribution: HexString;
   schnorrProof: { R: HexString; s: HexString };
   workerTranscriptHash: HexString;
-  /** Codex P1 #4: h * r_i (Ristretto point). Verifier checks `hContribution * mpcOpenM == hR`. */
-  hR: HexString;
   /** Codex P1 #4: MPC-opened m (Scalar). All 5 workers must report the same value. */
   mpcOpenM: HexString;
 }
@@ -494,7 +492,40 @@ export interface VaultEkDerivationInput {
   selectedSlots: number[];
   rosterHash: HexString;
   contributions: VaultEkContribution[];
+  /**
+   * Codex P1 #4 round0: vector of all 5 parties' `h_r_i` commitments published in
+   * round0, in player-ordinal (sorted slot) order. Replaces the per-contribution `hR`
+   * field — the verifier uses this for the `h_q_i * m == h_r_i` check and binds it into
+   * `worker_transcript_hash` so the Schnorr POK depends on the pre-MPC commitment.
+   */
+  allHRoundZero: HexString[];
   roster: CaDkgV2Roster;
+}
+
+/**
+ * Phase 2 round0 wire shape for `/worker/v2/derive/vault_ek/round0`. Workers commit
+ * `h_r_i = H * r_i` BEFORE MPC runs and BEFORE `m` is opened. The coordinator collects
+ * all 5 commitments and broadcasts them as `allHRoundZero` in round1.
+ */
+export interface VaultEkRound0Request {
+  dkgEpoch: string;
+  caDkgTranscriptHash: HexString;
+  rosterHash: HexString;
+  selectedSlots: number[];
+  selfSlot: number;
+  requestId: string;
+  sessionId: string;
+  playerId: number;
+  peerAddresses: string[];
+  lagrangeCoefficients: HexString[];
+}
+
+export interface VaultEkRound0Response {
+  slot: number;
+  /** `h_r_i = H * r_i` in compressed Ristretto (lowercase hex). */
+  hR: HexString;
+  /** Defense-in-depth tag the coordinator cross-checks. */
+  workerRound0Hash: HexString;
 }
 
 /**
@@ -519,6 +550,12 @@ export interface VaultEkRound1Request {
   peerAddresses: string[];
   /** Phase 2: hex-encoded Lagrange coefficients at x=0 for sorted(selectedSlots). */
   lagrangeCoefficients: HexString[];
+  /**
+   * Codex P1 #4 round0: coordinator-broadcast vector of all 5 round0 commitments.
+   * Worker asserts `allHRoundZero[playerId]` byte-matches its persisted h_r_i before
+   * running MPC.
+   */
+  allHRoundZero: HexString[];
 }
 
 export interface VaultEkDerivationTranscript {
@@ -528,6 +565,8 @@ export interface VaultEkDerivationTranscript {
   selectedSlots: number[];
   rosterHash: HexString;
   contributions: VaultEkContribution[];
+  /** Codex P1 #4 round0: see VaultEkDerivationInput.allHRoundZero. */
+  allHRoundZero: HexString[];
 }
 
 export type VaultEkDerivationCode =
