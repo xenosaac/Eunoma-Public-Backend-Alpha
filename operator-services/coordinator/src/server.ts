@@ -485,6 +485,23 @@ export function buildCoordinatorServer(
         roundResults.map((item) => item.body),
       );
 
+      // Codex P1 #4: all 5 workers MUST report the same MPC-opened m (MAC-checked by
+      // MASCOT). Reject 400 if any disagrees — the verifier worker will catch it too, but
+      // failing here gives a more specific error code and avoids paying the verify call.
+      if (contributions.length > 0) {
+        const expectedM = contributions[0].mpcOpenM.toLowerCase();
+        for (const c of contributions) {
+          if (c.mpcOpenM.toLowerCase() !== expectedM) {
+            return reply.code(400).send({
+              error: "mpc_open_m_disagreement",
+              slot: c.slot,
+              requestId,
+              message: `worker at slot ${c.slot} reported mpcOpenM that disagrees with slot ${contributions[0].slot}`,
+            });
+          }
+        }
+      }
+
       const transcript = assembleVaultEkTranscript({
         dkgEpoch,
         caDkgTranscriptHash: caDkgTranscriptHashInput,

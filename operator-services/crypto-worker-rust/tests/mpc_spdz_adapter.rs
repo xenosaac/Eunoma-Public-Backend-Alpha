@@ -315,8 +315,8 @@ fn real_mp_spdz_inversion_passes_registration_sigma() {
                 lagrange_coefficients_hex: lagrange_for_thread,
             };
             match adapter.compute_inverse_share(&dk_share, &ctx) {
-                Ok(q) => {
-                    let _ = tx.send(Ok((ordinal, q)));
+                Ok(share) => {
+                    let _ = tx.send(Ok((ordinal, share.q_i)));
                 }
                 Err(e) => {
                     let _ = tx.send(Err(format!("player {ordinal}: {e:?}")));

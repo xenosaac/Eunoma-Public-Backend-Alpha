@@ -24,7 +24,10 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroize;
 
-use crate::mpc_inverse_adapter::{AdapterError, InversionContext, MpcInverseAdapter};
+use crate::h_ristretto;
+use crate::mpc_inverse_adapter::{
+    AdapterError, InversionContext, InversionShare, MpcInverseAdapter,
+};
 use crate::DEOPERATOR_THRESHOLD;
 
 /// Filename produced by `npm run mpc:bootstrap` (matches scripts/_lib/mpc_spdz_constants.mjs).
@@ -84,7 +87,7 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         &self,
         dk_share: &Scalar,
         ctx: &InversionContext,
-    ) -> Result<Scalar, AdapterError> {
+    ) -> Result<InversionShare, AdapterError> {
         // Defense in depth: validate the context shape.
         if ctx.selected_slots.len() != DEOPERATOR_THRESHOLD {
             return Err(AdapterError::InvalidInput(format!(
@@ -405,14 +408,27 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         let m_inv = m.invert();
         let q_i = r_i * m_inv;
 
+        // Compute h * r_i for the public artifact (codex P1 #4). The verifier checks
+        // h_q_i * m == h_r_i, which binds q_i to the MPC-opened m and prevents a malicious
+        // worker from publishing an arbitrary point. We use the same H_RISTRETTO that the
+        // round1 + verify code paths use to make h_q_i. After this scalar-mult, r_i is no
+        // longer needed and is zeroized.
+        let h = h_ristretto().map_err(|e| AdapterError::Internal(format!("h_ristretto: {e:?}")))?;
+        let h_r_i = h * r_i;
+
         // Hide the unused-by-name placeholder.
         let _self_lambda_unused = self_lambda_decimal;
 
-        // Wipe sensitive material.
+        // Wipe sensitive material. q_i is still secret — caller is responsible for zeroizing
+        // it after producing h_q_i + Schnorr proof.
         r_i.zeroize();
 
         cleanup_or_keep(&session_dir, self.keep_session_dirs);
-        Ok(q_i)
+        Ok(InversionShare {
+            q_i,
+            h_r_i,
+            mpc_open_m: m,
+        })
     }
 }
 

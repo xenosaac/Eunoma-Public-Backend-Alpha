@@ -34,6 +34,10 @@ function caDkgRoster(epoch = "3"): CaDkgV2Roster {
   };
 }
 
+// Codex P1 #4: mock m=1 (LE-encoded Scalar::ONE = "0100...00") and h_r=h_contribution so
+// the per-party check `h_q_i * 1 == h_r_i` is satisfied trivially.
+const MOCK_M_HEX = "01" + "00".repeat(31);
+
 function buildContribution(args: {
   slot: number;
   hContribution: string;
@@ -42,6 +46,8 @@ function buildContribution(args: {
   rosterHash: string;
   sortedSelectedSlots: number[];
 }): VaultEkContribution {
+  const hR = args.hContribution; // h * q_i — same as hContribution under m=1 mock
+  const mpcOpenM = MOCK_M_HEX;
   const workerTranscriptHash = workerTranscriptHashCanonical({
     dkgEpoch: args.dkgEpoch,
     caDkgTranscriptHash: args.caDkgTranscriptHash,
@@ -49,12 +55,16 @@ function buildContribution(args: {
     sortedSelectedSlots: args.sortedSelectedSlots,
     slot: args.slot,
     hContribution: args.hContribution,
+    hR,
+    mpcOpenM,
   });
   return {
     slot: args.slot,
     hContribution: args.hContribution,
     schnorrProof: { R: h32(args.slot.toString(16)), s: h32("a") },
     workerTranscriptHash,
+    hR,
+    mpcOpenM,
   };
 }
 
@@ -420,6 +430,8 @@ describe("assembleVaultEkTranscript", () => {
       sortedSelectedSlots: number[];
       slot: number;
       hContribution: string;
+      hR: string;
+      mpcOpenM: string;
       workerTranscriptHash: string;
       workerTranscriptDomain: string;
     };
@@ -430,6 +442,8 @@ describe("assembleVaultEkTranscript", () => {
       sortedSelectedSlots: fixture.sortedSelectedSlots,
       slot: fixture.slot,
       hContribution: fixture.hContribution,
+      hR: fixture.hR,
+      mpcOpenM: fixture.mpcOpenM,
     });
     expect(observed).toBe(fixture.workerTranscriptHash);
     expect(fixture.workerTranscriptDomain).toBe("EUNOMA_VAULT_EK_DERIVATION_V1");

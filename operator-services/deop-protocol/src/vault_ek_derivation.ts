@@ -35,6 +35,10 @@ export const ED25519_SCALAR_Q =
  *   || slot_decimal_bytes
  *   || ":"
  *   || h_contribution_normalized_lowercase_hex_bytes
+ *   || ":"
+ *   || h_r_normalized_lowercase_hex_bytes          (codex P1 #4)
+ *   || ":"
+ *   || mpc_open_m_normalized_lowercase_hex_bytes   (codex P1 #4)
  *   -> SHA256 -> lowercase hex
  */
 export const VAULT_EK_DERIVATION_WORKER_DOMAIN = "EUNOMA_VAULT_EK_DERIVATION_V1";
@@ -158,11 +162,15 @@ export function assembleVaultEkTranscript(
 
     let hContributionNorm: string;
     let workerHashNorm: string;
+    let hRNorm: string;
+    let mpcOpenMNorm: string;
     try {
       hContributionNorm = normalizeHexBytes(contribution.hContribution, 32);
       normalizeHexBytes(contribution.schnorrProof?.R, 32);
       normalizeHexBytes(contribution.schnorrProof?.s, 32);
       workerHashNorm = normalizeHexBytes(contribution.workerTranscriptHash, 32);
+      hRNorm = normalizeHexBytes(contribution.hR, 32);
+      mpcOpenMNorm = normalizeHexBytes(contribution.mpcOpenM, 32);
     } catch (err) {
       throw new VaultEkDerivationError(
         "INVALID_CONTRIBUTION_SHAPE",
@@ -179,6 +187,8 @@ export function assembleVaultEkTranscript(
       sortedSelectedSlots: sortedSlots,
       slot: contribution.slot,
       hContribution: hContributionNorm,
+      hR: hRNorm,
+      mpcOpenM: mpcOpenMNorm,
     });
     if (workerHashNorm !== expectedHash) {
       throw new VaultEkDerivationError(
@@ -196,6 +206,8 @@ export function assembleVaultEkTranscript(
       s: normalizeHexBytes(contribution.schnorrProof.s, 32),
     },
     workerTranscriptHash: normalizeHexBytes(contribution.workerTranscriptHash, 32),
+    hR: normalizeHexBytes(contribution.hR, 32),
+    mpcOpenM: normalizeHexBytes(contribution.mpcOpenM, 32),
   }));
 
   return {
@@ -215,10 +227,14 @@ export function workerTranscriptHashCanonical(args: {
   sortedSelectedSlots: number[];
   slot: number;
   hContribution: string;
+  hR: string;
+  mpcOpenM: string;
 }): string {
   const ca = normalizeHex(args.caDkgTranscriptHash);
   const roster = normalizeHex(args.rosterHash);
   const h = normalizeHex(args.hContribution);
+  const hR = normalizeHex(args.hR);
+  const mpcOpenM = normalizeHex(args.mpcOpenM);
   const slotsJoined = args.sortedSelectedSlots.map((slot) => slot.toString()).join(",");
 
   const parts: Uint8Array[] = [
@@ -234,6 +250,10 @@ export function workerTranscriptHashCanonical(args: {
     new TextEncoder().encode(args.slot.toString()),
     new TextEncoder().encode(":"),
     new TextEncoder().encode(h),
+    new TextEncoder().encode(":"),
+    new TextEncoder().encode(hR),
+    new TextEncoder().encode(":"),
+    new TextEncoder().encode(mpcOpenM),
   ];
   let total = 0;
   for (const part of parts) total += part.byteLength;
@@ -279,11 +299,15 @@ export function parseVaultEkContribution(value: unknown): VaultEkContribution {
   let proofR: string;
   let proofS: string;
   let workerTranscriptHash: string;
+  let hR: string;
+  let mpcOpenM: string;
   try {
     hContribution = normalizeHexBytes(obj.hContribution, 32);
     proofR = normalizeHexBytes(proofObj?.R, 32);
     proofS = normalizeHexBytes(proofObj?.s, 32);
     workerTranscriptHash = normalizeHexBytes(obj.workerTranscriptHash, 32);
+    hR = normalizeHexBytes(obj.hR, 32);
+    mpcOpenM = normalizeHexBytes(obj.mpcOpenM, 32);
   } catch (err) {
     throw new VaultEkDerivationError(
       "INVALID_CONTRIBUTION_SHAPE",
@@ -295,6 +319,8 @@ export function parseVaultEkContribution(value: unknown): VaultEkContribution {
     hContribution,
     schnorrProof: { R: proofR, s: proofS },
     workerTranscriptHash,
+    hR,
+    mpcOpenM,
   };
 }
 

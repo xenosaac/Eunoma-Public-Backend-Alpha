@@ -482,6 +482,10 @@ export interface VaultEkContribution {
   hContribution: HexString;
   schnorrProof: { R: HexString; s: HexString };
   workerTranscriptHash: HexString;
+  /** Codex P1 #4: h * r_i (Ristretto point). Verifier checks `hContribution * mpcOpenM == hR`. */
+  hR: HexString;
+  /** Codex P1 #4: MPC-opened m (Scalar). All 5 workers must report the same value. */
+  mpcOpenM: HexString;
 }
 
 export interface VaultEkDerivationInput {

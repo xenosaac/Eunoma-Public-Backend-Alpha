@@ -710,13 +710,18 @@ describe("coordinator", () => {
     // gives a final transcript hash. The TS assembleVaultEkTranscript validates
     // workerTranscriptHash against canonical recomputation, so we must compute it the same
     // way the worker would.
+    // Codex P1 #4: contributions include hR + mpcOpenM. Mock m=1 (LE Scalar::ONE) and
+    // hR=hContribution so the per-party `h_q_i * 1 == h_r_i` check passes trivially.
     const dkgEpoch = "1";
     const caDkgTranscriptHashHex = h32("a");
     const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const MOCK_M_HEX = "01" + "00".repeat(31);
     const hContributionPerSlot: Record<number, string> = {};
+    const hRPerSlot: Record<number, string> = {};
     const workerHashPerSlot: Record<number, string> = {};
     for (const slot of expectedSelectedSlots) {
       hContributionPerSlot[slot] = h32(String((slot % 9) + 1));
+      hRPerSlot[slot] = hContributionPerSlot[slot]; // m=1 mock: h_r == h_q
       const enc = new TextEncoder();
       const sortedSlotsJoined = expectedSelectedSlots.join(",");
       const bytes = new Uint8Array([
@@ -732,6 +737,10 @@ describe("coordinator", () => {
         ...enc.encode(slot.toString()),
         ...enc.encode(":"),
         ...enc.encode(hContributionPerSlot[slot]),
+        ...enc.encode(":"),
+        ...enc.encode(hRPerSlot[slot]),
+        ...enc.encode(":"),
+        ...enc.encode(MOCK_M_HEX),
       ]);
       workerHashPerSlot[slot] = bytesToHex(sha256(bytes));
     }
@@ -777,6 +786,8 @@ describe("coordinator", () => {
               hContribution: hContributionPerSlot[slot],
               schnorrProof: { R: h32("3"), s: h32("4") },
               workerTranscriptHash: workerHashPerSlot[slot],
+              hR: hRPerSlot[slot],
+              mpcOpenM: MOCK_M_HEX,
             },
           };
         }
@@ -855,7 +866,8 @@ describe("coordinator", () => {
     const expectedSelectedSlots = [0, 1, 2, 3, 4];
 
     // Pre-compute the worker-transcript-hash for each slot so the mock returns valid
-    // contributions that pass assembleVaultEkTranscript.
+    // contributions that pass assembleVaultEkTranscript. Codex P1 #4: include hR + m=1.
+    const MOCK_M_HEX = "01" + "00".repeat(31);
     const hContributionPerSlot: Record<number, string> = {};
     const workerHashPerSlot: Record<number, string> = {};
     for (const slot of expectedSelectedSlots) {
@@ -875,6 +887,10 @@ describe("coordinator", () => {
         ...enc.encode(slot.toString()),
         ...enc.encode(":"),
         ...enc.encode(hContributionPerSlot[slot]),
+        ...enc.encode(":"),
+        ...enc.encode(hContributionPerSlot[slot]), // hR = hContribution under m=1 mock
+        ...enc.encode(":"),
+        ...enc.encode(MOCK_M_HEX),
       ]);
       workerHashPerSlot[slot] = bytesToHex(sha256(bytes));
     }
@@ -912,6 +928,8 @@ describe("coordinator", () => {
               hContribution: hContributionPerSlot[slot],
               schnorrProof: { R: h32("3"), s: h32("4") },
               workerTranscriptHash: workerHashPerSlot[slot],
+              hR: hContributionPerSlot[slot],
+              mpcOpenM: MOCK_M_HEX,
             },
           };
         }
@@ -1011,6 +1029,80 @@ describe("coordinator", () => {
     } finally {
       if (prev !== undefined) process.env.EUNOMA_LOCAL_CLUSTER = prev;
     }
+  });
+
+  it("rejects vault_ek when workers report disagreeing mpcOpenM (codex P1 #4)", async () => {
+    const { sha256 } = await import("@noble/hashes/sha256");
+    const { bytesToHex } = await import("@noble/hashes/utils");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const MOCK_M_HONEST = "01" + "00".repeat(31);
+    const MOCK_M_EVIL = "02" + "00".repeat(31);
+    const hContributionPerSlot: Record<number, string> = {};
+    const mForSlot: Record<number, string> = {};
+    const hRPerSlot: Record<number, string> = {};
+    const workerHashPerSlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      hContributionPerSlot[slot] = h32(String((slot % 9) + 1));
+      // Slot 2 disagrees on m.
+      mForSlot[slot] = slot === 2 ? MOCK_M_EVIL : MOCK_M_HONEST;
+      hRPerSlot[slot] = hContributionPerSlot[slot];
+      const enc = new TextEncoder();
+      const bytes = new Uint8Array([
+        ...enc.encode("EUNOMA_VAULT_EK_DERIVATION_V1"),
+        ...enc.encode(dkgEpoch),
+        ...enc.encode(":"),
+        ...enc.encode(caDkgTranscriptHashHex),
+        ...enc.encode(":"),
+        ...enc.encode(rosterHashHex),
+        ...enc.encode(":"),
+        ...enc.encode(expectedSelectedSlots.join(",")),
+        ...enc.encode(":"),
+        ...enc.encode(slot.toString()),
+        ...enc.encode(":"),
+        ...enc.encode(hContributionPerSlot[slot]),
+        ...enc.encode(":"),
+        ...enc.encode(hRPerSlot[slot]),
+        ...enc.encode(":"),
+        ...enc.encode(mForSlot[slot]),
+      ]);
+      workerHashPerSlot[slot] = bytesToHex(sha256(bytes));
+    }
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round1")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              hContribution: hContributionPerSlot[slot],
+              schnorrProof: { R: h32("3"), s: h32("4") },
+              workerTranscriptHash: workerHashPerSlot[slot],
+              hR: hRPerSlot[slot],
+              mpcOpenM: mForSlot[slot],
+            },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-m-disagree",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("mpc_open_m_disagreement");
   });
 
   it("returns 409 vault_ek_derivation_in_flight when a second request arrives during one", async () => {

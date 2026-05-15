@@ -2741,7 +2741,8 @@ pub mod ca_dkg_v2 {
 }
 
 pub mod mpc_inverse_adapter {
-    use curve25519_dalek::scalar::Scalar;
+    use crate::h_ristretto;
+    use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
     use std::path::PathBuf;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2790,12 +2791,27 @@ pub mod mpc_inverse_adapter {
         pub lagrange_coefficients_hex: Vec<String>,
     }
 
+    /// Per-party output of one MPC inversion call. The worker publishes h_r_i + mpc_open_m
+    /// alongside h_q_i so the verifier can publicly check `h_q_i * m == h_r_i`. Cross-party
+    /// MAC-check (in MASCOT) guarantees all 5 parties see the SAME `mpc_open_m`; coordinator
+    /// cross-checks at verify time. See codex P1 #4 fix.
+    #[derive(Debug, Clone)]
+    pub struct InversionShare {
+        /// q_i = r_i * m^{-1}. Sum over the 5 selected parties = 1/dk.
+        pub q_i: Scalar,
+        /// h * r_i. Each party publishes this so the verifier can check that q_i is the
+        /// MPC-derived value (no malicious worker can substitute an arbitrary scalar).
+        pub h_r_i: RistrettoPoint,
+        /// MPC-opened m. All 5 parties report the same value (MASCOT MAC-check).
+        pub mpc_open_m: Scalar,
+    }
+
     pub trait MpcInverseAdapter: Send + Sync {
         fn compute_inverse_share(
             &self,
             dk_share: &Scalar,
             ctx: &InversionContext,
-        ) -> Result<Scalar, AdapterError>;
+        ) -> Result<InversionShare, AdapterError>;
     }
 
     pub struct UnavailableMpcInverseAdapter;
@@ -2805,9 +2821,24 @@ pub mod mpc_inverse_adapter {
             &self,
             _dk_share: &Scalar,
             _ctx: &InversionContext,
-        ) -> Result<Scalar, AdapterError> {
+        ) -> Result<InversionShare, AdapterError> {
             Err(AdapterError::McpSpdzNotAvailable)
         }
+    }
+
+    /// Helper to build an `InversionShare` from a pre-computed q_i for tests/mocks that don't
+    /// actually run MPC. Picks mpc_open_m = 1 so h_r_i = h * q_i trivially satisfies the
+    /// `h_q_i * m == h_r_i` per-party check. All mocks must use the SAME m (=1) so the
+    /// coordinator's cross-party consistency check also passes.
+    pub fn mock_inversion_share_from_q(q_i: Scalar) -> Result<InversionShare, AdapterError> {
+        let h = h_ristretto().map_err(|e| AdapterError::Internal(format!("h_ristretto: {e:?}")))?;
+        let h_q_i = h * q_i;
+        // With m = 1: h_r_i = h_q_i, and h_q_i * 1 == h_r_i.
+        Ok(InversionShare {
+            q_i,
+            h_r_i: h_q_i,
+            mpc_open_m: Scalar::ONE,
+        })
     }
 }
 
@@ -2826,6 +2857,7 @@ pub mod vault_ek_derivation_v2 {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256, Sha512};
     use std::path::Path;
+    use zeroize::Zeroize;
 
     pub(crate) const WORKER_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_V1";
     pub(crate) const FINAL_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_EK_DERIVATION_FINAL_V1";
@@ -2873,6 +2905,12 @@ pub mod vault_ek_derivation_v2 {
         pub h_contribution: String,
         pub schnorr_proof: SchnorrProof,
         pub worker_transcript_hash: String,
+        /// Codex P1 #4: h * r_i (Ristretto point, compressed lowercase hex). Verifier checks
+        /// `h_contribution * mpc_open_m == h_r_i`.
+        pub h_r: String,
+        /// Codex P1 #4: MPC-opened m (Scalar, lowercase little-endian hex). All 5 parties
+        /// in a session MUST report the same value.
+        pub mpc_open_m: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -2882,6 +2920,10 @@ pub mod vault_ek_derivation_v2 {
         pub h_contribution: String,
         pub schnorr_proof: SchnorrProof,
         pub worker_transcript_hash: String,
+        /// Codex P1 #4: see Round1Result::h_r.
+        pub h_r: String,
+        /// Codex P1 #4: see Round1Result::mpc_open_m.
+        pub mpc_open_m: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -2956,13 +2998,18 @@ pub mod vault_ek_derivation_v2 {
             player_id: req.player_id,
             lagrange_coefficients_hex: req.lagrange_coefficients.clone(),
         };
-        let inv_share = adapter
+        let inversion = adapter
             .compute_inverse_share(&dk_share, &ctx)
             .map_err(adapter_error_to_worker)?;
+        let mut inv_share = inversion.q_i;
+        let h_r_point = inversion.h_r_i;
+        let mpc_open_m = inversion.mpc_open_m;
 
         let h = h_ristretto()?;
         let h_contribution = h * inv_share;
         let h_contribution_hex = compressed_hex(&h_contribution);
+        let h_r_hex = compressed_hex(&h_r_point);
+        let mpc_open_m_hex = hex_encode(mpc_open_m.to_bytes().as_slice());
         let worker_transcript_hash = worker_transcript_hash(
             &req.dkg_epoch,
             &ca_dkg_transcript_hash,
@@ -2970,14 +3017,20 @@ pub mod vault_ek_derivation_v2 {
             &sorted_unique_slots(&req.selected_slots)?,
             req.self_slot,
             &h_contribution_hex,
+            &h_r_hex,
+            &mpc_open_m_hex,
         );
         let proof = schnorr_pok(&inv_share, &h_contribution, &worker_transcript_hash)?;
+        // Codex P2 #7: zeroize q_i after producing the public artifacts.
+        inv_share.zeroize();
 
         Ok(Round1Result {
             slot: req.self_slot,
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash,
+            h_r: h_r_hex,
+            mpc_open_m: mpc_open_m_hex,
         })
     }
 
@@ -2996,8 +3049,12 @@ pub mod vault_ek_derivation_v2 {
 
         let mut seen = [false; DEOPERATOR_COUNT];
         let mut points: Vec<RistrettoPoint> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
-        let mut ordered: Vec<(usize, String, SchnorrProof)> =
+        let mut h_r_points: Vec<RistrettoPoint> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        let mut ordered: Vec<(usize, String, SchnorrProof, String, String)> =
             Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        // Codex P1 #4: cross-party consistency. All 5 workers must report the same MPC-
+        // opened m (MAC-checked by MASCOT). Reject if any disagrees.
+        let mut shared_m: Option<Scalar> = None;
         for contribution in &req.contributions {
             assert_slot(contribution.slot)?;
             if !selected_set.contains(&contribution.slot) {
@@ -3015,6 +3072,8 @@ pub mod vault_ek_derivation_v2 {
             seen[contribution.slot] = true;
 
             let h_contribution_norm = normalize_hex(&contribution.h_contribution, 32)?;
+            let h_r_norm = normalize_hex(&contribution.h_r, 32)?;
+            let mpc_open_m_norm = normalize_hex(&contribution.mpc_open_m, 32)?;
             let expected_worker_hash = worker_transcript_hash(
                 &req.dkg_epoch,
                 &ca_dkg_transcript_hash,
@@ -3022,6 +3081,8 @@ pub mod vault_ek_derivation_v2 {
                 &sorted_slots,
                 contribution.slot,
                 &h_contribution_norm,
+                &h_r_norm,
+                &mpc_open_m_norm,
             );
             let supplied = normalize_hex(&contribution.worker_transcript_hash, 32)?;
             if supplied != expected_worker_hash {
@@ -3032,6 +3093,34 @@ pub mod vault_ek_derivation_v2 {
             }
 
             let point = decompress_hex(&h_contribution_norm)?;
+            let h_r_point = decompress_hex(&h_r_norm)?;
+            let m_scalar = scalar_from_hex(&mpc_open_m_norm)?;
+            if m_scalar == Scalar::ZERO {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "mpc_open_m is zero for slot {}",
+                    contribution.slot
+                )));
+            }
+            // Codex P1 #4: per-party check `h_q_i * m == h_r_i` binds the published
+            // h_contribution to the MPC-opened m and the worker's r_i commitment.
+            if point * m_scalar != h_r_point {
+                return Err(WorkerError::Crypto(format!(
+                    "h_q_i * m != h_r_i for slot {}",
+                    contribution.slot
+                )));
+            }
+            // All 5 parties must report the same m.
+            match &shared_m {
+                None => shared_m = Some(m_scalar),
+                Some(prev) => {
+                    if *prev != m_scalar {
+                        return Err(WorkerError::InvalidRequest(format!(
+                            "mpc_open_m disagreement across parties at slot {}",
+                            contribution.slot
+                        )));
+                    }
+                }
+            }
             if !verify_schnorr_pok(&point, &contribution.schnorr_proof, &expected_worker_hash)? {
                 return Err(WorkerError::Crypto(format!(
                     "schnorr verification failed for slot {}",
@@ -3039,16 +3128,31 @@ pub mod vault_ek_derivation_v2 {
                 )));
             }
             points.push(point);
+            h_r_points.push(h_r_point);
             ordered.push((
                 contribution.slot,
                 h_contribution_norm,
                 contribution.schnorr_proof.clone(),
+                h_r_norm,
+                mpc_open_m_norm,
             ));
         }
 
         let mut vault_ek = RistrettoPoint::default();
         for point in &points {
             vault_ek += point;
+        }
+        let mut h_r_sum = RistrettoPoint::default();
+        for point in &h_r_points {
+            h_r_sum += point;
+        }
+        // Cross-aggregate sanity check: vault_ek * m == sum(h_r_i). Implied by the per-party
+        // check but cheap to verify (codex P1 #4).
+        let m_final = shared_m.expect("at least one contribution sets shared_m");
+        if vault_ek * m_final != h_r_sum {
+            return Err(WorkerError::Crypto(
+                "vault_ek * m != sum(h_r_i) — aggregate consistency check failed".to_string(),
+            ));
         }
         let vault_ek_hex = compressed_hex(&vault_ek);
         ordered.sort_by_key(|item| item.0);
@@ -3105,6 +3209,8 @@ pub mod vault_ek_derivation_v2 {
         sorted_selected_slots: &[usize],
         slot: usize,
         h_contribution_hex: &str,
+        h_r_hex: &str,
+        mpc_open_m_hex: &str,
     ) -> String {
         let joined_slots = sorted_selected_slots
             .iter()
@@ -3124,6 +3230,13 @@ pub mod vault_ek_derivation_v2 {
         bytes.extend_from_slice(slot.to_string().as_bytes());
         bytes.push(b':');
         bytes.extend_from_slice(h_contribution_hex.as_bytes());
+        // Codex P1 #4: bind h_r_i and mpc_open_m into the transcript hash so the Schnorr POK
+        // challenge covers them too; otherwise a malicious worker could swap (h_r, m) post-
+        // signing without invalidating the proof.
+        bytes.push(b':');
+        bytes.extend_from_slice(h_r_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(mpc_open_m_hex.as_bytes());
         sha256_hex(&bytes)
     }
 
@@ -3133,7 +3246,7 @@ pub mod vault_ek_derivation_v2 {
         roster_hash: &str,
         sorted_selected_slots: &[usize],
         vault_ek_hex: &str,
-        ordered_contributions: &[(usize, String, SchnorrProof)],
+        ordered_contributions: &[(usize, String, SchnorrProof, String, String)],
     ) -> String {
         let joined_slots = sorted_selected_slots
             .iter()
@@ -3151,7 +3264,7 @@ pub mod vault_ek_derivation_v2 {
         bytes.extend_from_slice(joined_slots.as_bytes());
         bytes.push(b':');
         bytes.extend_from_slice(vault_ek_hex.as_bytes());
-        for (slot, h_contribution_hex, proof) in ordered_contributions {
+        for (slot, h_contribution_hex, proof, h_r_hex, mpc_open_m_hex) in ordered_contributions {
             bytes.push(b':');
             bytes.extend_from_slice(slot.to_string().as_bytes());
             bytes.push(b'|');
@@ -3160,6 +3273,10 @@ pub mod vault_ek_derivation_v2 {
             bytes.extend_from_slice(proof.r.to_lowercase().as_bytes());
             bytes.push(b'|');
             bytes.extend_from_slice(proof.s.to_lowercase().as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(h_r_hex.to_lowercase().as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(mpc_open_m_hex.to_lowercase().as_bytes());
         }
         sha256_hex(&bytes)
     }

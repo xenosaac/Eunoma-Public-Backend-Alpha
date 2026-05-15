@@ -8,7 +8,8 @@ use curve25519_dalek::{
 };
 use eunoma_crypto_worker::{
     mpc_inverse_adapter::{
-        AdapterError, InversionContext, MpcInverseAdapter, UnavailableMpcInverseAdapter,
+        mock_inversion_share_from_q, AdapterError, InversionContext, InversionShare,
+        MpcInverseAdapter, UnavailableMpcInverseAdapter,
     },
     vault_ek_derivation_v2::{
         final_transcript_hash, run_round1, run_verify, schnorr_pok, verify_schnorr_pok,
@@ -66,6 +67,19 @@ fn h_point() -> RistrettoPoint {
     curve25519_dalek::ristretto::CompressedRistretto(arr)
         .decompress()
         .expect("valid H")
+}
+
+/// Codex P1 #4: mock contributions use `mpc_open_m = 1` so that h_r_i = h * q_i trivially
+/// passes the per-party check `h_q_i * m == h_r_i`. The hex bytes of Scalar::ONE in little-
+/// endian = "0100...00".
+fn mock_mpc_open_m_hex() -> String {
+    scalar_hex(&Scalar::ONE)
+}
+
+/// Helper for tests that build ContributionInput manually with `h_contribution = h * q_i`
+/// and `m = 1`. The h_r is identical to h_contribution under these mock semantics.
+fn mock_h_r_for_q(q: &Scalar) -> String {
+    compressed_hex(&(h_point() * q))
 }
 
 #[derive(Serialize)]
@@ -159,8 +173,8 @@ impl MpcInverseAdapter for MockFixedScalarAdapter {
         &self,
         _dk_share: &Scalar,
         _ctx: &InversionContext,
-    ) -> Result<Scalar, AdapterError> {
-        Ok(self.scalar)
+    ) -> Result<InversionShare, AdapterError> {
+        mock_inversion_share_from_q(self.scalar)
     }
 }
 
@@ -247,7 +261,7 @@ fn unavailable_adapter_returns_mp_spdz_unavailable() {
         lagrange_coefficients_hex: lagrange,
     };
     let result = adapter.compute_inverse_share(&Scalar::ONE, &ctx);
-    assert_eq!(result, Err(AdapterError::McpSpdzNotAvailable));
+    assert!(matches!(result, Err(AdapterError::McpSpdzNotAvailable)));
 }
 
 #[test]
@@ -383,6 +397,9 @@ fn round1_with_mock_adapter_succeeds_and_contribution_matches_h_mul() {
     assert_eq!(result.slot, 2);
     let expected_point = h_point() * inv_share;
     assert_eq!(result.h_contribution, compressed_hex(&expected_point));
+    // Codex P1 #4: mock adapter uses m=1 and h_r = h * q_i; result must echo those.
+    assert_eq!(result.mpc_open_m, mock_mpc_open_m_hex());
+    assert_eq!(result.h_r, mock_h_r_for_q(&inv_share));
     let expected_hash = worker_transcript_hash(
         DKG_EPOCH,
         &ca_dkg_transcript_hex(),
@@ -390,6 +407,8 @@ fn round1_with_mock_adapter_succeeds_and_contribution_matches_h_mul() {
         &[0, 1, 2, 3, 4],
         2,
         &result.h_contribution,
+        &result.h_r,
+        &result.mpc_open_m,
     );
     assert_eq!(result.worker_transcript_hash, expected_hash);
 }
@@ -403,6 +422,8 @@ fn verify_aggregates_five_contributions() {
     let mut expected_sum = RistrettoPoint::default();
     let sorted_slots = vec![0_usize, 1, 2, 3, 4];
     let h = h_point();
+    let m_hex = mock_mpc_open_m_hex();
+    let h_r_hex = mock_h_r_for_q(&fixed);
     for slot in &sorted_slots {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -413,6 +434,8 @@ fn verify_aggregates_five_contributions() {
             &sorted_slots,
             *slot,
             &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
         );
         let proof = schnorr_pok(&fixed, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -420,6 +443,8 @@ fn verify_aggregates_five_contributions() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
+            h_r: h_r_hex.clone(),
+            mpc_open_m: m_hex.clone(),
         });
         expected_sum += point;
     }
@@ -438,10 +463,16 @@ fn verify_aggregates_five_contributions() {
     let result = run_verify(&request).expect("verify succeeds");
     assert_eq!(result.vault_ek, compressed_hex(&expected_sum));
     // sanity: re-verify final hash matches recomputation
-    let ordered: Vec<(usize, String, SchnorrProof)> = request
+    let ordered: Vec<(usize, String, SchnorrProof, String, String)> = request
         .contributions
         .iter()
-        .map(|c| (c.slot, c.h_contribution.clone(), c.schnorr_proof.clone()))
+        .map(|c| (
+            c.slot,
+            c.h_contribution.clone(),
+            c.schnorr_proof.clone(),
+            c.h_r.clone(),
+            c.mpc_open_m.clone(),
+        ))
         .collect();
     let recomputed = final_transcript_hash(
         &request.dkg_epoch,
@@ -470,6 +501,8 @@ fn verify_rejects_under_quorum() {
                     s: "00".repeat(32),
                 },
                 worker_transcript_hash: "00".repeat(32),
+                h_r: "00".repeat(32),
+                mpc_open_m: "00".repeat(32),
             })
             .collect(),
     };
@@ -483,6 +516,8 @@ fn verify_rejects_duplicate_slot() {
     let sorted_slots = vec![0_usize, 1, 2, 3, 4];
     let mut contributions = Vec::new();
     let h = h_point();
+    let m_hex = mock_mpc_open_m_hex();
+    let h_r_hex = mock_h_r_for_q(&fixed);
     for _ in 0..5 {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -494,6 +529,8 @@ fn verify_rejects_duplicate_slot() {
             &sorted_slots,
             0,
             &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
         );
         let proof = schnorr_pok(&fixed, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -501,6 +538,8 @@ fn verify_rejects_duplicate_slot() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
+            h_r: h_r_hex.clone(),
+            mpc_open_m: m_hex.clone(),
         });
     }
     let request = VerifyRequest {
@@ -520,6 +559,8 @@ fn verify_rejects_worker_transcript_hash_mismatch() {
     let sorted_slots = vec![0_usize, 1, 2, 3, 4];
     let mut contributions = Vec::new();
     let h = h_point();
+    let m_hex = mock_mpc_open_m_hex();
+    let h_r_hex = mock_h_r_for_q(&fixed);
     for (idx, slot) in sorted_slots.iter().enumerate() {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -537,6 +578,8 @@ fn verify_rejects_worker_transcript_hash_mismatch() {
             &sorted_slots,
             *slot,
             &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
         );
         let proof = schnorr_pok(&fixed, &point, &worker_hash).expect("schnorr_pok");
         contributions.push(ContributionInput {
@@ -544,6 +587,8 @@ fn verify_rejects_worker_transcript_hash_mismatch() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
+            h_r: h_r_hex.clone(),
+            mpc_open_m: m_hex.clone(),
         });
     }
     let request = VerifyRequest {
@@ -567,6 +612,8 @@ fn verify_rejects_invalid_schnorr_proof() {
     let sorted_slots = vec![0_usize, 1, 2, 3, 4];
     let mut contributions = Vec::new();
     let h = h_point();
+    let m_hex = mock_mpc_open_m_hex();
+    let h_r_hex = mock_h_r_for_q(&fixed);
     for (idx, slot) in sorted_slots.iter().enumerate() {
         let point = h * fixed;
         let h_contribution_hex = compressed_hex(&point);
@@ -577,6 +624,8 @@ fn verify_rejects_invalid_schnorr_proof() {
             &sorted_slots,
             *slot,
             &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
         );
         // For the third entry, prove knowledge of the WRONG secret (bogus): the schnorr will
         // fail verification.
@@ -587,6 +636,8 @@ fn verify_rejects_invalid_schnorr_proof() {
             h_contribution: h_contribution_hex,
             schnorr_proof: proof,
             worker_transcript_hash: worker_hash,
+            h_r: h_r_hex.clone(),
+            mpc_open_m: m_hex.clone(),
         });
     }
     let request = VerifyRequest {
@@ -653,7 +704,11 @@ fn worker_transcript_hash_is_deterministic_and_layout_documented() {
     let slots = [0_usize, 2, 3, 4, 6];
     let slot = 3_usize;
     let h_hex = "cc".repeat(32);
-    let observed = worker_transcript_hash(dkg_epoch, &ca, &roster, &slots, slot, &h_hex);
+    let h_r_hex = "dd".repeat(32);
+    let m_hex = "ee".repeat(32);
+    let observed = worker_transcript_hash(
+        dkg_epoch, &ca, &roster, &slots, slot, &h_hex, &h_r_hex, &m_hex,
+    );
     let mut expected_input = Vec::new();
     expected_input.extend_from_slice(b"EUNOMA_VAULT_EK_DERIVATION_V1");
     expected_input.extend_from_slice(b"5");
@@ -667,6 +722,10 @@ fn worker_transcript_hash_is_deterministic_and_layout_documented() {
     expected_input.extend_from_slice(b"3");
     expected_input.extend_from_slice(b":");
     expected_input.extend_from_slice(h_hex.as_bytes());
+    expected_input.extend_from_slice(b":");
+    expected_input.extend_from_slice(h_r_hex.as_bytes());
+    expected_input.extend_from_slice(b":");
+    expected_input.extend_from_slice(m_hex.as_bytes());
     let mut hasher = Sha256::new();
     hasher.update(&expected_input);
     let manual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -685,7 +744,11 @@ fn emit_worker_transcript_hash_parity_fixture() {
     let slots = [0_usize, 1, 2, 4, 5];
     let slot = 4_usize;
     let h_hex = "0c".repeat(32);
-    let hash = worker_transcript_hash(dkg_epoch, &ca, &roster, &slots, slot, &h_hex);
+    let h_r_hex = "0d".repeat(32);
+    let m_hex = "0e".repeat(32);
+    let hash = worker_transcript_hash(
+        dkg_epoch, &ca, &roster, &slots, slot, &h_hex, &h_r_hex, &m_hex,
+    );
     let value = serde_json::json!({
         "dkgEpoch": dkg_epoch,
         "caDkgTranscriptHash": ca,
@@ -693,6 +756,8 @@ fn emit_worker_transcript_hash_parity_fixture() {
         "sortedSelectedSlots": slots,
         "slot": slot,
         "hContribution": h_hex,
+        "hR": h_r_hex,
+        "mpcOpenM": m_hex,
         "workerTranscriptHash": hash,
         "schnorrChallengeDomain": "EUNOMA_VAULT_EK_DERIVATION_SCHNORR_V1",
         "workerTranscriptDomain": "EUNOMA_VAULT_EK_DERIVATION_V1",
@@ -812,11 +877,13 @@ impl MpcInverseAdapter for MockAdditiveInverseAdapter {
         &self,
         _dk_share: &Scalar,
         ctx: &InversionContext,
-    ) -> Result<Scalar, AdapterError> {
-        self.by_slot
+    ) -> Result<InversionShare, AdapterError> {
+        let q = self
+            .by_slot
             .get(&ctx.self_slot)
             .copied()
-            .ok_or_else(|| AdapterError::Internal(format!("no mock share for slot {}", ctx.self_slot)))
+            .ok_or_else(|| AdapterError::Internal(format!("no mock share for slot {}", ctx.self_slot)))?;
+        mock_inversion_share_from_q(q)
     }
 }
 
@@ -924,6 +991,8 @@ fn vault_ek_passes_registration_sigma() {
             h_contribution: res.h_contribution,
             schnorr_proof: res.schnorr_proof,
             worker_transcript_hash: res.worker_transcript_hash,
+            h_r: res.h_r,
+            mpc_open_m: res.mpc_open_m,
         });
     }
 
@@ -993,6 +1062,168 @@ fn vault_ek_passes_registration_sigma() {
         &response_hex,
     )
     .expect("verify_registration_proof must return Ok(()) — this is the killer assertion");
+}
+
+// === Codex P1 #4 tests: bind h_q_i to (h_r_i, mpc_open_m) ===
+
+#[test]
+fn verify_rejects_malicious_h_contribution_unbacked_by_h_r() {
+    // Codex P1 #4: a malicious worker publishes h_q_i' = h * arbitrary, h_r_i still equal to
+    // the honest h * r_i. The check `h_q_i * m == h_r_i` must fail because the malicious
+    // h_q_i is not tied to the honest r_i.
+    let honest_q = det_scalar(0xDADA);
+    let evil_x = det_scalar(0xEEEE);
+    let sorted_slots = vec![0_usize, 1, 2, 3, 4];
+    let h = h_point();
+    let m_hex = mock_mpc_open_m_hex();
+    let h_r_honest = compressed_hex(&(h * honest_q)); // valid h_r for honest_q
+    let mut contributions = Vec::new();
+    for (idx, slot) in sorted_slots.iter().enumerate() {
+        // For slot 2, publish a malicious h_q_i = h * evil_x that does NOT satisfy
+        // h_q_i * 1 == h_r_honest. The Schnorr POK is still valid (evil_x is known).
+        let secret = if idx == 2 { evil_x } else { honest_q };
+        let point = h * secret;
+        let h_contribution_hex = compressed_hex(&point);
+        let h_r_hex = if idx == 2 {
+            h_r_honest.clone() // attacker re-uses honest h_r but publishes evil h_q
+        } else {
+            mock_h_r_for_q(&honest_q)
+        };
+        let worker_hash = worker_transcript_hash(
+            DKG_EPOCH,
+            &ca_dkg_transcript_hex(),
+            &roster_hash_hex(),
+            &sorted_slots,
+            *slot,
+            &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
+        );
+        let proof = schnorr_pok(&secret, &point, &worker_hash).expect("schnorr_pok");
+        contributions.push(ContributionInput {
+            slot: *slot,
+            h_contribution: h_contribution_hex,
+            schnorr_proof: proof,
+            worker_transcript_hash: worker_hash,
+            h_r: h_r_hex,
+            mpc_open_m: m_hex.clone(),
+        });
+    }
+    let request = VerifyRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: sorted_slots,
+        contributions,
+    };
+    let err = run_verify(&request).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::Crypto(msg) if msg.contains("h_q_i * m != h_r_i")),
+        "expected h_q_i * m mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn verify_rejects_disagreeing_mpc_open_m() {
+    // Codex P1 #4: all 5 workers MUST report the same MPC-opened m. The MAC-check in MASCOT
+    // guarantees they will in production; the verifier still asserts as defense in depth.
+    let honest_q = det_scalar(0xC0DE);
+    let sorted_slots = vec![0_usize, 1, 2, 3, 4];
+    let h = h_point();
+    let m_honest_hex = mock_mpc_open_m_hex(); // = Scalar::ONE
+    let m_evil = Scalar::from(2_u64);
+    let m_evil_hex = scalar_hex(&m_evil);
+    let mut contributions = Vec::new();
+    for (idx, slot) in sorted_slots.iter().enumerate() {
+        let point = h * honest_q;
+        let h_contribution_hex = compressed_hex(&point);
+        // To pass the per-party `h_q_i * m == h_r_i` check at slot 2 with m=2: h_r_i must be
+        // h * (2 * honest_q). For honest slots: m=1 and h_r = h * honest_q.
+        let m_hex = if idx == 2 { m_evil_hex.clone() } else { m_honest_hex.clone() };
+        let h_r_hex = if idx == 2 {
+            compressed_hex(&(h * (m_evil * honest_q)))
+        } else {
+            mock_h_r_for_q(&honest_q)
+        };
+        let worker_hash = worker_transcript_hash(
+            DKG_EPOCH,
+            &ca_dkg_transcript_hex(),
+            &roster_hash_hex(),
+            &sorted_slots,
+            *slot,
+            &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
+        );
+        let proof = schnorr_pok(&honest_q, &point, &worker_hash).expect("schnorr_pok");
+        contributions.push(ContributionInput {
+            slot: *slot,
+            h_contribution: h_contribution_hex,
+            schnorr_proof: proof,
+            worker_transcript_hash: worker_hash,
+            h_r: h_r_hex,
+            mpc_open_m: m_hex,
+        });
+    }
+    let request = VerifyRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: sorted_slots,
+        contributions,
+    };
+    let err = run_verify(&request).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::InvalidRequest(msg) if msg.contains("mpc_open_m disagreement")),
+        "expected mpc_open_m disagreement, got {err:?}"
+    );
+}
+
+#[test]
+fn verify_rejects_zero_mpc_open_m() {
+    // Codex P1 #4: m=0 is never legitimate (would imply dk*R == 0 mod q). Reject.
+    let honest_q = det_scalar(0x0707);
+    let sorted_slots = vec![0_usize, 1, 2, 3, 4];
+    let h = h_point();
+    let m_hex = "00".repeat(32); // m = 0
+    let mut contributions = Vec::new();
+    for slot in &sorted_slots {
+        let point = h * honest_q;
+        let h_contribution_hex = compressed_hex(&point);
+        // With m=0: h_q_i * 0 = identity. h_r_i must be identity too.
+        let h_r_hex = compressed_hex(&curve25519_dalek::ristretto::RistrettoPoint::default());
+        let worker_hash = worker_transcript_hash(
+            DKG_EPOCH,
+            &ca_dkg_transcript_hex(),
+            &roster_hash_hex(),
+            &sorted_slots,
+            *slot,
+            &h_contribution_hex,
+            &h_r_hex,
+            &m_hex,
+        );
+        let proof = schnorr_pok(&honest_q, &point, &worker_hash).expect("schnorr_pok");
+        contributions.push(ContributionInput {
+            slot: *slot,
+            h_contribution: h_contribution_hex,
+            schnorr_proof: proof,
+            worker_transcript_hash: worker_hash,
+            h_r: h_r_hex,
+            mpc_open_m: m_hex.clone(),
+        });
+    }
+    let request = VerifyRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        ca_dkg_transcript_hash: ca_dkg_transcript_hex(),
+        roster_hash: roster_hash_hex(),
+        selected_slots: sorted_slots,
+        contributions,
+    };
+    let err = run_verify(&request).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::InvalidRequest(msg) if msg.contains("mpc_open_m is zero")),
+        "expected zero m rejection, got {err:?}"
+    );
 }
 
 /// If a malicious or buggy implementation builds a Schnorr proof against G instead of H,
