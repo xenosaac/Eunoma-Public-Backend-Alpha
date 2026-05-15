@@ -261,6 +261,14 @@ export interface DkgRoundResult {
   frostPublicPackageHash?: HexString;
 }
 
+export interface FrostDkgV2WorkerArtifact {
+  slot: number;
+  artifactHash: HexString;
+  frostKeyPackageHash: HexString;
+  frostPublicPackageHash: HexString;
+  frostVerifyingShare: HexString;
+}
+
 export interface CaRegistrationCommitmentInput {
   slot: number;
   commitment: HexString;

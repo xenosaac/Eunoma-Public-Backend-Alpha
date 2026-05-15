@@ -484,6 +484,15 @@ describe("coordinator", () => {
     expect(body.requestId).toBe("frost-dkg-r");
     expect(body.frostDkgV2RosterHash).toBe(frostDkgV2RosterHash(fr));
     expect(body.groupPublicKey).toBe(h32("d"));
+    expect(body.operatorSetVersion).toBe("1");
+    expect(body.dkgEpoch).toBe("9");
+    expect(body.workerArtifactHashes).toHaveLength(7);
+    for (const artifact of body.workerArtifactHashes) {
+      expect(artifact.frostVerifyingShare).toBe(h32("e"));
+      expect(artifact.frostKeyPackageHash).toBe(h32("a"));
+      expect(artifact.frostPublicPackageHash).toBe(h32("b"));
+      expect(artifact.artifactHash).toBe(h32("c"));
+    }
     // 7 round1 + 7 round2_send + 7 round2_receive + 7 finalize == 28 calls
     expect(calls).toHaveLength(28);
     await expect(store.getStatus("frost-dkg-r")).resolves.toMatchObject({ status: "complete" });

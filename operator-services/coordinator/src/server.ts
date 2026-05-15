@@ -514,6 +514,8 @@ export function buildCoordinatorServer(
         accepted: true,
         requestId,
         sessionId,
+        operatorSetVersion: dkgRoster.operatorSetVersion,
+        dkgEpoch: dkgRoster.dkgEpoch,
         frostDkgV2RosterHash: dkgRosterHash,
         dkgTranscriptHash,
         groupPublicKey: firstGroupKey,
@@ -522,6 +524,7 @@ export function buildCoordinatorServer(
           artifactHash: result.artifactHash,
           frostKeyPackageHash: result.frostKeyPackageHash,
           frostPublicPackageHash: result.frostPublicPackageHash,
+          frostVerifyingShare: result.frostVerifyingShare,
         })),
       });
     } catch (err) {
