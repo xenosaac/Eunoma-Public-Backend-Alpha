@@ -32,10 +32,15 @@ console.log(JSON.stringify({
     "online-frost-dkg",
     "local-roster"
   ],
+  optionalGates: {
+    "local:online-frost-dkg-smoke": "HTTP cluster 4-phase DKG roundtrip; opt-in heavyweight",
+    "local:frost-rotation-smoke": "Full FROST rotation propagation closed loop (DKG -> apply -> restart -> sign -> verify rotated, fail seeded); opt-in heavyweight",
+    "testnet:rotate-frost-config": "Operator-driven rotation tx (simulate by default, --submit to land)"
+  },
   rosterHash: plan.rosterHash,
   coordinator: `http://127.0.0.1:${plan.coordinator.port}`,
   relayer: `http://127.0.0.1:${plan.relayer.port}`,
-  note: "Local verifier gates passed with ca_local fixture. The online-frost-dkg gate is exercised in-process by the Rust frost_dkg_v2_online_roundtrip test (runRustTests above); the heavyweight HTTP cluster path is opt-in via npm run local:online-frost-dkg-smoke. This is not a testnet flow; npm run testnet:e2e remains fail-closed until MPCCA finalize emits a real CA payload."
+  note: "Local verifier gates passed with ca_local fixture. The online-frost-dkg gate is exercised in-process by the Rust frost_dkg_v2_online_roundtrip test (runRustTests above); the heavyweight HTTP cluster path is opt-in via npm run local:online-frost-dkg-smoke. The full rotation propagation loop (in-memory roster + on-chain admin tx) is opt-in via npm run local:frost-rotation-smoke and npm run testnet:rotate-frost-config. This is not a testnet flow; npm run testnet:e2e remains fail-closed until MPCCA finalize emits a real CA payload."
 }, null, 2));
 
 function run(command, args) {

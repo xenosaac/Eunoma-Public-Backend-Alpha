@@ -70,9 +70,10 @@ writeFileSync(
   { mode: 0o644 },
 );
 
-console.warn(
-  "WARN: rotation not propagated to coordinator/node/Move; live attestations still use seeded key. " +
-    "Future step adds rotate_deoperator_config_v2 admin tx + service restart.",
+console.log(
+  "INFO: workers wrote rotated frost_key_package.json on disk.\n" +
+    "      To propagate to live services: scripts/local_frost_rotation_apply.mjs --dkg-artifact <path>\n" +
+    "      To propagate on-chain:        scripts/testnet_rotate_frost_config.mjs --dkg-artifact <path> --snapshot <path>",
 );
 
 console.log(JSON.stringify({ ...body, artifactPath }, null, 2));
