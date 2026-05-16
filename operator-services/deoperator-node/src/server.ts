@@ -280,7 +280,8 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/derive/ca_registration/round2"
       | "/worker/v2/derive/ca_registration/challenge"
       | "/worker/v2/derive/ca_registration/verify"
-      | "/worker/v2/derive/ca_registration/aggregate",
+      | "/worker/v2/derive/ca_registration/aggregate"
+      | "/worker/v2/vault_state/init",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -438,6 +439,28 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/worker/v2/derive/ca_registration/aggregate", req.body, reply);
+  });
+
+  // Milestone 2 sub-milestone 2a — vault_state_v2 init passthrough. Mirrors the
+  // ca_registration round1/round2 pattern: forbidden-field guard, rosterHash gate against the
+  // configured CA DKG V2 roster, selfSlot gate against this node's slot. Without these the
+  // worker could persist `vault_state_v2.json` for a stale roster or the wrong slot — both
+  // would corrupt audit logs and break MPCCA cross-checks later.
+  server.post("/worker/v2/vault_state/init", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/vault_state/init", req.body, reply);
   });
 
   return { server, store };
