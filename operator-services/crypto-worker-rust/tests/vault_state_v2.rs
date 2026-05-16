@@ -569,3 +569,41 @@ fn vault_state_v2_init_rejects_stale_dkg_epoch() {
     let file_path = fix.slot_dirs[slot].join("vault_state_v2.json");
     assert!(!file_path.exists());
 }
+
+#[test]
+fn vault_state_v2_init_rejects_mismatched_challenge() {
+    // Codex M2a P2 #4: the worker recomputes the Fiat-Shamir challenge locally and
+    // rejects any tuple whose `req.challenge` doesn't match. This guards against a
+    // caller (inline coordinator mode, or a confused deop-node) supplying a valid
+    // (commitment, response) tuple bound to one challenge but persisting a DIFFERENT
+    // challenge into vault_state_v2.json.
+    //
+    // We construct a real, valid (vault_ek, sender, asset, chain_id, agg_commitment,
+    // agg_response) tuple — i.e. `verify_registration_proof` accepts it — but flip a
+    // byte in `req.challenge`. The worker must:
+    //   1. Pass `verify_registration_proof` (the tuple is internally consistent), then
+    //   2. Recompute the challenge and find it disagrees with `req.challenge`, then
+    //   3. Reject `InvalidRequest("challenge_mismatch")` BEFORE writing the file.
+    let fix = build_milestone1_fixture("challenge-mismatch");
+    let slot = 4_usize;
+    let mut req = build_init_request(&fix, slot, 4);
+    // Tamper: flip the low byte of the challenge. The (commitment, response) tuple is
+    // still mathematically valid against the canonical Fiat-Shamir challenge, but
+    // `req.challenge` is now a different scalar.
+    let mut bytes = hex_decode(&req.challenge);
+    bytes[31] ^= 0x01;
+    req.challenge = hex_encode(&bytes);
+
+    let err = init_vault_state_v2(&fix.slot_dirs[slot], &req)
+        .expect_err("mismatched challenge should be rejected");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s == "challenge_mismatch"),
+        "expected InvalidRequest(\"challenge_mismatch\"), got {err:?}"
+    );
+    // KILLER ASSERTION: NO vault_state_v2.json file was written.
+    let file_path = fix.slot_dirs[slot].join("vault_state_v2.json");
+    assert!(
+        !file_path.exists(),
+        "challenge mismatch must not persist vault_state_v2.json"
+    );
+}

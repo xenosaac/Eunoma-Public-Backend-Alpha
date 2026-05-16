@@ -5269,7 +5269,10 @@ pub mod vault_state_v2 {
     use crate::ca_dkg_v2::load_ca_dkg_v2_share_metadata;
     // Codex M2a P1: V2 production code MUST NOT import from `crate::ca_local`. The public
     // sigma verifier + Fiat-Shamir challenge live in `crate::registration_verifier`.
-    use crate::registration_verifier::verify_registration_proof;
+    //
+    // Codex M2a P2 #4: import `registration_challenge` to recompute the Fiat-Shamir
+    // challenge locally instead of trusting the caller-supplied value.
+    use crate::registration_verifier::{registration_challenge, verify_registration_proof};
     use crate::mpc_spdz_adapter::is_safe_id;
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
     use serde::{Deserialize, Serialize};
@@ -5506,6 +5509,32 @@ pub mod vault_state_v2 {
             &aggregate_commitment,
             &aggregate_response,
         )?;
+
+        // Codex M2a P2 #4: recompute the Fiat-Shamir challenge LOCALLY and assert it
+        // matches the supplied `req.challenge`. The supplied challenge was previously
+        // persisted into vault_state_v2.json verbatim — but `verify_registration_proof`
+        // recomputes the challenge INTERNALLY and takes no supplied challenge parameter,
+        // so a caller could persist an arbitrary `challenge` alongside a valid
+        // `(commitment, response)` tuple without anyone here noticing the mismatch. The
+        // coordinator's provenance-resolved transcript guarantees this in stateRoot mode,
+        // but inline mode (no stateRoot) accepts the challenge from the request body
+        // directly. A future replay/2b path that reads vault_state_v2.json and relies on
+        // the persisted `challenge` field could be misled.
+        //
+        // This makes the worker an independent Fiat-Shamir verifier rather than a
+        // trusting persister.
+        let expected_challenge = registration_challenge(
+            &vault_ek_hex,
+            &sender,
+            &asset,
+            req.chain_id,
+            &aggregate_commitment,
+        )?;
+        if expected_challenge.to_lowercase() != challenge.to_lowercase() {
+            return Err(WorkerError::InvalidRequest(
+                "challenge_mismatch".to_string(),
+            ));
+        }
 
         // Cross-check: V2 share must exist and bind to (dkg_epoch, slot, ca_dkg_transcript_hash).
         // Codex M2a P2 #1: We use `load_ca_dkg_v2_share_metadata`, which deserializes into a
