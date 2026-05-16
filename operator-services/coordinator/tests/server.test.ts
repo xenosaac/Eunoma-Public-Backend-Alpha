@@ -7,6 +7,7 @@ import type {
 import {
   caDkgV2RosterHash,
   frostDkgV2RosterHash,
+  ingressEnvelopesHash,
   mpccaWithdrawRound1WorkerTranscriptHash,
   rosterHash,
   WITHDRAW_V2_CALL_ARGS_ORDER,
@@ -3515,6 +3516,26 @@ describe("coordinator", () => {
   // ---------------------------------------------------------------------------------------------
   // Milestone 3 sub-milestone 3a — MPCCA withdraw V2 round1 orchestrator.
   // ---------------------------------------------------------------------------------------------
+  function mockIngressEnvelope(seed: number): {
+    kem: "DHKEM_X25519_HKDF_SHA256";
+    kdf: "HKDF_SHA256";
+    aead: "AES_256_GCM";
+    enc: string;
+    ciphertext: string;
+    aadHash: string;
+  } {
+    const seedByte = seed.toString(16).padStart(2, "0");
+    return {
+      kem: "DHKEM_X25519_HKDF_SHA256",
+      kdf: "HKDF_SHA256",
+      aead: "AES_256_GCM",
+      enc: seedByte.repeat(32),
+      // 80 bytes = 64-byte plaintext (a_i || b_i) + 16-byte AES-GCM tag.
+      ciphertext: seedByte.repeat(80),
+      aadHash: seedByte.repeat(32),
+    };
+  }
+
   function mpccaWithdrawValidPayload(
     overrides: Record<string, unknown> = {},
   ): Record<string, unknown> {
@@ -3541,6 +3562,24 @@ describe("coordinator", () => {
       expirySecs: 1_700_000_000,
       requestHash: h32("6"),
       depositCount: 1,
+      // Milestone 1: amount ingress fields. The test stubs the per-share commitment check
+      // at the worker level (no real Pedersen verify here); coordinator-side defense-in-depth
+      // aggregate-sum check is deferred to the Commit 5 implementation.
+      amountCommitment: "ac".repeat(32),
+      perShareCommitments: [
+        "11".repeat(32),
+        "22".repeat(32),
+        "33".repeat(32),
+        "44".repeat(32),
+        "55".repeat(32),
+      ],
+      ingressEnvelopes: [
+        mockIngressEnvelope(0x11),
+        mockIngressEnvelope(0x22),
+        mockIngressEnvelope(0x33),
+        mockIngressEnvelope(0x44),
+        mockIngressEnvelope(0x55),
+      ],
       ...overrides,
     };
   }
@@ -3567,7 +3606,6 @@ describe("coordinator", () => {
     requestHash: string;
     depositCount: number;
     onCall?: (slot: number) => Promise<void>;
-    overridePhase?: (slot: number) => string | undefined;
     tamperWorkerHash?: (slot: number) => boolean;
   }) {
     return async (path: string, body: unknown, _roster: unknown, slot: number) => {
@@ -3581,14 +3619,23 @@ describe("coordinator", () => {
         };
       }
       const playerId = opts.expectedSelectedSlots.indexOf(slot);
-      const phase =
-        (opts.overridePhase && opts.overridePhase(slot)) ||
-        "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4";
       // Compute the canonical worker_transcript_hash so the orchestrator's defense-in-depth
-      // re-derivation matches. (Tests can opt to flip it via tamperWorkerHash to exercise the
-      // hash-mismatch path.)
-      const sessionId = (body as Record<string, unknown>).sessionId as string;
-      const requestId = (body as Record<string, unknown>).requestId as string;
+      // re-derivation matches. Under M1, this binds the ingress fields too — read them from
+      // the request body and fold them in via ingressEnvelopesHash.
+      const bodyObj = body as Record<string, unknown>;
+      const sessionId = bodyObj.sessionId as string;
+      const requestId = bodyObj.requestId as string;
+      const amountCommitment = bodyObj.amountCommitment as string;
+      const perShareCommitments = bodyObj.perShareCommitments as string[];
+      const ingressEnvs = bodyObj.ingressEnvelopes as Array<{
+        kem: "DHKEM_X25519_HKDF_SHA256";
+        kdf: "HKDF_SHA256";
+        aead: "AES_256_GCM";
+        enc: string;
+        ciphertext: string;
+        aadHash: string;
+      }>;
+      const ingressEnvelopesHashHex = ingressEnvelopesHash(ingressEnvs);
       const canonical = mpccaWithdrawRound1WorkerTranscriptHash({
         sessionId,
         requestId,
@@ -3614,13 +3661,16 @@ describe("coordinator", () => {
         expirySecs: opts.expirySecs,
         requestHash: opts.requestHash,
         depositCount: opts.depositCount,
+        amountCommitment,
+        perShareCommitments,
+        ingressEnvelopesHash: ingressEnvelopesHashHex,
       });
       const workerTranscriptHash =
         opts.tamperWorkerHash && opts.tamperWorkerHash(slot) ? h32(String((slot + 7) % 9)) : canonical;
       return {
         slot,
-        ok: false,
-        statusCode: 501,
+        ok: true,
+        statusCode: 200,
         body: {
           slot,
           playerId,
@@ -3628,14 +3678,14 @@ describe("coordinator", () => {
           sessionStateHash: h32(String((slot + 3) % 9)),
           workerTranscriptHash,
           observedAtUnixMs: 1_700_000_000_000 + slot,
-          completed: false,
-          notImplementedPhase: phase,
+          completed: true,
+          ingressTranscriptHash: workerTranscriptHash,
         },
       };
     };
   }
 
-  it("mpcca_withdraw_round1_concurrent_fan_out_surfaces_stub_phase", async () => {
+  it("mpcca_withdraw_round1_concurrent_fan_out_returns_completed_m1_ingress", async () => {
     const { mpccaWithdrawRound1WorkerTranscriptHash } = await import("@eunoma/deop-protocol");
     const caDkgV2Roster = dkgRoster();
     const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
@@ -3689,21 +3739,28 @@ describe("coordinator", () => {
       url: "/v2/withdraw/mpcca/start",
       payload: { requestId: "mpcca-wdr-concurrent", ...payload },
     });
-    expect(res.statusCode).toBe(501);
+    expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.accepted).toBe(false);
     expect(body.round).toBe("round1");
-    expect(body.phase).toBe(
-      "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
-    );
+    expect(body.completed).toBe(true);
     expect(body.requestId).toBe("mpcca-wdr-concurrent");
     expect(body.depositCount).toBe(1);
     expect(body.perSlotContributions).toHaveLength(5);
     // KILLER ASSERTION: concurrent fan-out — all 5 workers in flight simultaneously.
     expect(peak).toBe(5);
+    // M1 ingress: every contribution is completed:true with ingressTranscriptHash.
+    for (const c of body.perSlotContributions) {
+      expect(c.completed).toBe(true);
+      expect(c.ingressTranscriptHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(c.ingressTranscriptHash).toBe(c.workerTranscriptHash);
+    }
+    expect(body.amountCommitment).toBe(payload.amountCommitment);
+    expect(body.perShareCommitments).toEqual(payload.perShareCommitments);
+    expect(body.ingressEnvelopesHash).toMatch(/^[0-9a-f]{64}$/);
     // Codex M3a P2 #3: transcriptHash is a real 32-byte hex digest, NOT the scheme literal.
     expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(body.transcriptHash).not.toBe("mpcca_withdraw_v2_round1_partial");
+    expect(body.transcriptHash).not.toBe("mpcca_withdraw_v2_round1_ingress");
 
     // Touch the imported helper to keep TS happy (the stub uses it directly).
     expect(mpccaWithdrawRound1WorkerTranscriptHash).toBeTypeOf("function");
@@ -3834,6 +3891,22 @@ describe("coordinator", () => {
       expirySecs: 1_700_000_000,
       requestHash: h32("6"),
       depositCount: 0,
+      // M1 ingress fields.
+      amountCommitment: "ac".repeat(32),
+      perShareCommitments: [
+        "11".repeat(32),
+        "22".repeat(32),
+        "33".repeat(32),
+        "44".repeat(32),
+        "55".repeat(32),
+      ],
+      ingressEnvelopes: [
+        mockIngressEnvelope(0x11),
+        mockIngressEnvelope(0x22),
+        mockIngressEnvelope(0x33),
+        mockIngressEnvelope(0x44),
+        mockIngressEnvelope(0x55),
+      ],
     };
 
     const { server } = buildCoordinatorServer({
@@ -3868,7 +3941,7 @@ describe("coordinator", () => {
       url: "/v2/withdraw/mpcca/start",
       payload,
     });
-    expect(res.statusCode).toBe(501);
+    expect(res.statusCode).toBe(200);
     const body = res.json();
     const responseTranscriptHash = body.transcriptHash as string;
     expect(responseTranscriptHash).toMatch(/^[0-9a-f]{64}$/);
@@ -4095,15 +4168,21 @@ describe("coordinator", () => {
             },
           };
         }
+        // Non-conflicting slots return a valid M1 completed body. Slot 0's 409 makes the
+        // orchestrator surface 502 round1_unexpected_status regardless.
         return {
           slot,
-          ok: false,
-          statusCode: 501,
+          ok: true,
+          statusCode: 200,
           body: {
             slot,
             playerId: 0,
-            notImplementedPhase:
-              "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
+            sessionStatePath: `/tmp/slot-${slot}/mpc-sessions/req__sess/mpcca_withdraw_v2_round1.json`,
+            sessionStateHash: h32(String((slot + 3) % 9)),
+            workerTranscriptHash: h32(String((slot + 1) % 9)),
+            observedAtUnixMs: 1_700_000_000_000 + slot,
+            completed: true,
+            ingressTranscriptHash: h32(String((slot + 1) % 9)),
           },
         };
       },
@@ -4116,49 +4195,6 @@ describe("coordinator", () => {
     });
     expect(res.statusCode).toBe(502);
     expect(res.json().error).toBe("round1_unexpected_status");
-  });
-
-  it("mpcca_withdraw_round1 returns 502 crypto_stub_phase_divergence when workers disagree on phase", async () => {
-    const caDkgV2Roster = dkgRoster();
-    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
-    const payload = mpccaWithdrawValidPayload();
-    const expectedSelectedSlots = [0, 1, 2, 3, 4];
-
-    const { server } = buildCoordinatorServer({
-      caDkgV2Roster,
-      singleNodeForwarder: stubMpccaRound1Forwarder({
-        expectedSelectedSlots,
-        rosterHashHex,
-        dkgEpoch: payload.dkgEpoch as string,
-        vaultEkTranscriptHash: payload.vaultEkTranscriptHash as string,
-        registrationTranscriptHash: payload.registrationTranscriptHash as string,
-        vaultStateInitTranscriptHash: payload.vaultStateInitTranscriptHash as string,
-        observedDepositTranscriptHashes: payload.observedDepositTranscriptHashes as string[],
-        vaultEk: payload.vaultEk as string,
-        senderAddress: payload.senderAddress as string,
-        assetType: payload.assetType as string,
-        chainId: payload.chainId as number,
-        root: payload.root as string,
-        nullifierHash: payload.nullifierHash as string,
-        recipient: payload.recipient as string,
-        recipientHash: payload.recipientHash as string,
-        amountTag: payload.amountTag as string,
-        vaultSequence: payload.vaultSequence as number,
-        expirySecs: payload.expirySecs as number,
-        requestHash: payload.requestHash as string,
-        depositCount: payload.depositCount as number,
-        overridePhase: (slot) =>
-          slot === 3 ? "different_phase_string_for_slot_3" : undefined,
-      }),
-    });
-
-    const res = await server.inject({
-      method: "POST",
-      url: "/v2/withdraw/mpcca/start",
-      payload: { requestId: "mpcca-wdr-phase-div", ...payload },
-    });
-    expect(res.statusCode).toBe(502);
-    expect(res.json().error).toBe("crypto_stub_phase_divergence");
   });
 
   it("mpcca_withdraw_round1 returns 409 vault_mpcca_withdraw_in_flight on concurrent calls", async () => {
@@ -4289,6 +4325,22 @@ describe("coordinator", () => {
         expirySecs: 1_700_000_000,
         requestHash: h32("6"),
         depositCount: 1,
+        // M1 ingress fields.
+        amountCommitment: "ac".repeat(32),
+        perShareCommitments: [
+          "11".repeat(32),
+          "22".repeat(32),
+          "33".repeat(32),
+          "44".repeat(32),
+          "55".repeat(32),
+        ],
+        ingressEnvelopes: [
+          mockIngressEnvelope(0x11),
+          mockIngressEnvelope(0x22),
+          mockIngressEnvelope(0x33),
+          mockIngressEnvelope(0x44),
+          mockIngressEnvelope(0x55),
+        ],
       },
     });
     expect(res.statusCode).toBe(400);
@@ -4372,6 +4424,22 @@ describe("coordinator", () => {
         expirySecs: 1_700_000_000,
         requestHash: h32("6"),
         depositCount: 1, // > 0, but no observe transcript exists for it
+        // M1 ingress fields.
+        amountCommitment: "ac".repeat(32),
+        perShareCommitments: [
+          "11".repeat(32),
+          "22".repeat(32),
+          "33".repeat(32),
+          "44".repeat(32),
+          "55".repeat(32),
+        ],
+        ingressEnvelopes: [
+          mockIngressEnvelope(0x11),
+          mockIngressEnvelope(0x22),
+          mockIngressEnvelope(0x33),
+          mockIngressEnvelope(0x44),
+          mockIngressEnvelope(0x55),
+        ],
       },
     });
     expect(res.statusCode).toBe(400);

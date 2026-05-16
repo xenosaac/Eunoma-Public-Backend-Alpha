@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
+import type { HpkeEnvelope } from "../src/types.js";
 import {
   assembleMpccaWithdrawTranscript,
+  canonicalJsonStringify,
+  EUNOMA_M1_AMOUNT_INGRESS_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1,
+  EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2,
   EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1,
+  ingressEnvelopesHash,
+  m1IngressAad,
   MpccaWithdrawV2Error,
   mpccaWithdrawFinalTranscriptHash,
   mpccaWithdrawFinalizeWorkerTranscriptHash,
@@ -20,6 +26,7 @@ import {
   parseMpccaWithdrawRound1Response,
   parseMpccaWithdrawRound2Request,
   parseMpccaWithdrawRound2Response,
+  perShareCommitmentsHash,
 } from "../src/mpcca_withdraw_v2.js";
 
 const HEX32_A = "aa".repeat(32);
@@ -38,6 +45,37 @@ const HEX32_7 = "77".repeat(32);
 const HEX32_8 = "88".repeat(32);
 const HEX32_9 = "99".repeat(32);
 const HEX32_0 = "00".repeat(32);
+
+function mockEnvelope(seed: number): HpkeEnvelope {
+  const seedByte = seed.toString(16).padStart(2, "0");
+  return {
+    kem: "DHKEM_X25519_HKDF_SHA256",
+    kdf: "HKDF_SHA256",
+    aead: "AES_256_GCM",
+    enc: seedByte.repeat(32),
+    // 80-byte ciphertext = 64-byte plaintext + 16-byte GCM tag.
+    ciphertext: seedByte.repeat(80),
+    aadHash: seedByte.repeat(32),
+  };
+}
+
+const VALID_INGRESS = {
+  amountCommitment: "ac".repeat(32),
+  perShareCommitments: [
+    "11".repeat(32),
+    "22".repeat(32),
+    "33".repeat(32),
+    "44".repeat(32),
+    "55".repeat(32),
+  ],
+  ingressEnvelopes: [
+    mockEnvelope(0x11),
+    mockEnvelope(0x22),
+    mockEnvelope(0x33),
+    mockEnvelope(0x44),
+    mockEnvelope(0x55),
+  ],
+};
 
 function validRound1Body(): Record<string, unknown> {
   return {
@@ -65,18 +103,26 @@ function validRound1Body(): Record<string, unknown> {
     expirySecs: 1_700_000_000,
     requestHash: HEX32_9,
     depositCount: 7,
+    amountCommitment: VALID_INGRESS.amountCommitment,
+    perShareCommitments: [...VALID_INGRESS.perShareCommitments],
+    ingressEnvelopes: VALID_INGRESS.ingressEnvelopes.map((e) => ({ ...e })),
   };
 }
 
 function validChainedBody(): Record<string, unknown> {
+  const body = validRound1Body();
+  // Chained rounds do NOT carry ingress fields — drop them.
+  delete (body as Record<string, unknown>).amountCommitment;
+  delete (body as Record<string, unknown>).perShareCommitments;
+  delete (body as Record<string, unknown>).ingressEnvelopes;
   return {
-    ...validRound1Body(),
+    ...body,
     previousRoundTranscriptHash: HEX32_0,
     previousRoundCommitments: [HEX32_A, HEX32_B, HEX32_C, HEX32_D, HEX32_E],
   };
 }
 
-function validResponseBody(notImplementedPhase: string): Record<string, unknown> {
+function validStubResponseBody(notImplementedPhase: string): Record<string, unknown> {
   return {
     slot: 2,
     playerId: 2,
@@ -89,20 +135,35 @@ function validResponseBody(notImplementedPhase: string): Record<string, unknown>
   };
 }
 
+function validRound1ResponseBody(): Record<string, unknown> {
+  return {
+    slot: 2,
+    playerId: 2,
+    sessionStatePath: "/tmp/state/mpc-sessions/withdraw-r1__withdraw-r1/mpcca_withdraw_v2_round1.json",
+    sessionStateHash: HEX32_A,
+    workerTranscriptHash: HEX32_B,
+    observedAtUnixMs: 1_700_000_000_000,
+    completed: true,
+    ingressTranscriptHash: HEX32_B,
+  };
+}
+
 describe("mpcca_withdraw_v2 protocol — domain constants are distinct per round", () => {
   it("each round has its own domain string", () => {
     const all = new Set([
       EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1,
+      EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2,
       EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1,
       EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1,
       EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1,
       EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1,
+      EUNOMA_M1_AMOUNT_INGRESS_V1,
     ]);
-    expect(all.size).toBe(5);
+    expect(all.size).toBe(7);
   });
 });
 
-describe("mpcca_withdraw_v2 round1 worker transcript hash", () => {
+describe("mpcca_withdraw_v2 round1 worker transcript hash (M1 V2 with ingress binding)", () => {
   const base = {
     sessionId: "sess-x",
     requestId: "req-x",
@@ -128,6 +189,9 @@ describe("mpcca_withdraw_v2 round1 worker transcript hash", () => {
     expirySecs: 1_700_000_000,
     requestHash: HEX32_9,
     depositCount: 7,
+    amountCommitment: VALID_INGRESS.amountCommitment,
+    perShareCommitments: VALID_INGRESS.perShareCommitments,
+    ingressEnvelopesHash: ingressEnvelopesHash(VALID_INGRESS.ingressEnvelopes),
   };
 
   it("round1 hash is byte-stable for identical inputs", () => {
@@ -137,7 +201,7 @@ describe("mpcca_withdraw_v2 round1 worker transcript hash", () => {
     expect(a).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("round1 hash changes when ANY single field changes", () => {
+  it("round1 hash changes when ANY single field changes (including new ingress fields)", () => {
     const baseHash = mpccaWithdrawRound1WorkerTranscriptHash(base);
     const mutators: Array<(b: typeof base) => typeof base> = [
       (b) => ({ ...b, sessionId: "sess-y" }),
@@ -164,6 +228,13 @@ describe("mpcca_withdraw_v2 round1 worker transcript hash", () => {
       (b) => ({ ...b, expirySecs: 1_700_000_001 }),
       (b) => ({ ...b, requestHash: HEX32_F }),
       (b) => ({ ...b, depositCount: 8 }),
+      // M1 ingress fields — every one must flip the round1 hash.
+      (b) => ({ ...b, amountCommitment: HEX32_F }),
+      (b) => ({
+        ...b,
+        perShareCommitments: [HEX32_F, HEX32_2, HEX32_3, HEX32_4, HEX32_5],
+      }),
+      (b) => ({ ...b, ingressEnvelopesHash: HEX32_F }),
     ];
     for (const mutate of mutators) {
       const mutated = mutate(base);
@@ -171,6 +242,15 @@ describe("mpcca_withdraw_v2 round1 worker transcript hash", () => {
         baseHash,
       );
     }
+  });
+
+  it("round1 hash uses domain V2 (binds the ingress fields)", () => {
+    // A V1-style hash (no ingress fields) would necessarily differ from V2: the V2 domain
+    // string is bigger and the appended ingress bytes shift the input. We don't expose a
+    // V1 hash function publicly (V1 stub-mode is gone); this test just confirms the V2
+    // domain is non-empty and the export name matches.
+    expect(EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2).toBe("EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2");
+    expect(EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2).not.toBe(EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1);
   });
 });
 
@@ -262,8 +342,8 @@ describe("mpcca_withdraw_v2 final transcript hash", () => {
         slot,
         sessionStateHash: HEX32_A,
         workerTranscriptHash: HEX32_B,
-        completed: false as const,
-        notImplementedPhase: "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
+        completed: true as const,
+        ingressTranscriptHash: HEX32_B,
       })),
       round2Contributions: [],
       proveContributions: [],
@@ -280,6 +360,16 @@ describe("mpcca_withdraw_v2 final transcript hash", () => {
     };
     expect(mpccaWithdrawFinalTranscriptHash(mutated)).not.toBe(a);
   });
+
+  it("binds every per-slot ingressTranscriptHash (round1 V2 layout)", () => {
+    const a = mpccaWithdrawFinalTranscriptHash(fixture());
+    const mutated = fixture();
+    mutated.round1Contributions[3] = {
+      ...mutated.round1Contributions[3],
+      ingressTranscriptHash: HEX32_F,
+    };
+    expect(mpccaWithdrawFinalTranscriptHash(mutated)).not.toBe(a);
+  });
 });
 
 describe("mpcca_withdraw_v2 assembleMpccaWithdrawTranscript", () => {
@@ -289,8 +379,8 @@ describe("mpcca_withdraw_v2 assembleMpccaWithdrawTranscript", () => {
       slot,
       sessionStateHash: HEX32_A,
       workerTranscriptHash: HEX32_B,
-      completed: false as const,
-      notImplementedPhase: "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
+      completed: true as const,
+      ingressTranscriptHash: HEX32_B,
     }));
     const t = assembleMpccaWithdrawTranscript({
       dkgEpoch: "1",
@@ -360,12 +450,16 @@ describe("mpcca_withdraw_v2 assembleMpccaWithdrawTranscript", () => {
 });
 
 describe("mpcca_withdraw_v2 parsers", () => {
-  it("parseMpccaWithdrawRound1Request accepts a valid wire body", () => {
+  it("parseMpccaWithdrawRound1Request accepts a valid wire body (with M1 ingress)", () => {
     const parsed = parseMpccaWithdrawRound1Request(validRound1Body());
     expect(parsed.dkgEpoch).toBe("1");
     expect(parsed.selfSlot).toBe(2);
     expect(parsed.depositCount).toBe(7);
     expect(parsed.observedDepositTranscriptHashes).toHaveLength(2);
+    expect(parsed.amountCommitment).toBe(VALID_INGRESS.amountCommitment);
+    expect(parsed.perShareCommitments).toHaveLength(5);
+    expect(parsed.ingressEnvelopes).toHaveLength(5);
+    expect(parsed.ingressEnvelopes[0].kem).toBe("DHKEM_X25519_HKDF_SHA256");
   });
 
   it("parseMpccaWithdrawRound1Request rejects under-quorum selectedSlots", () => {
@@ -447,41 +541,217 @@ describe("mpcca_withdraw_v2 parsers", () => {
     ).toHaveLength(5);
   });
 
-  it("parseMpccaWithdrawRound1Response accepts a stub response", () => {
-    const r = parseMpccaWithdrawRound1Response(
-      validResponseBody("mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4"),
-    );
-    expect(r.completed).toBe(false);
-    expect(r.notImplementedPhase).toContain("round1");
+  it("parseMpccaWithdrawRound1Response accepts a completed M1 response", () => {
+    const r = parseMpccaWithdrawRound1Response(validRound1ResponseBody());
+    expect(r.completed).toBe(true);
+    expect(r.ingressTranscriptHash).toBe(HEX32_B);
   });
 
-  it("parseMpccaWithdrawRound1Response rejects completed=true", () => {
+  it("parseMpccaWithdrawRound1Response rejects completed=false (M3a stub shape)", () => {
     expect(() =>
       parseMpccaWithdrawRound1Response({
-        ...validResponseBody("nope"),
-        completed: true,
+        ...validRound1ResponseBody(),
+        completed: false,
+        notImplementedPhase: "any",
+      }),
+    ).toThrow(MpccaWithdrawV2Error);
+  });
+
+  it("parseMpccaWithdrawRound1Response rejects ingressTranscriptHash mismatch with workerTranscriptHash", () => {
+    expect(() =>
+      parseMpccaWithdrawRound1Response({
+        ...validRound1ResponseBody(),
+        ingressTranscriptHash: HEX32_F,
       }),
     ).toThrow(MpccaWithdrawV2Error);
   });
 
   it("parseMpccaWithdrawRound2Response accepts a stub response", () => {
     const r = parseMpccaWithdrawRound2Response(
-      validResponseBody("mpcca_withdraw_v2_round2_partial_sigma_pending_milestone4"),
+      validStubResponseBody("mpcca_withdraw_v2_round2_partial_sigma_pending_milestone4"),
     );
     expect(r.notImplementedPhase).toContain("round2");
   });
 
   it("parseMpccaWithdrawProveResponse accepts a stub response", () => {
     const r = parseMpccaWithdrawProveResponse(
-      validResponseBody("mpcca_withdraw_v2_prove_collaborative_bulletproof_pending_milestone4"),
+      validStubResponseBody("mpcca_withdraw_v2_prove_collaborative_bulletproof_pending_milestone4"),
     );
     expect(r.notImplementedPhase).toContain("prove");
   });
 
   it("parseMpccaWithdrawFinalizeResponse accepts a stub response", () => {
     const r = parseMpccaWithdrawFinalizeResponse(
-      validResponseBody("mpcca_withdraw_v2_finalize_aggregate_pending_milestone4"),
+      validStubResponseBody("mpcca_withdraw_v2_finalize_aggregate_pending_milestone4"),
     );
     expect(r.notImplementedPhase).toContain("finalize");
+  });
+});
+
+// =================================================================================================
+// Milestone 1 — killer tests for the ingress envelope wire shape, AAD canonical-JSON parity,
+// and helper byte-stability. These are the round1-specific guards that protect the no-plaintext
+// invariant at the wire boundary.
+// =================================================================================================
+describe("mpcca_withdraw_v2 M1 — ingress envelope wire validation", () => {
+  it("rejects perShareCommitments with wrong count (4 instead of 5)", () => {
+    const body = { ...validRound1Body() };
+    body.perShareCommitments = [HEX32_A, HEX32_B, HEX32_C, HEX32_D];
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/perShareCommitments must have/);
+  });
+
+  it("rejects perShareCommitments with wrong count (6 instead of 5)", () => {
+    const body = { ...validRound1Body() };
+    body.perShareCommitments = [HEX32_A, HEX32_B, HEX32_C, HEX32_D, HEX32_E, HEX32_F];
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/perShareCommitments must have/);
+  });
+
+  it("rejects perShareCommitments with non-32-byte hex entries", () => {
+    const body = { ...validRound1Body() };
+    body.perShareCommitments = [HEX32_A, HEX32_B, "ab".repeat(31), HEX32_D, HEX32_E];
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/must be 32-byte hex/);
+  });
+
+  it("rejects ingressEnvelopes with wrong count (4 instead of 5)", () => {
+    const body = { ...validRound1Body() };
+    body.ingressEnvelopes = VALID_INGRESS.ingressEnvelopes.slice(0, 4);
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/ingressEnvelopes must have/);
+  });
+
+  it("rejects ingressEnvelopes with mismatched ciphersuite", () => {
+    const body = { ...validRound1Body() };
+    const mutated = VALID_INGRESS.ingressEnvelopes.map((e) => ({ ...e }));
+    (mutated[2] as Record<string, unknown>).kem = "DHKEM_P256";
+    body.ingressEnvelopes = mutated;
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/DHKEM_X25519_HKDF_SHA256/);
+  });
+
+  it("rejects ingressEnvelopes with wrong ciphertext length (not 80 bytes)", () => {
+    const body = { ...validRound1Body() };
+    const mutated = VALID_INGRESS.ingressEnvelopes.map((e) => ({ ...e }));
+    mutated[1] = { ...mutated[1], ciphertext: "11".repeat(48) };
+    body.ingressEnvelopes = mutated;
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/80-byte hex/);
+  });
+
+  it("rejects ingressEnvelopes with non-32-byte enc (KEM ephemeral)", () => {
+    const body = { ...validRound1Body() };
+    const mutated = VALID_INGRESS.ingressEnvelopes.map((e) => ({ ...e }));
+    mutated[1] = { ...mutated[1], enc: "11".repeat(33) };
+    body.ingressEnvelopes = mutated;
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/32-byte hex \(X25519 KEM ephemeral\)/);
+  });
+
+  it("rejects amountCommitment with wrong byte length", () => {
+    const body = { ...validRound1Body() };
+    body.amountCommitment = "ab".repeat(33);
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/32-byte hex/);
+  });
+
+  it("forbidden-field guard still trips when ingress fields are valid (defense in depth)", () => {
+    const body = { ...validRound1Body(), secret: "leak" };
+    expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(/forbidden plaintext field/);
+  });
+
+  it("ingressEnvelopes field name is NOT caught by forbidden-field guard", () => {
+    // Sanity: 'ingressEnvelopes' contains no banned token. This protects against accidental
+    // future regressions that add 'envelope' or similar to the banned set.
+    expect(() => parseMpccaWithdrawRound1Request(validRound1Body())).not.toThrow(
+      /forbidden plaintext field/,
+    );
+  });
+
+  it("perShareCommitments field name is NOT caught by forbidden-field guard", () => {
+    // 'share' is not a banned token by itself; only banned tokens like 'secretshare',
+    // 'shamir_share', 'dk_share' trip. Defense-in-depth: ensure naming convention holds.
+    expect(() => parseMpccaWithdrawRound1Request(validRound1Body())).not.toThrow(
+      /forbidden plaintext field/,
+    );
+  });
+});
+
+describe("mpcca_withdraw_v2 M1 — ingress helper byte-stability", () => {
+  it("ingressEnvelopesHash is byte-stable", () => {
+    const a = ingressEnvelopesHash(VALID_INGRESS.ingressEnvelopes);
+    const b = ingressEnvelopesHash(VALID_INGRESS.ingressEnvelopes);
+    expect(a).toBe(b);
+    expect(a).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("ingressEnvelopesHash changes when any envelope flips", () => {
+    const a = ingressEnvelopesHash(VALID_INGRESS.ingressEnvelopes);
+    const mutated = VALID_INGRESS.ingressEnvelopes.map((e) => ({ ...e }));
+    mutated[3] = { ...mutated[3], ciphertext: "ff".repeat(80) };
+    expect(ingressEnvelopesHash(mutated)).not.toBe(a);
+  });
+
+  it("ingressEnvelopesHash changes when envelope ORDER flips", () => {
+    const a = ingressEnvelopesHash(VALID_INGRESS.ingressEnvelopes);
+    const reordered = [
+      VALID_INGRESS.ingressEnvelopes[1],
+      VALID_INGRESS.ingressEnvelopes[0],
+      VALID_INGRESS.ingressEnvelopes[2],
+      VALID_INGRESS.ingressEnvelopes[3],
+      VALID_INGRESS.ingressEnvelopes[4],
+    ];
+    expect(ingressEnvelopesHash(reordered)).not.toBe(a);
+  });
+
+  it("perShareCommitmentsHash is byte-stable + changes on commitment edit", () => {
+    const a = perShareCommitmentsHash(VALID_INGRESS.perShareCommitments);
+    const b = perShareCommitmentsHash(VALID_INGRESS.perShareCommitments);
+    expect(a).toBe(b);
+    expect(a).toMatch(/^[0-9a-f]{64}$/);
+    const mutated = [...VALID_INGRESS.perShareCommitments];
+    mutated[2] = HEX32_F;
+    expect(perShareCommitmentsHash(mutated)).not.toBe(a);
+  });
+
+  it("canonicalJsonStringify sorts keys deterministically", () => {
+    expect(canonicalJsonStringify({ b: 2, a: 1, c: 3 })).toBe('{"a":1,"b":2,"c":3}');
+    expect(canonicalJsonStringify({ nested: { y: 1, x: 0 } })).toBe(
+      '{"nested":{"x":0,"y":1}}',
+    );
+    expect(canonicalJsonStringify([{ b: 1, a: 2 }, { d: 3, c: 4 }])).toBe(
+      '[{"a":2,"b":1},{"c":4,"d":3}]',
+    );
+  });
+
+  it("m1IngressAad produces stable bytes and changes on any field flip", () => {
+    const args = {
+      requestId: "req-1",
+      sessionId: "sess-1",
+      dkgEpoch: "1",
+      selfSlot: 2,
+      playerId: 1,
+      rosterHash: HEX32_F,
+      vaultEk: HEX32_1,
+      root: HEX32_4,
+      nullifierHash: HEX32_5,
+      recipientHash: HEX32_7,
+      amountTag: HEX32_8,
+      vaultSequence: 4,
+      depositCount: 7,
+      amountCommitment: VALID_INGRESS.amountCommitment,
+      perShareCommitments: VALID_INGRESS.perShareCommitments,
+    };
+    const a = m1IngressAad(args);
+    const b = m1IngressAad(args);
+    expect(a).toEqual(b);
+
+    const flipSlot = m1IngressAad({ ...args, selfSlot: 3 });
+    expect(flipSlot).not.toEqual(a);
+
+    const flipPlayer = m1IngressAad({ ...args, playerId: 4 });
+    expect(flipPlayer).not.toEqual(a);
+
+    const flipCommit = m1IngressAad({
+      ...args,
+      perShareCommitments: [HEX32_F, ...args.perShareCommitments.slice(1)],
+    });
+    expect(flipCommit).not.toEqual(a);
+
+    const flipDomain = JSON.parse(new TextDecoder().decode(a));
+    expect(flipDomain.domain).toBe(EUNOMA_M1_AMOUNT_INGRESS_V1);
   });
 });

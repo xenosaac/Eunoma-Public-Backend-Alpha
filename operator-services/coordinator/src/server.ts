@@ -15,6 +15,7 @@ import {
   caRegistrationV2Round1WorkerTranscriptHash,
   caRegistrationV2Round2WorkerTranscriptHash,
   frostDkgV2RosterHash,
+  ingressEnvelopesHash,
   lagrangeCoefficientsAtZero,
   mpccaWithdrawRound1WorkerTranscriptHash,
   parseCaRegistrationAggregateRequest,
@@ -3028,6 +3029,83 @@ export function buildCoordinatorServer(
       }
       const depositCount = depositCountRaw as number;
 
+      // Milestone 1 — Threshold ElGamal Amount Ingress validation. User-supplied fields:
+      // - amountCommitment: 32-byte hex compressed Ristretto.
+      // - perShareCommitments[5]: per-slot Pedersen commitments.
+      // - ingressEnvelopes[5]: HPKE envelopes per sorted-selectedSlot.
+      // The aggregate-commitment invariant (Σ perShareCommitments == amountCommitment) is
+      // deferred to defense-in-depth in the M1 wire-completion commit; each worker recomputes
+      // G·a_j + H·b_j and compares to its slot's perShareCommitment, which is the per-share
+      // binding the coordinator must propagate intact.
+      const rawAmountCommitment = raw.amountCommitment;
+      if (typeof rawAmountCommitment !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(rawAmountCommitment)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "amountCommitment must be a 32-byte hex string (compressed Ristretto)",
+        });
+      }
+      const amountCommitment = rawAmountCommitment;
+      const rawPerShareCommitments = raw.perShareCommitments;
+      if (!Array.isArray(rawPerShareCommitments) || rawPerShareCommitments.length !== DEOPERATOR_THRESHOLD) {
+        return reply.code(400).send({
+          error: "ingress_commitment_count_mismatch",
+          message: `perShareCommitments must have exactly ${DEOPERATOR_THRESHOLD} entries`,
+        });
+      }
+      const perShareCommitments: string[] = [];
+      for (let i = 0; i < rawPerShareCommitments.length; i += 1) {
+        const c = rawPerShareCommitments[i];
+        if (typeof c !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(c)) {
+          return reply.code(400).send({
+            error: "ingress_invalid_commitment_shape",
+            message: `perShareCommitments[${i}] must be 32-byte hex (compressed Ristretto)`,
+          });
+        }
+        perShareCommitments.push(c);
+      }
+      const rawIngressEnvelopes = raw.ingressEnvelopes;
+      if (!Array.isArray(rawIngressEnvelopes) || rawIngressEnvelopes.length !== DEOPERATOR_THRESHOLD) {
+        return reply.code(400).send({
+          error: "ingress_envelope_count_mismatch",
+          message: `ingressEnvelopes must have exactly ${DEOPERATOR_THRESHOLD} entries`,
+        });
+      }
+      const ingressEnvelopes = rawIngressEnvelopes.map((entry, i) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          throw new Error(`ingressEnvelopes[${i}] must be an HpkeEnvelope object`);
+        }
+        const obj = entry as Record<string, unknown>;
+        if (obj.kem !== "DHKEM_X25519_HKDF_SHA256") {
+          throw new Error(`ingressEnvelopes[${i}].kem must be DHKEM_X25519_HKDF_SHA256`);
+        }
+        if (obj.kdf !== "HKDF_SHA256") {
+          throw new Error(`ingressEnvelopes[${i}].kdf must be HKDF_SHA256`);
+        }
+        if (obj.aead !== "AES_256_GCM") {
+          throw new Error(`ingressEnvelopes[${i}].aead must be AES_256_GCM`);
+        }
+        if (typeof obj.enc !== "string" || obj.enc.length === 0) {
+          throw new Error(`ingressEnvelopes[${i}].enc must be a non-empty hex string`);
+        }
+        if (typeof obj.ciphertext !== "string" || obj.ciphertext.length === 0) {
+          throw new Error(`ingressEnvelopes[${i}].ciphertext must be a non-empty hex string`);
+        }
+        if (typeof obj.aadHash !== "string" || obj.aadHash.length === 0) {
+          throw new Error(`ingressEnvelopes[${i}].aadHash must be a non-empty hex string`);
+        }
+        return {
+          kem: "DHKEM_X25519_HKDF_SHA256" as const,
+          kdf: "HKDF_SHA256" as const,
+          aead: "AES_256_GCM" as const,
+          enc: obj.enc as string,
+          ciphertext: obj.ciphertext as string,
+          aadHash: obj.aadHash as string,
+        };
+      });
+      // Pre-compute the ingress envelopes hash so every transcript-hash recompute uses the
+      // exact same bytes the workers will fold into their per-slot worker_transcript_hash.
+      const computedIngressEnvelopesHash = ingressEnvelopesHash(ingressEnvelopes);
+
       // 3. Sanitise caller-supplied requestId BEFORE acquiring any lock or touching the FS.
       requestId =
         typeof raw.requestId === "string" && raw.requestId.length > 0
@@ -3243,7 +3321,8 @@ export function buildCoordinatorServer(
 
       try {
         // 7. Build 5 round1 request bodies. Each slot gets the same payload modulo selfSlot
-        // and playerId.
+        // and playerId. M1: every body carries the M1 ingress envelope set; each worker opens
+        // ONLY its own envelope (envelopes[playerId]) on its side.
         const round1Bodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
           dkgEpoch,
           requestId: requestId!,
@@ -3273,6 +3352,10 @@ export function buildCoordinatorServer(
           expirySecs,
           requestHash: withdrawHex.requestHash,
           depositCount,
+          // M1 ingress fields — passed unchanged to every worker.
+          amountCommitment,
+          perShareCommitments,
+          ingressEnvelopes,
         }));
 
         // 8. KILLER: concurrent fan-out — all 5 worker calls launched before any completes.
@@ -3305,11 +3388,11 @@ export function buildCoordinatorServer(
                 res.reason instanceof Error ? res.reason.message : String(res.reason),
             });
           }
-          // Milestone 3a expectation: every worker returns 501 + a stub body. Anything else
-          // means either the worker accepted and ran (which is wrong under 3a) or it failed
-          // with a different error (which means the public binding fence kicked in for that
-          // slot and not the others — the orchestrator must surface that).
-          if (res.value.statusCode !== 501) {
+          // Milestone 1 expectation: every worker returns 200 with completed:true. Anything
+          // else means either the worker rejected the ingress (per-share commitment mismatch,
+          // zero share, HPKE failure, etc.) or it failed with a public-binding error (provenance
+          // gate kicked in for that slot and not the others).
+          if (res.value.statusCode !== 200) {
             // Codex M3a P1 v4: surface the SPECIFIC, OPERATOR-ACTIONABLE 409 the worker
             // emits when its persisted `init_transcript_hash` is None — meaning the cluster
             // is in the legitimate partial-finalize state and the operator should invoke
@@ -3357,7 +3440,7 @@ export function buildCoordinatorServer(
               statusCode: res.value.statusCode,
               body: res.value.body,
               message:
-                "milestone 3a stub expected to return 501 NotImplemented; received different status",
+                "Milestone 1 expected worker to return 200 with completed:true; received different status",
             });
           }
           if (!res.value.body) {
@@ -3378,9 +3461,8 @@ export function buildCoordinatorServer(
               message: err instanceof Error ? err.message : "unknown",
             });
           }
-          phasesObserved.add(parsed.notImplementedPhase);
           // Defense in depth: re-derive the worker transcript hash from public inputs and
-          // assert byte-equality.
+          // assert byte-equality. Under M1, the round1 hash binds the 3 ingress fields too.
           const expectedWorkerHash = mpccaWithdrawRound1WorkerTranscriptHash({
             sessionId,
             requestId: requestId!,
@@ -3406,6 +3488,9 @@ export function buildCoordinatorServer(
             expirySecs,
             requestHash: withdrawHex.requestHash,
             depositCount,
+            amountCommitment,
+            perShareCommitments,
+            ingressEnvelopesHash: computedIngressEnvelopesHash,
           });
           if (parsed.workerTranscriptHash !== expectedWorkerHash) {
             return reply.code(502).send({
@@ -3426,20 +3511,12 @@ export function buildCoordinatorServer(
           }
           responsesBySlot.set(res.slot, parsed);
         }
-        // Phase divergence: all 5 workers MUST return the same phase string. If not, the
-        // milestone 3a stub got out of sync across workers (or one was tampered).
-        if (phasesObserved.size !== 1) {
-          return reply.code(502).send({
-            error: "crypto_stub_phase_divergence",
-            requestId,
-            phasesObserved: [...phasesObserved],
-            message:
-              "milestone 3a stub returned divergent notImplementedPhase strings across the 5 workers",
-          });
-        }
-        const phase = [...phasesObserved][0];
+        // Under M1, every worker returns completed:true with ingressTranscriptHash; phase
+        // divergence is no longer a concept for round1. ingressTranscriptHash agreement was
+        // already enforced inside parseMpccaWithdrawRound1Response (it must equal
+        // workerTranscriptHash) and via the expectedWorkerHash equality check above.
 
-        // 10. Persist a partial round-1 transcript artifact.
+        // 10. Persist a completed round-1 (ingress) transcript artifact.
         const perSlotContributions: MpccaWithdrawRound1Contribution[] = sortedSelectedSlots.map(
           (slot) => {
             const r = responsesBySlot.get(slot)!;
@@ -3447,9 +3524,8 @@ export function buildCoordinatorServer(
               slot,
               sessionStateHash: r.sessionStateHash,
               workerTranscriptHash: r.workerTranscriptHash,
-              completed: false as const,
-              notImplementedPhase: r.notImplementedPhase,
-              roundCommitment: r.roundCommitment,
+              completed: true as const,
+              ingressTranscriptHash: r.ingressTranscriptHash,
             };
           },
         );
@@ -3459,7 +3535,7 @@ export function buildCoordinatorServer(
         // We sha256(canonicalize(artifact-without-transcriptHash)) and embed the digest into
         // the artifact, so a later reader can recompute the same hash and verify integrity.
         const round1ArtifactWithoutHash = {
-          scheme: "mpcca_withdraw_v2_round1_partial" as const,
+          scheme: "mpcca_withdraw_v2_round1_ingress" as const,
           dkgEpoch,
           requestId,
           vaultEkTranscriptHash,
@@ -3482,7 +3558,12 @@ export function buildCoordinatorServer(
           expirySecs,
           requestHash: withdrawHex.requestHash,
           depositCount,
-          notImplementedPhase: phase,
+          // M1 public binding — the envelope bodies are NOT persisted in this coordinator
+          // artifact (envelope bodies live worker-side, HPKE-encrypted-at-rest); only the
+          // public commitments and the envelopes-hash are persisted for audit.
+          amountCommitment,
+          perShareCommitments,
+          ingressEnvelopesHash: computedIngressEnvelopesHash,
           perSlotContributions,
           createdAtUnixMs: Date.now(),
         };
@@ -3515,15 +3596,15 @@ export function buildCoordinatorServer(
         // We do NOT call store.markComplete — the withdraw is mid-flight (3a only ships
         // round1). Milestone 4 will mark complete at finalize.
 
-        // 11. Return 501 with the partial round-1 outputs. The accept flag is false because
-        // the withdraw is NOT done — milestone 4 will fill in round2/prove/finalize.
-        return reply.code(501).send({
+        // 11. Return 200 with the completed M1 ingress round1 outputs. The accept flag stays
+        // false because the OVERALL withdraw is mid-flight — M4 will fill in round2/prove/finalize.
+        return reply.code(200).send({
           accepted: false,
           requestId,
           dkgEpoch,
           depositCount,
           round: "round1",
-          phase,
+          completed: true,
           rosterHash: dkgRosterHash,
           selectedSlots: sortedSelectedSlots,
           vaultEk,
@@ -3542,12 +3623,15 @@ export function buildCoordinatorServer(
           vaultSequence,
           expirySecs,
           requestHash: withdrawHex.requestHash,
+          amountCommitment,
+          perShareCommitments,
+          ingressEnvelopesHash: computedIngressEnvelopesHash,
           perSlotContributions,
           transcriptHash: round1TranscriptHash,
           transcriptPath,
           message:
-            "milestone 3a stub: round1 public binding succeeded across all 5 workers; round2/" +
-            "prove/finalize crypto deferred to milestone 4",
+            "Milestone 1 ingress: amount/blind shares received and validated by all 5 workers; " +
+            "round2/prove/finalize crypto deferred to milestone 4",
         });
       } finally {
         lock.release();

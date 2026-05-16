@@ -2,6 +2,7 @@ import { bytesToHex, hexToBytes, normalizeHex, sha256 } from "@eunoma/shared";
 import type { HexString } from "@eunoma/shared";
 import { DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD } from "./constants.js";
 import { assertNoForbiddenPlaintextFields } from "./forbidden.js";
+import type { HpkeEnvelope } from "./types.js";
 
 /**
  * Milestone 3 sub-milestone 3a — MPCCA withdraw state machine scaffolding.
@@ -36,11 +37,49 @@ import { assertNoForbiddenPlaintextFields } from "./forbidden.js";
 // Domain constants — one per round + a final-transcript domain. Each per-round worker hash binds
 // the round name into its domain so cross-round transcript replay is impossible by construction.
 // =================================================================================================
+/**
+ * Round1 domain bumped to V2 in Milestone 1 (Threshold ElGamal Amount Ingress).
+ * V1 was the M3a stub-mode domain that bound only the public withdraw envelope; V2 extends
+ * the bound bytes with `amount_commitment`, `per_share_commitments`, and `ingress_envelopes_hash`,
+ * so any tampered ingress field flips the per-worker transcript hash and is rejected by the
+ * coordinator's worker-transcript-agreement check. V1 stays exported as a historical marker —
+ * the active hash function uses V2.
+ */
 export const EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1";
+export const EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2 = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2";
 export const EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1";
 export const EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1";
 export const EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1";
 export const EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1";
+
+/**
+ * HPKE AAD domain for the M1 amount-ingress envelope. Locked. Any change must bump the V1
+ * suffix and is a wire-protocol break.
+ *
+ * AAD layout (canonical JSON, byte-identical TS↔Rust):
+ *   {
+ *     "amountCommitmentHex": <32-byte hex>,
+ *     "amountTag": <32-byte hex>,
+ *     "depositCount": <decimal>,
+ *     "dkgEpoch": <decimal>,
+ *     "domain": "EUNOMA_M1_AMOUNT_INGRESS_V1",
+ *     "nullifierHash": <32-byte hex>,
+ *     "perShareCommitmentsHashHex": <sha256-hex>,
+ *     "playerId": <0..4>,
+ *     "recipientHash": <32-byte hex>,
+ *     "requestId": <string>,
+ *     "root": <32-byte hex>,
+ *     "rosterHash": <32-byte hex>,
+ *     "selfSlot": <0..6>,
+ *     "sessionId": <string>,
+ *     "vaultEk": <32-byte hex>,
+ *     "vaultSequence": <decimal>
+ *   }
+ *
+ * Keys are alphabetically sorted (TS uses `canonicalJsonStringify`; Rust uses a `BTreeMap` →
+ * `serde_json::to_vec`). Tampering with any field invalidates the HPKE seal.
+ */
+export const EUNOMA_M1_AMOUNT_INGRESS_V1 = "EUNOMA_M1_AMOUNT_INGRESS_V1";
 
 // =================================================================================================
 // Error codes — every failure mode the orchestrator + worker can surface. Mapped to HTTP status
@@ -57,7 +96,13 @@ export type MpccaWithdrawV2ErrorCode =
   | "OBSERVED_DEPOSIT_NOT_FOUND"
   | "CRYPTO_STUB_PHASE_DIVERGENCE"
   | "INVALID_WITHDRAW_FIELD_SHAPE"
-  | "INVALID_CONTRIBUTION_SHAPE";
+  | "INVALID_CONTRIBUTION_SHAPE"
+  // Milestone 1: Threshold ElGamal Amount Ingress validation.
+  | "INGRESS_COMMITMENT_COUNT_MISMATCH"
+  | "INGRESS_ENVELOPE_COUNT_MISMATCH"
+  | "INGRESS_AGGREGATE_COMMITMENT_MISMATCH"
+  | "INGRESS_INVALID_COMMITMENT_SHAPE"
+  | "INGRESS_INVALID_ENVELOPE_SHAPE";
 
 export class MpccaWithdrawV2Error extends Error {
   constructor(
@@ -125,45 +170,91 @@ interface MpccaWithdrawChainedRequest extends MpccaWithdrawBaseRequest {
   previousRoundCommitments: HexString[];
 }
 
-export type MpccaWithdrawRound1Request = MpccaWithdrawBaseRequest;
+/**
+ * Milestone 1 — Threshold ElGamal Amount Ingress fields carried by the round1 request.
+ *
+ * The user's client constructs `amount` and `blind` as scalars over the Ed25519 scalar
+ * field, computes the public Pedersen commitment `amountCommitment = G·amount + H·blind`,
+ * additively shares each into 5 pieces over the same field, computes per-share Pedersen
+ * commitments `perShareCommitments[i] = G·a_i + H·b_i`, and seals each `(a_i, b_i)` to the
+ * i-th selectedSlot's HPKE public key with the M1 AAD (see EUNOMA_M1_AMOUNT_INGRESS_V1 above).
+ *
+ * Coordinator validates `Σ perShareCommitments[i] = amountCommitment` over compressed
+ * Ristretto bytes; each worker validates its own decrypted `(a_i, b_i)` against the claimed
+ * per-share commitment and rejects zero shares. Plaintext shares never leave the worker's
+ * own process — they are persisted HPKE-encrypted-at-rest under the same slot's HPKE pubkey
+ * for later consumption by M4b/c/d.
+ */
+export interface MpccaWithdrawRound1IngressFields {
+  /** Public Pedersen commitment to the full amount + blind. 32-byte compressed Ristretto. */
+  amountCommitment: HexString;
+  /**
+   * Per-slot public Pedersen commitments. `perShareCommitments[i]` MUST equal
+   * `G·a_i + H·b_i` where `(a_i, b_i)` is the share addressed to selectedSlots[i]
+   * (sorted-selectedSlots order). Length === DEOPERATOR_THRESHOLD (5).
+   */
+  perShareCommitments: HexString[];
+  /**
+   * HPKE envelopes, one per sorted-selectedSlot. `ingressEnvelopes[i]` is sealed under the
+   * i-th sorted-selectedSlot worker's HPKE public key with the M1 AAD (binding requestId,
+   * sessionId, dkgEpoch, selfSlot, playerId, rosterHash, vaultEk, root, nullifierHash,
+   * recipientHash, amountTag, vaultSequence, depositCount, amountCommitmentHex,
+   * perShareCommitmentsHashHex). Plaintext is 64 bytes: `concat(a_i.to_bytes_le(32),
+   * b_i.to_bytes_le(32))`. Length === DEOPERATOR_THRESHOLD (5).
+   */
+  ingressEnvelopes: HpkeEnvelope[];
+}
+
+export type MpccaWithdrawRound1Request = MpccaWithdrawBaseRequest &
+  MpccaWithdrawRound1IngressFields;
 export type MpccaWithdrawRound2Request = MpccaWithdrawChainedRequest;
 export type MpccaWithdrawProveRequest = MpccaWithdrawChainedRequest;
 export type MpccaWithdrawFinalizeRequest = MpccaWithdrawChainedRequest;
 
 // =================================================================================================
 // Per-round Response shapes. Each round returns a per-slot "contribution" (commitment, partial
-// response, partial bulletproof share, partial CA payload field bytes — whichever applies). On
-// the NotImplemented stub path (milestone 3a), the response still carries the public binding
-// outputs (session_state_path, session_state_hash, worker_transcript_hash) so the coordinator
-// can persist the partial round transcript even though the crypto is pending milestone 4.
+// response, partial bulletproof share, partial CA payload field bytes — whichever applies).
+//
+// Round1 ships with completed:true in Milestone 1 (ingress is real). Rounds 2/prove/finalize
+// remain stub-mode with completed:false + notImplementedPhase until M4 lands.
 // =================================================================================================
-interface MpccaWithdrawBaseResponse {
+interface MpccaWithdrawBasePublicOutputs {
   slot: number;
   playerId: number;
   sessionStatePath: string;
   sessionStateHash: HexString;
   workerTranscriptHash: HexString;
   observedAtUnixMs: number;
+}
+
+interface MpccaWithdrawBaseStubResponse extends MpccaWithdrawBasePublicOutputs {
   completed: false;
   notImplementedPhase: string;
 }
 
-export interface MpccaWithdrawRound1Response extends MpccaWithdrawBaseResponse {
-  /** Per-slot Round 1 commitment (32-byte hex). undefined under the milestone 3a stub. */
-  roundCommitment?: HexString;
+/**
+ * Round1 ingress response. Successful M1 ingress flips `completed` to true and drops
+ * `notImplementedPhase`. The new `ingressTranscriptHash` re-publishes the per-worker hash
+ * over the M1-extended round1 transcript bytes so the coordinator's worker-agreement check
+ * binds every worker to the same `(amountCommitment, perShareCommitments[], ingressEnvelopesHash)`.
+ */
+export interface MpccaWithdrawRound1Response extends MpccaWithdrawBasePublicOutputs {
+  completed: true;
+  /** Equals workerTranscriptHash. Named explicitly to make the M1 binding contract searchable. */
+  ingressTranscriptHash: HexString;
 }
 
-export interface MpccaWithdrawRound2Response extends MpccaWithdrawBaseResponse {
+export interface MpccaWithdrawRound2Response extends MpccaWithdrawBaseStubResponse {
   /** Per-slot Round 2 partial sigma response (32-byte hex scalar). */
   partialResponse?: HexString;
 }
 
-export interface MpccaWithdrawProveResponse extends MpccaWithdrawBaseResponse {
+export interface MpccaWithdrawProveResponse extends MpccaWithdrawBaseStubResponse {
   /** Per-slot Bulletproof partial share (bytes hex). */
   partialBulletproofShare?: HexString;
 }
 
-export interface MpccaWithdrawFinalizeResponse extends MpccaWithdrawBaseResponse {
+export interface MpccaWithdrawFinalizeResponse extends MpccaWithdrawBaseStubResponse {
   /** Per-slot CA payload partial bytes that the finalize aggregator collects. */
   partialCaPayloadFields?: HexString;
 }
@@ -172,28 +263,35 @@ export interface MpccaWithdrawFinalizeResponse extends MpccaWithdrawBaseResponse
 // Per-round Contribution — the slim shape the coordinator persists in the round transcript.
 // Mirrors the (slot, contribution-hash, worker-transcript-hash) triple pattern from
 // vault_state_v2 + ca_registration_v2.
+//
+// Round1 contribution carries completed:true under M1; chained rounds remain stub.
 // =================================================================================================
-interface MpccaWithdrawBaseContribution {
+interface MpccaWithdrawBaseContributionFields {
   slot: number;
   sessionStateHash: HexString;
   workerTranscriptHash: HexString;
+}
+
+interface MpccaWithdrawBaseStubContribution extends MpccaWithdrawBaseContributionFields {
   completed: false;
   notImplementedPhase: string;
 }
 
-export interface MpccaWithdrawRound1Contribution extends MpccaWithdrawBaseContribution {
-  roundCommitment?: HexString;
+export interface MpccaWithdrawRound1Contribution extends MpccaWithdrawBaseContributionFields {
+  completed: true;
+  /** Equals workerTranscriptHash. Public re-publication for the M1 binding contract. */
+  ingressTranscriptHash: HexString;
 }
 
-export interface MpccaWithdrawRound2Contribution extends MpccaWithdrawBaseContribution {
+export interface MpccaWithdrawRound2Contribution extends MpccaWithdrawBaseStubContribution {
   partialResponse?: HexString;
 }
 
-export interface MpccaWithdrawProveContribution extends MpccaWithdrawBaseContribution {
+export interface MpccaWithdrawProveContribution extends MpccaWithdrawBaseStubContribution {
   partialBulletproofShare?: HexString;
 }
 
-export interface MpccaWithdrawFinalizeContribution extends MpccaWithdrawBaseContribution {
+export interface MpccaWithdrawFinalizeContribution extends MpccaWithdrawBaseStubContribution {
   partialCaPayloadFields?: HexString;
 }
 
@@ -341,6 +439,22 @@ function baseHashParts(args: {
   ];
 }
 
+/**
+ * Hash over the M1-extended round1 worker transcript. Domain bumped to V2; binds the three
+ * ingress fields in addition to the base public envelope. Byte-identical to the Rust
+ * `mpcca_withdraw_v2::round1_worker_transcript_hash` helper.
+ *
+ * Layout (round1 V2):
+ *   base_parts (V2 domain) || ":"
+ *   || amount_commitment_hex
+ *   || ":" || joined(per_share_commitments_hex, "|")
+ *   || ":" || ingress_envelopes_hash_hex
+ *   → sha256 → lowercase hex.
+ *
+ * `ingressEnvelopesHash` is the lowercase hex of `sha256(concat(canonicalJsonStringify(env)
+ * bytes))` over the 5 envelopes in sorted-selectedSlots order. The 5-of-7 worker-agreement
+ * check at the coordinator binds every worker to the same envelope set.
+ */
 export function mpccaWithdrawRound1WorkerTranscriptHash(args: {
   sessionId: string;
   requestId: string;
@@ -366,11 +480,21 @@ export function mpccaWithdrawRound1WorkerTranscriptHash(args: {
   expirySecs: number;
   requestHash: string;
   depositCount: number;
+  amountCommitment: string;
+  perShareCommitments: string[];
+  ingressEnvelopesHash: string;
 }): HexString {
   const parts = baseHashParts({
-    domain: EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1,
+    domain: EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2,
     ...args,
   });
+  const enc = new TextEncoder();
+  parts.push(enc.encode(":"));
+  parts.push(enc.encode(normalizeHex(args.amountCommitment)));
+  parts.push(enc.encode(":"));
+  parts.push(enc.encode(args.perShareCommitments.map(normalizeHex).join("|")));
+  parts.push(enc.encode(":"));
+  parts.push(enc.encode(normalizeHex(args.ingressEnvelopesHash)));
   return bytesToHex(sha256(concat(parts)));
 }
 
@@ -588,9 +712,9 @@ export function mpccaWithdrawFinalTranscriptHash(input: {
     enc.encode(":"),
     enc.encode(input.depositCount.toString()),
   ];
-  const writeContribution = (
+  const writeStubContribution = (
     label: string,
-    contribs: MpccaWithdrawBaseContribution[],
+    contribs: MpccaWithdrawBaseStubContribution[],
     perSlotPayload: (idx: number) => string,
   ) => {
     parts.push(enc.encode(":"));
@@ -610,22 +734,36 @@ export function mpccaWithdrawFinalTranscriptHash(input: {
       parts.push(enc.encode(perSlotPayload(idx)));
     }
   };
+  // Round1 has its own completed:true layout under M1: label "r1v2" + per-slot
+  // ingressTranscriptHash. The "r1v2" label intentionally differs from the M3a "r1" stub
+  // label so any stale stub-mode transcript cannot collide with a completed-M1 transcript.
   const sortedR1 = [...input.round1Contributions].sort((a, b) => a.slot - b.slot);
-  writeContribution("r1", sortedR1, (i) =>
-    sortedR1[i].roundCommitment ? normalizeHex(sortedR1[i].roundCommitment!) : "",
-  );
+  parts.push(enc.encode(":"));
+  parts.push(enc.encode("r1v2"));
+  for (const c of sortedR1) {
+    parts.push(enc.encode(":"));
+    parts.push(enc.encode(c.slot.toString()));
+    parts.push(enc.encode("|"));
+    parts.push(enc.encode(normalizeHex(c.sessionStateHash)));
+    parts.push(enc.encode("|"));
+    parts.push(enc.encode(normalizeHex(c.workerTranscriptHash)));
+    parts.push(enc.encode("|"));
+    parts.push(enc.encode("completed"));
+    parts.push(enc.encode("|"));
+    parts.push(enc.encode(normalizeHex(c.ingressTranscriptHash)));
+  }
   const sortedR2 = [...input.round2Contributions].sort((a, b) => a.slot - b.slot);
-  writeContribution("r2", sortedR2, (i) =>
+  writeStubContribution("r2", sortedR2, (i) =>
     sortedR2[i].partialResponse ? normalizeHex(sortedR2[i].partialResponse!) : "",
   );
   const sortedPr = [...input.proveContributions].sort((a, b) => a.slot - b.slot);
-  writeContribution("pr", sortedPr, (i) =>
+  writeStubContribution("pr", sortedPr, (i) =>
     sortedPr[i].partialBulletproofShare
       ? normalizeHex(sortedPr[i].partialBulletproofShare!)
       : "",
   );
   const sortedFin = [...input.finalizeContributions].sort((a, b) => a.slot - b.slot);
-  writeContribution("fin", sortedFin, (i) =>
+  writeStubContribution("fin", sortedFin, (i) =>
     sortedFin[i].partialCaPayloadFields
       ? normalizeHex(sortedFin[i].partialCaPayloadFields!)
       : "",
@@ -934,6 +1072,235 @@ function requireObservedDepositTranscriptHashes(
   return out;
 }
 
+// =================================================================================================
+// Milestone 1 — ingress envelope validation helpers. All shape validation; no crypto evaluation.
+// The aggregate-commitment invariant (`Σ perShareCommitments = amountCommitment`) is checked
+// by `aggregatePerShareCommitments` outside of the parser to keep parsing pure.
+// =================================================================================================
+function requireHpkeEnvelopeShape(value: unknown, where: string): HpkeEnvelope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where} must be an HpkeEnvelope object`,
+    );
+  }
+  const obj = value as Record<string, unknown>;
+  if (obj.kem !== "DHKEM_X25519_HKDF_SHA256") {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.kem must be DHKEM_X25519_HKDF_SHA256`,
+    );
+  }
+  if (obj.kdf !== "HKDF_SHA256") {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.kdf must be HKDF_SHA256`,
+    );
+  }
+  if (obj.aead !== "AES_256_GCM") {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.aead must be AES_256_GCM`,
+    );
+  }
+  const enc = obj.enc;
+  const ciphertext = obj.ciphertext;
+  const aadHash = obj.aadHash;
+  if (typeof enc !== "string" || enc.length === 0) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.enc must be a non-empty hex string`,
+    );
+  }
+  if (typeof ciphertext !== "string" || ciphertext.length === 0) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.ciphertext must be a non-empty hex string`,
+    );
+  }
+  if (typeof aadHash !== "string" || aadHash.length === 0) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.aadHash must be a non-empty hex string`,
+    );
+  }
+  const encNorm = normalizeHex(enc);
+  if (hexToBytes(encNorm).length !== 32) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.enc must be 32-byte hex (X25519 KEM ephemeral)`,
+    );
+  }
+  const aadHashNorm = normalizeHex(aadHash);
+  if (hexToBytes(aadHashNorm).length !== 32) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.aadHash must be 32-byte hex`,
+    );
+  }
+  const ciphertextNorm = normalizeHex(ciphertext);
+  const ctBytes = hexToBytes(ciphertextNorm);
+  // 64-byte plaintext (a_i || b_i) + 16-byte AES-GCM tag.
+  if (ctBytes.length !== 80) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_INVALID_ENVELOPE_SHAPE",
+      `${where}.ciphertext must be 80-byte hex (64-byte plaintext + 16-byte GCM tag)`,
+    );
+  }
+  return {
+    kem: "DHKEM_X25519_HKDF_SHA256",
+    kdf: "HKDF_SHA256",
+    aead: "AES_256_GCM",
+    enc: encNorm,
+    ciphertext: ciphertextNorm,
+    aadHash: aadHashNorm,
+  };
+}
+
+function requireIngressEnvelopes(obj: Record<string, unknown>): HpkeEnvelope[] {
+  const v = obj.ingressEnvelopes;
+  if (!Array.isArray(v)) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_ENVELOPE_COUNT_MISMATCH",
+      "ingressEnvelopes must be an array",
+    );
+  }
+  if (v.length !== DEOPERATOR_THRESHOLD) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_ENVELOPE_COUNT_MISMATCH",
+      `ingressEnvelopes must have exactly ${DEOPERATOR_THRESHOLD} entries, got ${v.length}`,
+    );
+  }
+  return v.map((entry, i) =>
+    requireHpkeEnvelopeShape(entry, `ingressEnvelopes[${i}]`),
+  );
+}
+
+function requirePerShareCommitments(obj: Record<string, unknown>): HexString[] {
+  const v = obj.perShareCommitments;
+  if (!Array.isArray(v)) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_COMMITMENT_COUNT_MISMATCH",
+      "perShareCommitments must be an array",
+    );
+  }
+  if (v.length !== DEOPERATOR_THRESHOLD) {
+    throw new MpccaWithdrawV2Error(
+      "INGRESS_COMMITMENT_COUNT_MISMATCH",
+      `perShareCommitments must have exactly ${DEOPERATOR_THRESHOLD} entries, got ${v.length}`,
+    );
+  }
+  const out: HexString[] = [];
+  for (let i = 0; i < v.length; i += 1) {
+    const entry = v[i];
+    if (typeof entry !== "string" || entry.length === 0) {
+      throw new MpccaWithdrawV2Error(
+        "INGRESS_INVALID_COMMITMENT_SHAPE",
+        `perShareCommitments[${i}] must be a non-empty hex string`,
+      );
+    }
+    const norm = normalizeHex(entry);
+    if (hexToBytes(norm).length !== 32) {
+      throw new MpccaWithdrawV2Error(
+        "INGRESS_INVALID_COMMITMENT_SHAPE",
+        `perShareCommitments[${i}] must be 32-byte hex (compressed Ristretto)`,
+      );
+    }
+    out.push(norm);
+  }
+  return out;
+}
+
+/**
+ * Canonical JSON-stringify with sorted keys. Used for AAD and `ingressEnvelopesHash`
+ * computation so byte-parity holds across TS↔Rust.
+ */
+export function canonicalJsonStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return "[" + value.map((v) => canonicalJsonStringify(v)).join(",") + "]";
+  }
+  const entries = Object.entries(value as Record<string, unknown>).sort(
+    ([a], [b]) => (a < b ? -1 : a > b ? 1 : 0),
+  );
+  return (
+    "{" +
+    entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJsonStringify(v)}`).join(",") +
+    "}"
+  );
+}
+
+/**
+ * sha256-hex over `concat(canonicalJsonStringify(env) as utf8 bytes)` across the 5 envelopes
+ * in sorted-selectedSlots order. Used as the public binding for the M1 round1 transcript hash.
+ * Byte-identical to Rust `mpcca_withdraw_v2::ingress_envelopes_hash`.
+ */
+export function ingressEnvelopesHash(envelopes: HpkeEnvelope[]): HexString {
+  const enc = new TextEncoder();
+  const parts: Uint8Array[] = [];
+  for (const e of envelopes) {
+    parts.push(enc.encode(canonicalJsonStringify(e)));
+  }
+  return bytesToHex(sha256(concat(parts)));
+}
+
+/**
+ * sha256-hex over `concat(perShareCommitmentsHexBytes...)`. The result is folded into the
+ * M1 AAD so a tampered commitment list invalidates every envelope.
+ */
+export function perShareCommitmentsHash(perShareCommitments: HexString[]): HexString {
+  const enc = new TextEncoder();
+  const parts: Uint8Array[] = [];
+  for (const c of perShareCommitments) {
+    parts.push(enc.encode(normalizeHex(c)));
+  }
+  return bytesToHex(sha256(concat(parts)));
+}
+
+/**
+ * AAD used by the user's client and re-derived by each worker on decrypt. Byte-identical
+ * to Rust `mpcca_withdraw_v2::m1_ingress_aad`. Any field mismatch invalidates the seal.
+ */
+export function m1IngressAad(args: {
+  requestId: string;
+  sessionId: string;
+  dkgEpoch: string;
+  selfSlot: number;
+  playerId: number;
+  rosterHash: HexString;
+  vaultEk: HexString;
+  root: HexString;
+  nullifierHash: HexString;
+  recipientHash: HexString;
+  amountTag: HexString;
+  vaultSequence: number;
+  depositCount: number;
+  amountCommitment: HexString;
+  perShareCommitments: HexString[];
+}): Uint8Array {
+  const aad = {
+    amountCommitmentHex: normalizeHex(args.amountCommitment),
+    amountTag: normalizeHex(args.amountTag),
+    depositCount: args.depositCount.toString(),
+    dkgEpoch: args.dkgEpoch,
+    domain: EUNOMA_M1_AMOUNT_INGRESS_V1,
+    nullifierHash: normalizeHex(args.nullifierHash),
+    perShareCommitmentsHashHex: perShareCommitmentsHash(args.perShareCommitments),
+    playerId: args.playerId.toString(),
+    recipientHash: normalizeHex(args.recipientHash),
+    requestId: args.requestId,
+    root: normalizeHex(args.root),
+    rosterHash: normalizeHex(args.rosterHash),
+    selfSlot: args.selfSlot.toString(),
+    sessionId: args.sessionId,
+    vaultEk: normalizeHex(args.vaultEk),
+    vaultSequence: args.vaultSequence.toString(),
+  };
+  return new TextEncoder().encode(canonicalJsonStringify(aad));
+}
+
 function requirePreviousRoundCommitments(obj: Record<string, unknown>): HexString[] {
   const v = obj.previousRoundCommitments;
   if (!Array.isArray(v) || v.length !== DEOPERATOR_THRESHOLD) {
@@ -1009,7 +1376,17 @@ function parseChainedRequest(body: unknown): MpccaWithdrawChainedRequest {
 export function parseMpccaWithdrawRound1Request(
   body: unknown,
 ): MpccaWithdrawRound1Request {
-  return parseBaseRequest(body);
+  const base = parseBaseRequest(body);
+  const obj = objectBody(body);
+  const amountCommitment = requireHex(obj, "amountCommitment", 32);
+  const perShareCommitments = requirePerShareCommitments(obj);
+  const ingressEnvelopes = requireIngressEnvelopes(obj);
+  return {
+    ...base,
+    amountCommitment,
+    perShareCommitments,
+    ingressEnvelopes,
+  };
 }
 
 export function parseMpccaWithdrawRound2Request(
@@ -1030,18 +1407,9 @@ export function parseMpccaWithdrawFinalizeRequest(
   return parseChainedRequest(body);
 }
 
-function parseBaseResponse(body: unknown): MpccaWithdrawBaseResponse {
+function parsePublicOutputs(body: unknown): MpccaWithdrawBasePublicOutputs {
   assertNoForbiddenPlaintextFields(body);
   const obj = objectBody(body);
-  const completed = obj.completed;
-  if (completed !== false) {
-    // Sub-milestone 3a returns `completed: false` from the stub. Milestone 4 will return
-    // `completed: true` from the finalize handler; that's a separate Response type.
-    throw new MpccaWithdrawV2Error(
-      "INVALID_CONTRIBUTION_SHAPE",
-      "completed must be the literal boolean false (milestone 3a is stub-only)",
-    );
-  }
   return {
     slot: requireInt(obj, "slot", 0, DEOPERATOR_COUNT - 1),
     playerId: requireInt(obj, "playerId", 0, DEOPERATOR_THRESHOLD - 1),
@@ -1049,6 +1417,21 @@ function parseBaseResponse(body: unknown): MpccaWithdrawBaseResponse {
     sessionStateHash: requireHex(obj, "sessionStateHash", 32),
     workerTranscriptHash: requireHex(obj, "workerTranscriptHash", 32),
     observedAtUnixMs: requireInt(obj, "observedAtUnixMs", 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function parseBaseStubResponse(body: unknown): MpccaWithdrawBaseStubResponse {
+  const pub = parsePublicOutputs(body);
+  const obj = objectBody(body);
+  const completed = obj.completed;
+  if (completed !== false) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_CONTRIBUTION_SHAPE",
+      "completed must be the literal boolean false for stub-mode rounds (round2/prove/finalize)",
+    );
+  }
+  return {
+    ...pub,
     completed: false,
     notImplementedPhase: requireString(obj, "notImplementedPhase"),
   };
@@ -1076,15 +1459,29 @@ function maybeHex(obj: Record<string, unknown>, key: string): HexString | undefi
 export function parseMpccaWithdrawRound1Response(
   body: unknown,
 ): MpccaWithdrawRound1Response {
-  const base = parseBaseResponse(body);
+  const pub = parsePublicOutputs(body);
   const obj = objectBody(body);
-  return { ...base, roundCommitment: maybeHex(obj, "roundCommitment") };
+  const completed = obj.completed;
+  if (completed !== true) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_CONTRIBUTION_SHAPE",
+      "round1 response must have completed: true (Milestone 1 ingress is real, not stub)",
+    );
+  }
+  const ingressTranscriptHash = requireHex(obj, "ingressTranscriptHash", 32);
+  if (normalizeHex(ingressTranscriptHash) !== normalizeHex(pub.workerTranscriptHash)) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_CONTRIBUTION_SHAPE",
+      "ingressTranscriptHash must equal workerTranscriptHash",
+    );
+  }
+  return { ...pub, completed: true, ingressTranscriptHash };
 }
 
 export function parseMpccaWithdrawRound2Response(
   body: unknown,
 ): MpccaWithdrawRound2Response {
-  const base = parseBaseResponse(body);
+  const base = parseBaseStubResponse(body);
   const obj = objectBody(body);
   return { ...base, partialResponse: maybeHex(obj, "partialResponse") };
 }
@@ -1092,7 +1489,7 @@ export function parseMpccaWithdrawRound2Response(
 export function parseMpccaWithdrawProveResponse(
   body: unknown,
 ): MpccaWithdrawProveResponse {
-  const base = parseBaseResponse(body);
+  const base = parseBaseStubResponse(body);
   const obj = objectBody(body);
   return {
     ...base,
@@ -1103,7 +1500,7 @@ export function parseMpccaWithdrawProveResponse(
 export function parseMpccaWithdrawFinalizeResponse(
   body: unknown,
 ): MpccaWithdrawFinalizeResponse {
-  const base = parseBaseResponse(body);
+  const base = parseBaseStubResponse(body);
   const obj = objectBody(body);
   return {
     ...base,
