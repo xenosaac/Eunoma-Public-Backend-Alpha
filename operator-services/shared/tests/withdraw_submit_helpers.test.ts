@@ -108,6 +108,34 @@ describe("loadMpccaFinalizeTranscript — disk loader", () => {
     expect(result!.withdrawV2CallArgsFields!.root).toBe(fields.root);
   });
 
+  // KILLER (Codex M5b P1 #2): the loader rejects a transcript whose embedded
+  // (dkgEpoch, requestId) does not match the request tuple passed in. Previously
+  // a misfiled transcript would pass shape checks and be assembled/submitted
+  // under the caller's tuple, breaking auditability.
+  it("rejects_transcript_whose_embedded_identity_differs_from_request_tuple", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "eunoma-finalize-stale-id-"));
+    const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+    await mkdir(dir, { recursive: true });
+    // Misfile a transcript embedded with (epoch=2, requestId=req-A) under the
+    // filename for (epoch=1, requestId=req-B).
+    const misfiledPath = join(dir, "1__req-B__finalize.json");
+    await writeFile(
+      misfiledPath,
+      JSON.stringify({
+        scheme: "mpcca_withdraw_v2_finalize",
+        dkgEpoch: "2",
+        requestId: "req-A",
+        notImplementedPhase: "stub",
+      }),
+    );
+    await expect(
+      loadMpccaFinalizeTranscript(stateRoot, "1", "req-B"),
+    ).rejects.toMatchObject({
+      code: "mpcca_finalize_transcript_identity_mismatch",
+      message: expect.stringMatching(/does not match the request tuple/),
+    });
+  });
+
   it("rejects a transcript with wrong scheme", async () => {
     const stateRoot = await mkdtemp(join(tmpdir(), "eunoma-finalize-badscheme-"));
     const dir = join(stateRoot, "coordinator", "mpcca_withdraw");

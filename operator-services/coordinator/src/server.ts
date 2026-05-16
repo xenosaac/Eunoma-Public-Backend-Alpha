@@ -3626,12 +3626,26 @@ export function buildCoordinatorServer(
         });
       }
       try {
-        // 5. Load the finalize transcript.
-        const finalize = await loadMpccaFinalizeTranscript(
-          opts.stateRoot,
-          parsed.dkgEpoch,
-          parsed.requestId,
-        );
+        // 5. Load the finalize transcript. The loader enforces both shape AND identity
+        // (dkgEpoch / requestId on disk must match the request tuple) — Codex M5b P1 #2.
+        let finalize: Awaited<ReturnType<typeof loadMpccaFinalizeTranscript>>;
+        try {
+          finalize = await loadMpccaFinalizeTranscript(
+            opts.stateRoot,
+            parsed.dkgEpoch,
+            parsed.requestId,
+          );
+        } catch (err) {
+          if (err instanceof WithdrawSubmitAssemblyError) {
+            return reply.code(400).send({
+              error: err.code,
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              message: err.message,
+            });
+          }
+          throw err;
+        }
         if (!finalize) {
           return reply.code(400).send({
             error: "mpcca_finalize_transcript_not_found",

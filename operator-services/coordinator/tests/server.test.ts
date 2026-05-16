@@ -4622,6 +4622,50 @@ describe("coordinator", () => {
       expect(res.json().error).toBe("invalid_request");
     });
 
+    // KILLER (Codex M5b P1 #2): the loader enforces that the on-disk transcript's
+    // embedded (dkgEpoch, requestId) matches the request tuple. Previously a transcript
+    // file copied under a different filename would pass shape validation and could be
+    // assembled/submitted under the caller's tuple, while the submit artifact recorded
+    // the caller's tuple — silently breaking auditability.
+    it("submit_route_rejects_stale_transcript_identity_mismatch", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-stale-id-");
+      const { mkdir, writeFile, readFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      // Write a finalize transcript whose EMBEDDED (dkgEpoch, requestId) is (2, req-A)
+      // but at the FILENAME for (1, req-B). The loader must reject this.
+      const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+      await mkdir(dir, { recursive: true });
+      const correctPath = join(dir, "2__req-A__finalize.json");
+      // Use the helper to write a valid transcript at (2, req-A) first.
+      await writeFinalizeTranscriptComplete(stateRoot, "2", "req-A");
+      // Now COPY the bytes to the misfiled path (1, req-B) so they pass shape checks
+      // but mismatch the request tuple the route uses.
+      const misfiledPath = join(dir, "1__req-B__finalize.json");
+      const raw = await readFile(correctPath, "utf8");
+      await writeFile(misfiledPath, raw);
+      let submitterInvoked = false;
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => {
+          submitterInvoked = true;
+          return { accepted: true, txHash: "0x" + "ab".repeat(32), simulated: true };
+        },
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        // Caller asks for (1, req-B) — the transcript embedded identity is (2, req-A).
+        payload: { dkgEpoch: "1", requestId: "req-B" },
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json();
+      expect(body.error).toBe("mpcca_finalize_transcript_identity_mismatch");
+      expect(body.message).toContain("does not match the request tuple");
+      // CRITICAL: the relayer must NEVER have been invoked.
+      expect(submitterInvoked).toBe(false);
+    });
+
     // KILLER (Codex M5b P1 #1): the assembler enforces the M5a/M5b no-auditor invariant
     // BEFORE the relayer is ever called. The relayer parser also enforces this at the HTTP
     // boundary (defense in depth), but a mocked/in-process submitter trusting the

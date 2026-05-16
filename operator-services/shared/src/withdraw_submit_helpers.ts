@@ -266,7 +266,23 @@ export async function loadMpccaFinalizeTranscript(
       `loadMpccaFinalizeTranscript: ${path} is not valid JSON: ${(err as Error).message}`,
     );
   }
-  return assertFinalizeTranscriptShape(parsed, path);
+  const finalize = assertFinalizeTranscriptShape(parsed, path);
+  // Codex M5b P1 #2: enforce that the on-disk transcript's identity matches the request
+  // tuple. The loader previously only validated that the embedded (dkgEpoch, requestId)
+  // were well-shaped; it never compared them against the REQUEST's (dkgEpoch, requestId).
+  // A transcript file for epoch/request A copied under epoch/request B's filename would
+  // pass the shape check and could be assembled + submitted under B's identity. Fail
+  // closed with the stable code so callers can branch deterministically.
+  if (finalize.dkgEpoch !== dkgEpoch || finalize.requestId !== requestId) {
+    throw new WithdrawSubmitAssemblyError(
+      "mpcca_finalize_transcript_identity_mismatch",
+      `loadMpccaFinalizeTranscript: ${path} embedded identity ` +
+        `(dkgEpoch=${finalize.dkgEpoch}, requestId=${finalize.requestId}) does not match the ` +
+        `request tuple (dkgEpoch=${dkgEpoch}, requestId=${requestId}); transcript was likely ` +
+        `copied under the wrong filename or the request is forged`,
+    );
+  }
+  return finalize;
 }
 
 function assertFinalizeTranscriptShape(value: unknown, path: string): FinalizeTranscript {
