@@ -22,6 +22,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import {
   ForbiddenPlaintextFieldError,
   WITHDRAW_V2_CALL_ARGS_ORDER,
+  WithdrawV2CallArgsError,
   type WithdrawV2CallArgs,
   parseWithdrawV2CallArgs,
 } from "@eunoma/deop-protocol";
@@ -80,6 +81,11 @@ export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInst
     } catch (err) {
       if (err instanceof ForbiddenPlaintextFieldError) {
         return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof WithdrawV2CallArgsError) {
+        // Structured invariant violation (e.g. M5a no-auditor gate). Surface
+        // the stable error code so callers can branch deterministically.
+        return reply.code(400).send({ error: err.code, message: err.message });
       }
       return reply.code(400).send({
         error: "invalid_request",

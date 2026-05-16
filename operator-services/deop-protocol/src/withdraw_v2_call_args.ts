@@ -15,7 +15,11 @@
 //      the Move side asserts `assert_hash`, decimal string for u64, bitmap
 //      range 0..=255 for the fallback bitmap, depth-3 nesting for
 //      amountRVolunAuds).
-//   3. Returns a fully-typed WithdrawV2CallArgs ready for the CLI submitter
+//   3. Enforces the M5a no-auditor invariant: the four auditor-only vectors
+//      (newBalanceREffAud, amountREffAud, ekVolunAuds, amountRVolunAuds) MUST
+//      be empty arrays. Eunoma is no-auditor today; Milestone 4d / future
+//      hardening will introduce auditor support and relax this gate.
+//   4. Returns a fully-typed WithdrawV2CallArgs ready for the CLI submitter
 //      to encode via aptos_args.* helpers.
 //
 // The domain constant EUNOMA_WITHDRAW_V2_CALL_ARGS_V1 is exported for future
@@ -26,6 +30,18 @@ import { hexToBytes } from "@eunoma/shared";
 import type { HexString } from "@eunoma/shared";
 import { FR_BYTES } from "./constants.js";
 import { assertNoForbiddenPlaintextFields } from "./forbidden.js";
+
+/**
+ * Error raised when the call-args body fails structural validation in a way
+ * that carries a stable error code (vs. a free-form parser message). The
+ * relayer surfaces `code` over the wire so callers can branch on it.
+ */
+export class WithdrawV2CallArgsError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "WithdrawV2CallArgsError";
+  }
+}
 
 export const EUNOMA_WITHDRAW_V2_DOMAIN = "EUNOMA_WITHDRAW_V2_CALL_ARGS_V1";
 
@@ -148,7 +164,7 @@ export function parseWithdrawV2CallArgs(raw: unknown): WithdrawV2CallArgs {
     throw new Error("WithdrawV2CallArgs body must be an object");
   }
   const obj = raw as Record<string, unknown>;
-  return {
+  const parsed: WithdrawV2CallArgs = {
     root: hexField(obj, "root", FR_BYTES),
     nullifierHash: hexField(obj, "nullifierHash", FR_BYTES),
     recipient: hexField(obj, "recipient", 32),
@@ -177,6 +193,25 @@ export function parseWithdrawV2CallArgs(raw: unknown): WithdrawV2CallArgs {
     sigmaProtoResp: hexArrayField(obj, "sigmaProtoResp", { allowEmpty: false }),
     memo: hexField(obj, "memo", undefined, { allowEmpty: true }),
   };
+
+  // M5a no-auditor invariant: every auditor-only vector MUST be empty. The
+  // Move side will eventually accept non-empty auditor payloads (Milestone 4d
+  // / future hardening) but for the alpha-testnet milestone we fail closed at
+  // the HTTP boundary so a future "add auditors" feature can never be turned
+  // on by accident from an upstream client.
+  if (
+    parsed.newBalanceREffAud.length !== 0 ||
+    parsed.amountREffAud.length !== 0 ||
+    parsed.ekVolunAuds.length !== 0 ||
+    parsed.amountRVolunAuds.length !== 0
+  ) {
+    throw new WithdrawV2CallArgsError(
+      "auditor_branch_not_supported_in_milestone_5a",
+      "Eunoma is no-auditor today; auditor fields must be empty arrays. Milestone 4d / future hardening will introduce auditor support.",
+    );
+  }
+
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------

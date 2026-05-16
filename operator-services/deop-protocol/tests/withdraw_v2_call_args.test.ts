@@ -3,6 +3,7 @@ import {
   EUNOMA_WITHDRAW_V2_DOMAIN,
   ForbiddenPlaintextFieldError,
   WITHDRAW_V2_CALL_ARGS_ORDER,
+  WithdrawV2CallArgsError,
   parseWithdrawV2CallArgs,
 } from "../src/index.js";
 
@@ -113,28 +114,57 @@ describe("parseWithdrawV2CallArgs — happy path", () => {
     expect(parsed.sigmaProtoResp).toHaveLength(25);
   });
 
-  it("accepts a body with one effective auditor and one voluntary auditor (non-empty optional vectors)", () => {
-    const fixture = buildValidFixture();
-    fixture.newBalanceREffAud = Array.from({ length: 8 }, (_, i) =>
-      ((i + 0xd0) & 0xff).toString(16).padStart(2, "0").repeat(32),
-    );
-    fixture.amountREffAud = Array.from({ length: 4 }, (_, i) =>
-      ((i + 0xe0) & 0xff).toString(16).padStart(2, "0").repeat(32),
-    );
-    fixture.ekVolunAuds = [
-      "ff".repeat(32),
+  it("parser_rejects_nonempty_auditor_fields_until_milestone_4d", () => {
+    // M5a is no-auditor: any non-empty auditor vector MUST be rejected with
+    // a stable error code. Milestone 4d will relax this once auditor support
+    // ships on the Move side. Each of the four auditor vectors is exercised
+    // INDEPENDENTLY so a regression on any single field fails the test.
+    const baseFixture = buildValidFixture();
+    const oneHash = "ff".repeat(32);
+
+    const cases: Array<[string, (f: Record<string, unknown>) => void]> = [
+      [
+        "newBalanceREffAud non-empty",
+        (f) => {
+          f.newBalanceREffAud = [oneHash];
+        },
+      ],
+      [
+        "amountREffAud non-empty",
+        (f) => {
+          f.amountREffAud = [oneHash];
+        },
+      ],
+      [
+        "ekVolunAuds non-empty",
+        (f) => {
+          f.ekVolunAuds = [oneHash];
+        },
+      ],
+      [
+        "amountRVolunAuds non-empty",
+        (f) => {
+          f.amountRVolunAuds = [[oneHash]];
+        },
+      ],
     ];
-    fixture.amountRVolunAuds = [
-      Array.from({ length: 4 }, (_, i) =>
-        ((i + 0x01) & 0xff).toString(16).padStart(2, "0").repeat(32),
-      ),
-    ];
-    const parsed = parseWithdrawV2CallArgs(fixture);
-    expect(parsed.newBalanceREffAud).toHaveLength(8);
-    expect(parsed.amountREffAud).toHaveLength(4);
-    expect(parsed.ekVolunAuds).toHaveLength(1);
-    expect(parsed.amountRVolunAuds).toHaveLength(1);
-    expect(parsed.amountRVolunAuds[0]).toHaveLength(4);
+
+    for (const [label, mutate] of cases) {
+      const fixture = { ...baseFixture };
+      mutate(fixture);
+      try {
+        parseWithdrawV2CallArgs(fixture);
+        throw new Error(`expected rejection for ${label}`);
+      } catch (err) {
+        expect(err, label).toBeInstanceOf(WithdrawV2CallArgsError);
+        expect((err as WithdrawV2CallArgsError).code, label).toBe(
+          "auditor_branch_not_supported_in_milestone_5a",
+        );
+        expect((err as WithdrawV2CallArgsError).message, label).toMatch(
+          /no-auditor today.*Milestone 4d/,
+        );
+      }
+    }
   });
 });
 
