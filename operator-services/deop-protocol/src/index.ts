@@ -3,6 +3,7 @@ export * from "./ca_registration_v2.js";
 export * from "./constants.js";
 export * from "./forbidden.js";
 export * from "./local_cluster.js";
+export * from "./mpcca_withdraw_v2.js";
 export * from "./roster.js";
 export * from "./types.js";
 export * from "./validation.js";
