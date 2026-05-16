@@ -17,6 +17,10 @@ import {
   frostDkgV2RosterHash,
   ingressEnvelopesHash,
   lagrangeCoefficientsAtZero,
+  mpccaWithdrawFinalizeAggregateHash,
+  mpccaWithdrawFinalizeAggregatedCommitmentsHash,
+  mpccaWithdrawFinalizeDeriveChallenge,
+  mpccaWithdrawFinalizeWorkerTranscriptHash,
   mpccaWithdrawRound1WorkerTranscriptHash,
   mpccaWithdrawRound2AggregateHash,
   mpccaWithdrawRound2StatementInputsHash,
@@ -38,6 +42,8 @@ import {
   parseDkgRoundResult,
   parseMpccaRoundRequest,
   parseMpccaRoundResult,
+  parseMpccaWithdrawFinalizeDkResult,
+  parseMpccaWithdrawFinalizeOrchestrateRequest,
   parseMpccaWithdrawRound1Response,
   parseMpccaWithdrawRound2DkResult,
   parseMpccaWithdrawRound2OrchestrateRequest,
@@ -64,6 +70,8 @@ import {
   type FrostDkgV2Roster,
   type FrostRound1Broadcast,
   type FrostRound2Envelope,
+  type MpccaWithdrawFinalizeDkResult,
+  type MpccaWithdrawFinalizeOrchestrateRequest,
   type MpccaWithdrawRound1Contribution,
   type MpccaWithdrawRound2DkPartial,
   type MpccaWithdrawRound2DkResult,
@@ -83,6 +91,7 @@ import {
   mpccaFinalizeTranscriptPath,
   waitForTx,
   WithdrawSubmitAssemblyError,
+  type MpccaWithdrawFinalizeArtifact,
   type WithdrawV2CallArgsShape,
 } from "@eunoma/shared";
 import { assertNoForbiddenPlaintextFields } from "@eunoma/deop-protocol";
@@ -215,6 +224,8 @@ export interface CoordinatorServerOptions {
    * a `round2_worker_timeout` 502 for the slow slot.
    */
   mpccaWithdrawRound2WorkerTimeoutMs?: number;
+  /** M4 commit 4 — per-worker AbortController timeout for the finalize fan-out. Default 30s. */
+  mpccaWithdrawFinalizeWorkerTimeoutMs?: number;
 }
 
 export function buildCoordinatorServer(
@@ -4267,6 +4278,706 @@ export function buildCoordinatorServer(
   });
 
   // =================================================================================================
+  // Milestone 4 sub-milestone 4-c4 — MPCCA withdraw V2 finalize orchestrator.
+  //
+  // POST /v2/withdraw/mpcca/finalize reads the persisted __round2.json artifact (built by
+  // M4-c2), aggregates the worker dk-base partials with the user-supplied A_user[29] into the
+  // full 30-point sigma commitment vector, computes the canonical Aptos CA TransferV1
+  // Fiat-Shamir challenge `e`, fans out the per-worker FinalizeRequest to all 5 selected
+  // slots, collects the 5 partial dk response shares s_share_j = α_share_j[0] + e·(λ_j·dk_share_j),
+  // aggregates s[0] = Σ_j s_share_j, combines with the user-supplied s_user[1..25] to assemble
+  // the full 25-scalar sigma response vector, and persists __finalize.json. The 27-field
+  // WithdrawV2CallArgs assembly is deferred to M5 (it needs the FROST attestation), so this
+  // route writes a finalize transcript with `notImplementedPhase =
+  // "m4_pending_frost_signature_assembly"` and the MPCCA-finalize artifact populated.
+  //
+  // Privacy contract: workers see only Statement inputs + aggregated A + challenge e. The
+  // user's Bulletproof bytes / per-chunk commitments / sigma α-points / response shares stay
+  // coordinator-side and are echoed-back from __round2.json into __finalize.json for M5.
+  //
+  // Wire shape:
+  //   1. Forbidden-plaintext-field guard on the raw body.
+  //   2. parseMpccaWithdrawFinalizeOrchestrateRequest — base identity only.
+  //   3. isSafeId(requestId) before any FS path construction.
+  //   4. Load __round2.json for (dkgEpoch, requestId). 400 round2_transcript_not_found if
+  //      absent.
+  //   5. compareFinalizeIdentityWithRound2 — every identity field MUST match the round2 artifact.
+  //   6. Acquire vaultMpccaWithdrawInFlight (re-used from M3a; only one withdraw session
+  //      at a time). 409 vault_mpcca_withdraw_in_flight on contention.
+  //   7. Build aggregated 30-point sigma commitment vector A_full:
+  //        A_full[0] = Σ_j round2.perSlotContributions[j].partialDkCommitments[index=0]
+  //        A_full[17] = userSigmaCommitmentsHex[16]
+  //                    + Σ_j round2.perSlotContributions[j].partialDkCommitments[index=17]
+  //        A_full[i] = userSigmaCommitmentsHex[i-1] for i ∈ [1..30) \ {17}
+  //      (Ristretto point addition mod curve order; uses @aptos-labs/confidential-asset's
+  //      RistrettoPoint.)
+  //   8. Compute Fiat-Shamir challenge e via mpccaWithdrawFinalizeDeriveChallenge (Aptos
+  //      SDK's sigmaProtocolFiatShamir over BCS-encoded inputs). Byte-canonical with the
+  //      Move-side verifier + each worker's local re-derivation.
+  //   9. Build per-worker FinalizeRequest body: chained envelope (previousRoundTranscriptHash
+  //      = round2AggregateHash; previousRoundCommitments[i] = round2 per-slot worker
+  //      transcript hash) + Statement inputs + aggregated A + e. The Statement inputs +
+  //      aggregated A + e are byte-identical across workers.
+  //  10. Promise.all fan-out with per-worker AbortController timeout (default 30s,
+  //      configurable via mpccaWithdrawFinalizeWorkerTimeoutMs). 502 finalize_worker_timeout
+  //      on per-slot abort.
+  //  11. Collect 5 FinalizeDkResult artifacts. Validate:
+  //        a. Each slot in sortedSelectedSlots returned a body.
+  //        b. Each worker's workerTranscriptHash byte-equals the coordinator's recompute via
+  //           mpccaWithdrawFinalizeWorkerTranscriptHash.
+  //        c. Every worker's dkBaseIndicesUsed equals the canonical [0, 17]. Cross-worker
+  //           divergence surfaces 502 dk_base_indices_divergence.
+  //  12. Aggregate s[0] = Σ_j partialResponseDkHex_j (scalar addition mod ed25519 order).
+  //  13. Combine with user s_user[1..25] (from __round2.json's userSigmaResponseSharesHex)
+  //      to form the full 25-scalar sigma response vector.
+  //  14. Compute deterministic finalize aggregate hash via mpccaWithdrawFinalizeAggregateHash.
+  //  15. Persist __finalize.json at
+  //      <stateRoot>/coordinator/mpcca_withdraw/<dkgEpoch>__<requestId>__finalize.json with
+  //      `notImplementedPhase = "m4_pending_frost_signature_assembly"` and
+  //      `mpccaWithdrawFinalizeArtifact` populated (so the M5 FROST attestation pass can
+  //      complete the 27-field WithdrawV2CallArgs without re-running MPCCA).
+  //  16. Return 200 with deterministic transcriptHash (= finalize aggregate hash), per-slot
+  //      partial responses, aggregated A, e.
+  // =================================================================================================
+  const mpccaWithdrawFinalizeWorkerTimeoutMs =
+    opts.mpccaWithdrawFinalizeWorkerTimeoutMs ?? 30_000;
+  server.post("/v2/withdraw/mpcca/finalize", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      // 1+2. Forbidden-plaintext-field guard + parse.
+      let parsed: MpccaWithdrawFinalizeOrchestrateRequest;
+      try {
+        parsed = parseMpccaWithdrawFinalizeOrchestrateRequest(raw);
+      } catch (err) {
+        if (err instanceof ForbiddenPlaintextFieldError) {
+          return reply
+            .code(400)
+            .send({ error: "forbidden_plaintext_field", field: err.path });
+        }
+        if (err instanceof MpccaWithdrawV2Error) {
+          return reply.code(400).send({ error: err.code, message: err.message });
+        }
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: err instanceof Error ? err.message : "unknown",
+        });
+      }
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+      if (parsed.rosterHash !== dkgRosterHash) {
+        return reply.code(400).send({
+          error: "stale_roster_hash",
+          requestId: parsed.requestId,
+          message: `rosterHash mismatch (request=${parsed.rosterHash}, roster=${dkgRosterHash})`,
+        });
+      }
+      if (parsed.dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          requestId: parsed.requestId,
+          message: `dkgEpoch mismatch (request=${parsed.dkgEpoch}, roster=${dkgRoster.dkgEpoch})`,
+        });
+      }
+      // 3. Sanitize requestId BEFORE FS path construction.
+      requestId = parsed.requestId;
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds it into FS paths",
+        });
+      }
+      const sortedSelectedSlots = [...parsed.selectedSlots].sort((a, b) => a - b);
+
+      // 4. Read __round2.json artifact.
+      if (!opts.stateRoot) {
+        return reply.code(400).send({
+          error: "state_root_not_configured",
+          requestId,
+          message:
+            "MPCCA withdraw finalize requires stateRoot to be configured so __round2.json " +
+            "can be read from disk.",
+        });
+      }
+      const round2ArtifactPath = join(
+        opts.stateRoot,
+        "coordinator",
+        "mpcca_withdraw",
+        `${parsed.dkgEpoch}__${requestId}__round2.json`,
+      );
+      let round2Artifact: Record<string, unknown>;
+      try {
+        const raw2 = await readFile(round2ArtifactPath, "utf8");
+        round2Artifact = JSON.parse(raw2) as Record<string, unknown>;
+      } catch (err) {
+        return reply.code(400).send({
+          error: "round2_transcript_not_found",
+          requestId,
+          path: round2ArtifactPath,
+          message:
+            err instanceof Error ? err.message : "unable to read round2 artifact",
+        });
+      }
+      const round2IdentityMismatch = compareFinalizeIdentityWithRound2(
+        parsed,
+        round2Artifact,
+        sortedSelectedSlots,
+      );
+      if (round2IdentityMismatch) {
+        return reply.code(400).send({
+          error: "round2_transcript_identity_mismatch",
+          requestId,
+          field: round2IdentityMismatch.field,
+          round2Value: round2IdentityMismatch.round2Value,
+          requestValue: round2IdentityMismatch.requestValue,
+        });
+      }
+      // Extract round2 artifact fields needed for the finalize fan-out.
+      const round2AggregateHash = (round2Artifact.transcriptHash as string).replace(
+        /^0x/i,
+        "",
+      );
+      const statementInputs = round2Artifact.statementInputs as MpccaWithdrawRound2StatementInputFields;
+      const statementInputsHashHex = round2Artifact.statementInputsHashHex as string;
+      const round2PerSlot = round2Artifact.perSlotContributions as Array<{
+        slot: number;
+        playerId: number;
+        sessionStateHash: string;
+        workerTranscriptHash: string;
+        partialDkCommitments: MpccaWithdrawRound2DkPartial[];
+        dkBaseIndicesUsed: number[];
+      }>;
+      const userProof = round2Artifact.userProofArtifacts as {
+        userSigmaCommitmentsHex: string[];
+        userSigmaResponseSharesHex: string[];
+        bulletproofZkrpAmountHex: string;
+        bulletproofZkrpNewBalanceHex: string;
+        perChunkCommitmentsAmountHex: string[];
+        perChunkCommitmentsNewBalanceHex: string[];
+      };
+      const canonicalDkIndices = round2Artifact.dkBaseIndicesUsed as number[];
+      // previousRoundCommitments[i] = round2 per-slot workerTranscriptHash of slot
+      // sortedSelectedSlots[i].
+      const previousRoundCommitments: string[] = [];
+      for (const slot of sortedSelectedSlots) {
+        const entry = round2PerSlot.find((c) => c.slot === slot);
+        if (!entry) {
+          return reply.code(400).send({
+            error: "round2_transcript_identity_mismatch",
+            requestId,
+            field: "perSlotContributions",
+            message: `round2 artifact missing slot ${slot}`,
+          });
+        }
+        previousRoundCommitments.push(entry.workerTranscriptHash.replace(/^0x/i, ""));
+      }
+
+      // 5. Acquire MPCCA withdraw lock.
+      const lock = await acquireVaultMpccaWithdrawLock();
+      if (lock === "busy") {
+        return reply.code(409).send({
+          error: "vault_mpcca_withdraw_in_flight",
+          requestId,
+          message:
+            "another MPCCA withdraw session is in progress; retry shortly",
+        });
+      }
+
+      try {
+        // 7. Build aggregated 30-point A_full vector.
+        //    A_full[0]   = Σ_j worker_partial_j[index=0]            (purely worker)
+        //    A_full[17]  = userSigmaCommitmentsHex[16]
+        //                + Σ_j worker_partial_j[index=17]           (worker + user)
+        //    A_full[i]   = userSigmaCommitmentsHex[i-1]              (purely user) for i ∉ {0,17}
+        //
+        // user supplies 29 entries covering positions [1..29] (i.e. 30 positions minus {0}).
+        // At position 17 the user contributes the NON-dk component; workers contribute the
+        // dk component; the coordinator sums.
+        const aggregatedSigmaCommitmentsHex: string[] = new Array(30);
+        // Compute per-index worker sums via aggregateRistrettoCommitments.
+        const workerSumByIndex = new Map<number, string>();
+        for (const idx of canonicalDkIndices) {
+          const partialsHex: string[] = [];
+          for (const slot of sortedSelectedSlots) {
+            const entry = round2PerSlot.find((c) => c.slot === slot);
+            if (!entry) continue;
+            const partial = entry.partialDkCommitments.find((p) => p.index === idx);
+            if (!partial) {
+              return reply.code(502).send({
+                error: "round2_partial_missing",
+                requestId,
+                slot,
+                index: idx,
+                message: `slot ${slot} missing partial_dk at index ${idx}`,
+              });
+            }
+            partialsHex.push(partial.commitmentHex);
+          }
+          let workerSum: string;
+          try {
+            workerSum = await aggregateRistrettoCommitments(partialsHex);
+          } catch (err) {
+            return reply.code(502).send({
+              error: "round2_partial_aggregation_failed",
+              requestId,
+              index: idx,
+              message: err instanceof Error ? err.message : "unknown",
+            });
+          }
+          workerSumByIndex.set(idx, workerSum);
+        }
+
+        // Fill A_full[i] from worker sum (i ∈ canonicalDkIndices) + user contribution
+        // (i ∉ {0}). The user-supplied vector has 29 entries at positions [1..29] (skipping
+        // position 0). Position 17 sums BOTH contributions.
+        if (userProof.userSigmaCommitmentsHex.length !== 29) {
+          return reply.code(502).send({
+            error: "round2_user_sigma_commitments_length_invalid",
+            requestId,
+            actual: userProof.userSigmaCommitmentsHex.length,
+            expected: 29,
+          });
+        }
+        for (let i = 0; i < 30; i += 1) {
+          if (i === 0) {
+            // Pure worker contribution.
+            const ws = workerSumByIndex.get(0);
+            if (!ws) {
+              return reply.code(500).send({
+                error: "round2_worker_sum_missing_at_0",
+                requestId,
+              });
+            }
+            aggregatedSigmaCommitmentsHex[i] = ws;
+          } else if (canonicalDkIndices.includes(i)) {
+            // Shared: user-supplied non-dk part at position i, plus worker sum.
+            const userPart = userProof.userSigmaCommitmentsHex[i - 1];
+            const workerPart = workerSumByIndex.get(i);
+            if (!workerPart || !userPart) {
+              return reply.code(500).send({
+                error: "round2_shared_position_missing",
+                requestId,
+                index: i,
+              });
+            }
+            try {
+              aggregatedSigmaCommitmentsHex[i] = await aggregateRistrettoCommitments([
+                userPart,
+                workerPart,
+              ]);
+            } catch (err) {
+              return reply.code(502).send({
+                error: "round2_shared_position_aggregation_failed",
+                requestId,
+                index: i,
+                message: err instanceof Error ? err.message : "unknown",
+              });
+            }
+          } else {
+            // Pure user contribution.
+            aggregatedSigmaCommitmentsHex[i] = userProof.userSigmaCommitmentsHex[i - 1];
+          }
+        }
+
+        // 8. Compute canonical Fiat-Shamir e via Aptos SDK.
+        let challengeHex: string;
+        try {
+          challengeHex = await mpccaWithdrawFinalizeDeriveChallenge({
+            vaultEkHex: parsed.vaultEk,
+            statementInputs,
+            senderAddressHex: parsed.senderAddress,
+            recipientAddressHex: parsed.recipient,
+            assetTypeHex: parsed.assetType,
+            chainId: parsed.chainId,
+            aggregatedSigmaCommitmentsHex,
+          });
+        } catch (err) {
+          return reply.code(500).send({
+            error: "finalize_challenge_derivation_failed",
+            requestId,
+            message: err instanceof Error ? err.message : "unknown",
+          });
+        }
+
+        // 9. Build per-worker FinalizeRequest body.
+        const sessionId = parsed.sessionId;
+        const finalizeBodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
+          dkgEpoch: parsed.dkgEpoch,
+          requestId: requestId!,
+          sessionId,
+          vaultEkTranscriptHash: parsed.vaultEkTranscriptHash,
+          registrationTranscriptHash: parsed.registrationTranscriptHash,
+          vaultStateInitTranscriptHash: parsed.vaultStateInitTranscriptHash,
+          observedDepositTranscriptHashes: parsed.observedDepositTranscriptHashes,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selfSlot: slot,
+          playerId: ordinalIndex,
+          vaultEk: parsed.vaultEk,
+          senderAddress: parsed.senderAddress,
+          assetType: parsed.assetType,
+          chainId: parsed.chainId,
+          root: parsed.root,
+          nullifierHash: parsed.nullifierHash,
+          recipient: parsed.recipient,
+          recipientHash: parsed.recipientHash,
+          amountTag: parsed.amountTag,
+          vaultSequence: parsed.vaultSequence,
+          expirySecs: parsed.expirySecs,
+          requestHash: parsed.requestHash,
+          depositCount: parsed.depositCount,
+          // previousRoundTranscriptHash = round2 PER-SLOT workerTranscriptHash for this slot
+          // (NOT the round2 aggregate hash). This is INTENTIONAL: the Rust M4-c3 worker checks
+          // `round2_state.worker_transcript_hash == previous_round_transcript_hash` as a load-
+          // bearing per-slot binding — each worker verifies the finalize call is tied to the
+          // exact round2 contribution it produced. Sending the aggregate hash would break
+          // every legitimate finalize call (the aggregate is not stored worker-side; the
+          // worker has no way to verify against it). Defense-in-depth on round2-aggregation
+          // is provided separately by the coordinator's own aggregate hash + the per-slot
+          // statement_inputs_hash cross-check (which catches Statement-input drift).
+          //
+          // M4-c2 round2 used the aggregate-hash pattern (round2.previousRoundTranscriptHash =
+          // round1.transcriptHash), but the round2 worker doesn't STORE round1's transcript
+          // hash — it only folds the supplied value into its chained binding. M4-c3 raised the
+          // bar by persisting the per-slot worker_transcript_hash in Round2StateFile and
+          // adding the equality gate at finalize. Switching back to the aggregate-hash pattern
+          // would silently drop that gate.
+          previousRoundTranscriptHash:
+            round2PerSlot.find((c) => c.slot === slot)!.workerTranscriptHash,
+          previousRoundCommitments,
+          recipientEk: statementInputs.recipientEk,
+          oldBalanceC: statementInputs.oldBalanceC,
+          oldBalanceD: statementInputs.oldBalanceD,
+          newBalanceC: statementInputs.newBalanceC,
+          newBalanceD: statementInputs.newBalanceD,
+          transferAmountC: statementInputs.transferAmountC,
+          transferAmountDSender: statementInputs.transferAmountDSender,
+          transferAmountDRecipient: statementInputs.transferAmountDRecipient,
+          aggregatedSigmaCommitmentsHex,
+          challengeHex,
+        }));
+
+        // 10. Concurrent fan-out with AbortController timeouts.
+        const fanoutPromises = sortedSelectedSlots.map((slot, ordinalIndex) => {
+          const controller = new AbortController();
+          const timer = setTimeout(
+            () => controller.abort(),
+            mpccaWithdrawFinalizeWorkerTimeoutMs,
+          );
+          return singleNodeForwarder(
+            "/worker/v2/mpcca/withdraw/finalize",
+            finalizeBodies[ordinalIndex],
+            dkgRoster,
+            slot,
+            controller.signal,
+          )
+            .then(
+              (value) => ({
+                kind: "value" as const,
+                slot,
+                value,
+                aborted: controller.signal.aborted,
+              }),
+              (reason) => ({
+                kind: "rejected" as const,
+                slot,
+                reason,
+                aborted: controller.signal.aborted,
+              }),
+            )
+            .finally(() => clearTimeout(timer));
+        });
+        const forwarded = await Promise.all(fanoutPromises);
+
+        // 11. Parse + cross-check.
+        const responsesBySlot = new Map<number, MpccaWithdrawFinalizeDkResult>();
+        const seenSlots = new Set<number>();
+        let canonicalFinalizeDkIndices: number[] | null = null;
+        for (const res of forwarded) {
+          if (seenSlots.has(res.slot)) {
+            return reply.code(502).send({
+              error: "finalize_duplicate_slot",
+              slot: res.slot,
+              requestId,
+            });
+          }
+          seenSlots.add(res.slot);
+          if (res.kind === "rejected") {
+            if (res.aborted) {
+              return reply.code(502).send({
+                error: "finalize_worker_timeout",
+                slot: res.slot,
+                requestId,
+                timeoutMs: mpccaWithdrawFinalizeWorkerTimeoutMs,
+              });
+            }
+            return reply.code(502).send({
+              error: "finalize_forward_rejected",
+              slot: res.slot,
+              requestId,
+              reason: res.reason instanceof Error ? res.reason.message : String(res.reason),
+            });
+          }
+          if (res.aborted) {
+            return reply.code(502).send({
+              error: "finalize_worker_timeout",
+              slot: res.slot,
+              requestId,
+              timeoutMs: mpccaWithdrawFinalizeWorkerTimeoutMs,
+            });
+          }
+          if (res.value.statusCode !== 200) {
+            return reply.code(502).send({
+              error: "finalize_unexpected_status",
+              slot: res.slot,
+              requestId,
+              statusCode: res.value.statusCode,
+              body: res.value.body,
+            });
+          }
+          if (!res.value.body) {
+            return reply.code(502).send({
+              error: "finalize_empty_body",
+              slot: res.slot,
+              requestId,
+            });
+          }
+          let dkResult: MpccaWithdrawFinalizeDkResult;
+          try {
+            dkResult = parseMpccaWithdrawFinalizeDkResult(res.value.body);
+          } catch (err) {
+            return reply.code(502).send({
+              error: "finalize_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: err instanceof Error ? err.message : "unknown",
+            });
+          }
+          if (dkResult.slot !== res.slot) {
+            return reply.code(502).send({
+              error: "finalize_slot_drift",
+              slot: res.slot,
+              requestId,
+              returnedSlot: dkResult.slot,
+            });
+          }
+          if (dkResult.playerId !== sortedSelectedSlots.indexOf(res.slot)) {
+            return reply.code(502).send({
+              error: "finalize_player_id_drift",
+              slot: res.slot,
+              requestId,
+              returnedPlayerId: dkResult.playerId,
+            });
+          }
+          const expectedHash = mpccaWithdrawFinalizeWorkerTranscriptHash({
+            sessionId,
+            requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            vaultEkTranscriptHash: parsed.vaultEkTranscriptHash,
+            registrationTranscriptHash: parsed.registrationTranscriptHash,
+            vaultStateInitTranscriptHash: parsed.vaultStateInitTranscriptHash,
+            observedDepositTranscriptHashes: parsed.observedDepositTranscriptHashes,
+            rosterHash: dkgRosterHash,
+            sortedSelectedSlots,
+            selfSlot: res.slot,
+            playerId: sortedSelectedSlots.indexOf(res.slot),
+            vaultEk: parsed.vaultEk,
+            senderAddress: parsed.senderAddress,
+            assetType: parsed.assetType,
+            chainId: parsed.chainId,
+            root: parsed.root,
+            nullifierHash: parsed.nullifierHash,
+            recipient: parsed.recipient,
+            recipientHash: parsed.recipientHash,
+            amountTag: parsed.amountTag,
+            vaultSequence: parsed.vaultSequence,
+            expirySecs: parsed.expirySecs,
+            requestHash: parsed.requestHash,
+            depositCount: parsed.depositCount,
+            previousRoundTranscriptHash: finalizeBodies[sortedSelectedSlots.indexOf(res.slot)]
+              .previousRoundTranscriptHash,
+            previousRoundCommitments,
+            statementInputs,
+            aggregatedSigmaCommitmentsHex,
+            challengeHex,
+          });
+          if (dkResult.workerTranscriptHash !== expectedHash) {
+            return reply.code(502).send({
+              error: "finalize_worker_transcript_hash_mismatch",
+              slot: res.slot,
+              requestId,
+              expected: expectedHash,
+              actual: dkResult.workerTranscriptHash,
+            });
+          }
+          const sortedDkIndices = [...dkResult.dkBaseIndicesUsed].sort((a, b) => a - b);
+          if (canonicalFinalizeDkIndices === null) {
+            canonicalFinalizeDkIndices = sortedDkIndices;
+          } else if (
+            canonicalFinalizeDkIndices.length !== sortedDkIndices.length ||
+            canonicalFinalizeDkIndices.some((v, i) => v !== sortedDkIndices[i])
+          ) {
+            return reply.code(502).send({
+              error: "dk_base_indices_divergence",
+              slot: res.slot,
+              requestId,
+              expected: canonicalFinalizeDkIndices,
+              actual: sortedDkIndices,
+            });
+          }
+          responsesBySlot.set(res.slot, dkResult);
+        }
+        if (responsesBySlot.size !== DEOPERATOR_THRESHOLD) {
+          return reply.code(502).send({
+            error: "finalize_under_quorum",
+            requestId,
+            received: responsesBySlot.size,
+            expected: DEOPERATOR_THRESHOLD,
+          });
+        }
+        // Verify canonical BASE_DK_SET.
+        const expectedCanonical = [...DK_BASE_INDICES_CANONICAL].sort((a, b) => a - b);
+        if (
+          !canonicalFinalizeDkIndices ||
+          canonicalFinalizeDkIndices.length !== expectedCanonical.length ||
+          canonicalFinalizeDkIndices.some((v, i) => v !== expectedCanonical[i])
+        ) {
+          return reply.code(502).send({
+            error: "dk_base_indices_unexpected",
+            requestId,
+            expected: expectedCanonical,
+            actual: canonicalFinalizeDkIndices ?? [],
+          });
+        }
+
+        // 12. Aggregate s[0] = Σ_j partialResponseDkHex_j (scalar addition mod n).
+        const sZero = await aggregateScalarsModN(
+          sortedSelectedSlots.map((slot) => responsesBySlot.get(slot)!.partialResponseDkHex),
+        );
+
+        // 13. Combine with user-supplied s_user[1..25] (24 scalars) → full 25-vector.
+        if (userProof.userSigmaResponseSharesHex.length !== 24) {
+          return reply.code(502).send({
+            error: "round2_user_sigma_response_shares_length_invalid",
+            requestId,
+            actual: userProof.userSigmaResponseSharesHex.length,
+            expected: 24,
+          });
+        }
+        const sigmaResponseHex = [sZero, ...userProof.userSigmaResponseSharesHex];
+
+        // 14. Compute deterministic finalize aggregate hash.
+        const perSlotContributionsOrdered = sortedSelectedSlots.map((slot) => {
+          const r = responsesBySlot.get(slot)!;
+          return {
+            slot,
+            workerTranscriptHash: r.workerTranscriptHash,
+            partialResponseDkHex: r.partialResponseDkHex,
+          };
+        });
+        const finalizeAggregateHash = mpccaWithdrawFinalizeAggregateHash({
+          statementInputs,
+          aggregatedSigmaCommitmentsHex,
+          challengeHex,
+          dkBaseIndicesUsed: canonicalFinalizeDkIndices,
+          perSlotContributions: perSlotContributionsOrdered,
+        });
+
+        // 15. Persist __finalize.json with the MPCCA-finalize artifact populated.
+        // notImplementedPhase signals to the M5b submit route that FROST attestation +
+        // 27-field WithdrawV2CallArgs assembly is still pending.
+        const mpccaWithdrawFinalizeArtifact: MpccaWithdrawFinalizeArtifact = {
+          aggregatedSigmaCommitmentsHex,
+          challengeHex,
+          sigmaResponseHex,
+          perChunkCommitmentsAmountHex: userProof.perChunkCommitmentsAmountHex,
+          perChunkCommitmentsNewBalanceHex: userProof.perChunkCommitmentsNewBalanceHex,
+          bulletproofZkrpAmountHex: userProof.bulletproofZkrpAmountHex,
+          bulletproofZkrpNewBalanceHex: userProof.bulletproofZkrpNewBalanceHex,
+          dkBaseIndicesUsed: canonicalFinalizeDkIndices,
+          perSlotContributions: perSlotContributionsOrdered,
+          aggregateHash: finalizeAggregateHash,
+        };
+        const finalizeTranscriptArtifact = {
+          scheme: "mpcca_withdraw_v2_finalize" as const,
+          dkgEpoch: parsed.dkgEpoch,
+          requestId,
+          notImplementedPhase: "m4_pending_frost_signature_assembly",
+          mpccaWithdrawFinalizeArtifact,
+          transcriptHash: finalizeAggregateHash,
+          createdAtUnixMs: Date.now(),
+        };
+        const finalizeTranscriptPath = join(
+          opts.stateRoot,
+          "coordinator",
+          "mpcca_withdraw",
+          `${parsed.dkgEpoch}__${requestId}__finalize.json`,
+        );
+        await writeTranscriptArtifactAtomic(
+          finalizeTranscriptPath,
+          finalizeTranscriptArtifact,
+        );
+        for (const slot of sortedSelectedSlots) {
+          const r = responsesBySlot.get(slot)!;
+          await store.recordPartialArtifact({
+            requestId,
+            sessionId,
+            rosterHash: dkgRosterHash,
+            slot,
+            artifactKind: "mpcca-withdraw-v2-finalize",
+            artifactHash: r.sessionStateHash,
+            transcriptHash: r.workerTranscriptHash,
+          });
+        }
+
+        // 16. Return 200 with the finalize transcript hash + per-slot contributions.
+        return reply.code(200).send({
+          accepted: false,
+          requestId,
+          dkgEpoch: parsed.dkgEpoch,
+          round: "finalize",
+          completed: true,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          dkBaseIndicesUsed: canonicalFinalizeDkIndices,
+          perSlotContributions: perSlotContributionsOrdered,
+          previousRoundTranscriptHash: round2AggregateHash,
+          statementInputsHashHex,
+          transcriptHash: finalizeAggregateHash,
+          aggregatedSigmaCommitmentsHash:
+            mpccaWithdrawFinalizeAggregatedCommitmentsHash(aggregatedSigmaCommitmentsHex),
+          challengeHex,
+          sigmaResponseHex,
+          transcriptPath: finalizeTranscriptPath,
+          notImplementedPhase: "m4_pending_frost_signature_assembly",
+          message:
+            "M4 commit 4 MPCCA finalize complete; M5 FROST attestation pass consumes " +
+            "mpccaWithdrawFinalizeArtifact + signs caPayloadHash to assemble the 27-field " +
+            "WithdrawV2CallArgs.",
+        });
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      if (requestId) await store.markAborted(requestId);
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof MpccaWithdrawV2Error) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // =================================================================================================
   // Milestone 5 sub-milestone 5b — MPCCA withdraw V2 chain-submit orchestrator.
   //
   // POST /v2/withdraw/mpcca/submit reads the finalize transcript that M4e will write at
@@ -5779,6 +6490,168 @@ function compareRound2IdentityWithRound1(
     };
   }
   return undefined;
+}
+
+/**
+ * M4 commit 4 — cross-check finalize body identity against the persisted __round2.json
+ * artifact. Walks every immutable identity field (rosterHash, vault binding hashes, sender,
+ * recipient, etc.) and returns the first mismatch for operator triage. The finalize body
+ * MUST match round2 byte-for-byte on all these fields; a drift means the coordinator is
+ * being asked to finalize a session that doesn't match what round2 produced.
+ */
+function compareFinalizeIdentityWithRound2(
+  request: MpccaWithdrawFinalizeOrchestrateRequest,
+  round2: Record<string, unknown>,
+  sortedSelectedSlots: number[],
+):
+  | { field: string; round2Value: unknown; requestValue: unknown }
+  | undefined {
+  const lowerHex = (v: unknown): string => {
+    if (typeof v !== "string") return "";
+    return v.replace(/^0x/i, "").toLowerCase();
+  };
+  const checks: Array<[string, unknown, unknown]> = [
+    ["dkgEpoch", round2.dkgEpoch, request.dkgEpoch],
+    ["rosterHash", lowerHex(round2.rosterHash), lowerHex(request.rosterHash)],
+    [
+      "vaultEkTranscriptHash",
+      lowerHex(round2.vaultEkTranscriptHash),
+      lowerHex(request.vaultEkTranscriptHash),
+    ],
+    [
+      "registrationTranscriptHash",
+      lowerHex(round2.registrationTranscriptHash),
+      lowerHex(request.registrationTranscriptHash),
+    ],
+    [
+      "vaultStateInitTranscriptHash",
+      lowerHex(round2.vaultStateInitTranscriptHash),
+      lowerHex(request.vaultStateInitTranscriptHash),
+    ],
+    ["vaultEk", lowerHex(round2.vaultEk), lowerHex(request.vaultEk)],
+    [
+      "senderAddress",
+      lowerHex(round2.senderAddress),
+      lowerHex(request.senderAddress),
+    ],
+    ["assetType", lowerHex(round2.assetType), lowerHex(request.assetType)],
+    ["chainId", round2.chainId, request.chainId],
+    ["root", lowerHex(round2.root), lowerHex(request.root)],
+    [
+      "nullifierHash",
+      lowerHex(round2.nullifierHash),
+      lowerHex(request.nullifierHash),
+    ],
+    ["recipient", lowerHex(round2.recipient), lowerHex(request.recipient)],
+    [
+      "recipientHash",
+      lowerHex(round2.recipientHash),
+      lowerHex(request.recipientHash),
+    ],
+    ["amountTag", lowerHex(round2.amountTag), lowerHex(request.amountTag)],
+    ["vaultSequence", round2.vaultSequence, request.vaultSequence],
+    ["expirySecs", round2.expirySecs, request.expirySecs],
+    ["requestHash", lowerHex(round2.requestHash), lowerHex(request.requestHash)],
+    ["depositCount", round2.depositCount, request.depositCount],
+  ];
+  for (const [field, a, b] of checks) {
+    if (a !== b) return { field, round2Value: a, requestValue: b };
+  }
+  const round2Slots = Array.isArray(round2.selectedSlots)
+    ? (round2.selectedSlots as number[])
+    : [];
+  if (
+    round2Slots.length !== sortedSelectedSlots.length ||
+    round2Slots.some((v, i) => v !== sortedSelectedSlots[i])
+  ) {
+    return {
+      field: "selectedSlots",
+      round2Value: round2Slots,
+      requestValue: sortedSelectedSlots,
+    };
+  }
+  const r2Observed = Array.isArray(round2.observedDepositTranscriptHashes)
+    ? (round2.observedDepositTranscriptHashes as string[])
+    : [];
+  if (r2Observed.length !== request.observedDepositTranscriptHashes.length) {
+    return {
+      field: "observedDepositTranscriptHashes.length",
+      round2Value: r2Observed.length,
+      requestValue: request.observedDepositTranscriptHashes.length,
+    };
+  }
+  for (let i = 0; i < r2Observed.length; i += 1) {
+    if (lowerHex(r2Observed[i]) !== lowerHex(request.observedDepositTranscriptHashes[i])) {
+      return {
+        field: `observedDepositTranscriptHashes[${i}]`,
+        round2Value: r2Observed[i],
+        requestValue: request.observedDepositTranscriptHashes[i],
+      };
+    }
+  }
+  if (typeof round2.transcriptHash !== "string") {
+    return {
+      field: "transcriptHash",
+      round2Value: round2.transcriptHash,
+      requestValue: "<derived from round2>",
+    };
+  }
+  if (!Array.isArray(round2.perSlotContributions)) {
+    return {
+      field: "perSlotContributions",
+      round2Value: round2.perSlotContributions,
+      requestValue: "<expected array>",
+    };
+  }
+  if (!round2.statementInputs || typeof round2.statementInputs !== "object") {
+    return {
+      field: "statementInputs",
+      round2Value: round2.statementInputs,
+      requestValue: "<expected object>",
+    };
+  }
+  if (!round2.userProofArtifacts || typeof round2.userProofArtifacts !== "object") {
+    return {
+      field: "userProofArtifacts",
+      round2Value: round2.userProofArtifacts,
+      requestValue: "<expected object>",
+    };
+  }
+  return undefined;
+}
+
+/**
+ * M4 commit 4 — aggregate scalar response shares mod the ed25519 group order.
+ * `s[0] = Σ_j s_share_j (mod n)`. Each input is a 32-byte canonical Ed25519 scalar hex (LE).
+ */
+async function aggregateScalarsModN(hexes: string[]): Promise<string> {
+  if (hexes.length === 0) {
+    throw new Error("aggregateScalarsModN: empty input");
+  }
+  const { ed25519 } = await import("@noble/curves/ed25519");
+  const { bytesToNumberLE, numberToBytesLE } = await import(
+    "@noble/curves/abstract/utils"
+  );
+  const n = ed25519.CURVE.n;
+  let sum = 0n;
+  for (let i = 0; i < hexes.length; i += 1) {
+    const norm = hexes[i].replace(/^0x/i, "").toLowerCase();
+    if (norm.length !== 64) {
+      throw new Error(
+        `aggregateScalarsModN: input[${i}] must be 64 hex chars; got ${norm.length}`,
+      );
+    }
+    const bytes = new Uint8Array(32);
+    for (let b = 0; b < 32; b += 1) {
+      bytes[b] = parseInt(norm.slice(b * 2, b * 2 + 2), 16);
+    }
+    const value = bytesToNumberLE(bytes);
+    sum = (sum + value) % n;
+  }
+  const outBytes = numberToBytesLE(sum, 32);
+  return Array.from(outBytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 async function findVaultStateV2InitProvenance(

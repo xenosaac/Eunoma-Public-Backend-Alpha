@@ -109,6 +109,55 @@ export interface FinalizeTranscript {
   /** SHA-256 over the canonicalized transcript content (set by M4e's persistence step). */
   transcriptHash?: HexString;
   createdAtUnixMs?: number;
+  /**
+   * M4 Commit 4 — MPCCA-finalize-specific public outputs produced by the worker dk-threshold
+   * + coordinator aggregation. Persisted alongside `notImplementedPhase =
+   * "m4_pending_frost_signature_assembly"` (until M5 wires the FROST attestation pass that
+   * produces `withdrawV2CallArgsFields`).
+   *
+   * Privacy contract: every field is a public crypto output. The plaintext chunk values +
+   * amount NEVER appear here.
+   */
+  mpccaWithdrawFinalizeArtifact?: MpccaWithdrawFinalizeArtifact;
+}
+
+/**
+ * M4 Commit 4 — MPCCA-finalize artifact. Captures the public outputs of the worker
+ * dk-threshold + coordinator aggregation path so a follow-up FROST attestation pass can
+ * consume them without re-running the MPCCA ceremony. Fields:
+ *
+ *   - `aggregatedSigmaCommitmentsHex` (30 × 32-byte hex): the full sigma A vector.
+ *   - `challengeHex` (32-byte hex): the canonical Fiat-Shamir e.
+ *   - `sigmaResponseHex` (25 × 32-byte hex): the assembled sigma response vector
+ *     `s = [s[0] = Σ_j s_share_j, ...s_user[1..25]]`. `s[0]` is the threshold-aggregated
+ *     dk-component; `s[1..25]` is the user-supplied non-dk component.
+ *   - `perChunkCommitmentsAmountHex` (4 × 32-byte hex): Pedersen commitments per transfer
+ *     amount chunk (echo-back from the round2 user proof artifact).
+ *   - `perChunkCommitmentsNewBalanceHex` (8 × 32-byte hex): Pedersen commitments per new
+ *     balance chunk (echo-back).
+ *   - `bulletproofZkrpAmountHex`, `bulletproofZkrpNewBalanceHex`: Bulletproof bytes
+ *     (echo-back from the round2 user proof artifact).
+ *   - `dkBaseIndicesUsed`: canonical BASE_DK_SET indices (= `[0, 17]` for Aptos CA TransferV1).
+ *   - `perSlotContributions`: per-slot worker partial response shares + worker transcript
+ *     hashes. Sorted by slot. Anyone can recompute the finalize aggregate hash from this.
+ *   - `aggregateHash`: deterministic finalize aggregate fingerprint
+ *     (`mpccaWithdrawFinalizeAggregateHash` over Statement + A + e + per-slot contribs).
+ */
+export interface MpccaWithdrawFinalizeArtifact {
+  aggregatedSigmaCommitmentsHex: HexString[];
+  challengeHex: HexString;
+  sigmaResponseHex: HexString[];
+  perChunkCommitmentsAmountHex: HexString[];
+  perChunkCommitmentsNewBalanceHex: HexString[];
+  bulletproofZkrpAmountHex: HexString;
+  bulletproofZkrpNewBalanceHex: HexString;
+  dkBaseIndicesUsed: number[];
+  perSlotContributions: Array<{
+    slot: number;
+    workerTranscriptHash: HexString;
+    partialResponseDkHex: HexString;
+  }>;
+  aggregateHash: HexString;
 }
 
 /**
@@ -366,6 +415,12 @@ function assertFinalizeTranscriptShape(value: unknown, path: string): FinalizeTr
   if (attestationConfigRaw !== undefined && attestationConfigRaw !== null) {
     attestationConfig = assertAttestationConfigShape(attestationConfigRaw, path);
   }
+  // M4 commit 4 — optional mpccaWithdrawFinalizeArtifact block.
+  const artifactRaw = obj.mpccaWithdrawFinalizeArtifact;
+  let mpccaWithdrawFinalizeArtifact: MpccaWithdrawFinalizeArtifact | undefined;
+  if (artifactRaw !== undefined && artifactRaw !== null) {
+    mpccaWithdrawFinalizeArtifact = assertMpccaWithdrawFinalizeArtifactShape(artifactRaw, path);
+  }
   return {
     scheme: "mpcca_withdraw_v2_finalize",
     dkgEpoch: obj.dkgEpoch,
@@ -375,8 +430,118 @@ function assertFinalizeTranscriptShape(value: unknown, path: string): FinalizeTr
       ? { withdrawV2CallArgsFields: withdrawV2CallArgsFields as FinalizeWithdrawV2CallArgsFields }
       : {}),
     ...(attestationConfig !== undefined ? { attestationConfig } : {}),
+    ...(mpccaWithdrawFinalizeArtifact !== undefined
+      ? { mpccaWithdrawFinalizeArtifact }
+      : {}),
     ...(transcriptHash !== undefined ? { transcriptHash: transcriptHash as HexString } : {}),
     ...(typeof obj.createdAtUnixMs === "number" ? { createdAtUnixMs: obj.createdAtUnixMs } : {}),
+  };
+}
+
+/**
+ * M4 commit 4 — assert the optional `mpccaWithdrawFinalizeArtifact` block is well-shaped.
+ * This is a lightweight shape check; the deop-protocol parser does deeper hex/length
+ * validation when the coordinator persists this. The submit route only reads this field
+ * for forward-compat (a follow-up FROST attestation pass will consume it).
+ */
+function assertMpccaWithdrawFinalizeArtifactShape(
+  value: unknown,
+  path: string,
+): MpccaWithdrawFinalizeArtifact {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(
+      `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact must be an object when present`,
+    );
+  }
+  const obj = value as Record<string, unknown>;
+  const requireHexArr = (key: string): HexString[] => {
+    const v = obj[key];
+    if (!Array.isArray(v) || v.length === 0) {
+      throw new Error(
+        `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.${key} must be a non-empty array`,
+      );
+    }
+    for (let i = 0; i < v.length; i += 1) {
+      if (typeof v[i] !== "string" || (v[i] as string).length === 0) {
+        throw new Error(
+          `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.${key}[${i}] must be a non-empty hex string`,
+        );
+      }
+    }
+    return v as HexString[];
+  };
+  const requireHex = (key: string): HexString => {
+    const v = obj[key];
+    if (typeof v !== "string" || v.length === 0) {
+      throw new Error(
+        `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.${key} must be a non-empty hex string`,
+      );
+    }
+    hexToBytes(v);
+    return v as HexString;
+  };
+  const requireIntArr = (key: string): number[] => {
+    const v = obj[key];
+    if (!Array.isArray(v) || v.length === 0) {
+      throw new Error(
+        `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.${key} must be a non-empty array`,
+      );
+    }
+    return v.map((entry, i) => {
+      if (!Number.isInteger(entry) || (entry as number) < 0) {
+        throw new Error(
+          `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.${key}[${i}] must be a non-negative integer`,
+        );
+      }
+      return entry as number;
+    });
+  };
+  const perSlot = obj.perSlotContributions;
+  if (!Array.isArray(perSlot) || perSlot.length === 0) {
+    throw new Error(
+      `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.perSlotContributions must be a non-empty array`,
+    );
+  }
+  const perSlotContributions = perSlot.map((entry, i) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(
+        `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.perSlotContributions[${i}] must be an object`,
+      );
+    }
+    const e = entry as Record<string, unknown>;
+    const slot = e.slot;
+    if (!Number.isInteger(slot) || (slot as number) < 0) {
+      throw new Error(
+        `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.perSlotContributions[${i}].slot must be a non-negative integer`,
+      );
+    }
+    const workerTranscriptHash = e.workerTranscriptHash;
+    const partialResponseDkHex = e.partialResponseDkHex;
+    if (
+      typeof workerTranscriptHash !== "string" ||
+      typeof partialResponseDkHex !== "string"
+    ) {
+      throw new Error(
+        `loadMpccaFinalizeTranscript: ${path}.mpccaWithdrawFinalizeArtifact.perSlotContributions[${i}] hash fields must be non-empty strings`,
+      );
+    }
+    return {
+      slot: slot as number,
+      workerTranscriptHash: workerTranscriptHash as HexString,
+      partialResponseDkHex: partialResponseDkHex as HexString,
+    };
+  });
+  return {
+    aggregatedSigmaCommitmentsHex: requireHexArr("aggregatedSigmaCommitmentsHex"),
+    challengeHex: requireHex("challengeHex"),
+    sigmaResponseHex: requireHexArr("sigmaResponseHex"),
+    perChunkCommitmentsAmountHex: requireHexArr("perChunkCommitmentsAmountHex"),
+    perChunkCommitmentsNewBalanceHex: requireHexArr("perChunkCommitmentsNewBalanceHex"),
+    bulletproofZkrpAmountHex: requireHex("bulletproofZkrpAmountHex"),
+    bulletproofZkrpNewBalanceHex: requireHex("bulletproofZkrpNewBalanceHex"),
+    dkBaseIndicesUsed: requireIntArr("dkBaseIndicesUsed"),
+    perSlotContributions,
+    aggregateHash: requireHex("aggregateHash"),
   };
 }
 

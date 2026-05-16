@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import type { HexString } from "@eunoma/shared";
 import type { HpkeEnvelope } from "../src/types.js";
 import {
   assembleMpccaWithdrawTranscript,
   canonicalJsonStringify,
   DK_BASE_INDICES_CANONICAL,
   EUNOMA_M1_AMOUNT_INGRESS_V1,
+  EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_AGGREGATE_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1,
@@ -16,12 +18,16 @@ import {
   m1IngressAad,
   MpccaWithdrawV2Error,
   mpccaWithdrawFinalTranscriptHash,
+  mpccaWithdrawFinalizeAggregatedCommitmentsHash,
+  mpccaWithdrawFinalizeAggregateHash,
   mpccaWithdrawFinalizeWorkerTranscriptHash,
   mpccaWithdrawProveWorkerTranscriptHash,
   mpccaWithdrawRound1WorkerTranscriptHash,
   mpccaWithdrawRound2AggregateHash,
   mpccaWithdrawRound2StatementInputsHash,
   mpccaWithdrawRound2WorkerTranscriptHash,
+  parseMpccaWithdrawFinalizeDkResult,
+  parseMpccaWithdrawFinalizeOrchestrateRequest,
   parseMpccaWithdrawFinalizeRequest,
   parseMpccaWithdrawFinalizeResponse,
   parseMpccaWithdrawProveRequest,
@@ -376,11 +382,21 @@ describe("mpcca_withdraw_v2 chained rounds (round2/prove/finalize)", () => {
     previousRoundCommitments: [HEX32_A, HEX32_B, HEX32_C, HEX32_D, HEX32_E],
   };
   const round2Base = { ...chainedBase, statementInputs: VALID_STATEMENT_INPUTS };
+  const FINALIZE_AGG: HexString[] = Array.from({ length: 30 }, (_, i) =>
+    `${(0x70 + i).toString(16).padStart(2, "0")}`.repeat(32),
+  );
+  const FINALIZE_CHALLENGE_HEX = HEX32_B;
+  const finalizeBase = {
+    ...chainedBase,
+    statementInputs: VALID_STATEMENT_INPUTS,
+    aggregatedSigmaCommitmentsHex: FINALIZE_AGG,
+    challengeHex: FINALIZE_CHALLENGE_HEX,
+  };
 
   it("each chained round returns distinct hashes for the same body", () => {
     const r2 = mpccaWithdrawRound2WorkerTranscriptHash(round2Base);
     const pr = mpccaWithdrawProveWorkerTranscriptHash(chainedBase);
-    const fin = mpccaWithdrawFinalizeWorkerTranscriptHash(chainedBase);
+    const fin = mpccaWithdrawFinalizeWorkerTranscriptHash(finalizeBase);
     expect(new Set([r2, pr, fin]).size).toBe(3);
     expect(r2).toMatch(/^[0-9a-f]{64}$/);
     expect(pr).toMatch(/^[0-9a-f]{64}$/);
@@ -577,6 +593,231 @@ describe("mpcca_withdraw_v2 round2 aggregate hash (M4 commit 2)", () => {
     expect(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1).not.toBe(
       EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1,
     );
+  });
+});
+
+describe("mpcca_withdraw_v2 finalize hashes (M4 commit 3 + 4)", () => {
+  const FINALIZE_AGG_FIXTURE: HexString[] = Array.from({ length: 30 }, (_, i) =>
+    `${(0x70 + i).toString(16).padStart(2, "0")}`.repeat(32),
+  );
+  const FINALIZE_CHALLENGE_HEX = HEX32_B;
+
+  it("aggregated commitments hash is byte-stable + 64 hex chars + flips on entry change", () => {
+    const h = mpccaWithdrawFinalizeAggregatedCommitmentsHash(FINALIZE_AGG_FIXTURE);
+    expect(h).toMatch(/^[0-9a-f]{64}$/);
+    expect(h).toBe(mpccaWithdrawFinalizeAggregatedCommitmentsHash(FINALIZE_AGG_FIXTURE));
+    const mutated = [...FINALIZE_AGG_FIXTURE];
+    mutated[5] = HEX32_F;
+    expect(mpccaWithdrawFinalizeAggregatedCommitmentsHash(mutated)).not.toBe(h);
+  });
+
+  function finalizeArgs() {
+    return {
+      sessionId: "sess",
+      requestId: "req",
+      dkgEpoch: "1",
+      vaultEkTranscriptHash: HEX32_A,
+      registrationTranscriptHash: HEX32_B,
+      vaultStateInitTranscriptHash: HEX32_C,
+      observedDepositTranscriptHashes: [HEX32_D],
+      rosterHash: HEX32_F,
+      sortedSelectedSlots: [0, 1, 2, 3, 4],
+      selfSlot: 2,
+      playerId: 2,
+      vaultEk: HEX32_1,
+      senderAddress: HEX32_2,
+      assetType: HEX32_3,
+      chainId: 2,
+      root: HEX32_4,
+      nullifierHash: HEX32_5,
+      recipient: HEX32_6,
+      recipientHash: HEX32_7,
+      amountTag: HEX32_8,
+      vaultSequence: 4,
+      expirySecs: 1_700_000_000,
+      requestHash: HEX32_9,
+      depositCount: 7,
+      previousRoundTranscriptHash: HEX32_0,
+      previousRoundCommitments: [HEX32_A, HEX32_B, HEX32_C, HEX32_D, HEX32_E],
+      statementInputs: VALID_STATEMENT_INPUTS,
+      aggregatedSigmaCommitmentsHex: FINALIZE_AGG_FIXTURE,
+      challengeHex: FINALIZE_CHALLENGE_HEX,
+    };
+  }
+
+  it("finalize worker_transcript_hash is byte-stable", () => {
+    const base = finalizeArgs();
+    expect(mpccaWithdrawFinalizeWorkerTranscriptHash(base)).toBe(
+      mpccaWithdrawFinalizeWorkerTranscriptHash(base),
+    );
+  });
+
+  it("finalize worker_transcript_hash flips on aggregated A change", () => {
+    const base = finalizeArgs();
+    const baseHash = mpccaWithdrawFinalizeWorkerTranscriptHash(base);
+    const mutatedAgg = [...base.aggregatedSigmaCommitmentsHex];
+    mutatedAgg[7] = HEX32_F;
+    expect(
+      mpccaWithdrawFinalizeWorkerTranscriptHash({
+        ...base,
+        aggregatedSigmaCommitmentsHex: mutatedAgg,
+      }),
+    ).not.toBe(baseHash);
+  });
+
+  it("finalize worker_transcript_hash flips on challenge change", () => {
+    const base = finalizeArgs();
+    const baseHash = mpccaWithdrawFinalizeWorkerTranscriptHash(base);
+    expect(
+      mpccaWithdrawFinalizeWorkerTranscriptHash({ ...base, challengeHex: HEX32_F }),
+    ).not.toBe(baseHash);
+  });
+
+  it("finalize worker_transcript_hash flips on Statement input change", () => {
+    const base = finalizeArgs();
+    const baseHash = mpccaWithdrawFinalizeWorkerTranscriptHash(base);
+    expect(
+      mpccaWithdrawFinalizeWorkerTranscriptHash({
+        ...base,
+        statementInputs: { ...VALID_STATEMENT_INPUTS, recipientEk: HEX32_F },
+      }),
+    ).not.toBe(baseHash);
+  });
+
+  it("finalize aggregate hash is byte-stable + flips on aggregated A change", () => {
+    const baseInput = {
+      statementInputs: VALID_STATEMENT_INPUTS,
+      aggregatedSigmaCommitmentsHex: FINALIZE_AGG_FIXTURE,
+      challengeHex: FINALIZE_CHALLENGE_HEX,
+      dkBaseIndicesUsed: [...DK_BASE_INDICES_CANONICAL],
+      perSlotContributions: [0, 1, 2, 3, 4].map((slot) => ({
+        slot,
+        workerTranscriptHash: HEX32_A,
+        partialResponseDkHex: HEX32_1,
+      })),
+    };
+    const a = mpccaWithdrawFinalizeAggregateHash(baseInput);
+    expect(a).toMatch(/^[0-9a-f]{64}$/);
+    expect(a).toBe(mpccaWithdrawFinalizeAggregateHash(baseInput));
+    const mutatedAgg = [...baseInput.aggregatedSigmaCommitmentsHex];
+    mutatedAgg[3] = HEX32_F;
+    expect(
+      mpccaWithdrawFinalizeAggregateHash({
+        ...baseInput,
+        aggregatedSigmaCommitmentsHex: mutatedAgg,
+      }),
+    ).not.toBe(a);
+  });
+
+  it("finalize aggregate hash flips on per-slot partial response change", () => {
+    const baseInput = {
+      statementInputs: VALID_STATEMENT_INPUTS,
+      aggregatedSigmaCommitmentsHex: FINALIZE_AGG_FIXTURE,
+      challengeHex: FINALIZE_CHALLENGE_HEX,
+      dkBaseIndicesUsed: [...DK_BASE_INDICES_CANONICAL],
+      perSlotContributions: [0, 1, 2, 3, 4].map((slot) => ({
+        slot,
+        workerTranscriptHash: HEX32_A,
+        partialResponseDkHex: HEX32_1,
+      })),
+    };
+    const base = mpccaWithdrawFinalizeAggregateHash(baseInput);
+    const mutated = {
+      ...baseInput,
+      perSlotContributions: baseInput.perSlotContributions.map((c, i) =>
+        i === 2 ? { ...c, partialResponseDkHex: HEX32_F } : c,
+      ),
+    };
+    expect(mpccaWithdrawFinalizeAggregateHash(mutated)).not.toBe(base);
+  });
+
+  it("finalize aggregate hash uses its own domain distinct from round2 aggregate", () => {
+    expect(EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_AGGREGATE_V1).toBe(
+      "EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_AGGREGATE_V1",
+    );
+    expect(EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_AGGREGATE_V1).not.toBe(
+      EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1,
+    );
+  });
+
+  it("parseMpccaWithdrawFinalizeOrchestrateRequest accepts a base identity body", () => {
+    const body = validChainedBody();
+    // Strip chained-round-only fields the orchestrate body shouldn't carry.
+    const { previousRoundTranscriptHash: _drop1, previousRoundCommitments: _drop2, ...base } =
+      body;
+    void _drop1;
+    void _drop2;
+    const parsed = parseMpccaWithdrawFinalizeOrchestrateRequest(base);
+    expect(parsed.dkgEpoch).toBe("1");
+    expect(parsed.selectedSlots).toHaveLength(5);
+  });
+
+  it("parseMpccaWithdrawFinalizeRequest rejects wrong aggregated commitments length", () => {
+    const body = {
+      ...validChainedBody(),
+      ...VALID_STATEMENT_INPUTS,
+      aggregatedSigmaCommitmentsHex: Array.from({ length: 29 }, () => HEX32_A),
+      challengeHex: HEX32_B,
+    };
+    expect(() => parseMpccaWithdrawFinalizeRequest(body)).toThrow(MpccaWithdrawV2Error);
+  });
+
+  it("parseMpccaWithdrawFinalizeRequest rejects wrong challengeHex length", () => {
+    const body = {
+      ...validChainedBody(),
+      ...VALID_STATEMENT_INPUTS,
+      aggregatedSigmaCommitmentsHex: Array.from({ length: 30 }, () => HEX32_A),
+      challengeHex: "01",
+    };
+    expect(() => parseMpccaWithdrawFinalizeRequest(body)).toThrow(MpccaWithdrawV2Error);
+  });
+
+  it("parseMpccaWithdrawFinalizeDkResult accepts a completed M4-c3 reply", () => {
+    const body = {
+      slot: 0,
+      playerId: 0,
+      sessionStatePath: "/tmp/session",
+      sessionStateHash: HEX32_A,
+      workerTranscriptHash: HEX32_B,
+      observedAtUnixMs: 1_700_000_000_000,
+      completed: true,
+      partialResponseDkHex: HEX32_1,
+      dkBaseIndicesUsed: [0, 17],
+    };
+    const parsed = parseMpccaWithdrawFinalizeDkResult(body);
+    expect(parsed.completed).toBe(true);
+    expect(parsed.partialResponseDkHex).toBe(HEX32_1);
+    expect(parsed.dkBaseIndicesUsed).toEqual([0, 17]);
+  });
+
+  it("parseMpccaWithdrawFinalizeDkResult rejects out-of-canonical-set dk indices", () => {
+    const body = {
+      slot: 0,
+      playerId: 0,
+      sessionStatePath: "/tmp/session",
+      sessionStateHash: HEX32_A,
+      workerTranscriptHash: HEX32_B,
+      observedAtUnixMs: 1_700_000_000_000,
+      completed: true,
+      partialResponseDkHex: HEX32_1,
+      dkBaseIndicesUsed: [0, 99],
+    };
+    expect(() => parseMpccaWithdrawFinalizeDkResult(body)).toThrow(MpccaWithdrawV2Error);
+  });
+
+  it("parseMpccaWithdrawFinalizeDkResult rejects wrong partialResponseDkHex length", () => {
+    const body = {
+      slot: 0,
+      playerId: 0,
+      sessionStatePath: "/tmp/session",
+      sessionStateHash: HEX32_A,
+      workerTranscriptHash: HEX32_B,
+      observedAtUnixMs: 1_700_000_000_000,
+      completed: true,
+      partialResponseDkHex: "01".repeat(16), // 16 bytes, not 32
+      dkBaseIndicesUsed: [0, 17],
+    };
+    expect(() => parseMpccaWithdrawFinalizeDkResult(body)).toThrow(MpccaWithdrawV2Error);
   });
 });
 
@@ -1041,10 +1282,21 @@ describe("mpcca_withdraw_v2 parsers", () => {
     );
   });
 
-  it("parseMpccaWithdrawFinalizeRequest accepts a chained body", () => {
-    expect(
-      parseMpccaWithdrawFinalizeRequest(validChainedBody()).previousRoundCommitments,
-    ).toHaveLength(5);
+  it("parseMpccaWithdrawFinalizeRequest accepts a finalize body (chained + statement + aggregated + challenge)", () => {
+    const body = {
+      ...validChainedBody(),
+      ...VALID_STATEMENT_INPUTS,
+      aggregatedSigmaCommitmentsHex: Array.from(
+        { length: 30 },
+        (_, i) => `${(0x70 + i).toString(16).padStart(2, "0")}`.repeat(32),
+      ),
+      challengeHex: HEX32_B,
+    };
+    const parsed = parseMpccaWithdrawFinalizeRequest(body);
+    expect(parsed.previousRoundCommitments).toHaveLength(5);
+    expect(parsed.aggregatedSigmaCommitmentsHex).toHaveLength(30);
+    expect(parsed.challengeHex).toBe(HEX32_B);
+    expect(parsed.recipientEk).toBe(VALID_STATEMENT_INPUTS.recipientEk);
   });
 
   it("parseMpccaWithdrawRound1Response accepts a completed M1 response", () => {

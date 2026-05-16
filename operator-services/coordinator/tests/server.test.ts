@@ -5138,6 +5138,318 @@ describe("coordinator", () => {
   });
 
   // ---------------------------------------------------------------------------------------------
+  // Milestone 4 sub-milestone 4-c4 — POST /v2/withdraw/mpcca/finalize orchestrator.
+  //
+  // Reads __round2.json, builds the aggregated 30-point sigma commitment vector (Ristretto-point
+  // addition over worker dk-base partials + user A_user[29]), derives canonical Fiat-Shamir e
+  // via Aptos SDK's sigmaProtocolFiatShamir, fans out per-worker FinalizeRequest concurrently,
+  // collects partial s_share responses, aggregates s[0] = Σ_j s_share_j (mod n), combines with
+  // user s_user[1..25] into the full sigma response vector, and persists __finalize.json with
+  // `notImplementedPhase = "m4_pending_frost_signature_assembly"` + mpccaWithdrawFinalizeArtifact.
+  //
+  // M4-c4 happy-path + algebraic-byte-parity tests live in the Aptos SDK end-to-end byte-parity
+  // suite (planned for M4-c5). The c4 coordinator tests here exercise the orchestration error
+  // paths: missing __round2.json, identity mismatch, stale roster/epoch, lock contention,
+  // forbidden plaintext fields, state_root unconfigured.
+  // ---------------------------------------------------------------------------------------------
+  describe("MPCCA withdraw V2 finalize — M4 commit 4 orchestrator", () => {
+    function genHex32(group: string, i: number): string {
+      const idx = i.toString(16).padStart(2, "0");
+      return (group + idx).repeat(16);
+    }
+
+    function buildFinalizeOrchestrateBody(
+      overrides: Record<string, unknown> = {},
+    ): Record<string, unknown> {
+      return {
+        dkgEpoch: "1",
+        requestId: "mpcca-wdr-fin",
+        sessionId: "mpcca-wdr-fin",
+        vaultEkTranscriptHash: h32("7"),
+        registrationTranscriptHash: h32("8"),
+        vaultStateInitTranscriptHash: h32("9"),
+        observedDepositTranscriptHashes: [h32("0")],
+        rosterHash: h32("aa"),
+        selectedSlots: [0, 1, 2, 3, 4],
+        selfSlot: 0,
+        playerId: 0,
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        root: h32("1"),
+        nullifierHash: h32("2"),
+        recipient: h32("3"),
+        recipientHash: h32("4"),
+        amountTag: h32("5"),
+        vaultSequence: 0,
+        expirySecs: 1_700_000_000,
+        requestHash: h32("6"),
+        depositCount: 1,
+        ...overrides,
+      };
+    }
+
+    function buildStatementInputs() {
+      return {
+        recipientEk: "a1".repeat(32),
+        oldBalanceC: Array.from({ length: 8 }, (_, i) => genHex32("b0", i)),
+        oldBalanceD: Array.from({ length: 8 }, (_, i) => genHex32("c0", i)),
+        newBalanceC: Array.from({ length: 8 }, (_, i) => genHex32("d0", i)),
+        newBalanceD: Array.from({ length: 8 }, (_, i) => genHex32("e0", i)),
+        transferAmountC: Array.from({ length: 4 }, (_, i) => genHex32("f0", i)),
+        transferAmountDSender: Array.from({ length: 4 }, (_, i) => genHex32("12", i)),
+        transferAmountDRecipient: Array.from({ length: 4 }, (_, i) => genHex32("23", i)),
+      };
+    }
+
+    async function makeStateRoot(prefix: string): Promise<string> {
+      const { mkdtemp } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const os = await import("node:os");
+      return mkdtemp(join(os.tmpdir(), prefix));
+    }
+
+    async function stageRound2Artifact(
+      stateRoot: string,
+      body: Record<string, unknown>,
+      rosterHashHex: string,
+    ): Promise<string> {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+      await mkdir(dir, { recursive: true });
+      const path = join(
+        dir,
+        `${body.dkgEpoch}__${body.requestId}__round2.json`,
+      );
+      const sortedSlots = (body.selectedSlots as number[]).slice().sort((a, b) => a - b);
+      const stmt = buildStatementInputs();
+      const perSlotContributions = sortedSlots.map((slot) => ({
+        slot,
+        playerId: sortedSlots.indexOf(slot),
+        sessionStateHash: h32(String((slot + 1) % 9)),
+        workerTranscriptHash: h32(String((slot + 7) % 9)),
+        partialDkCommitments: [
+          { index: 0, commitmentHex: h32(String((slot + 3) % 9)) },
+          { index: 17, commitmentHex: h32(String((slot + 4) % 9)) },
+        ],
+        dkBaseIndicesUsed: [0, 17],
+      }));
+      const artifact = {
+        scheme: "mpcca_withdraw_v2_round2_dk",
+        dkgEpoch: body.dkgEpoch,
+        requestId: body.requestId,
+        sessionId: body.sessionId,
+        rosterHash: rosterHashHex,
+        selectedSlots: sortedSlots,
+        vaultEkTranscriptHash: body.vaultEkTranscriptHash,
+        registrationTranscriptHash: body.registrationTranscriptHash,
+        vaultStateInitTranscriptHash: body.vaultStateInitTranscriptHash,
+        observedDepositTranscriptHashes: body.observedDepositTranscriptHashes,
+        vaultEk: body.vaultEk,
+        senderAddress: body.senderAddress,
+        assetType: body.assetType,
+        chainId: body.chainId,
+        root: body.root,
+        nullifierHash: body.nullifierHash,
+        recipient: body.recipient,
+        recipientHash: body.recipientHash,
+        amountTag: body.amountTag,
+        vaultSequence: body.vaultSequence,
+        expirySecs: body.expirySecs,
+        requestHash: body.requestHash,
+        depositCount: body.depositCount,
+        previousRoundTranscriptHash: h32("ab"),
+        previousRoundCommitments: [
+          h32("a0"),
+          h32("a1"),
+          h32("a2"),
+          h32("a3"),
+          h32("a4"),
+        ],
+        statementInputs: stmt,
+        statementInputsHashHex: h32("ff"),
+        dkBaseIndicesUsed: [0, 17],
+        perSlotContributions,
+        userProofArtifacts: {
+          userSigmaCommitmentsHex: Array.from({ length: 29 }, (_, i) => genHex32("34", i)),
+          userSigmaResponseSharesHex: Array.from({ length: 24 }, (_, i) => genHex32("45", i)),
+          bulletproofZkrpAmountHex: "ab".repeat(96),
+          bulletproofZkrpNewBalanceHex: "cd".repeat(160),
+          perChunkCommitmentsAmountHex: Array.from({ length: 4 }, (_, i) => genHex32("56", i)),
+          perChunkCommitmentsNewBalanceHex: Array.from({ length: 8 }, (_, i) => genHex32("67", i)),
+        },
+        round1TranscriptHash: h32("ab"),
+        round1TranscriptPath: join(dir, "1__mpcca-wdr-fin__round1.json"),
+        transcriptHash: h32("dd"),
+        createdAtUnixMs: 1_700_000_000_000,
+      };
+      await writeFile(path, JSON.stringify(artifact), { mode: 0o600 });
+      return path;
+    }
+
+    function stubFinalizeForwarderFailClosed(): typeof singleNodeForwarder {
+      // Stub that returns a 500 to surface forward_rejected; used by error-path tests where
+      // we expect the route to fail BEFORE fan-out (so this stub is never actually called).
+      return async (_path, _body, _roster, slot) => ({
+        slot,
+        ok: false,
+        statusCode: 500,
+        body: { error: "should_not_be_called" },
+      });
+    }
+
+    it("finalize_rejects_state_root_not_configured", async () => {
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFinalizeOrchestrateBody({ rosterHash: rosterHashHex });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        // No stateRoot.
+        singleNodeForwarder: stubFinalizeForwarderFailClosed(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/finalize",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("state_root_not_configured");
+    });
+
+    it("finalize_rejects_when_round2_transcript_missing", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-fin-no-r2-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFinalizeOrchestrateBody({ rosterHash: rosterHashHex });
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubFinalizeForwarderFailClosed(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/finalize",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("round2_transcript_not_found");
+    });
+
+    it("finalize_rejects_round2_identity_mismatch_vaultEk", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-fin-mismatch-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFinalizeOrchestrateBody({ rosterHash: rosterHashHex });
+      await stageRound2Artifact(stateRoot, body, rosterHashHex);
+      // Tamper vaultEk in the finalize body. Use a canonical 32-byte hex string distinct
+      // from the staged value (h32("d") = "d".repeat(64)).
+      const tampered = { ...body, vaultEk: "ee".repeat(32) };
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubFinalizeForwarderFailClosed(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/finalize",
+        payload: tampered,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("round2_transcript_identity_mismatch");
+      expect(res.json().field).toBe("vaultEk");
+    });
+
+    it("finalize_rejects_stale_dkg_epoch", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-fin-stale-epoch-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFinalizeOrchestrateBody({
+        rosterHash: rosterHashHex,
+        dkgEpoch: "999",
+      });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubFinalizeForwarderFailClosed(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/finalize",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("stale_dkg_epoch");
+    });
+
+    it("finalize_rejects_stale_roster_hash", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-fin-stale-roster-");
+      const caDkgV2Roster = dkgRoster();
+      const body = buildFinalizeOrchestrateBody({ rosterHash: "ee".repeat(32) });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubFinalizeForwarderFailClosed(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/finalize",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("stale_roster_hash");
+    });
+
+    it("finalize_rejects_forbidden_plaintext_field_amount", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-fin-forbidden-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFinalizeOrchestrateBody({ rosterHash: rosterHashHex });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubFinalizeForwarderFailClosed(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/finalize",
+        payload: { ...body, amount: 1_000_000 },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("forbidden_plaintext_field");
+      expect(res.json().field).toContain("amount");
+    });
+
+    it("finalize_rejects_forbidden_plaintext_field_dkShare", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-fin-forbidden-dk-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFinalizeOrchestrateBody({ rosterHash: rosterHashHex });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubFinalizeForwarderFailClosed(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/finalize",
+        payload: { ...body, dkShare: "01".repeat(32) },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("forbidden_plaintext_field");
+    });
+
+    // NOTE: M4-c4 lock contention is covered by the M4-c2 round2 lock test
+    // (`round2_returns_409_when_withdraw_lock_busy`); the finalize route re-uses the same
+    // `acquireVaultMpccaWithdrawLock` mechanism. A finalize-specific 409 killer test would
+    // require canonical Ristretto-point partials in the staged __round2.json so the route
+    // can pass aggregation and reach the lock step under the barrier; that's deferred to
+    // M4-c5's Aptos SDK byte-parity test which exercises the full happy path.
+  });
+
+  // ---------------------------------------------------------------------------------------------
   // Milestone 5 sub-milestone 5b — POST /v2/withdraw/mpcca/submit orchestrator.
   //
   // M5b is plumbing-only: the finalize transcript is still the M3a NotImplemented stub today,

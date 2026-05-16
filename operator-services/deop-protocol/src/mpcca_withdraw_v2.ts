@@ -295,7 +295,88 @@ export type MpccaWithdrawRound2Request = MpccaWithdrawChainedRequest &
   MpccaWithdrawRound2StatementInputFields;
 
 export type MpccaWithdrawProveRequest = MpccaWithdrawChainedRequest;
-export type MpccaWithdrawFinalizeRequest = MpccaWithdrawChainedRequest;
+
+/**
+ * M4 Commit 3 — public Fiat-Shamir / aggregate fields carried alongside the chained-round
+ * envelope at the finalize boundary. The coordinator builds these from the persisted
+ * `__round2.json` artifact (worker dk-base partials aggregated across the 5 selected workers,
+ * combined with the user-supplied 29-entry `A_user` to form the full 30-point `A`); `e` is
+ * computed by the coordinator via `sigma_fiat_shamir_seed(BCS(domain, type_name, k=25, stmt.x,
+ * stmt.scalars, A))`. Each worker re-derives `e` locally and asserts byte-equality so a
+ * malicious coordinator cannot lie about `e`.
+ *
+ * Privacy contract: every field is a public crypto output (commitment / scalar). No plaintext
+ * witness component appears here.
+ */
+export interface MpccaWithdrawFinalizeFiatShamirFields {
+  /**
+   * Coordinator-aggregated 30-point sigma commitment vector `A_full`. Built by inlining the
+   * worker dk-base partials at canonical BASE_DK_SET positions into the user-supplied
+   * `A_user[29]` and the 1 shared position. 30 × 32-byte hex compressed Ristretto.
+   */
+  aggregatedSigmaCommitmentsHex: HexString[];
+  /**
+   * Coordinator-computed Fiat-Shamir challenge `e`. 32-byte canonical Ed25519 scalar hex.
+   * Each worker re-derives `e` and rejects on byte mismatch.
+   */
+  challengeHex: HexString;
+}
+
+/**
+ * M4 Commit 3 — Finalize worker request. Extends the chained-round envelope with the same
+ * Aptos CA TransferV1 Statement input fields as round2 (the worker re-derives BASE_DK_SET and
+ * the Fiat-Shamir input from these) PLUS the coordinator-aggregated `A` + `e`. Byte-shape
+ * mirrors the Rust `FinalizeRequest` struct (which uses `#[serde(flatten)]` to splice
+ * `ChainedRoundRequest` into the JSON top level).
+ *
+ * The worker is the ONLY party that can decrypt `α_share_j[0]` from the round2 at-rest
+ * envelope; the coordinator supplies (A, e) and the worker returns `s_share_j = α_share_j[0]
+ * + e · (λ_j · dk_share_j)`. The at-rest finalize pin (see Rust `FinalizePinFile`) makes
+ * any second call with different (A, e) fail closed BEFORE α is decrypted, blocking the
+ * α-share replay key-recovery attack.
+ */
+export type MpccaWithdrawFinalizeRequest = MpccaWithdrawChainedRequest &
+  MpccaWithdrawRound2StatementInputFields &
+  MpccaWithdrawFinalizeFiatShamirFields;
+
+/**
+ * M4 Commit 3 — Finalize worker response shape. The worker contributes ONLY the dk-component
+ * of the sigma response vector `s`: a single 32-byte canonical Ed25519 scalar
+ * `s_share_j = α_share_j[0] + e · (λ_j · dk_share_j)`. The coordinator aggregates the 5
+ * selected workers' shares via `s[0] = Σ_j s_share_j` and combines with user-supplied
+ * `s_user[1..25]` to assemble the full 25-vector sigma response.
+ *
+ * `dkBaseIndicesUsed` mirrors round2's contract — re-derived from `psi_transfer` at finalize
+ * as defense-in-depth.
+ */
+export interface MpccaWithdrawFinalizeDkResult extends MpccaWithdrawBasePublicOutputs {
+  completed: true;
+  /** Single 32-byte canonical Ed25519 scalar hex. */
+  partialResponseDkHex: HexString;
+  /** Canonical BASE_DK_SET indices re-derived at finalize via psi_transfer inspection. */
+  dkBaseIndicesUsed: number[];
+}
+
+/**
+ * M4 Commit 4 — coordinator-inbound `/v2/withdraw/mpcca/finalize` request body. Only the base
+ * identity envelope is carried; the coordinator reconstructs the Statement inputs + user
+ * sigma response + Bulletproof + per-chunk commitments + worker dk-base partials by reading
+ * the persisted `__round2.json` artifact for `(dkgEpoch, requestId)`. The coordinator then:
+ *   1. Builds the aggregated 30-point `A_full` (worker dk-base partials at canonical BASE_DK_SET
+ *      positions, user-supplied `A_user[29]` at the remaining positions).
+ *   2. Computes the canonical Fiat-Shamir challenge `e` via Aptos CA TransferV1 BCS-encoded
+ *      sigma_fiat_shamir_seed.
+ *   3. Fans out the per-worker `MpccaWithdrawFinalizeRequest` (with aggregated A + e) to all
+ *      5 selected slots concurrently with bounded AbortController timeouts.
+ *   4. Aggregates `s[0] = Σ_j partialResponseDkHex_j` and combines with the user-supplied
+ *      `s_user[1..25]` to form the full 25-scalar sigma response.
+ *   5. Persists `__finalize.json` with the canonical mpcca-finalize artifact (transcript hash,
+ *      aggregated A, e, s[0..25], per-slot worker partial responses, perChunk commitments,
+ *      bulletproof bytes echo-back).
+ *
+ * Forbidden plaintext fields are guarded by `parseBaseRequest`.
+ */
+export interface MpccaWithdrawFinalizeOrchestrateRequest extends MpccaWithdrawBaseRequest {}
 
 /**
  * M4 Commit 2 — user-supplied proof artifacts carried by the coordinator-inbound round2
@@ -866,6 +947,35 @@ export function mpccaWithdrawProveWorkerTranscriptHash(args: {
   return chainedRoundHash(EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1, args);
 }
 
+/**
+ * M4 Commit 4 — canonical sha256 hex over the 30-entry aggregated sigma commitment vector.
+ * Each entry is the normalised 32-byte hex; entries joined by `|`. Byte-identical with the
+ * Rust `aggregated_sigma_commitments_hash_hex` helper.
+ */
+export function mpccaWithdrawFinalizeAggregatedCommitmentsHash(
+  aggregatedSigmaCommitmentsHex: HexString[],
+): HexString {
+  const enc = new TextEncoder();
+  const joined = aggregatedSigmaCommitmentsHex.map(normalizeHex).join("|");
+  return bytesToHex(sha256(enc.encode(joined)));
+}
+
+/**
+ * M4 Commit 3 — finalize worker_transcript_hash. Byte-identical with Rust
+ * `finalize_v2_worker_transcript_hash(chained_hash, statement_inputs_hash,
+ * aggregated_commitments_hash, challenge_hex)`.
+ *
+ *   chained_hash             = chainedRoundHash(FINALIZE domain)
+ *   statement_inputs_hash    = mpccaWithdrawRound2StatementInputsHash(7 groups)
+ *   aggregated_commits_hash  = sha256("hex0|hex1|...|hex29")
+ *   worker_transcript_hash   = sha256(chained_hash || ":" || statement_inputs_hash
+ *                                    || ":" || aggregated_commits_hash
+ *                                    || ":" || challenge_hex)
+ *
+ * Binds the full coordinator-supplied (Statement, A, e) tuple into the per-slot hash so a
+ * coordinator that tampers with ANY of the three for a single worker is rejected at the
+ * coordinator-side cross-check.
+ */
 export function mpccaWithdrawFinalizeWorkerTranscriptHash(args: {
   sessionId: string;
   requestId: string;
@@ -893,8 +1003,203 @@ export function mpccaWithdrawFinalizeWorkerTranscriptHash(args: {
   depositCount: number;
   previousRoundTranscriptHash: string;
   previousRoundCommitments: string[];
+  statementInputs: MpccaWithdrawRound2StatementInputFields;
+  aggregatedSigmaCommitmentsHex: HexString[];
+  challengeHex: HexString;
 }): HexString {
-  return chainedRoundHash(EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1, args);
+  const {
+    statementInputs,
+    aggregatedSigmaCommitmentsHex,
+    challengeHex,
+    ...chainedArgs
+  } = args;
+  const chainedHash = chainedRoundHash(EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1, chainedArgs);
+  const statementInputsHash = mpccaWithdrawRound2StatementInputsHash(statementInputs);
+  const aggregatedCommitmentsHash = mpccaWithdrawFinalizeAggregatedCommitmentsHash(
+    aggregatedSigmaCommitmentsHex,
+  );
+  const challengeHexNorm = normalizeHex(challengeHex);
+  const enc = new TextEncoder();
+  const combined = concat([
+    enc.encode(chainedHash),
+    enc.encode(":"),
+    enc.encode(statementInputsHash),
+    enc.encode(":"),
+    enc.encode(aggregatedCommitmentsHash),
+    enc.encode(":"),
+    enc.encode(challengeHexNorm),
+  ]);
+  return bytesToHex(sha256(combined));
+}
+
+/**
+ * M4 Commit 4 — deterministic coordinator-side finalize aggregate hash. Persisted into
+ * `__finalize.json` as the audit fingerprint binding:
+ *
+ *   - Statement input set (via `mpccaWithdrawRound2StatementInputsHash`).
+ *   - Aggregated 30-point sigma commitment vector hash.
+ *   - Fiat-Shamir challenge `e`.
+ *   - Per-slot worker partial response shares + worker transcript hashes (sorted by slot).
+ *
+ * Domain: `EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_AGGREGATE_V1`. Distinct from the round2 aggregate
+ * hash domain so cross-round transcript replay is impossible by construction.
+ */
+export const EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_AGGREGATE_V1 =
+  "EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_AGGREGATE_V1";
+
+/**
+ * M4 Commit 4 — coordinator-side Fiat-Shamir challenge `e` derivation for the Aptos CA
+ * TransferV1 sigma protocol. Calls into the Aptos SDK's `sigmaProtocolFiatShamir`, which
+ * is the byte-canonical Move-compatible implementation, so the coordinator's e matches
+ * what each worker computes locally (and what the chain verifier would compute).
+ *
+ * Inputs:
+ *   - `statementInputs`: the 7 Aptos CA TransferV1 Statement input fields (recipient_ek +
+ *     6 ciphertext vectors). Used together with the `vaultEkHex` (= sender_ek) to build
+ *     the public Statement points.
+ *   - `senderAddressHex`, `recipientAddressHex`, `assetTypeHex`, `chainId`: the chain-side
+ *     identity that goes into the DomainSeparator's BCS-serialized TransferSession.
+ *   - `aggregatedSigmaCommitmentsHex`: the 30-point aggregated commitment vector (each
+ *     entry 32-byte compressed Ristretto hex).
+ *
+ * Returns the canonical 32-byte hex of `e` (LE bytes of the scalar mod ed25519 order).
+ *
+ * Defense in depth: each worker also recomputes `e` locally; the coordinator-supplied
+ * `challengeHex` is byte-equality-checked by the worker before s_share is computed.
+ */
+export async function mpccaWithdrawFinalizeDeriveChallenge(input: {
+  vaultEkHex: HexString;
+  statementInputs: MpccaWithdrawRound2StatementInputFields;
+  senderAddressHex: HexString;
+  recipientAddressHex: HexString;
+  assetTypeHex: HexString;
+  chainId: number;
+  aggregatedSigmaCommitmentsHex: HexString[];
+}): Promise<HexString> {
+  const {
+    APTOS_FRAMEWORK_ADDRESS,
+    H_RISTRETTO,
+    RistrettoPoint,
+    bcsSerializeTransferSession,
+    sigmaProtocolFiatShamir,
+  } = await import("@aptos-labs/confidential-asset");
+  const PROTOCOL_ID = "AptosConfidentialAsset/TransferV1";
+  const TYPE_NAME = "0x1::sigma_protocol_transfer::Transfer";
+
+  function hexBytes32(hex: HexString, label: string): Uint8Array {
+    const norm = normalizeHex(hex);
+    const bytes = hexToBytes(norm);
+    if (bytes.length !== 32) {
+      throw new Error(
+        `${label} must be 32-byte hex; got ${bytes.length} bytes`,
+      );
+    }
+    return bytes;
+  }
+
+  const ekSidBytes = hexBytes32(input.vaultEkHex, "vaultEk");
+  const ekRidBytes = hexBytes32(input.statementInputs.recipientEk, "recipientEk");
+  const ekSid = RistrettoPoint.fromHex(ekSidBytes);
+  const ekRid = RistrettoPoint.fromHex(ekRidBytes);
+  const G = RistrettoPoint.BASE;
+  const H = H_RISTRETTO;
+
+  const points: ReturnType<typeof RistrettoPoint.fromHex>[] = [G, H, ekSid, ekRid];
+  const compressedPoints: Uint8Array[] = [
+    G.toRawBytes(),
+    H.toRawBytes(),
+    ekSidBytes,
+    ekRidBytes,
+  ];
+  const pushAll = (group: HexString[], label: string) => {
+    for (let i = 0; i < group.length; i += 1) {
+      const bytes = hexBytes32(group[i], `${label}[${i}]`);
+      points.push(RistrettoPoint.fromHex(bytes));
+      compressedPoints.push(bytes);
+    }
+  };
+  pushAll(input.statementInputs.oldBalanceC, "oldBalanceC");
+  pushAll(input.statementInputs.oldBalanceD, "oldBalanceD");
+  pushAll(input.statementInputs.newBalanceC, "newBalanceC");
+  pushAll(input.statementInputs.newBalanceD, "newBalanceD");
+  pushAll(input.statementInputs.transferAmountC, "transferAmountC");
+  pushAll(input.statementInputs.transferAmountDSender, "transferAmountDSender");
+  pushAll(input.statementInputs.transferAmountDRecipient, "transferAmountDRecipient");
+
+  const senderAddr = hexBytes32(input.senderAddressHex, "senderAddress");
+  const recipientAddr = hexBytes32(input.recipientAddressHex, "recipientAddress");
+  const assetAddr = hexBytes32(input.assetTypeHex, "assetType");
+  const sessionId = bcsSerializeTransferSession(
+    senderAddr,
+    recipientAddr,
+    assetAddr,
+    ROUND2_ELL,
+    ROUND2_N,
+    false,
+    0,
+  );
+  const dst = {
+    contractAddress: APTOS_FRAMEWORK_ADDRESS,
+    chainId: input.chainId,
+    protocolId: new TextEncoder().encode(PROTOCOL_ID),
+    sessionId,
+  };
+
+  if (input.aggregatedSigmaCommitmentsHex.length !== 30) {
+    throw new Error(
+      `aggregatedSigmaCommitmentsHex must have 30 entries; got ${input.aggregatedSigmaCommitmentsHex.length}`,
+    );
+  }
+  const compressedA: Uint8Array[] = input.aggregatedSigmaCommitmentsHex.map(
+    (hex, i) => hexBytes32(hex, `aggregatedSigmaCommitmentsHex[${i}]`),
+  );
+
+  const stmt = { points, compressedPoints, scalars: [] };
+  const { e } = sigmaProtocolFiatShamir(dst, TYPE_NAME, stmt, compressedA, 25);
+
+  // Convert e (bigint scalar mod n) to 32-byte LE hex matching Rust's `Scalar::to_bytes()`.
+  const eBytes = new Uint8Array(32);
+  let value = e;
+  for (let i = 0; i < 32; i += 1) {
+    eBytes[i] = Number(value & 0xffn);
+    value >>= 8n;
+  }
+  return bytesToHex(eBytes);
+}
+
+export function mpccaWithdrawFinalizeAggregateHash(input: {
+  statementInputs: MpccaWithdrawRound2StatementInputFields;
+  aggregatedSigmaCommitmentsHex: HexString[];
+  challengeHex: HexString;
+  dkBaseIndicesUsed: number[];
+  perSlotContributions: Array<{
+    slot: number;
+    workerTranscriptHash: HexString;
+    partialResponseDkHex: HexString;
+  }>;
+}): HexString {
+  const enc = new TextEncoder();
+  const parts: Uint8Array[] = [
+    enc.encode(EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_AGGREGATE_V1),
+    enc.encode(":"),
+    enc.encode(mpccaWithdrawRound2StatementInputsHash(input.statementInputs)),
+    enc.encode(":"),
+    enc.encode(mpccaWithdrawFinalizeAggregatedCommitmentsHash(input.aggregatedSigmaCommitmentsHex)),
+    enc.encode(":"),
+    enc.encode(normalizeHex(input.challengeHex)),
+    enc.encode(":"),
+    enc.encode([...input.dkBaseIndicesUsed].sort((a, b) => a - b).join(",")),
+  ];
+  const sortedContribs = [...input.perSlotContributions].sort((a, b) => a.slot - b.slot);
+  for (const c of sortedContribs) {
+    parts.push(enc.encode(":"));
+    parts.push(enc.encode(c.slot.toString()));
+    parts.push(enc.encode("|"));
+    parts.push(enc.encode(normalizeHex(c.workerTranscriptHash)));
+    parts.push(enc.encode("|"));
+    parts.push(enc.encode(normalizeHex(c.partialResponseDkHex)));
+  }
+  return bytesToHex(sha256(concat(parts)));
 }
 
 // =================================================================================================
@@ -1844,10 +2149,139 @@ export function parseMpccaWithdrawProveRequest(
   return parseChainedRequest(body);
 }
 
+/**
+ * M4 Commit 3 — finalize worker request. Chained-round envelope + 7 Statement input fields
+ * (byte-identical to round2's) + the coordinator-aggregated 30-point sigma commitment vector
+ * + Fiat-Shamir challenge `e`. Used by the worker-side handler at
+ * `POST /worker/v2/mpcca/withdraw/finalize`. Forbidden plaintext fields are guarded by
+ * `parseBaseRequest`.
+ *
+ * Wire shape: every base ChainedRoundRequest field at top level, then the 7 Statement input
+ * fields, then `aggregatedSigmaCommitmentsHex` (30 × 32-byte hex compressed Ristretto), then
+ * `challengeHex` (32-byte canonical Ed25519 scalar hex). Mirrors the Rust `FinalizeRequest`
+ * struct.
+ */
 export function parseMpccaWithdrawFinalizeRequest(
   body: unknown,
 ): MpccaWithdrawFinalizeRequest {
-  return parseChainedRequest(body);
+  const chained = parseChainedRequest(body);
+  const obj = objectBody(body);
+  const stmt = requireRound2StatementInputs(obj);
+  const aggregatedSigmaCommitmentsHex = requireFixedLengthHexVec(
+    obj,
+    "aggregatedSigmaCommitmentsHex",
+    30,
+    32,
+    "INVALID_USER_SIGMA_SHAPE",
+  );
+  const challengeHex = requireFixedLengthHex(
+    obj,
+    "challengeHex",
+    32,
+    "INVALID_USER_SIGMA_SHAPE",
+  );
+  return {
+    ...chained,
+    ...stmt,
+    aggregatedSigmaCommitmentsHex,
+    challengeHex,
+  };
+}
+
+/**
+ * M4 Commit 3 — parse the worker's `FinalizeDkResult` HTTP reply. The Rust worker emits this
+ * shape under `#[serde(rename_all = "camelCase")]`. Validates:
+ *   - `completed === true` (M4 commit 3 path; stub-mode finalize is retired).
+ *   - `partialResponseDkHex` is canonical 32-byte hex (an Ed25519 scalar).
+ *   - `dkBaseIndicesUsed` is a sorted-equal-to-canonical subset of `DK_BASE_INDICES_CANONICAL`
+ *     (= `[0, 17]`).
+ *
+ * Caller-side: the coordinator additionally cross-checks
+ * `dkBaseIndicesUsed === DK_BASE_INDICES_CANONICAL` across ALL 5 workers (any divergence
+ * surfaces `DK_BASE_INDICES_DIVERGENCE`).
+ */
+export function parseMpccaWithdrawFinalizeDkResult(
+  body: unknown,
+): MpccaWithdrawFinalizeDkResult {
+  const pub = parsePublicOutputs(body);
+  const obj = objectBody(body);
+  const completed = obj.completed;
+  if (completed !== true) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_ROUND2_PARTIAL_SHAPE",
+      "M4 commit 3 finalize response must have completed: true",
+    );
+  }
+  const partialResponseDkHex = requireFixedLengthHex(
+    obj,
+    "partialResponseDkHex",
+    32,
+    "INVALID_ROUND2_PARTIAL_SHAPE",
+  );
+  const rawIndices = obj.dkBaseIndicesUsed;
+  if (!Array.isArray(rawIndices)) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_ROUND2_PARTIAL_SHAPE",
+      "dkBaseIndicesUsed must be an array",
+    );
+  }
+  const dkBaseIndicesUsed: number[] = [];
+  for (let i = 0; i < rawIndices.length; i += 1) {
+    const idx = rawIndices[i];
+    if (!Number.isInteger(idx) || (idx as number) < 0 || (idx as number) > 1024) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        `dkBaseIndicesUsed[${i}] must be a small non-negative integer`,
+      );
+    }
+    dkBaseIndicesUsed.push(idx as number);
+  }
+  // Defense-in-depth: every index must be in the canonical {0, 17} set.
+  for (const idx of dkBaseIndicesUsed) {
+    if (!DK_BASE_INDICES_CANONICAL.includes(idx)) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        `dkBaseIndicesUsed entry ${idx} not in canonical BASE_DK_SET ${DK_BASE_INDICES_CANONICAL.join(",")}`,
+      );
+    }
+  }
+  return {
+    ...pub,
+    completed: true,
+    partialResponseDkHex,
+    dkBaseIndicesUsed,
+  };
+}
+
+/**
+ * M4 Commit 4 — coordinator-inbound orchestrate request for `POST /v2/withdraw/mpcca/finalize`.
+ *
+ * Wire shape: ONLY the base identity envelope. The coordinator reconstructs Statement inputs +
+ * user proof artifacts from the persisted `__round2.json` artifact and aggregates worker
+ * partials into `A_full[30]` + computes Fiat-Shamir `e`. Forbidden plaintext fields are
+ * guarded by `parseBaseRequest`.
+ */
+export function parseMpccaWithdrawFinalizeOrchestrateRequest(
+  body: unknown,
+): MpccaWithdrawFinalizeOrchestrateRequest {
+  return parseBaseRequest(body);
+}
+
+function requireFixedLengthHex(
+  obj: Record<string, unknown>,
+  key: string,
+  bytes: number,
+  errorCode: MpccaWithdrawV2ErrorCode,
+): HexString {
+  const v = obj[key];
+  if (typeof v !== "string" || v.length === 0) {
+    throw new MpccaWithdrawV2Error(errorCode, `${key} must be a non-empty hex string`);
+  }
+  const norm = normalizeHex(v);
+  if (hexToBytes(norm).length !== bytes) {
+    throw new MpccaWithdrawV2Error(errorCode, `${key} must be ${bytes}-byte hex`);
+  }
+  return norm;
 }
 
 function parsePublicOutputs(body: unknown): MpccaWithdrawBasePublicOutputs {
