@@ -3621,6 +3621,207 @@ describe("coordinator", () => {
     expect(mpccaWithdrawRound1WorkerTranscriptHash).toBeTypeOf("function");
   });
 
+  // Codex M3a P3: response.transcriptHash is a REAL digest over the persisted artifact.
+  // The original P2 #3 test only asserted shape (32-byte hex) and the negative literal
+  // — it didn't recompute the hash from the on-disk artifact and assert equality. That
+  // gap meant a future refactor could drift the persistence path and the response shape
+  // independently without the test catching it.
+  //
+  // This test:
+  //   1. Configures stateRoot so the orchestrator writes the artifact to disk.
+  //   2. Calls /v2/withdraw/mpcca/start and captures both the response transcriptHash AND
+  //      the persisted artifact's transcriptHash.
+  //   3. Recomputes the canonical hash by re-running the SAME canonicalize+sha256 the
+  //      orchestrator runs (deterministic JSON over the artifact minus the transcriptHash
+  //      field).
+  //   4. Asserts all three match. If they don't, the integrity contract is broken.
+  it("mpcca_withdraw_round1 transcriptHash recomputes byte-for-byte from persisted artifact", async () => {
+    const { mkdtemp, writeFile, mkdir, readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const { sha256, bytesToHex } = await import("@eunoma/shared");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-mpcca-transcript-"));
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const vaultEk = h32("d");
+    const senderAddress = h32("e");
+    const assetType = h32("f");
+    const chainId = 2;
+    const persistedVaultEkTranscriptHash = h32("7");
+    const persistedRegistrationTranscriptHash = h32("8");
+    const persistedAggCommitment = h32("4");
+    const persistedAggResponse = h32("5");
+    const persistedChallenge = h32("6");
+    const persistedInitTranscriptHash = h32("9");
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    // Materialise the prereq transcripts so the orchestrator can resolve provenance.
+    const phase2Dir = join(stateRoot, "coordinator", "vault_ek_derivation");
+    await mkdir(phase2Dir, { recursive: true });
+    await writeFile(
+      join(phase2Dir, `${dkgEpoch}__phase2.json`),
+      JSON.stringify({
+        scheme: "vault_ek_derivation_v1",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        selectedSlots: expectedSelectedSlots,
+        selectionRationale: "coordinator-chosen",
+        rosterHash: rosterHashHex,
+        verifierSlot: 0,
+        perSlotContributions: [],
+        vaultEk,
+        finalTranscriptHash: persistedVaultEkTranscriptHash,
+        createdAtUnixMs: 1_700_000_000_000,
+      }),
+      { mode: 0o600 },
+    );
+    const m1Dir = join(stateRoot, "coordinator", "ca_registration_v2");
+    await mkdir(m1Dir, { recursive: true });
+    await writeFile(
+      join(m1Dir, `${dkgEpoch}__milestone1.json`),
+      JSON.stringify({
+        scheme: "ca_registration_v2",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        rosterHash: rosterHashHex,
+        selectedSlots: expectedSelectedSlots,
+        verifierSlot: 0,
+        vaultEk,
+        vaultEkTranscriptHash: persistedVaultEkTranscriptHash,
+        senderAddress,
+        assetType,
+        chainId,
+        aggregateCommitment: persistedAggCommitment,
+        aggregateResponse: persistedAggResponse,
+        challenge: persistedChallenge,
+        perSlotContributions: [],
+        transcriptHash: persistedRegistrationTranscriptHash,
+        createdAtUnixMs: 1_700_000_000_000,
+      }),
+      { mode: 0o600 },
+    );
+    const m2aDir = join(stateRoot, "coordinator", "vault_state_v2");
+    await mkdir(m2aDir, { recursive: true });
+    await writeFile(
+      join(m2aDir, `${dkgEpoch}__m2a-recompute.json`),
+      JSON.stringify({
+        scheme: "vault_state_v2",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEkTranscriptHash: persistedVaultEkTranscriptHash,
+        registrationTranscriptHash: persistedRegistrationTranscriptHash,
+        rosterHash: rosterHashHex,
+        selectedSlots: expectedSelectedSlots,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+        aggregateCommitment: persistedAggCommitment,
+        aggregateResponse: persistedAggResponse,
+        challenge: persistedChallenge,
+        perSlotContributions: [],
+        transcriptHash: persistedInitTranscriptHash,
+        createdAtUnixMs: 1_700_000_000_000,
+      }),
+      { mode: 0o600 },
+    );
+
+    // No observed deposits — keeps the test focused on the round1 transcript binding.
+    const payload = {
+      requestId: "mpcca-wdr-recompute",
+      dkgEpoch,
+      caDkgTranscriptHash: caDkgTranscriptHashHex,
+      vaultEk,
+      senderAddress,
+      assetType,
+      chainId,
+      root: h32("1"),
+      nullifierHash: h32("2"),
+      recipient: h32("3"),
+      recipientHash: h32("4"),
+      amountTag: h32("5"),
+      vaultSequence: 0,
+      expirySecs: 1_700_000_000,
+      requestHash: h32("6"),
+      depositCount: 0,
+    };
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: stubMpccaRound1Forwarder({
+        expectedSelectedSlots,
+        rosterHashHex,
+        dkgEpoch,
+        vaultEkTranscriptHash: persistedVaultEkTranscriptHash,
+        registrationTranscriptHash: persistedRegistrationTranscriptHash,
+        vaultStateInitTranscriptHash: persistedInitTranscriptHash,
+        observedDepositTranscriptHashes: [],
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+        root: payload.root,
+        nullifierHash: payload.nullifierHash,
+        recipient: payload.recipient,
+        recipientHash: payload.recipientHash,
+        amountTag: payload.amountTag,
+        vaultSequence: payload.vaultSequence,
+        expirySecs: payload.expirySecs,
+        requestHash: payload.requestHash,
+        depositCount: payload.depositCount,
+      }),
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload,
+    });
+    expect(res.statusCode).toBe(501);
+    const body = res.json();
+    const responseTranscriptHash = body.transcriptHash as string;
+    expect(responseTranscriptHash).toMatch(/^[0-9a-f]{64}$/);
+
+    // Read the persisted artifact and assert its transcriptHash matches the response.
+    const artifactPath = join(
+      stateRoot,
+      "coordinator",
+      "mpcca_withdraw",
+      `${dkgEpoch}__${payload.requestId}__round1.json`,
+    );
+    const raw = await readFile(artifactPath, "utf8");
+    const artifact = JSON.parse(raw) as Record<string, unknown>;
+    expect(artifact.transcriptHash).toBe(responseTranscriptHash);
+
+    // KILLER: independently recompute the canonical hash from the persisted artifact
+    // and assert it matches. This proves the artifact's transcriptHash is a REAL digest
+    // over its own contents (minus the transcriptHash field itself), not a literal or a
+    // stale value from an earlier write.
+    //
+    // Mirror the orchestrator's canonicalize() in this test scope so a coordinator-side
+    // refactor that drifts the serializer is caught here.
+    function canonicalize(value: unknown): unknown {
+      if (value === null || typeof value !== "object") return value;
+      if (Array.isArray(value)) return value.map(canonicalize);
+      const obj = value as Record<string, unknown>;
+      const sorted: Record<string, unknown> = {};
+      for (const key of Object.keys(obj).sort()) {
+        const v = obj[key];
+        if (v === undefined) continue;
+        sorted[key] = canonicalize(v);
+      }
+      return sorted;
+    }
+    const { transcriptHash: _stripped, ...artifactWithoutHash } = artifact;
+    const recomputed = bytesToHex(
+      sha256(new TextEncoder().encode(JSON.stringify(canonicalize(artifactWithoutHash)))),
+    );
+    expect(recomputed).toBe(responseTranscriptHash);
+  });
+
   it("mpcca_withdraw_round1 returns 502 worker_transcript_hash_mismatch on tampered reply", async () => {
     const caDkgV2Roster = dkgRoster();
     const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
