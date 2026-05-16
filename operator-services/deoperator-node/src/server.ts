@@ -262,19 +262,23 @@ export function buildDeoperatorNodeServer(
     }
   });
 
-  // Phase 2: passthrough routes for the vault_ek derive HTTP fan-out. The coordinator hits
-  // `node.endpoint` (the deop-node), and the deop-node forwards to its local crypto worker.
-  // This sits in between because we keep worker URLs private to each node + we want the
-  // deop-node's bearer-auth hook to apply.
+  // Phase 2 / Milestone 1: passthrough routes for the vault_ek derive HTTP fan-out AND the
+  // V2 CA registration sigma fan-out. The coordinator hits `node.endpoint` (the deop-node),
+  // and the deop-node forwards to its local crypto worker. This sits in between because we
+  // keep worker URLs private to each node + we want the deop-node's bearer-auth hook to apply.
   //
   // Codex P1 #5: BEFORE forwarding, validate `rosterHash` matches the configured
   // CA_DKG_V2_ROSTER_JSON and (for round1) `selfSlot` matches this node's slot. Otherwise
-  // a stale or wrong-roster request can reach MP-SPDZ.
+  // a stale or wrong-roster request can reach MP-SPDZ or persist a malformed nonce file.
   const forwardToWorker = async (
     path:
       | "/worker/v2/derive/vault_ek/round0"
       | "/worker/v2/derive/vault_ek/round1"
-      | "/worker/v2/derive/vault_ek/verify",
+      | "/worker/v2/derive/vault_ek/verify"
+      | "/worker/v2/derive/ca_registration/round1"
+      | "/worker/v2/derive/ca_registration/round2"
+      | "/worker/v2/derive/ca_registration/verify"
+      | "/worker/v2/derive/ca_registration/aggregate",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -345,6 +349,52 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/worker/v2/derive/vault_ek/verify", req.body, reply);
+  });
+
+  // Milestone 1: V2 threshold CA registration passthroughs. Mirror the vault_ek
+  // round0/round1 pattern — assert rosterHash + (for round1/round2) selfSlot before
+  // forwarding so a stale-roster or wrong-slot request can't persist a nonce file under
+  // this node's state_dir.
+  server.post("/worker/v2/derive/ca_registration/round1", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/derive/ca_registration/round1", req.body, reply);
+  });
+  server.post("/worker/v2/derive/ca_registration/round2", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/derive/ca_registration/round2", req.body, reply);
+  });
+  server.post("/worker/v2/derive/ca_registration/verify", async (req, reply) => {
+    // /verify body has no selfSlot — coordinator picks the verifier. The roster-hash
+    // gate binds it to our configured roster.
+    return forwardToWorker("/worker/v2/derive/ca_registration/verify", req.body, reply);
+  });
+  server.post("/worker/v2/derive/ca_registration/aggregate", async (req, reply) => {
+    // /aggregate is share-independent public compute over already-published commitments
+    // + responses. No selfSlot binding required — the coordinator targets the verifier
+    // slot. Forward directly to the local worker.
+    return forwardToWorker("/worker/v2/derive/ca_registration/aggregate", req.body, reply);
   });
 
   return { server, store };

@@ -700,4 +700,198 @@ describe("deoperator node", () => {
       globalThis.fetch = oldFetch;
     }
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Milestone 1: V2 threshold CA registration passthrough — rosterHash + selfSlot gating.
+  // ---------------------------------------------------------------------------------------------
+  it("ca_registration_v2 round1 passthrough rejects mismatched rosterHash before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/ca_registration/round1",
+        payload: {
+          dkgEpoch: "1",
+          requestId: "ca-reg-bogus",
+          sessionId: "ca-reg-bogus",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: h32("d"), // bogus
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 0,
+          playerId: 0,
+          vaultEk: h32("c"),
+          senderAddress: h32("e"),
+          assetType: h32("f"),
+          chainId: 2,
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("ca_registration_v2 round1 passthrough rejects wrong selfSlot before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/ca_registration/round1",
+        payload: {
+          dkgEpoch: "1",
+          requestId: "ca-reg-wrong-slot",
+          sessionId: "ca-reg-wrong-slot",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: caDkgV2RosterHash(caDkgV2Roster),
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 3, // wrong: this node is slot 0
+          playerId: 3,
+          vaultEk: h32("c"),
+          senderAddress: h32("e"),
+          assetType: h32("f"),
+          chainId: 2,
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("ca_registration_v2 round2 passthrough rejects mismatched rosterHash + wrong selfSlot", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      // Bogus rosterHash → 400.
+      const bogusRoster = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/ca_registration/round2",
+        payload: {
+          dkgEpoch: "1",
+          requestId: "ca-reg-round2-bogus",
+          sessionId: "ca-reg-round2-bogus",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: h32("d"),
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 0,
+          playerId: 0,
+          nonceId: h32("1"),
+          challenge: h32("3"),
+        },
+      });
+      expect(bogusRoster.statusCode).toBe(400);
+      // Right rosterHash + wrong selfSlot → 400.
+      const wrongSlot = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/ca_registration/round2",
+        payload: {
+          dkgEpoch: "1",
+          requestId: "ca-reg-round2-wrong-slot",
+          sessionId: "ca-reg-round2-wrong-slot",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: caDkgV2RosterHash(caDkgV2Roster),
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 4, // wrong: this node is slot 0
+          playerId: 4,
+          nonceId: h32("1"),
+          challenge: h32("3"),
+        },
+      });
+      expect(wrongSlot.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("ca_registration_v2 verify + aggregate passthroughs forward to local worker without slot binding", async () => {
+    // verify + aggregate are share-independent public compute. No selfSlot binding;
+    // coordinator targets the verifier slot. Confirm the deop-node forwards the body to
+    // the local worker URL without rejecting on absent selfSlot.
+    const caDkgV2Roster = testDkgRoster();
+    let workerCallCount = 0;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown) => {
+      workerCallCount += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const verifyRes = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/ca_registration/verify",
+        payload: {
+          vaultEk: h32("c"),
+          senderAddress: h32("d"),
+          assetType: h32("e"),
+          chainId: 2,
+          aggregateCommitment: h32("4"),
+          aggregateResponse: h32("5"),
+        },
+      });
+      expect(verifyRes.statusCode).toBe(200);
+      const aggregateRes = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/ca_registration/aggregate",
+        payload: {
+          vaultEk: h32("c"),
+          senderAddress: h32("d"),
+          assetType: h32("e"),
+          chainId: 2,
+          commitments: [0, 1, 2, 3, 4].map((slot) => ({ slot, commitment: h32("4") })),
+          responses: [0, 1, 2, 3, 4].map((slot) => ({ slot, response: h32("5") })),
+        },
+      });
+      expect(aggregateRes.statusCode).toBe(200);
+      expect(workerCallCount).toBe(2);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
 });
