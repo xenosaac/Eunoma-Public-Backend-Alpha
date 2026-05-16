@@ -281,7 +281,8 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/derive/ca_registration/challenge"
       | "/worker/v2/derive/ca_registration/verify"
       | "/worker/v2/derive/ca_registration/aggregate"
-      | "/worker/v2/vault_state/init",
+      | "/worker/v2/vault_state/init"
+      | "/worker/v2/vault_state/observe_deposit",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -461,6 +462,28 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/worker/v2/vault_state/init", req.body, reply);
+  });
+
+  // Milestone 2 sub-milestone 2b — vault_state_v2/observe_deposit passthrough. Mirrors the
+  // init passthrough: forbidden-field guard runs first, rosterHash must match the configured
+  // CA DKG V2 roster, selfSlot must equal this node's slot. Without these a stale-roster or
+  // wrong-slot observer call could bump a cursor on a worker whose state binds to a different
+  // vault — corrupting the deposit ordering invariant the MPCCA round will read.
+  server.post("/worker/v2/vault_state/observe_deposit", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/vault_state/observe_deposit", req.body, reply);
   });
 
   return { server, store };

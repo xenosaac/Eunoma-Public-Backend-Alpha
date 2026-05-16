@@ -1308,4 +1308,176 @@ describe("deoperator node", () => {
       globalThis.fetch = oldFetch;
     }
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Milestone 2 sub-milestone 2b: vault_state_v2/observe_deposit passthrough — rosterHash + selfSlot
+  // gate, forbidden-field guard. Same shape as the 2a init passthrough.
+  // ---------------------------------------------------------------------------------------------
+  function observeDepositBody(rosterHashHex: string, overrides: Record<string, unknown> = {}) {
+    return {
+      dkgEpoch: "1",
+      requestId: "obs-pt",
+      sessionId: "obs-pt",
+      vaultEkTranscriptHash: h32("a"),
+      registrationTranscriptHash: h32("b"),
+      rosterHash: rosterHashHex,
+      selectedSlots: [0, 1, 2, 3, 4],
+      selfSlot: 0,
+      playerId: 0,
+      vaultEk: h32("d"),
+      senderAddress: h32("e"),
+      assetType: h32("f"),
+      chainId: 2,
+      depositCount: 1,
+      commitment: h32("1"),
+      amountTag: h32("2"),
+      caPayloadHash: h32("3"),
+      depositNonce: h32("4"),
+      sequenceNumber: "0",
+      txVersion: "1234567",
+      eventGuid: "0:0xfeed",
+      previousDepositCountObserved: 0,
+      newDepositCountObserved: 1,
+      ...overrides,
+    };
+  }
+
+  it("vault_state_v2 observe_deposit passthrough rejects mismatched rosterHash before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/vault_state/observe_deposit",
+        payload: observeDepositBody(h32("9")), // bogus roster hash
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_state_v2 observe_deposit passthrough rejects wrong selfSlot before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/vault_state/observe_deposit",
+        payload: observeDepositBody(caDkgV2RosterHash(caDkgV2Roster), {
+          selfSlot: 4, // node is slot 0
+          playerId: 4,
+        }),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_state_v2 observe_deposit passthrough rejects forbidden plaintext fields", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/vault_state/observe_deposit",
+        payload: observeDepositBody(caDkgV2RosterHash(caDkgV2Roster), {
+          dkShare: h32("9"), // FORBIDDEN
+        }),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("forbidden_plaintext_field");
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_state_v2 observe_deposit passthrough forwards to local worker on valid body", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let forwardedPath: string | undefined;
+    let forwardedBody: Record<string, unknown> | undefined;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      forwardedPath = (url as URL | string).toString();
+      if (init?.body) forwardedBody = JSON.parse(init.body as string);
+      return new Response(
+        JSON.stringify({
+          slot: 0,
+          playerId: 0,
+          vaultStatePath: "/tmp/slot-0/vault_state_v2.json",
+          vaultStateHash: h32("a"),
+          workerTranscriptHash: h32("b"),
+          previousDepositCountObserved: 0,
+          depositCountObserved: 1,
+          vaultSequence: 0,
+          observedAtUnixMs: 1_700_000_000_000,
+          observed: true,
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/vault_state/observe_deposit",
+        payload: observeDepositBody(caDkgV2RosterHash(caDkgV2Roster)),
+      });
+      expect(res.statusCode).toBe(200);
+      expect(forwardedPath).toContain("/worker/v2/vault_state/observe_deposit");
+      expect(forwardedBody?.selfSlot).toBe(0);
+      expect(forwardedBody?.depositCount).toBe(1);
+      const body = res.json();
+      expect(body.observed).toBe(true);
+      expect(body.depositCountObserved).toBe(1);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
 });
