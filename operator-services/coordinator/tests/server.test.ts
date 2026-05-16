@@ -7,6 +7,7 @@ import type {
 import {
   caDkgV2RosterHash,
   frostDkgV2RosterHash,
+  mpccaWithdrawRound1WorkerTranscriptHash,
   rosterHash,
 } from "@eunoma/deop-protocol";
 import { buildCoordinatorServer, forwardSessionShareToRoster } from "../src/index.js";
@@ -3380,6 +3381,503 @@ describe("coordinator", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe("vault_state_init_provenance_unknown");
+    expect(workerCalled).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Milestone 3 sub-milestone 3a — MPCCA withdraw V2 round1 orchestrator.
+  // ---------------------------------------------------------------------------------------------
+  function mpccaWithdrawValidPayload(
+    overrides: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      dkgEpoch: "1",
+      caDkgTranscriptHash: h32("a"),
+      vaultEk: h32("d"),
+      senderAddress: h32("e"),
+      assetType: h32("f"),
+      chainId: 2,
+      // Inline (no-stateRoot) provenance fields:
+      vaultEkTranscriptHash: h32("7"),
+      registrationTranscriptHash: h32("8"),
+      vaultStateInitTranscriptHash: h32("9"),
+      observedDepositTranscriptHashes: [h32("0")],
+      selectedSlots: [0, 1, 2, 3, 4],
+      // Withdraw envelope:
+      root: h32("1"),
+      nullifierHash: h32("2"),
+      recipient: h32("3"),
+      recipientHash: h32("4"),
+      amountTag: h32("5"),
+      vaultSequence: 0,
+      expirySecs: 1_700_000_000,
+      requestHash: h32("6"),
+      depositCount: 1,
+      ...overrides,
+    };
+  }
+
+  function stubMpccaRound1Forwarder(opts: {
+    expectedSelectedSlots: number[];
+    rosterHashHex: string;
+    dkgEpoch: string;
+    vaultEkTranscriptHash: string;
+    registrationTranscriptHash: string;
+    vaultStateInitTranscriptHash: string;
+    observedDepositTranscriptHashes: string[];
+    vaultEk: string;
+    senderAddress: string;
+    assetType: string;
+    chainId: number;
+    root: string;
+    nullifierHash: string;
+    recipient: string;
+    recipientHash: string;
+    amountTag: string;
+    vaultSequence: number;
+    expirySecs: number;
+    requestHash: string;
+    depositCount: number;
+    onCall?: (slot: number) => Promise<void>;
+    overridePhase?: (slot: number) => string | undefined;
+    tamperWorkerHash?: (slot: number) => boolean;
+  }) {
+    return async (path: string, body: unknown, _roster: unknown, slot: number) => {
+      if (opts.onCall) await opts.onCall(slot);
+      if (path !== "/worker/v2/mpcca/withdraw/round1") {
+        return {
+          slot,
+          ok: false,
+          statusCode: 500,
+          body: { error: "unexpected_path", path },
+        };
+      }
+      const playerId = opts.expectedSelectedSlots.indexOf(slot);
+      const phase =
+        (opts.overridePhase && opts.overridePhase(slot)) ||
+        "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4";
+      // Compute the canonical worker_transcript_hash so the orchestrator's defense-in-depth
+      // re-derivation matches. (Tests can opt to flip it via tamperWorkerHash to exercise the
+      // hash-mismatch path.)
+      const sessionId = (body as Record<string, unknown>).sessionId as string;
+      const requestId = (body as Record<string, unknown>).requestId as string;
+      const canonical = mpccaWithdrawRound1WorkerTranscriptHash({
+        sessionId,
+        requestId,
+        dkgEpoch: opts.dkgEpoch,
+        vaultEkTranscriptHash: opts.vaultEkTranscriptHash,
+        registrationTranscriptHash: opts.registrationTranscriptHash,
+        vaultStateInitTranscriptHash: opts.vaultStateInitTranscriptHash,
+        observedDepositTranscriptHashes: opts.observedDepositTranscriptHashes,
+        rosterHash: opts.rosterHashHex,
+        sortedSelectedSlots: opts.expectedSelectedSlots,
+        selfSlot: slot,
+        playerId,
+        vaultEk: opts.vaultEk,
+        senderAddress: opts.senderAddress,
+        assetType: opts.assetType,
+        chainId: opts.chainId,
+        root: opts.root,
+        nullifierHash: opts.nullifierHash,
+        recipient: opts.recipient,
+        recipientHash: opts.recipientHash,
+        amountTag: opts.amountTag,
+        vaultSequence: opts.vaultSequence,
+        expirySecs: opts.expirySecs,
+        requestHash: opts.requestHash,
+        depositCount: opts.depositCount,
+      });
+      const workerTranscriptHash =
+        opts.tamperWorkerHash && opts.tamperWorkerHash(slot) ? h32(String((slot + 7) % 9)) : canonical;
+      return {
+        slot,
+        ok: false,
+        statusCode: 501,
+        body: {
+          slot,
+          playerId,
+          sessionStatePath: `/tmp/slot-${slot}/mpc-sessions/req__sess/mpcca_withdraw_v2_round1.json`,
+          sessionStateHash: h32(String((slot + 3) % 9)),
+          workerTranscriptHash,
+          observedAtUnixMs: 1_700_000_000_000 + slot,
+          completed: false,
+          notImplementedPhase: phase,
+        },
+      };
+    };
+  }
+
+  it("mpcca_withdraw_round1_concurrent_fan_out_surfaces_stub_phase", async () => {
+    const { mpccaWithdrawRound1WorkerTranscriptHash } = await import("@eunoma/deop-protocol");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const payload = mpccaWithdrawValidPayload();
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    // KILLER: track in-flight count so we can assert all 5 worker calls launched before any
+    // completed.
+    let inFlight = 0;
+    let peak = 0;
+    let releaseBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: stubMpccaRound1Forwarder({
+        expectedSelectedSlots,
+        rosterHashHex,
+        dkgEpoch: payload.dkgEpoch as string,
+        vaultEkTranscriptHash: payload.vaultEkTranscriptHash as string,
+        registrationTranscriptHash: payload.registrationTranscriptHash as string,
+        vaultStateInitTranscriptHash: payload.vaultStateInitTranscriptHash as string,
+        observedDepositTranscriptHashes: payload.observedDepositTranscriptHashes as string[],
+        vaultEk: payload.vaultEk as string,
+        senderAddress: payload.senderAddress as string,
+        assetType: payload.assetType as string,
+        chainId: payload.chainId as number,
+        root: payload.root as string,
+        nullifierHash: payload.nullifierHash as string,
+        recipient: payload.recipient as string,
+        recipientHash: payload.recipientHash as string,
+        amountTag: payload.amountTag as string,
+        vaultSequence: payload.vaultSequence as number,
+        expirySecs: payload.expirySecs as number,
+        requestHash: payload.requestHash as string,
+        depositCount: payload.depositCount as number,
+        onCall: async (_slot) => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          if (inFlight === 5) queueMicrotask(() => releaseBarrier());
+          await barrier;
+          inFlight -= 1;
+        },
+      }),
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-wdr-concurrent", ...payload },
+    });
+    expect(res.statusCode).toBe(501);
+    const body = res.json();
+    expect(body.accepted).toBe(false);
+    expect(body.round).toBe("round1");
+    expect(body.phase).toBe(
+      "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
+    );
+    expect(body.requestId).toBe("mpcca-wdr-concurrent");
+    expect(body.depositCount).toBe(1);
+    expect(body.perSlotContributions).toHaveLength(5);
+    // KILLER ASSERTION: concurrent fan-out — all 5 workers in flight simultaneously.
+    expect(peak).toBe(5);
+
+    // Touch the imported helper to keep TS happy (the stub uses it directly).
+    expect(mpccaWithdrawRound1WorkerTranscriptHash).toBeTypeOf("function");
+  });
+
+  it("mpcca_withdraw_round1 returns 502 worker_transcript_hash_mismatch on tampered reply", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const payload = mpccaWithdrawValidPayload();
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: stubMpccaRound1Forwarder({
+        expectedSelectedSlots,
+        rosterHashHex,
+        dkgEpoch: payload.dkgEpoch as string,
+        vaultEkTranscriptHash: payload.vaultEkTranscriptHash as string,
+        registrationTranscriptHash: payload.registrationTranscriptHash as string,
+        vaultStateInitTranscriptHash: payload.vaultStateInitTranscriptHash as string,
+        observedDepositTranscriptHashes: payload.observedDepositTranscriptHashes as string[],
+        vaultEk: payload.vaultEk as string,
+        senderAddress: payload.senderAddress as string,
+        assetType: payload.assetType as string,
+        chainId: payload.chainId as number,
+        root: payload.root as string,
+        nullifierHash: payload.nullifierHash as string,
+        recipient: payload.recipient as string,
+        recipientHash: payload.recipientHash as string,
+        amountTag: payload.amountTag as string,
+        vaultSequence: payload.vaultSequence as number,
+        expirySecs: payload.expirySecs as number,
+        requestHash: payload.requestHash as string,
+        depositCount: payload.depositCount as number,
+        tamperWorkerHash: (slot) => slot === 2, // slot 2 lies about its transcript hash
+      }),
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-wdr-tamper", ...payload },
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("worker_transcript_hash_mismatch");
+  });
+
+  it("mpcca_withdraw_round1 returns 502 crypto_stub_phase_divergence when workers disagree on phase", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const payload = mpccaWithdrawValidPayload();
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: stubMpccaRound1Forwarder({
+        expectedSelectedSlots,
+        rosterHashHex,
+        dkgEpoch: payload.dkgEpoch as string,
+        vaultEkTranscriptHash: payload.vaultEkTranscriptHash as string,
+        registrationTranscriptHash: payload.registrationTranscriptHash as string,
+        vaultStateInitTranscriptHash: payload.vaultStateInitTranscriptHash as string,
+        observedDepositTranscriptHashes: payload.observedDepositTranscriptHashes as string[],
+        vaultEk: payload.vaultEk as string,
+        senderAddress: payload.senderAddress as string,
+        assetType: payload.assetType as string,
+        chainId: payload.chainId as number,
+        root: payload.root as string,
+        nullifierHash: payload.nullifierHash as string,
+        recipient: payload.recipient as string,
+        recipientHash: payload.recipientHash as string,
+        amountTag: payload.amountTag as string,
+        vaultSequence: payload.vaultSequence as number,
+        expirySecs: payload.expirySecs as number,
+        requestHash: payload.requestHash as string,
+        depositCount: payload.depositCount as number,
+        overridePhase: (slot) =>
+          slot === 3 ? "different_phase_string_for_slot_3" : undefined,
+      }),
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-wdr-phase-div", ...payload },
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("crypto_stub_phase_divergence");
+  });
+
+  it("mpcca_withdraw_round1 returns 409 vault_mpcca_withdraw_in_flight on concurrent calls", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const payload = mpccaWithdrawValidPayload();
+
+    let releaseHung: () => void = () => {};
+    const hungBarrier = new Promise<void>((resolve) => {
+      releaseHung = resolve;
+    });
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (_path, _body, _roster, slot) => {
+        await hungBarrier;
+        return { slot, ok: false, statusCode: 500, body: {} };
+      },
+    });
+    const firstPromise = server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-wdr-lock-1", ...payload },
+    });
+    // Allow first call's microtasks to run + acquire the lock.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const secondRes = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-wdr-lock-2", ...payload },
+    });
+    expect(secondRes.statusCode).toBe(409);
+    expect(secondRes.json().error).toBe("vault_mpcca_withdraw_in_flight");
+    releaseHung();
+    await firstPromise;
+  });
+
+  it("mpcca_withdraw_round1 rejects forbidden plaintext fields", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: {
+        ...mpccaWithdrawValidPayload(),
+        secret: "leak",
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("forbidden_plaintext_field");
+  });
+
+  it("mpcca_withdraw_round1 rejects nested dkShare guard", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: {
+        ...mpccaWithdrawValidPayload(),
+        metadata: { dkShare: h32("9") },
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("forbidden_plaintext_field");
+  });
+
+  it("mpcca_withdraw_round1 rejects stale dkgEpoch", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: {
+        ...mpccaWithdrawValidPayload(),
+        dkgEpoch: "99",
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("stale_dkg_epoch");
+  });
+
+  it("mpcca_withdraw_round1 rejects unsafe requestId before lock acquire", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: {
+        ...mpccaWithdrawValidPayload(),
+        requestId: "../../etc/passwd",
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("unsafe_request_id");
+  });
+
+  it("mpcca_withdraw_round1 returns 400 vault_state_init_provenance_unknown when no init transcript exists", async () => {
+    const { mkdtemp } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-mpcca-no-provenance-"));
+    const caDkgV2Roster = dkgRoster();
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async (_path, _body, _roster, slot) => {
+        workerCalled = true;
+        return { slot, ok: false, statusCode: 500, body: {} };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: {
+        requestId: "mpcca-wdr-no-prov",
+        dkgEpoch: "1",
+        caDkgTranscriptHash: h32("a"),
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        root: h32("1"),
+        nullifierHash: h32("2"),
+        recipient: h32("3"),
+        recipientHash: h32("4"),
+        amountTag: h32("5"),
+        vaultSequence: 0,
+        expirySecs: 1_700_000_000,
+        requestHash: h32("6"),
+        depositCount: 1,
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("vault_state_init_provenance_unknown");
+    expect(workerCalled).toBe(false);
+  });
+
+  it("mpcca_withdraw_round1 returns 400 vault_state_observed_provenance_unknown when init transcript exists but no observe transcript for depositCount", async () => {
+    const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(
+      join(os.tmpdir(), "eunoma-coord-mpcca-no-observe-"),
+    );
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const vaultEk = h32("d");
+    const senderAddress = h32("e");
+    const assetType = h32("f");
+    const chainId = 2;
+    const persistedVaultEkTranscriptHash = h32("7");
+    const persistedRegistrationTranscriptHash = h32("8");
+    const persistedInitTranscriptHash = h32("9");
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    const initDir = join(stateRoot, "coordinator", "vault_state_v2");
+    await mkdir(initDir, { recursive: true });
+    await writeFile(
+      join(initDir, `${dkgEpoch}__init.json`),
+      JSON.stringify(
+        {
+          scheme: "vault_state_v2",
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashHex,
+          vaultEkTranscriptHash: persistedVaultEkTranscriptHash,
+          registrationTranscriptHash: persistedRegistrationTranscriptHash,
+          rosterHash: rosterHashHex,
+          selectedSlots: expectedSelectedSlots,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          transcriptHash: persistedInitTranscriptHash,
+          perSlotContributions: [],
+          createdAtUnixMs: 1_700_000_000_000,
+        },
+        null,
+        2,
+      ),
+      { mode: 0o600 },
+    );
+
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async (_path, _body, _roster, slot) => {
+        workerCalled = true;
+        return { slot, ok: false, statusCode: 500, body: {} };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: {
+        requestId: "mpcca-wdr-no-observe",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+        root: h32("1"),
+        nullifierHash: h32("2"),
+        recipient: h32("3"),
+        recipientHash: h32("4"),
+        amountTag: h32("5"),
+        vaultSequence: 0,
+        expirySecs: 1_700_000_000,
+        requestHash: h32("6"),
+        depositCount: 1, // > 0, but no observe transcript exists for it
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("vault_state_observed_provenance_unknown");
     expect(workerCalled).toBe(false);
   });
 });
