@@ -4,6 +4,7 @@ import {
   type WithdrawV2CallArgs,
 } from "@eunoma/deop-protocol";
 import {
+  RelayerSubmitterError,
   createAptosCliSubmitter,
   encodeCallArgs,
   type SpawnAptosFn,
@@ -254,20 +255,47 @@ describe("createAptosCliSubmitter — stdout parsing", () => {
     expect(result.simulated).toBe(false);
   });
 
-  it("throws when the aptos CLI exits non-zero", async () => {
+  it("cli_submitter_stderr_not_in_http_response_body", async () => {
+    // Killer test for the codex P2 finding: raw subprocess stderr must NEVER
+    // appear in the thrown error message. Operators read their own logs to
+    // see the underlying CLI failure; over-the-wire callers see only an
+    // opaque `aptos_cli_error` code with a generic message.
+    const stderrPayload =
+      "Error: insufficient gas\nbacktrace: 0xdeadbeef at admin@0xff...\nWALLET_PATH=/home/op/wallet.json";
+    const buffered: string[] = [];
     const submitter = createAptosCliSubmitter(
       "0xabc",
       undefined,
       {
         spawnAptos: buildMockSpawn({
           stdout: "",
-          stderr: "Error: insufficient gas\nbacktrace: ...",
+          stderr: stderrPayload,
           captureArgs: {},
           exitCode: 1,
         }),
+        stderrSink: { write: (chunk: string) => buffered.push(chunk) },
       },
     );
-    await expect(submitter(fixtureCallArgs())).rejects.toThrow(/aptos cli exited 1/);
+    try {
+      await submitter(fixtureCallArgs());
+      throw new Error("expected RelayerSubmitterError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(RelayerSubmitterError);
+      const submitErr = err as RelayerSubmitterError;
+      expect(submitErr.code).toBe("aptos_cli_error");
+      // Generic message — no stderr text leaks.
+      expect(submitErr.message).toBe(
+        "Aptos CLI invocation failed; check relayer logs for details.",
+      );
+      expect(submitErr.message).not.toContain("insufficient gas");
+      expect(submitErr.message).not.toContain("backtrace");
+      expect(submitErr.message).not.toContain("WALLET_PATH");
+      expect(submitErr.message).not.toContain("0xdeadbeef");
+    }
+    // The stderr SHOULD have been logged locally to the injected sink.
+    const sinkText = buffered.join("");
+    expect(sinkText).toContain("insufficient gas");
+    expect(sinkText).toContain("backtrace");
   });
 
   it("throws when the aptos CLI stdout is missing transaction_hash", async () => {

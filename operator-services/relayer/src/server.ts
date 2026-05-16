@@ -42,6 +42,27 @@ export interface RelayerSubmitResult {
   simulated: boolean;
 }
 
+/**
+ * Structured error type thrown by submitters when the downstream invocation
+ * fails. The HTTP route surfaces `code` + `message` over the wire; raw stderr
+ * / stdout never enters the response body — those are logged locally to the
+ * relayer process stderr for operator debugging.
+ *
+ * Stable codes:
+ *   - `aptos_cli_error`            — `aptos move run` exited non-zero. Operator
+ *                                    must read the relayer logs (NOT the
+ *                                    HTTP response) for the underlying stderr.
+ *   - `aptos_cli_missing_tx_hash`  — CLI exited 0 but stdout did not contain
+ *                                    a transaction_hash. Indicates an
+ *                                    unexpected CLI output schema.
+ */
+export class RelayerSubmitterError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "RelayerSubmitterError";
+  }
+}
+
 export type RelayerWithdrawSubmitter = (
   args: WithdrawV2CallArgs,
 ) => Promise<RelayerSubmitResult>;
@@ -97,8 +118,20 @@ export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInst
       return reply.code(202).send(result);
     } catch (err) {
       // Submitter failures (e.g. submit_disabled, aptos CLI error) surface as
-      // a 502 with the message body — operators read this to decide whether
-      // to retry. We never leak the request body in the error.
+      // a 502 with a stable error code. Raw subprocess stderr is NEVER
+      // returned in the response body — it is logged locally by the
+      // submitter for operator debugging. Operators read the relayer logs to
+      // diagnose the underlying CLI failure.
+      if (err instanceof RelayerSubmitterError) {
+        return reply.code(502).send({
+          error: "submit_failed",
+          code: err.code,
+          message: err.message,
+        });
+      }
+      // Legacy/unstructured submitter errors (e.g. injected mocks throwing
+      // bare Error). Keep the existing wire shape but constrain to message
+      // text the submitter chose to expose.
       return reply.code(502).send({
         error: "submit_failed",
         message: err instanceof Error ? err.message : "unknown",
@@ -147,6 +180,12 @@ export interface CreateAptosCliSubmitterOptions {
    * Override for the aptos CLI path. Defaults to `"aptos"` (PATH lookup).
    */
   aptosBin?: string;
+  /**
+   * Sink for local-only stderr logging when the CLI exits non-zero. Defaults
+   * to `process.stderr`. Tests inject a buffered sink to assert the bytes
+   * land HERE and not in the thrown error / HTTP response body.
+   */
+  stderrSink?: { write: (chunk: string) => void };
 }
 
 /**
@@ -169,6 +208,7 @@ export function createAptosCliSubmitter(
   const spawnFn = opts.spawnAptos ?? defaultSpawnAptos;
   const aptosBin = opts.aptosBin ?? "aptos";
   const simulate = opts.submit !== true;
+  const stderrSink = opts.stderrSink ?? defaultStderrSink;
 
   return async (callArgs: WithdrawV2CallArgs): Promise<RelayerSubmitResult> => {
     const positionalArgs = encodeCallArgs(callArgs);
@@ -197,15 +237,23 @@ export function createAptosCliSubmitter(
     const [exitCode] = await Promise.all([done, collectOut, collectErr]);
 
     if (exitCode !== 0) {
-      const trimmed = stderrText.split(/\n/).filter(Boolean).slice(0, 5).join(" | ");
-      throw new Error(
-        `aptos cli exited ${exitCode ?? "(signal)"}${trimmed ? `: ${trimmed}` : ""}`,
+      // Log stderr LOCALLY (relayer process) so the operator can grep their
+      // own logs for the underlying CLI failure. The error thrown to the
+      // route handler carries an opaque code + generic message — raw stderr
+      // text NEVER enters the HTTP response body.
+      stderrSink.write(
+        `[relayer] aptos cli exited ${exitCode ?? "(signal)"}; stderr=\n${stderrText}\n`,
+      );
+      throw new RelayerSubmitterError(
+        "aptos_cli_error",
+        "Aptos CLI invocation failed; check relayer logs for details.",
       );
     }
 
     const txHash = parseTxHashFromAptosCliStdout(stdoutText);
     if (!txHash) {
-      throw new Error(
+      throw new RelayerSubmitterError(
+        "aptos_cli_missing_tx_hash",
         `aptos cli stdout missing transaction_hash (simulate=${simulate})`,
       );
     }
@@ -290,4 +338,10 @@ const defaultSpawnAptos: SpawnAptosFn = (command, args) => {
     proc.on("error", (err) => reject(err));
   });
   return { stdout: proc.stdout, stderr: proc.stderr, done };
+};
+
+const defaultStderrSink: { write: (chunk: string) => void } = {
+  write: (chunk: string) => {
+    process.stderr.write(chunk);
+  },
 };
