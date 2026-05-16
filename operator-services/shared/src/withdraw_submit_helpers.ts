@@ -129,8 +129,11 @@ export interface WithdrawFinalizeAttestationConfig {
 
 /**
  * The 27-field projection. Field order MUST mirror
- * `@eunoma/deop-protocol::WITHDRAW_V2_CALL_ARGS_ORDER`. The `keyof` exhaustiveness check in
- * `assembleWithdrawV2CallArgs` catches any drift.
+ * `@eunoma/deop-protocol::WITHDRAW_V2_CALL_ARGS_ORDER` byte-for-byte. The
+ * `expectFieldOrderMatches` test asserts the assembled bundle's iteration order
+ * equals WITHDRAW_V2_CALL_ARGS_ORDER. Codex M5b P3 aligned this with the canonical
+ * Move-signature order (was: vaultSequence → expirySecs → withdrawProof; is:
+ * vaultSequence → withdrawProof → expirySecs).
  */
 export interface FinalizeWithdrawV2CallArgsFields {
   // 7 single-32-byte hash/address fields:
@@ -141,16 +144,17 @@ export interface FinalizeWithdrawV2CallArgsFields {
   amountTag: HexString;
   caPayloadHash: HexString;
   requestHash: HexString;
-  // 2 decimal-string u64s:
+  // u64 vaultSequence, then variable-length proof, then u64 expirySecs (matches Move
+  // signature and WITHDRAW_V2_CALL_ARGS_ORDER):
   vaultSequence: string;
-  expirySecs: string;
-  // 2 variable-length proof bytes:
   withdrawProof: HexString;
+  expirySecs: string;
+  // variable-length FROST signature:
   groupSignature: HexString;
   // 1 u8 + 1 vector<vector<u8>>:
   fallbackBitmap: number;
   fallbackSignatures: HexString[];
-  // 12 chunked-ciphertext fields (Aptos CA SDK shape; the M4e finalize aggregator outputs
+  // 9 chunked-ciphertext fields (Aptos CA SDK shape; the M4e finalize aggregator outputs
   // these byte-identically to the @aptos-labs/confidential-asset reference):
   newBalanceP: HexString[];
   newBalanceR: HexString[];
@@ -489,9 +493,10 @@ export function assembleWithdrawV2CallArgs(
   hex32("amountTag", fields.amountTag);
   hex32("caPayloadHash", fields.caPayloadHash);
   hex32("requestHash", fields.requestHash);
+  // Codex M5b P3: WITHDRAW_V2_CALL_ARGS_ORDER puts withdrawProof BEFORE expirySecs.
   decimalU64("vaultSequence", fields.vaultSequence);
-  decimalU64("expirySecs", fields.expirySecs);
   hexNonEmpty("withdrawProof", fields.withdrawProof);
+  decimalU64("expirySecs", fields.expirySecs);
   hexNonEmpty("groupSignature", fields.groupSignature);
   u8("fallbackBitmap", fields.fallbackBitmap);
   hexArray("fallbackSignatures", fields.fallbackSignatures, { allowEmpty: true });
@@ -511,6 +516,9 @@ export function assembleWithdrawV2CallArgs(
   hexMaybeEmpty("memo", fields.memo);
   // The above checks ALL 27 fields named in `FinalizeWithdrawV2CallArgsFields`. If a
   // future commit adds a 28th field to that interface, this exhaustiveness lock catches it.
+  // Codex M5b P3: field order matches WITHDRAW_V2_CALL_ARGS_ORDER byte-for-byte. Adding
+  // a 28th field to FinalizeWithdrawV2CallArgsFields breaks the keyof exhaustiveness
+  // check above; reordering breaks the `expectFieldOrderMatches` killer test.
   return {
     root: fields.root,
     nullifierHash: fields.nullifierHash,
@@ -520,8 +528,8 @@ export function assembleWithdrawV2CallArgs(
     caPayloadHash: fields.caPayloadHash,
     requestHash: fields.requestHash,
     vaultSequence: fields.vaultSequence,
-    expirySecs: fields.expirySecs,
     withdrawProof: fields.withdrawProof,
+    expirySecs: fields.expirySecs,
     groupSignature: fields.groupSignature,
     fallbackBitmap: fields.fallbackBitmap,
     fallbackSignatures: fields.fallbackSignatures,

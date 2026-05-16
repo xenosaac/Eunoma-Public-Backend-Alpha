@@ -9,7 +9,9 @@ import {
   frostDkgV2RosterHash,
   mpccaWithdrawRound1WorkerTranscriptHash,
   rosterHash,
+  WITHDRAW_V2_CALL_ARGS_ORDER,
 } from "@eunoma/deop-protocol";
+import { assembleWithdrawV2CallArgs } from "@eunoma/shared";
 import { buildCoordinatorServer, forwardSessionShareToRoster } from "../src/index.js";
 import { buildDefaultRelayerSubmitter, configFromEnv } from "../src/config.js";
 
@@ -4481,6 +4483,33 @@ describe("coordinator", () => {
       );
       return path;
     }
+
+    // KILLER (Codex M5b P3): the shared assembler's bundle MUST iterate keys in
+    // exactly `WITHDRAW_V2_CALL_ARGS_ORDER` byte-for-byte — the relayer's CLI encoder
+    // depends on this order to splice positional `--args` in the Move-signature order.
+    // Locks the helper's FinalizeWithdrawV2CallArgsFields layout to the canonical list.
+    it("expect_assembled_field_order_matches_WITHDRAW_V2_CALL_ARGS_ORDER", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-fieldorder-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-fieldorder");
+      const finalizeArtifact = await (async () => {
+        const { readFile } = await import("node:fs/promises");
+        const { join } = await import("node:path");
+        return JSON.parse(
+          await readFile(
+            join(
+              stateRoot,
+              "coordinator",
+              "mpcca_withdraw",
+              "1__withdraw-fieldorder__finalize.json",
+            ),
+            "utf8",
+          ),
+        );
+      })();
+      const assembled = assembleWithdrawV2CallArgs(finalizeArtifact);
+      const keys = Object.keys(assembled);
+      expect(keys).toEqual([...WITHDRAW_V2_CALL_ARGS_ORDER]);
+    });
 
     it("mpcca_submit_returns_400_when_finalize_transcript_missing", async () => {
       const stateRoot = await makeStateRoot("eunoma-mpcca-submit-no-finalize-");
