@@ -5363,6 +5363,21 @@ pub mod vault_state_v2 {
         /// this vault. Starts at 0; sub-milestone 2b will increment.
         pub deposit_count_observed: u64,
         pub created_at_unix_ms: u128,
+        /// Codex M3a P1: per-worker init transcript hash. This is the EXACT same value the
+        /// worker returns as `worker_transcript_hash` from its init call — by persisting it,
+        /// downstream MPCCA withdraw rounds can verify a caller-supplied
+        /// `vault_state_init_transcript_hash` byte-for-byte against the worker's own bound
+        /// init transcript. Without this field the MPCCA round1 path could only shape-check
+        /// the value, and a forged init transcript hash would reach NotImplemented instead of
+        /// `InvalidDkgState("vault_state_init_transcript_hash_mismatch")`.
+        ///
+        /// Wrapped in `Option` for backwards-compatibility with on-disk files written by the
+        /// Milestone 2a code that pre-dates this fix: `load_vault_state_v2` auto-migrates a
+        /// `None` value by recomputing the per-worker init worker_transcript_hash from the
+        /// persisted bindings and writing the file back atomically. New files (and migrated
+        /// files) always carry `Some(_)` from this point forward.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub init_transcript_hash: Option<String>,
     }
 
     fn vault_state_file_path(state_dir: &Path) -> PathBuf {
@@ -5565,11 +5580,20 @@ pub mod vault_state_v2 {
             // mismatch → `vault_state_v2_already_initialized_with_different_inputs`. We reject
             // even cursor-bump attempts via this endpoint: 2b will have its own dedicated
             // endpoint with its own cursor-monotonicity check.
+            //
+            // Codex M3a P1: `load_vault_state_v2` auto-migrates a missing `init_transcript_hash`
+            // here so old files written before this field landed get the value backfilled. The
+            // re-init path runs through this branch so the migrated `Some(_)` is available
+            // when we return.
+            let existing = load_vault_state_v2(state_dir)?.ok_or_else(|| {
+                WorkerError::Crypto(
+                    "vault_state_v2 file present but load returned None".to_string(),
+                )
+            })?;
+            // Re-read raw bytes for the idempotent vault_state_hash. The migration in
+            // `load_vault_state_v2` may have rewritten them, so we re-fetch them post-migration.
             let raw = fs::read(&file_path).map_err(|err| {
                 WorkerError::Crypto(format!("read existing vault_state_v2 file: {err}"))
-            })?;
-            let existing: VaultStateFile = serde_json::from_slice(&raw).map_err(|err| {
-                WorkerError::Crypto(format!("parse vault_state_v2 file: {err}"))
             })?;
             if existing.scheme != "vault_state_v2" {
                 return Err(WorkerError::InvalidDkgState(
@@ -5597,27 +5621,22 @@ pub mod vault_state_v2 {
                 ));
             }
             let vault_state_hash = sha256_hex(&raw);
-            let worker_transcript_hash = init_worker_transcript_hash(
-                &req.session_id,
-                &req.request_id,
-                &req.dkg_epoch,
-                &ca_transcript,
-                &vault_ek_transcript,
-                &registration_transcript,
-                &roster_hash,
-                &sorted,
-                req.self_slot,
-                req.player_id,
-                &vault_ek_hex,
-                &sender,
-                &asset,
-                req.chain_id,
-                &aggregate_commitment,
-                &aggregate_response,
-                &challenge,
-                existing.vault_sequence,
-                existing.deposit_count_observed,
-            );
+            // Codex M3a P1: the persisted `init_transcript_hash` is the FIRST-init worker
+            // transcript hash — frozen. Idempotent replays return that same hash so the
+            // coordinator + MPCCA withdraw rounds see a STABLE value regardless of how many
+            // re-init calls happened.
+            //
+            // Legacy file (pre-fix) → field is absent. We fail closed with a specific code so
+            // operators know to wipe + re-init (per the load_vault_state_v2 backwards-compat
+            // policy above).
+            let worker_transcript_hash = existing.init_transcript_hash.clone().ok_or_else(|| {
+                WorkerError::InvalidDkgState(
+                    "vault_state_v2_init_transcript_hash_missing: legacy vault_state_v2.json \
+                     written before Codex M3a P1 landed; remove the file and re-run \
+                     /v2/vault_state/init to populate the init_transcript_hash field"
+                        .to_string(),
+                )
+            })?;
             return Ok(InitResult {
                 slot: req.self_slot,
                 player_id: req.player_id,
@@ -5636,36 +5655,9 @@ pub mod vault_state_v2 {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let layout = VaultStateFile {
-            scheme: "vault_state_v2".to_string(),
-            slot: req.self_slot,
-            player_id: req.player_id,
-            dkg_epoch: req.dkg_epoch.clone(),
-            ca_dkg_transcript_hash: ca_transcript.clone(),
-            vault_ek_transcript_hash: vault_ek_transcript.clone(),
-            registration_transcript_hash: registration_transcript.clone(),
-            roster_hash: roster_hash.clone(),
-            selected_slots: sorted.clone(),
-            vault_ek_hex: vault_ek_hex.clone(),
-            sender_address: sender.clone(),
-            asset_type: asset.clone(),
-            chain_id: req.chain_id,
-            aggregate_commitment: aggregate_commitment.clone(),
-            aggregate_response: aggregate_response.clone(),
-            challenge: challenge.clone(),
-            vault_sequence: 0,
-            deposit_count_observed: 0,
-            created_at_unix_ms: created_at,
-        };
-        // pretty-print so the file is human-auditable. JSON canonicalisation isn't needed for
-        // the integrity hash because `vault_state_hash` is over the EXACT byte buffer the worker
-        // both wrote AND returned (and 2b will compute it again on read), so any future caller
-        // that wants to verify integrity can read the file byte-for-byte and re-hash.
-        let bytes = serde_json::to_vec_pretty(&layout)
-            .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;
-        write_secret_file(&file_path, &bytes)?;
-
-        let vault_state_hash = sha256_hex(&bytes);
+        // Codex M3a P1: compute the per-worker init transcript hash NOW so we can persist it.
+        // The mpcca_withdraw_v2 round1/2/prove/finalize handlers verify a caller-supplied
+        // `vault_state_init_transcript_hash` against this exact value byte-for-byte.
         let worker_transcript_hash = init_worker_transcript_hash(
             &req.session_id,
             &req.request_id,
@@ -5687,6 +5679,37 @@ pub mod vault_state_v2 {
             0,
             0,
         );
+        let layout = VaultStateFile {
+            scheme: "vault_state_v2".to_string(),
+            slot: req.self_slot,
+            player_id: req.player_id,
+            dkg_epoch: req.dkg_epoch.clone(),
+            ca_dkg_transcript_hash: ca_transcript.clone(),
+            vault_ek_transcript_hash: vault_ek_transcript.clone(),
+            registration_transcript_hash: registration_transcript.clone(),
+            roster_hash: roster_hash.clone(),
+            selected_slots: sorted.clone(),
+            vault_ek_hex: vault_ek_hex.clone(),
+            sender_address: sender.clone(),
+            asset_type: asset.clone(),
+            chain_id: req.chain_id,
+            aggregate_commitment: aggregate_commitment.clone(),
+            aggregate_response: aggregate_response.clone(),
+            challenge: challenge.clone(),
+            vault_sequence: 0,
+            deposit_count_observed: 0,
+            created_at_unix_ms: created_at,
+            init_transcript_hash: Some(worker_transcript_hash.clone()),
+        };
+        // pretty-print so the file is human-auditable. JSON canonicalisation isn't needed for
+        // the integrity hash because `vault_state_hash` is over the EXACT byte buffer the worker
+        // both wrote AND returned (and 2b will compute it again on read), so any future caller
+        // that wants to verify integrity can read the file byte-for-byte and re-hash.
+        let bytes = serde_json::to_vec_pretty(&layout)
+            .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;
+        write_secret_file(&file_path, &bytes)?;
+
+        let vault_state_hash = sha256_hex(&bytes);
         Ok(InitResult {
             slot: req.self_slot,
             player_id: req.player_id,
@@ -5703,6 +5726,19 @@ pub mod vault_state_v2 {
     /// Pure helper: read + parse the on-disk vault-state file for the given state_dir. Returns
     /// `Ok(None)` if the file does not exist; `Err` on any parse/IO failure. Used by 2b's
     /// observer to read the cursor without going through the HTTP endpoint.
+    ///
+    /// Codex M3a P1 backwards-compat policy: the `init_transcript_hash` field is a load-bearing
+    /// binding for the MPCCA withdraw rounds. Files written by the Milestone 2a code that
+    /// pre-dates this field will not have it. We do NOT attempt to auto-migrate by recomputing
+    /// a placeholder hash — that would produce a value that doesn't match anything the
+    /// original init returned, breaking the coordinator's cross-check. Instead, the field
+    /// stays `None` on read for legacy files. Code paths that REQUIRE the field present must
+    /// fail closed with a specific `vault_state_v2_init_transcript_hash_missing` error.
+    /// Operators upgrading from pre-fix code MUST re-init the vault by removing
+    /// `vault_state_v2.json` and re-running `/v2/vault_state/init`.
+    ///
+    /// This is the safer policy per the codex playbook's "if migration is risky, prefer
+    /// re-init" guidance: a wrong migration would silently bind the wrong identity.
     pub fn load_vault_state_v2(state_dir: &Path) -> WorkerResult<Option<VaultStateFile>> {
         let file_path = vault_state_file_path(state_dir);
         if !file_path.exists() {
@@ -6065,6 +6101,10 @@ pub mod vault_state_v2 {
             vault_sequence: existing.vault_sequence, // untouched by observe
             deposit_count_observed: req.deposit_count,
             created_at_unix_ms: existing.created_at_unix_ms,
+            // Codex M3a P1: preserve the persisted init transcript hash verbatim across
+            // cursor bumps. Observe does not touch identity, so the original init binding
+            // remains valid.
+            init_transcript_hash: existing.init_transcript_hash.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&updated)
             .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;

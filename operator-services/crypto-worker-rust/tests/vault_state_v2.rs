@@ -424,6 +424,17 @@ fn vault_state_v2_init_five_workers_idempotent() {
         );
         assert_eq!(result.worker_transcript_hash, expected_hash);
 
+        // Codex M3a P1 KILLER ASSERTION: init_transcript_hash is persisted and equals the
+        // worker's returned worker_transcript_hash byte-for-byte. Downstream MPCCA withdraw
+        // rounds will verify a caller-supplied `vault_state_init_transcript_hash` against
+        // this exact value, so a tampered request fails closed instead of reaching
+        // NotImplemented.
+        assert_eq!(
+            loaded.init_transcript_hash.as_deref(),
+            Some(result.worker_transcript_hash.as_str()),
+            "slot {slot}: persisted init_transcript_hash MUST equal returned worker_transcript_hash"
+        );
+
         first_results.push(result);
     }
 
