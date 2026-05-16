@@ -22,13 +22,25 @@
 //!
 //! If the resulting proof bytes match the committed fixture verbatim, the
 //! Aptos WASM ↔ native Rust byte parity is established.
+//!
+//! Milestone 4d — threshold collaborative Bulletproof primitives. Tests at
+//! the bottom of this file (`threshold_*`) extend the M4a parity invariant
+//! to the additive-shared-blinding form: Σ partials over additive r-shares
+//! must produce the same range-proof bytes as the single-party M4a fixture
+//! for both `amount` (4 chunks) and `newBalance` (8 chunks).
 
 use std::{fs, path::PathBuf};
 
-use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::{ristretto::CompressedRistretto, scalar::Scalar};
 use eunoma_crypto_worker::{
     bulletproof_reference::{
-        aptos_commit, prove_range_with_rng, verify_range_single_party, APTOS_NUM_BITS,
+        aptos_commit, prove_range_with_rng,
+        threshold::{
+            aggregate_blinding_shares, aggregate_partial_range_commitments,
+            compute_partial_range_blinding_share, prove_threshold_range_multi,
+            verify_partial_against_shares, ThresholdRangePartial,
+        },
+        verify_range_single_party, APTOS_NUM_BITS,
     },
     transfer_sigma_reference::{prng_next_scalar_list, CounterPrng},
 };
@@ -322,4 +334,399 @@ fn tampered_value_diverges() {
         good_proof, bad_proof,
         "changing one chunk value must change the proof bytes"
     );
+}
+
+// =============================================================================
+// Milestone 4d — threshold collaborative Bulletproof primitive byte-parity tests
+//
+// These exercise the load-bearing invariant of the threshold construction:
+// additive sharing of the per-chunk blinding scalars across 5 parties + per-party
+// partial-commitment computation + aggregated prove MUST byte-match the
+// single-party M4a fixture for both `amount` (4 chunks) and `newBalance` (8 chunks).
+// =============================================================================
+
+const NUM_PARTIES: usize = 5;
+
+/// Deterministic test scalar from a label. Same construction as the
+/// twisted_elgamal/transfer_sigma threshold tests, with a distinct domain so
+/// the M4d split is independent of the M4b/M4c splits and we can detect any
+/// cross-domain coupling immediately.
+fn det_scalar(label: &[u8]) -> Scalar {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    h.update(b"EUNOMA_M4D_BULLETPROOF_TEST_DET_SCALAR_V1");
+    h.update((label.len() as u64).to_le_bytes());
+    h.update(label);
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&h.finalize());
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+/// Split a vector of scalars (per-chunk blindings) into `NUM_PARTIES` additive
+/// shares per chunk. Each party gets a full chunk-length vector; the per-index
+/// sum across parties equals the input. Four pseudorandom shares plus a
+/// balancing fifth. Deterministic per `domain_label`.
+fn split_blindings_into_five_additive_shares(
+    blindings: &[Scalar],
+    domain_label: &[u8],
+) -> [Vec<Scalar>; NUM_PARTIES] {
+    let chunk_count = blindings.len();
+    let mut shares: [Vec<Scalar>; NUM_PARTIES] = [
+        vec![Scalar::ZERO; chunk_count],
+        vec![Scalar::ZERO; chunk_count],
+        vec![Scalar::ZERO; chunk_count],
+        vec![Scalar::ZERO; chunk_count],
+        vec![Scalar::ZERO; chunk_count],
+    ];
+    for i in 0..chunk_count {
+        let mut sum_pseudorandom = Scalar::ZERO;
+        for j in 0..(NUM_PARTIES - 1) {
+            let label = format!("party/{j}/chunk/{i}").into_bytes();
+            let s = det_scalar(&[domain_label, b"/", label.as_slice()].concat());
+            shares[j][i] = s;
+            sum_pseudorandom += s;
+        }
+        shares[NUM_PARTIES - 1][i] = blindings[i] - sum_pseudorandom;
+    }
+    shares
+}
+
+#[test]
+fn threshold_split_actually_sums_to_blindings() {
+    // Sanity test: the additive split helper itself works before we hold the
+    // full pipeline accountable to byte-parity. Catch any split bug locally so
+    // a downstream mismatch points at the bulletproof MPC, not the test harness.
+    let fix = load_fixture();
+    let amt_r = le_hex_to_scalars(&fix.randomness.transfer_amount);
+    let nb_r = le_hex_to_scalars(&fix.randomness.new_balance);
+
+    let amt_shares =
+        split_blindings_into_five_additive_shares(&amt_r, b"M4D_RANGE_BLINDING_AMOUNT_V1");
+    for i in 0..amt_r.len() {
+        let sum: Scalar = (0..NUM_PARTIES).map(|j| amt_shares[j][i]).sum();
+        assert_eq!(sum, amt_r[i], "amount blinding[{i}] additive split mismatch");
+    }
+    let nb_shares =
+        split_blindings_into_five_additive_shares(&nb_r, b"M4D_RANGE_BLINDING_NEWBAL_V1");
+    for i in 0..nb_r.len() {
+        let sum: Scalar = (0..NUM_PARTIES).map(|j| nb_shares[j][i]).sum();
+        assert_eq!(sum, nb_r[i], "newBalance blinding[{i}] additive split mismatch");
+    }
+}
+
+#[test]
+fn threshold_partial_commitment_aggregates_to_aptos_commit() {
+    // Stage 1 of the threshold pipeline: each party publishes its
+    // per-chunk `H * r_share[i]` partial; the dealer aggregates with the
+    // public value term to recover V[i] = G*v[i] + H*r[i]. The aggregated
+    // value commitments MUST byte-match the M4a fixture's `comms` array (and
+    // therefore the single-party `aptos_commit` output) before we can hold
+    // the proof bytes accountable to byte-parity downstream.
+    let fix = load_fixture();
+    let amt_values = decimal_to_u64(&fix.plaintext_chunks.transfer_amount);
+    let amt_blindings = le_hex_to_scalars(&fix.randomness.transfer_amount);
+
+    let shares =
+        split_blindings_into_five_additive_shares(&amt_blindings, b"M4D_RANGE_BLINDING_AMOUNT_V1");
+
+    let partials: Vec<ThresholdRangePartial> = (0..NUM_PARTIES)
+        .map(|p| compute_partial_range_blinding_share(&shares[p]).expect("compute partial"))
+        .collect();
+
+    let aggregated_comms =
+        aggregate_partial_range_commitments(&partials, &amt_values).expect("aggregate commitments");
+
+    let expected_comms: Vec<[u8; 32]> =
+        fix.range_proofs.amount.comms.iter().map(|h| hex_32(h)).collect();
+    assert_eq!(aggregated_comms, expected_comms);
+    // And consistent with the single-party aptos_commit helper.
+    let single_party_comms = aptos_commit(&amt_values, &amt_blindings).expect("aptos_commit");
+    assert_eq!(aggregated_comms, single_party_comms);
+}
+
+#[test]
+fn threshold_bulletproof_byte_parity_with_m4a_fixture_amount() {
+    // KILLER TEST 1: 5-party additive blinding split + threshold prove on the
+    // M4a `amount` fixture (4 × 16-bit chunks). The aggregated range-proof
+    // bytes MUST byte-match the M4a fixture's `rangeProofs.amount.proof`.
+    let fix = load_fixture();
+    let ell = fix.params.ell;
+    let n = fix.params.n;
+
+    let amount_values = decimal_to_u64(&fix.plaintext_chunks.transfer_amount);
+    let amount_blindings = le_hex_to_scalars(&fix.randomness.transfer_amount);
+    let new_balance_values = decimal_to_u64(&fix.plaintext_chunks.new_balance);
+    let new_balance_blindings = le_hex_to_scalars(&fix.randomness.new_balance);
+
+    let amount_shares = split_blindings_into_five_additive_shares(
+        &amount_blindings,
+        b"M4D_RANGE_BLINDING_AMOUNT_V1",
+    );
+    let new_balance_shares = split_blindings_into_five_additive_shares(
+        &new_balance_blindings,
+        b"M4D_RANGE_BLINDING_NEWBAL_V1",
+    );
+
+    // Same WASM-seeded ChaCha12 instance the M4a fixture was generated with
+    // — the RNG must be shared across both proofs (amount → newBalance)
+    // because the WASM thread_rng caches state across calls.
+    let (_seed_bytes, mut rng) = build_wasm_chacha(&fix.generator.prng_seed, ell, n);
+
+    let (amount_proof_bytes, amount_comms) = prove_threshold_range_multi(
+        &amount_values,
+        &amount_shares,
+        APTOS_NUM_BITS,
+        n,
+        &mut rng,
+    )
+    .expect("threshold amount range proof");
+    let (new_balance_proof_bytes, new_balance_comms) = prove_threshold_range_multi(
+        &new_balance_values,
+        &new_balance_shares,
+        APTOS_NUM_BITS,
+        ell,
+        &mut rng,
+    )
+    .expect("threshold newBalance range proof");
+
+    // Commitment sanity (the same V[i] math the prover produces internally).
+    let expected_amount_comms: Vec<[u8; 32]> =
+        fix.range_proofs.amount.comms.iter().map(|h| hex_32(h)).collect();
+    assert_eq!(amount_comms, expected_amount_comms);
+    let expected_new_balance_comms: Vec<[u8; 32]> = fix
+        .range_proofs
+        .new_balance
+        .comms
+        .iter()
+        .map(|h| hex_32(h))
+        .collect();
+    assert_eq!(new_balance_comms, expected_new_balance_comms);
+
+    // -------- The actual byte-parity assertion --------
+    let expected_amount_proof = hex_decode(&fix.range_proofs.amount.proof);
+    assert_eq!(
+        hex_encode(&amount_proof_bytes),
+        hex_encode(&expected_amount_proof),
+        "threshold amount range proof byte mismatch (5-party additive blinding split, \
+         bulletproofs-5.0.0, label={SDK_TRANSCRIPT_LABEL})"
+    );
+    // Same prover continues consuming the RNG → newBalance proof must also match.
+    let expected_new_balance_proof = hex_decode(&fix.range_proofs.new_balance.proof);
+    assert_eq!(
+        hex_encode(&new_balance_proof_bytes),
+        hex_encode(&expected_new_balance_proof),
+        "threshold newBalance range proof byte mismatch on the same prover-side RNG \
+         (catches RNG state drift between the two consecutive proofs)"
+    );
+}
+
+#[test]
+fn threshold_bulletproof_byte_parity_with_m4a_fixture_new_balance() {
+    // KILLER TEST 2: same 5-party additive blinding split but the assertion
+    // focuses on the M4a `newBalance` fixture (8 × 16-bit chunks). The two
+    // proofs MUST be byte-identical to the M4a single-party fixture.
+    let fix = load_fixture();
+    let ell = fix.params.ell;
+    let n = fix.params.n;
+
+    let amount_values = decimal_to_u64(&fix.plaintext_chunks.transfer_amount);
+    let amount_blindings = le_hex_to_scalars(&fix.randomness.transfer_amount);
+    let new_balance_values = decimal_to_u64(&fix.plaintext_chunks.new_balance);
+    let new_balance_blindings = le_hex_to_scalars(&fix.randomness.new_balance);
+
+    let amount_shares = split_blindings_into_five_additive_shares(
+        &amount_blindings,
+        b"M4D_RANGE_BLINDING_AMOUNT_V1",
+    );
+    let new_balance_shares = split_blindings_into_five_additive_shares(
+        &new_balance_blindings,
+        b"M4D_RANGE_BLINDING_NEWBAL_V1",
+    );
+
+    let (_seed_bytes, mut rng) = build_wasm_chacha(&fix.generator.prng_seed, ell, n);
+
+    let (_amount_proof_bytes, _amount_comms) = prove_threshold_range_multi(
+        &amount_values,
+        &amount_shares,
+        APTOS_NUM_BITS,
+        n,
+        &mut rng,
+    )
+    .expect("threshold amount range proof (pre-roll RNG)");
+    let (new_balance_proof_bytes, new_balance_comms) = prove_threshold_range_multi(
+        &new_balance_values,
+        &new_balance_shares,
+        APTOS_NUM_BITS,
+        ell,
+        &mut rng,
+    )
+    .expect("threshold newBalance range proof");
+    let expected_new_balance_comms: Vec<[u8; 32]> = fix
+        .range_proofs
+        .new_balance
+        .comms
+        .iter()
+        .map(|h| hex_32(h))
+        .collect();
+    assert_eq!(new_balance_comms, expected_new_balance_comms);
+
+    let expected_new_balance_proof = hex_decode(&fix.range_proofs.new_balance.proof);
+    assert_eq!(
+        hex_encode(&new_balance_proof_bytes),
+        hex_encode(&expected_new_balance_proof),
+        "threshold newBalance range proof byte mismatch (5-party additive blinding split, \
+         bulletproofs-5.0.0, label={SDK_TRANSCRIPT_LABEL})"
+    );
+
+    // The aggregated proof MUST also verify under the standard single-party
+    // verifier — confirms the threshold construction is structurally valid.
+    let comms_bytes: Vec<[u8; 32]> = fix
+        .range_proofs
+        .new_balance
+        .comms
+        .iter()
+        .map(|h| hex_32(h))
+        .collect();
+    assert!(
+        verify_range_single_party(&new_balance_proof_bytes, &comms_bytes, APTOS_NUM_BITS, ell)
+            .expect("verify threshold newBalance"),
+        "Threshold-produced newBalance range proof must verify"
+    );
+}
+
+#[test]
+fn threshold_bulletproof_collapses_to_single_party_when_one_holds_all_blinding() {
+    // N=5 where party 0 carries the FULL blinding for every chunk and parties
+    // 1..4 contribute zero. The aggregated proof MUST byte-match the
+    // single-party `prove_range_with_rng` output verbatim. Confirms the
+    // threshold API has no per-party RNG side channel that would diverge when
+    // the additive split collapses.
+    let fix = load_fixture();
+    let n = fix.params.n;
+    let amount_values = decimal_to_u64(&fix.plaintext_chunks.transfer_amount);
+    let amount_blindings = le_hex_to_scalars(&fix.randomness.transfer_amount);
+
+    let mut shares: Vec<Vec<Scalar>> = vec![vec![Scalar::ZERO; n]; NUM_PARTIES];
+    shares[0] = amount_blindings.clone();
+
+    // Sanity: per-chunk sum equals the original blinding (degenerate split).
+    for i in 0..n {
+        let sum: Scalar = (0..NUM_PARTIES).map(|j| shares[j][i]).sum();
+        assert_eq!(sum, amount_blindings[i], "degenerate split[{i}] mismatch");
+    }
+
+    let (_seed1, mut rng_threshold) =
+        build_wasm_chacha(&fix.generator.prng_seed, fix.params.ell, n);
+    let (threshold_proof, threshold_comms) = prove_threshold_range_multi(
+        &amount_values,
+        &shares,
+        APTOS_NUM_BITS,
+        n,
+        &mut rng_threshold,
+    )
+    .expect("threshold prove");
+
+    let (_seed2, mut rng_single) =
+        build_wasm_chacha(&fix.generator.prng_seed, fix.params.ell, n);
+    let (single_proof, single_comms) = prove_range_with_rng(
+        &amount_values,
+        &amount_blindings,
+        APTOS_NUM_BITS,
+        n,
+        &mut rng_single,
+    )
+    .expect("single-party prove");
+
+    assert_eq!(
+        hex_encode(&threshold_proof),
+        hex_encode(&single_proof),
+        "degenerate threshold split (party 0 = full blinding) must produce byte-identical \
+         proof to single-party prove_range_with_rng"
+    );
+    assert_eq!(threshold_comms, single_comms);
+}
+
+#[test]
+fn threshold_partial_verification_round_trip() {
+    // verify_partial_against_shares MUST accept the exact shares used to
+    // compute the partial, and reject any single-byte mutation.
+    let fix = load_fixture();
+    let amt_blindings = le_hex_to_scalars(&fix.randomness.transfer_amount);
+    let shares =
+        split_blindings_into_five_additive_shares(&amt_blindings, b"M4D_VERIFY_PARTIAL_V1");
+
+    for p in 0..NUM_PARTIES {
+        let partial = compute_partial_range_blinding_share(&shares[p]).expect("compute partial");
+        assert!(
+            verify_partial_against_shares(&partial, &shares[p]).expect("verify"),
+            "partial from party {p} must verify against its own shares"
+        );
+
+        // Tamper with a single share (party 0): partial must no longer verify.
+        let mut wrong = shares[p].clone();
+        wrong[0] += Scalar::ONE;
+        assert!(
+            !verify_partial_against_shares(&partial, &wrong).expect("verify wrong"),
+            "partial from party {p} must NOT verify against perturbed shares"
+        );
+    }
+}
+
+#[test]
+fn threshold_aggregate_blinding_shares_byte_parity() {
+    // The aggregate of N additive shares MUST equal the original blinding
+    // scalar — confirms aggregate_blinding_shares isn't masking a mismatch
+    // before it reaches prove_threshold_range_multi.
+    let fix = load_fixture();
+    let amt_blindings = le_hex_to_scalars(&fix.randomness.transfer_amount);
+    let shares =
+        split_blindings_into_five_additive_shares(&amt_blindings, b"M4D_AGGREGATE_TEST_V1");
+    let agg = aggregate_blinding_shares(&shares).expect("aggregate");
+    for i in 0..amt_blindings.len() {
+        assert_eq!(agg[i], amt_blindings[i], "aggregated blinding[{i}] mismatch");
+    }
+}
+
+#[test]
+fn threshold_rejects_mismatched_share_lengths() {
+    // Defensive: a deoperator that submits a wrong-length share vector MUST
+    // fail closed at aggregate, BEFORE we ever invoke the bulletproof MPC.
+    let bad_shares: Vec<Vec<Scalar>> = vec![
+        vec![Scalar::ONE, Scalar::ONE],
+        vec![Scalar::ONE], // wrong length
+    ];
+    let err = aggregate_blinding_shares(&bad_shares).unwrap_err();
+    match err {
+        eunoma_crypto_worker::WorkerError::InvalidRequest(msg) => {
+            assert!(
+                msg.contains("aggregate_blinding_shares"),
+                "error message should identify aggregate_blinding_shares: {msg}"
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    let mismatched_partials = vec![
+        ThresholdRangePartial {
+            h_blinding_partials: vec![
+                CompressedRistretto::default().decompress().unwrap_or_default()
+            ],
+        },
+        ThresholdRangePartial {
+            h_blinding_partials: vec![
+                CompressedRistretto::default().decompress().unwrap_or_default(),
+                CompressedRistretto::default().decompress().unwrap_or_default(),
+            ],
+        },
+    ];
+    let err = aggregate_partial_range_commitments(&mismatched_partials, &[0]).unwrap_err();
+    match err {
+        eunoma_crypto_worker::WorkerError::InvalidRequest(msg) => {
+            assert!(
+                msg.contains("aggregate_partial_range_commitments"),
+                "error should identify aggregate_partial_range_commitments: {msg}"
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
 }
