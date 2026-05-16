@@ -194,6 +194,18 @@ function worker(slot: number): CryptoWorker {
         transcript_hash: h32("6"),
       };
     },
+    async runMpccaWithdrawRound1() {
+      throw new Error("not used in deop-node tests — coordinator drives this via forwardToWorker");
+    },
+    async runMpccaWithdrawRound2() {
+      throw new Error("not used in deop-node tests — coordinator drives this via forwardToWorker");
+    },
+    async runMpccaWithdrawProve() {
+      throw new Error("not used in deop-node tests — coordinator drives this via forwardToWorker");
+    },
+    async runMpccaWithdrawFinalize() {
+      throw new Error("not used in deop-node tests — coordinator drives this via forwardToWorker");
+    },
   };
 }
 
@@ -1480,4 +1492,202 @@ describe("deoperator node", () => {
       globalThis.fetch = oldFetch;
     }
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Milestone 3 sub-milestone 3a: MPCCA withdraw V2 passthroughs. Each round mirrors the
+  // vault_state_v2 passthrough pattern (forbidden-field guard → rosterHash gate → selfSlot
+  // gate → forward). The worker returns 501 from the milestone 3a stub; the deop-node preserves
+  // that status code verbatim through forwardToWorker.
+  // ---------------------------------------------------------------------------------------------
+  function mpccaWithdrawBaseBody(
+    rosterHashHex: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return {
+      dkgEpoch: "1",
+      requestId: "mpcca-wdr-pt",
+      sessionId: "mpcca-wdr-pt",
+      vaultEkTranscriptHash: h32("a"),
+      registrationTranscriptHash: h32("b"),
+      vaultStateInitTranscriptHash: h32("c"),
+      observedDepositTranscriptHashes: [h32("d"), h32("e")],
+      rosterHash: rosterHashHex,
+      selectedSlots: [0, 1, 2, 3, 4],
+      selfSlot: 0,
+      playerId: 0,
+      vaultEk: h32("1"),
+      senderAddress: h32("2"),
+      assetType: h32("3"),
+      chainId: 2,
+      root: h32("4"),
+      nullifierHash: h32("5"),
+      recipient: h32("6"),
+      recipientHash: h32("7"),
+      amountTag: h32("8"),
+      vaultSequence: 0,
+      expirySecs: 1_700_000_000,
+      requestHash: h32("9"),
+      depositCount: 2,
+      ...overrides,
+    };
+  }
+  function mpccaWithdrawChainedBody(
+    rosterHashHex: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return {
+      ...mpccaWithdrawBaseBody(rosterHashHex),
+      previousRoundTranscriptHash: h32("0"),
+      previousRoundCommitments: [h32("a"), h32("b"), h32("c"), h32("d"), h32("e")],
+      ...overrides,
+    };
+  }
+
+  for (const round of ["round1", "round2", "prove", "finalize"] as const) {
+    const url = `/worker/v2/mpcca/withdraw/${round}`;
+    const isChained = round !== "round1";
+
+    it(`mpcca withdraw ${round} passthrough rejects mismatched rosterHash before forwarding`, async () => {
+      const caDkgV2Roster = testDkgRoster();
+      let workerCalled = false;
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = (async () => {
+        workerCalled = true;
+        return new Response("{}", { status: 501 });
+      }) as typeof fetch;
+      try {
+        const { server } = buildDeoperatorNodeServer({
+          slot: 0,
+          nodeId: "node-0",
+          caDkgV2Roster,
+          cryptoWorker: worker(0),
+          cryptoWorkerUrl: "http://localhost:9000",
+        });
+        const payload = isChained ? mpccaWithdrawChainedBody(h32("9")) : mpccaWithdrawBaseBody(h32("9"));
+        const res = await server.inject({
+          method: "POST",
+          url,
+          payload,
+        });
+        expect(res.statusCode).toBe(400);
+        expect(workerCalled).toBe(false);
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    });
+
+    it(`mpcca withdraw ${round} passthrough rejects wrong selfSlot before forwarding`, async () => {
+      const caDkgV2Roster = testDkgRoster();
+      let workerCalled = false;
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = (async () => {
+        workerCalled = true;
+        return new Response("{}", { status: 501 });
+      }) as typeof fetch;
+      try {
+        const { server } = buildDeoperatorNodeServer({
+          slot: 0,
+          nodeId: "node-0",
+          caDkgV2Roster,
+          cryptoWorker: worker(0),
+          cryptoWorkerUrl: "http://localhost:9000",
+        });
+        const hashHex = caDkgV2RosterHash(caDkgV2Roster);
+        const payload = isChained
+          ? mpccaWithdrawChainedBody(hashHex, { selfSlot: 4, playerId: 4 })
+          : mpccaWithdrawBaseBody(hashHex, { selfSlot: 4, playerId: 4 });
+        const res = await server.inject({
+          method: "POST",
+          url,
+          payload,
+        });
+        expect(res.statusCode).toBe(400);
+        expect(workerCalled).toBe(false);
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    });
+
+    it(`mpcca withdraw ${round} passthrough rejects forbidden plaintext fields`, async () => {
+      const caDkgV2Roster = testDkgRoster();
+      let workerCalled = false;
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = (async () => {
+        workerCalled = true;
+        return new Response("{}", { status: 501 });
+      }) as typeof fetch;
+      try {
+        const { server } = buildDeoperatorNodeServer({
+          slot: 0,
+          nodeId: "node-0",
+          caDkgV2Roster,
+          cryptoWorker: worker(0),
+          cryptoWorkerUrl: "http://localhost:9000",
+        });
+        const hashHex = caDkgV2RosterHash(caDkgV2Roster);
+        const payload = isChained
+          ? mpccaWithdrawChainedBody(hashHex, { dkShare: h32("9") })
+          : mpccaWithdrawBaseBody(hashHex, { dkShare: h32("9") });
+        const res = await server.inject({
+          method: "POST",
+          url,
+          payload,
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().error).toBe("forbidden_plaintext_field");
+        expect(workerCalled).toBe(false);
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    });
+
+    it(`mpcca withdraw ${round} passthrough forwards stub 501 to local worker on valid body`, async () => {
+      const caDkgV2Roster = testDkgRoster();
+      let forwardedPath: string | undefined;
+      let forwardedBody: Record<string, unknown> | undefined;
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        forwardedPath = (url as URL | string).toString();
+        if (init?.body) forwardedBody = JSON.parse(init.body as string);
+        // The milestone 3a worker stub returns 501 + body with the public-binding outputs.
+        return new Response(
+          JSON.stringify({
+            slot: 0,
+            playerId: 0,
+            sessionStatePath: `/tmp/slot-0/mpc-sessions/mpcca-wdr-pt__mpcca-wdr-pt/mpcca_withdraw_v2_${round}.json`,
+            sessionStateHash: h32("a"),
+            workerTranscriptHash: h32("b"),
+            observedAtUnixMs: 1_700_000_000_000,
+            completed: false,
+            notImplementedPhase: `mpcca_withdraw_v2_${round}_pending_milestone4`,
+          }),
+          { status: 501 },
+        );
+      }) as typeof fetch;
+      try {
+        const { server } = buildDeoperatorNodeServer({
+          slot: 0,
+          nodeId: "node-0",
+          caDkgV2Roster,
+          cryptoWorker: worker(0),
+          cryptoWorkerUrl: "http://localhost:9000",
+        });
+        const hashHex = caDkgV2RosterHash(caDkgV2Roster);
+        const payload = isChained ? mpccaWithdrawChainedBody(hashHex) : mpccaWithdrawBaseBody(hashHex);
+        const res = await server.inject({
+          method: "POST",
+          url,
+          payload,
+        });
+        expect(res.statusCode).toBe(501);
+        expect(forwardedPath).toContain(`/worker/v2/mpcca/withdraw/${round}`);
+        expect(forwardedBody?.selfSlot).toBe(0);
+        const body = res.json();
+        expect(body.completed).toBe(false);
+        expect(body.notImplementedPhase).toContain(round);
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    });
+  }
 });

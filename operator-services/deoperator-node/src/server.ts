@@ -282,7 +282,11 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/derive/ca_registration/verify"
       | "/worker/v2/derive/ca_registration/aggregate"
       | "/worker/v2/vault_state/init"
-      | "/worker/v2/vault_state/observe_deposit",
+      | "/worker/v2/vault_state/observe_deposit"
+      | "/worker/v2/mpcca/withdraw/round1"
+      | "/worker/v2/mpcca/withdraw/round2"
+      | "/worker/v2/mpcca/withdraw/prove"
+      | "/worker/v2/mpcca/withdraw/finalize",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -484,6 +488,84 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/worker/v2/vault_state/observe_deposit", req.body, reply);
+  });
+
+  // Milestone 3 sub-milestone 3a — MPCCA withdraw V2 round1/round2/prove/finalize passthroughs.
+  // Mirrors the vault_state_v2 passthrough pattern: forbidden-field guard runs first, then
+  // rosterHash gate against the configured CA DKG V2 roster, then selfSlot gate against this
+  // node's slot. Without these a stale-roster or wrong-slot withdraw call could persist a
+  // round-N state file under this node's state_dir bound to a different vault.
+  //
+  // The worker handler will surface 501 NotImplemented from the crypto stub (with the public
+  // binding outputs in the body) — that 501 is preserved verbatim through forwardToWorker so
+  // the coordinator's orchestrator can parse the per-slot transcript + cursor outputs even
+  // though the crypto is pending milestone 4.
+  server.post("/worker/v2/mpcca/withdraw/round1", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/mpcca/withdraw/round1", req.body, reply);
+  });
+
+  server.post("/worker/v2/mpcca/withdraw/round2", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/mpcca/withdraw/round2", req.body, reply);
+  });
+
+  server.post("/worker/v2/mpcca/withdraw/prove", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/mpcca/withdraw/prove", req.body, reply);
+  });
+
+  server.post("/worker/v2/mpcca/withdraw/finalize", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/mpcca/withdraw/finalize", req.body, reply);
   });
 
   return { server, store };

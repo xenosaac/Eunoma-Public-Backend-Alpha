@@ -116,6 +116,61 @@ export interface FrostAggregateResult {
   transcript_hash: string;
 }
 
+/**
+ * Milestone 3 sub-milestone 3a — typed bodies for the MPCCA withdraw V2 round1/round2/prove/
+ * finalize wire shapes. The coordinator constructs these and the crypto-worker-client forwards
+ * them via HTTP. The Response shape is intentionally loose (`completed: false` +
+ * `notImplementedPhase: string`) because the milestone 3a stub returns NotImplemented from the
+ * Rust worker — the public binding outputs (sessionStatePath, sessionStateHash,
+ * workerTranscriptHash) ARE filled in alongside the 501 body so the coordinator can persist
+ * its partial transcript.
+ */
+export interface MpccaWithdrawRoundRequest {
+  // Provenance + identity envelope shared by all four rounds.
+  dkgEpoch: string;
+  requestId: string;
+  sessionId: string;
+  vaultEkTranscriptHash: string;
+  registrationTranscriptHash: string;
+  vaultStateInitTranscriptHash: string;
+  observedDepositTranscriptHashes: string[];
+  rosterHash: string;
+  selectedSlots: number[];
+  selfSlot: number;
+  playerId: number;
+  vaultEk: string;
+  senderAddress: string;
+  assetType: string;
+  chainId: number;
+  root: string;
+  nullifierHash: string;
+  recipient: string;
+  recipientHash: string;
+  amountTag: string;
+  vaultSequence: number;
+  expirySecs: number;
+  requestHash: string;
+  depositCount: number;
+  // Optional chained-round fields (round2/prove/finalize only).
+  previousRoundTranscriptHash?: string;
+  previousRoundCommitments?: string[];
+}
+
+export interface MpccaWithdrawRoundResult {
+  slot: number;
+  playerId: number;
+  sessionStatePath: string;
+  sessionStateHash: string;
+  workerTranscriptHash: string;
+  observedAtUnixMs: number;
+  completed: false;
+  notImplementedPhase: string;
+  roundCommitment?: string;
+  partialResponse?: string;
+  partialBulletproofShare?: string;
+  partialCaPayloadFields?: string;
+}
+
 export interface CryptoWorker {
   getLocalState(): Promise<WorkerLocalState>;
   acceptSessionShare(input: SessionShareEnvelope): Promise<{ accepted: true; transcriptHash: string }>;
@@ -133,6 +188,15 @@ export interface CryptoWorker {
   caRegistrationChallenge(input: CaRegistrationChallengeRequest): Promise<CaRegistrationChallengeResult>;
   caRegistrationPartial(input: CaRegistrationPartialRequest): Promise<CaRegistrationPartialResult>;
   caRegistrationAggregate(input: CaRegistrationAggregateRequest): Promise<CaRegistrationAggregateResult>;
+  /**
+   * Milestone 3 sub-milestone 3a — MPCCA withdraw V2 round1/round2/prove/finalize. Each rejects
+   * with `CryptoWorkerUnavailableError` under the milestone 3a stub (HTTP 501); milestone 4
+   * will resolve with the round result.
+   */
+  runMpccaWithdrawRound1(input: MpccaWithdrawRoundRequest): Promise<MpccaWithdrawRoundResult>;
+  runMpccaWithdrawRound2(input: MpccaWithdrawRoundRequest): Promise<MpccaWithdrawRoundResult>;
+  runMpccaWithdrawProve(input: MpccaWithdrawRoundRequest): Promise<MpccaWithdrawRoundResult>;
+  runMpccaWithdrawFinalize(input: MpccaWithdrawRoundRequest): Promise<MpccaWithdrawRoundResult>;
 }
 
 export class CryptoWorkerUnavailableError extends Error {

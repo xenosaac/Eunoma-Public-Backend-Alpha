@@ -32,6 +32,8 @@ import type {
   FrostNonceCommitResult,
   FrostPartialSignRequest,
   FrostPartialSignResult,
+  MpccaWithdrawRoundRequest,
+  MpccaWithdrawRoundResult,
   WorkerLocalState,
 } from "./types.js";
 import { CryptoWorkerUnavailableError } from "./types.js";
@@ -108,6 +110,34 @@ export class HttpCryptoWorkerClient implements CryptoWorker {
     input: CaRegistrationAggregateRequest,
   ): Promise<CaRegistrationAggregateResult> {
     return this.post("/worker/v2/ca/registration/aggregate", input);
+  }
+
+  // Milestone 3 sub-milestone 3a — MPCCA withdraw V2. The HTTP layer surfaces 501 (stub) as
+  // CryptoWorkerUnavailableError via the shared `post` helper. The coordinator calls these
+  // through the deop-node + singleNodeForwarder path (not through this client), so these
+  // methods are exposed for parity but not on the orchestration hot path.
+  runMpccaWithdrawRound1(
+    input: MpccaWithdrawRoundRequest,
+  ): Promise<MpccaWithdrawRoundResult> {
+    return this.post("/worker/v2/mpcca/withdraw/round1", input);
+  }
+
+  runMpccaWithdrawRound2(
+    input: MpccaWithdrawRoundRequest,
+  ): Promise<MpccaWithdrawRoundResult> {
+    return this.post("/worker/v2/mpcca/withdraw/round2", input);
+  }
+
+  runMpccaWithdrawProve(
+    input: MpccaWithdrawRoundRequest,
+  ): Promise<MpccaWithdrawRoundResult> {
+    return this.post("/worker/v2/mpcca/withdraw/prove", input);
+  }
+
+  runMpccaWithdrawFinalize(
+    input: MpccaWithdrawRoundRequest,
+  ): Promise<MpccaWithdrawRoundResult> {
+    return this.post("/worker/v2/mpcca/withdraw/finalize", input);
   }
 
   private async get<T>(path: string): Promise<T> {
@@ -200,6 +230,22 @@ export class FailClosedCryptoWorker implements CryptoWorker {
   }
 
   async caRegistrationAggregate(): Promise<CaRegistrationAggregateResult> {
+    throw new CryptoWorkerUnavailableError();
+  }
+
+  async runMpccaWithdrawRound1(): Promise<MpccaWithdrawRoundResult> {
+    throw new CryptoWorkerUnavailableError();
+  }
+
+  async runMpccaWithdrawRound2(): Promise<MpccaWithdrawRoundResult> {
+    throw new CryptoWorkerUnavailableError();
+  }
+
+  async runMpccaWithdrawProve(): Promise<MpccaWithdrawRoundResult> {
+    throw new CryptoWorkerUnavailableError();
+  }
+
+  async runMpccaWithdrawFinalize(): Promise<MpccaWithdrawRoundResult> {
     throw new CryptoWorkerUnavailableError();
   }
 }
