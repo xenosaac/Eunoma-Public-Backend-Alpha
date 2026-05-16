@@ -56,6 +56,13 @@ export class HttpCryptoWorkerClient implements CryptoWorker {
     return this.post(`/worker/v2/dkg/${input.protocol}/${input.round}`, input);
   }
 
+  /**
+   * @deprecated Codex M3a P3: the legacy generic MPCCA route was removed from the worker
+   * because it crossed the `ca_local` trusted-party surface (load_ca_share). Inbound
+   * requests now fail closed at the worker side. Use the per-round methods
+   * `mpccaWithdrawRound1` / `Round2` / `Prove` / `Finalize` instead. Retained here
+   * for one release cycle to preserve type compatibility for downstream consumers.
+   */
   runMpccaRound(input: MpccaRoundRequest): Promise<MpccaRoundResult> {
     return this.post(`/worker/v2/mpcca/${input.protocol}/${input.round}`, input);
   }

@@ -334,6 +334,14 @@ export interface CaRegistrationAggregateResult {
   transcript_hash: HexString;
 }
 
+/**
+ * @deprecated Codex M3a P3: the legacy generic MPCCA round request shape was retired.
+ * The new MPCCA withdraw API lives at `/v2/withdraw/mpcca/start` on the coordinator with
+ * per-round handlers `/worker/v2/mpcca/withdraw/{round1,round2,prove,finalize}` on the
+ * worker. This interface is retained for one release cycle so external consumers can
+ * migrate; the legacy worker route has been removed and inbound requests will fail closed.
+ * Use `MpccaWithdrawRound1Request` (and its sibling round types) in `mpcca_withdraw_v2.ts`.
+ */
 export interface MpccaRoundRequest {
   requestId: string;
   sessionId: string;
@@ -354,6 +362,10 @@ export interface MpccaRoundRequest {
   roundCommitments: HexString[];
 }
 
+/**
+ * @deprecated Codex M3a P3: see `MpccaRoundRequest`. Use the per-round result types in
+ * `mpcca_withdraw_v2.ts`.
+ */
 export interface MpccaRoundResult {
   requestId: string;
   sessionId: string;

@@ -108,10 +108,12 @@ async fn main() {
             "/worker/v2/dkg/:protocol/:round",
             post(dkg_round),
         )
-        .route(
-            "/worker/v2/mpcca/:protocol/:round",
-            post(mpcca_round),
-        )
+        // Codex M3a P3: the legacy generic MPCCA route was removed. Its only crypto path
+        // was `load_ca_share(&state.state_dir)` which crosses the `ca_local` trusted-party
+        // surface — a violation of the V2 invariant that production code must not import
+        // from ca_local. The new MPCCA withdraw lives at
+        // `/worker/v2/mpcca/withdraw/{round1,round2,prove,finalize}` (registered below)
+        // and never touches ca_local.
         .route(
             "/worker/v2/ca/registration/nonce-commit",
             post(ca_registration_nonce_commit),
@@ -590,23 +592,6 @@ struct DkgRoundBody {
     complaint: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct MpccaRoundBody {
-    #[serde(rename = "requestId")]
-    request_id: String,
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    slot: usize,
-    #[serde(rename = "quorumSlots")]
-    quorum_slots: Option<Vec<usize>>,
-    #[serde(rename = "vaultSequence")]
-    vault_sequence: String,
-    #[serde(rename = "transcriptHash")]
-    transcript_hash: String,
-    #[serde(rename = "publicInputsHash")]
-    public_inputs_hash: String,
-}
-
 async fn dkg_round(
     State(state): State<AppState>,
     Path((protocol, round)): Path<(String, String)>,
@@ -730,73 +715,6 @@ async fn dkg_round(
                     "publicShare": share.public_share,
                     "groupPublicKey": share.vault_ek,
                     "abortEvidenceHash": abort_evidence_hash
-                })),
-            )
-        }
-        Err(err) => worker_error_response(err),
-    }
-}
-
-async fn mpcca_round(
-    State(state): State<AppState>,
-    Path((protocol, round)): Path<(String, String)>,
-    Json(body): Json<MpccaRoundBody>,
-) -> impl IntoResponse {
-    if protocol != "withdraw" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid_request", "message": "invalid MPCCA protocol" })),
-        );
-    }
-    if body.slot != state.slot {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid_request", "message": "slot mismatch" })),
-        );
-    }
-    if round == "prove" || round == "finalize" {
-        let Some(quorum_slots) = body.quorum_slots.as_deref() else {
-            return worker_error_response(eunoma_crypto_worker::WorkerError::InvalidRequest(
-                "quorumSlots is required for MPCCA prove/finalize".to_string(),
-            ));
-        };
-        if let Err(err) = eunoma_crypto_worker::assert_quorum_slots5(quorum_slots) {
-            return worker_error_response(err);
-        }
-        return worker_error_response(eunoma_crypto_worker::WorkerError::NotImplemented(
-            "collaborative Aptos CA transfer sigma and Bulletproof payload generation are required for MPCCA prove/finalize",
-        ));
-    }
-    match load_ca_share(&state.state_dir) {
-        Ok(share) => {
-            let artifact_hash = hash_hex(&[
-                b"EUNOMA_MPCCA_WITHDRAW_ROUND_ARTIFACT_V1".as_slice(),
-                body.request_id.as_bytes(),
-                body.session_id.as_bytes(),
-                body.vault_sequence.as_bytes(),
-                protocol.as_bytes(),
-                round.as_bytes(),
-                body.transcript_hash.as_bytes(),
-                body.public_inputs_hash.as_bytes(),
-                share.transcript_hash.as_bytes(),
-                share.public_share.as_bytes(),
-            ]);
-            let ca_payload_hash_share = hash_hex(&[
-                b"EUNOMA_MPCCA_CA_PAYLOAD_HASH_SHARE_V1".as_slice(),
-                artifact_hash.as_bytes(),
-            ]);
-            (
-                StatusCode::ACCEPTED,
-                Json(json!({
-                    "requestId": body.request_id,
-                    "sessionId": body.session_id,
-                    "protocol": protocol,
-                    "round": round,
-                    "slot": state.slot,
-                    "accepted": true,
-                    "transcriptHash": body.transcript_hash,
-                    "artifactHash": artifact_hash,
-                    "caPayloadHashShare": ca_payload_hash_share
                 })),
             )
         }
