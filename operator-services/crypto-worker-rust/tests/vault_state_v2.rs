@@ -27,7 +27,9 @@ use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
 };
 use eunoma_crypto_worker::{
-    ca_local::{
+    // Codex M2a P1: V2 production code paths (and tests asserting V2 behaviour) MUST import
+    // the public verifier surface from `registration_verifier`, NOT from `ca_local`.
+    registration_verifier::{
         aggregate_registration_commitment, registration_challenge,
         verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
     },

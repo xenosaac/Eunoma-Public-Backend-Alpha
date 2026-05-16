@@ -850,6 +850,369 @@ pub mod local_state {
     }
 }
 
+/// Public CA-registration sigma-protocol verifier + helpers.
+///
+/// Codex M2a P1: V2 production code paths previously imported the public verifier
+/// (`verify_registration_proof`) and the Fiat-Shamir challenge derivation
+/// (`registration_challenge_scalar`) from `crate::ca_local`. The architectural invariant
+/// states that `ca_local` is unit/local-smoke fixture ONLY and V2 production code must
+/// not import from it. This module hosts the pure-math, share-independent verifier
+/// surface so V2 callers can depend on it without crossing the trusted-party namespace
+/// boundary.
+///
+/// Contents:
+/// - `verify_registration_proof(...)` — the equation `vault_ek * response == commitment
+///   + h * challenge`. Fail-closed on mismatch.
+/// - `registration_challenge_scalar(...)` / `registration_challenge(...)` — Fiat-Shamir
+///   over `(vault_ek, sender, asset, chain_id, aggregate_commitment)`. Mirrors the
+///   Aptos Confidential-Asset registration domain separator byte-for-byte.
+/// - `aggregate_registration_commitment(...)` — Lagrange-aggregate a 5-of-7
+///   `(slot, commitment)` set at x = 0. Pure public algebra.
+/// - `RegistrationCommitmentInput` / `RegistrationResponseInput` — public DTOs.
+///
+/// What this module deliberately does NOT contain:
+/// - Anything that touches secret share material (dk, blind, nonce).
+/// - Anything that reads/writes disk state.
+/// - Anything from `crate::ca_local::{init_ca_dkg_local, registration_proof,
+///   load_ca_share, ...}` — those are the trusted-party fixture code and stay in
+///   `ca_local`.
+///
+/// `ca_local` re-exports each item from this module to keep V1 local-smoke tests and
+/// the legacy `local_ca_dkg_registration_sigma_roundtrip` test compiling. Production
+/// V2 code paths (`ca_registration_v2`, `vault_state_v2`, future MPCCA rounds) MUST
+/// import directly from `crate::registration_verifier` to honor the invariant.
+pub mod registration_verifier {
+    use crate::{
+        assert_quorum_slots5, assert_slot, h_ristretto, WorkerError, WorkerResult,
+        DEOPERATOR_THRESHOLD,
+    };
+    use curve25519_dalek::{
+        ristretto::{CompressedRistretto, RistrettoPoint},
+        scalar::Scalar,
+    };
+    use serde::Deserialize;
+    use sha2::{Digest, Sha512};
+
+    const REGISTRATION_PROTOCOL_ID: &str = "AptosConfidentialAsset/RegistrationV1";
+    const REGISTRATION_TYPE_NAME: &str = "0x1::sigma_protocol_registration::Registration";
+
+    /// Input DTO: a per-slot Round-1 commitment `T_i = vault_ek * r_i`. Public.
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct RegistrationCommitmentInput {
+        pub slot: usize,
+        pub commitment: String,
+    }
+
+    /// Input DTO: a per-slot Round-2 response `s_i = r_i + challenge * dk_share_i`. Public.
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct RegistrationResponseInput {
+        pub slot: usize,
+        pub response: String,
+    }
+
+    /// Verify the aggregate registration sigma proof: `vault_ek * response ==
+    /// aggregate_commitment + H * challenge` where `challenge` is derived via
+    /// `registration_challenge_scalar`. Pure public algebra — caller passes only
+    /// public material.
+    pub fn verify_registration_proof(
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        commitment_hex: &str,
+        response_hex: &str,
+    ) -> WorkerResult<()> {
+        let vault_ek = ristretto_from_hex(vault_ek_hex)?;
+        let h = h_ristretto()?;
+        let commitment = ristretto_from_hex(commitment_hex)?;
+        let response = scalar_from_hex(response_hex)?;
+        let challenge = registration_challenge_scalar(
+            vault_ek_hex,
+            sender_address_hex,
+            asset_type_hex,
+            chain_id,
+            commitment_hex,
+        )?;
+        let lhs = vault_ek * response;
+        let rhs = commitment + h * challenge;
+        if lhs == rhs {
+            Ok(())
+        } else {
+            Err(WorkerError::Crypto(
+                "registration sigma proof verification failed".to_string(),
+            ))
+        }
+    }
+
+    /// Fiat-Shamir challenge as a `Scalar`. Domain-separates over the Aptos Confidential
+    /// Asset registration prefix + protocol id + chain id + asset session bytes + `(H,
+    /// vault_ek, aggregate_commitment)`. Byte-identical with the TS reconstructor.
+    pub fn registration_challenge_scalar(
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        aggregate_commitment_hex: &str,
+    ) -> WorkerResult<Scalar> {
+        let h = h_ristretto()?;
+        let vault_ek = compressed_ristretto_from_hex(vault_ek_hex)?;
+        let aggregate_commitment = compressed_ristretto_from_hex(aggregate_commitment_hex)?;
+        let sender = address_bytes(sender_address_hex)?;
+        let asset = address_bytes(asset_type_hex)?;
+        let mut dst = Writer::new();
+        dst.write_uleb128(0);
+        let mut framework = [0u8; 32];
+        framework[31] = 1;
+        dst.write_raw(&framework);
+        dst.write_u8(chain_id);
+        dst.write_vector(REGISTRATION_PROTOCOL_ID.as_bytes());
+        let session = registration_session_bytes(&sender, &asset);
+        dst.write_vector(&session);
+
+        let mut challenge = Writer::new();
+        challenge.write_raw(&dst.finish());
+        challenge.write_vector(REGISTRATION_TYPE_NAME.as_bytes());
+        challenge.write_u64(1);
+        challenge.write_uleb128(2);
+        challenge.write_vector(h.compress().as_bytes());
+        challenge.write_vector(vault_ek.as_bytes());
+        challenge.write_uleb128(0);
+        challenge.write_uleb128(1);
+        challenge.write_vector(aggregate_commitment.as_bytes());
+        let first = Sha512::digest(challenge.finish());
+        let mut expanded = [0u8; 65];
+        expanded[..64].copy_from_slice(&first);
+        expanded[64] = 0;
+        let wide = Sha512::digest(expanded);
+        let mut wide_array = [0u8; 64];
+        wide_array.copy_from_slice(&wide);
+        Ok(Scalar::from_bytes_mod_order_wide(&wide_array))
+    }
+
+    /// Fiat-Shamir challenge as 32-byte hex. Thin wrapper over `registration_challenge_scalar`.
+    pub fn registration_challenge(
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        aggregate_commitment_hex: &str,
+    ) -> WorkerResult<String> {
+        Ok(scalar_hex(registration_challenge_scalar(
+            vault_ek_hex,
+            sender_address_hex,
+            asset_type_hex,
+            chain_id,
+            aggregate_commitment_hex,
+        )?))
+    }
+
+    /// Lagrange-aggregate a 5-of-7 `(slot, commitment)` set at x = 0. Public algebra.
+    /// Returns the aggregate commitment hex.
+    pub fn aggregate_registration_commitment(
+        commitments: &[RegistrationCommitmentInput],
+    ) -> WorkerResult<String> {
+        let slots = slots_from_commitments(commitments)?;
+        assert_quorum_slots5(&slots)?;
+        let coeffs = lagrange_coefficients_at_zero(&slots)?;
+        let mut aggregate = RistrettoPoint::default();
+        for (item, coeff) in commitments.iter().zip(coeffs.iter()) {
+            aggregate += ristretto_from_hex(&item.commitment)? * coeff;
+        }
+        Ok(hex_encode(aggregate.compress().as_bytes()))
+    }
+
+    /// Public helper: extract + validate the slot vector from a commitment list.
+    pub fn slots_from_commitments(
+        items: &[RegistrationCommitmentInput],
+    ) -> WorkerResult<Vec<usize>> {
+        let mut slots = Vec::with_capacity(items.len());
+        for item in items {
+            assert_slot(item.slot)?;
+            if slots.contains(&item.slot) {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate registration commitment slot {}",
+                    item.slot
+                )));
+            }
+            ristretto_from_hex(&item.commitment)?;
+            slots.push(item.slot);
+        }
+        Ok(slots)
+    }
+
+    /// Public helper: extract + validate the slot vector from a response list.
+    pub fn slots_from_responses(
+        items: &[RegistrationResponseInput],
+    ) -> WorkerResult<Vec<usize>> {
+        let mut slots = Vec::with_capacity(items.len());
+        for item in items {
+            assert_slot(item.slot)?;
+            if slots.contains(&item.slot) {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate registration response slot {}",
+                    item.slot
+                )));
+            }
+            scalar_from_hex(&item.response)?;
+            slots.push(item.slot);
+        }
+        Ok(slots)
+    }
+
+    /// Public helper: Lagrange coefficients at x = 0 for the given 5-slot subset. Pure
+    /// public algebra (Shamir recombination).
+    pub fn lagrange_coefficients_at_zero(slots: &[usize]) -> WorkerResult<Vec<Scalar>> {
+        assert_quorum_slots5(slots)?;
+        let xs = slots
+            .iter()
+            .map(|slot| slot_scalar(*slot))
+            .collect::<WorkerResult<Vec<_>>>()?;
+        let mut out = Vec::with_capacity(xs.len());
+        for (i, x_i) in xs.iter().enumerate() {
+            let mut numerator = Scalar::ONE;
+            let mut denominator = Scalar::ONE;
+            for (j, x_j) in xs.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                numerator *= -*x_j;
+                denominator *= *x_i - *x_j;
+            }
+            out.push(numerator * denominator.invert());
+        }
+        Ok(out)
+    }
+
+    fn slot_scalar(slot: usize) -> WorkerResult<Scalar> {
+        assert_slot(slot)?;
+        Ok(Scalar::from((slot as u64) + 1))
+    }
+
+    fn registration_session_bytes(sender: &[u8; 32], asset: &[u8; 32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(sender);
+        out.extend_from_slice(asset);
+        out
+    }
+
+    fn ristretto_from_hex(hex: &str) -> WorkerResult<RistrettoPoint> {
+        compressed_ristretto_from_hex(hex)?
+            .decompress()
+            .ok_or_else(|| {
+                WorkerError::InvalidRequest("invalid compressed Ristretto point".to_string())
+            })
+    }
+
+    fn compressed_ristretto_from_hex(hex: &str) -> WorkerResult<CompressedRistretto> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != 32 {
+            return Err(WorkerError::InvalidRequest(format!(
+                "compressed Ristretto point must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        Ok(CompressedRistretto(array))
+    }
+
+    fn scalar_from_hex(hex: &str) -> WorkerResult<Scalar> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != 32 {
+            return Err(WorkerError::InvalidRequest(format!(
+                "scalar must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        Ok(Scalar::from_bytes_mod_order(array))
+    }
+
+    fn scalar_hex(scalar: Scalar) -> String {
+        hex_encode(&scalar.to_bytes())
+    }
+
+    fn address_bytes(hex: &str) -> WorkerResult<[u8; 32]> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != 32 {
+            return Err(WorkerError::InvalidRequest(format!(
+                "address must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        Ok(array)
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WorkerError::InvalidRequest("expected even-length hex".to_string()));
+        }
+        (0..raw.len())
+            .step_by(2)
+            .map(|idx| {
+                u8::from_str_radix(&raw[idx..idx + 2], 16)
+                    .map_err(|err| WorkerError::InvalidRequest(err.to_string()))
+            })
+            .collect()
+    }
+
+    // Silence dead-code: DEOPERATOR_THRESHOLD is brought into scope above via the `use`
+    // line for completeness with the rest of the crate; it's referenced through
+    // assert_quorum_slots5 only.
+    const _: usize = DEOPERATOR_THRESHOLD;
+
+    #[derive(Default)]
+    struct Writer {
+        parts: Vec<u8>,
+    }
+
+    impl Writer {
+        fn new() -> Self {
+            Self { parts: Vec::new() }
+        }
+
+        fn write_raw(&mut self, bytes: &[u8]) {
+            self.parts.extend_from_slice(bytes);
+        }
+
+        fn write_u8(&mut self, value: u8) {
+            self.parts.push(value);
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.parts.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn write_uleb128(&mut self, mut value: usize) {
+            while value >= 0x80 {
+                self.parts.push(((value & 0x7f) as u8) | 0x80);
+                value >>= 7;
+            }
+            self.parts.push((value & 0x7f) as u8);
+        }
+
+        fn write_vector(&mut self, bytes: &[u8]) {
+            self.write_uleb128(bytes.len());
+            self.write_raw(bytes);
+        }
+
+        fn finish(self) -> Vec<u8> {
+            self.parts
+        }
+    }
+}
+
 pub mod ca_local {
     use crate::{
         assert_quorum_slots5, assert_slot, assert_v2_threshold, WorkerError, WorkerResult,
@@ -863,7 +1226,7 @@ pub mod ca_local {
     use rand::rngs::OsRng;
     use serde::{Deserialize, Serialize};
     use serde_json::{json, Value};
-    use sha2::{Digest, Sha256, Sha512};
+    use sha2::{Digest, Sha256};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -873,8 +1236,6 @@ pub mod ca_local {
     const CA_DKG_SHARE_FILE: &str = "ca_dkg_share.json";
     const CA_REGISTRATION_NONCES_DIR: &str = "ca_registration_nonces";
     use crate::h_ristretto;
-    const REGISTRATION_PROTOCOL_ID: &str = "AptosConfidentialAsset/RegistrationV1";
-    const REGISTRATION_TYPE_NAME: &str = "0x1::sigma_protocol_registration::Registration";
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct LocalCaDkgInitSummary {
@@ -941,17 +1302,16 @@ pub mod ca_local {
         pub transcript_hash: String,
     }
 
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct RegistrationCommitmentInput {
-        pub slot: usize,
-        pub commitment: String,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct RegistrationResponseInput {
-        pub slot: usize,
-        pub response: String,
-    }
+    // Codex M2a P1: the public verifier surface (DTOs + verifier + Fiat-Shamir + Lagrange)
+    // lives in `crate::registration_verifier`. We re-export here so V1 local-smoke tests
+    // and the legacy `local_ca_dkg_registration_sigma_roundtrip` test that still imports
+    // from `eunoma_crypto_worker::ca_local::{...}` continue to compile unchanged. V2
+    // production code paths import from `crate::registration_verifier` directly.
+    pub use crate::registration_verifier::{
+        aggregate_registration_commitment, registration_challenge, registration_challenge_scalar,
+        verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
+    };
+    use crate::registration_verifier::{lagrange_coefficients_at_zero, slots_from_responses};
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct RegistrationProofResult {
@@ -1172,35 +1532,6 @@ pub mod ca_local {
         })
     }
 
-    pub fn aggregate_registration_commitment(
-        commitments: &[RegistrationCommitmentInput],
-    ) -> WorkerResult<String> {
-        let slots = slots_from_commitments(commitments)?;
-        assert_quorum_slots5(&slots)?;
-        let coeffs = lagrange_coefficients_at_zero(&slots)?;
-        let mut aggregate = RistrettoPoint::default();
-        for (item, coeff) in commitments.iter().zip(coeffs.iter()) {
-            aggregate += ristretto_from_hex(&item.commitment)? * coeff;
-        }
-        Ok(hex_encode(aggregate.compress().as_bytes()))
-    }
-
-    pub fn registration_challenge(
-        vault_ek_hex: &str,
-        sender_address_hex: &str,
-        asset_type_hex: &str,
-        chain_id: u8,
-        aggregate_commitment_hex: &str,
-    ) -> WorkerResult<String> {
-        Ok(scalar_hex(registration_challenge_scalar(
-            vault_ek_hex,
-            sender_address_hex,
-            asset_type_hex,
-            chain_id,
-            aggregate_commitment_hex,
-        )?))
-    }
-
     pub fn aggregate_registration_proof(
         vault_ek_hex: &str,
         sender_address_hex: &str,
@@ -1209,7 +1540,7 @@ pub mod ca_local {
         commitments: Vec<RegistrationCommitmentInput>,
         responses: Vec<RegistrationResponseInput>,
     ) -> WorkerResult<RegistrationProofResult> {
-        let commitment_slots = slots_from_commitments(&commitments)?;
+        let commitment_slots = crate::registration_verifier::slots_from_commitments(&commitments)?;
         let response_slots = slots_from_responses(&responses)?;
         assert_quorum_slots5(&commitment_slots)?;
         assert_quorum_slots5(&response_slots)?;
@@ -1269,36 +1600,6 @@ pub mod ca_local {
             proof_hash,
             transcript_hash,
         })
-    }
-
-    pub fn verify_registration_proof(
-        vault_ek_hex: &str,
-        sender_address_hex: &str,
-        asset_type_hex: &str,
-        chain_id: u8,
-        commitment_hex: &str,
-        response_hex: &str,
-    ) -> WorkerResult<()> {
-        let vault_ek = ristretto_from_hex(vault_ek_hex)?;
-        let h = h_ristretto()?;
-        let commitment = ristretto_from_hex(commitment_hex)?;
-        let response = scalar_from_hex(response_hex)?;
-        let challenge = registration_challenge_scalar(
-            vault_ek_hex,
-            sender_address_hex,
-            asset_type_hex,
-            chain_id,
-            commitment_hex,
-        )?;
-        let lhs = vault_ek * response;
-        let rhs = commitment + h * challenge;
-        if lhs == rhs {
-            Ok(())
-        } else {
-            Err(WorkerError::Crypto(
-                "registration sigma proof verification failed".to_string(),
-            ))
-        }
     }
 
     fn verify_ca_share_file(share: &LocalCaShareFile) -> WorkerResult<()> {
@@ -1363,109 +1664,6 @@ pub mod ca_local {
         )
     }
 
-    pub fn registration_challenge_scalar(
-        vault_ek_hex: &str,
-        sender_address_hex: &str,
-        asset_type_hex: &str,
-        chain_id: u8,
-        aggregate_commitment_hex: &str,
-    ) -> WorkerResult<Scalar> {
-        let h = h_ristretto()?;
-        let vault_ek = compressed_ristretto_from_hex(vault_ek_hex)?;
-        let aggregate_commitment = compressed_ristretto_from_hex(aggregate_commitment_hex)?;
-        let sender = address_bytes(sender_address_hex)?;
-        let asset = address_bytes(asset_type_hex)?;
-        let mut dst = Writer::new();
-        dst.write_uleb128(0);
-        let mut framework = [0u8; 32];
-        framework[31] = 1;
-        dst.write_raw(&framework);
-        dst.write_u8(chain_id);
-        dst.write_vector(REGISTRATION_PROTOCOL_ID.as_bytes());
-        let session = registration_session_bytes(&sender, &asset);
-        dst.write_vector(&session);
-
-        let mut challenge = Writer::new();
-        challenge.write_raw(&dst.finish());
-        challenge.write_vector(REGISTRATION_TYPE_NAME.as_bytes());
-        challenge.write_u64(1);
-        challenge.write_uleb128(2);
-        challenge.write_vector(h.compress().as_bytes());
-        challenge.write_vector(vault_ek.as_bytes());
-        challenge.write_uleb128(0);
-        challenge.write_uleb128(1);
-        challenge.write_vector(aggregate_commitment.as_bytes());
-        let first = Sha512::digest(challenge.finish());
-        let mut expanded = [0u8; 65];
-        expanded[..64].copy_from_slice(&first);
-        expanded[64] = 0;
-        let wide = Sha512::digest(expanded);
-        let mut wide_array = [0u8; 64];
-        wide_array.copy_from_slice(&wide);
-        Ok(Scalar::from_bytes_mod_order_wide(&wide_array))
-    }
-
-    fn registration_session_bytes(sender: &[u8; 32], asset: &[u8; 32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64);
-        out.extend_from_slice(sender);
-        out.extend_from_slice(asset);
-        out
-    }
-
-    fn slots_from_commitments(items: &[RegistrationCommitmentInput]) -> WorkerResult<Vec<usize>> {
-        let mut slots = Vec::with_capacity(items.len());
-        for item in items {
-            assert_slot(item.slot)?;
-            if slots.contains(&item.slot) {
-                return Err(WorkerError::InvalidRequest(format!(
-                    "duplicate registration commitment slot {}",
-                    item.slot
-                )));
-            }
-            ristretto_from_hex(&item.commitment)?;
-            slots.push(item.slot);
-        }
-        Ok(slots)
-    }
-
-    fn slots_from_responses(items: &[RegistrationResponseInput]) -> WorkerResult<Vec<usize>> {
-        let mut slots = Vec::with_capacity(items.len());
-        for item in items {
-            assert_slot(item.slot)?;
-            if slots.contains(&item.slot) {
-                return Err(WorkerError::InvalidRequest(format!(
-                    "duplicate registration response slot {}",
-                    item.slot
-                )));
-            }
-            scalar_from_hex(&item.response)?;
-            slots.push(item.slot);
-        }
-        Ok(slots)
-    }
-
-    fn lagrange_coefficients_at_zero(slots: &[usize]) -> WorkerResult<Vec<Scalar>> {
-        assert_quorum_slots5(slots)?;
-        let xs = slots
-            .iter()
-            .map(|slot| slot_scalar(*slot))
-            .collect::<WorkerResult<Vec<_>>>()?;
-        let mut out = Vec::with_capacity(xs.len());
-        for (i, x_i) in xs.iter().enumerate() {
-            let mut numerator = Scalar::ONE;
-            let mut denominator = Scalar::ONE;
-            for (j, x_j) in xs.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                numerator *= -*x_j;
-                denominator *= *x_i - *x_j;
-            }
-            out.push(numerator * denominator.invert());
-        }
-        Ok(out)
-    }
-
     fn eval_polynomial(coeffs: &[Scalar], x: Scalar) -> Scalar {
         let mut acc = Scalar::ZERO;
         for coeff in coeffs.iter().rev() {
@@ -1522,19 +1720,6 @@ pub mod ca_local {
 
     fn scalar_hex(scalar: Scalar) -> String {
         hex_encode(&scalar.to_bytes())
-    }
-
-    fn address_bytes(hex: &str) -> WorkerResult<[u8; 32]> {
-        let bytes = hex_decode(hex)?;
-        if bytes.len() != 32 {
-            return Err(WorkerError::InvalidRequest(format!(
-                "address must be 32 bytes, got {}",
-                bytes.len()
-            )));
-        }
-        let mut array = [0u8; 32];
-        array.copy_from_slice(&bytes);
-        Ok(array)
     }
 
     fn slot_dir(state_root: &Path, slot: usize) -> PathBuf {
@@ -1643,46 +1828,6 @@ pub mod ca_local {
             .duration_since(UNIX_EPOCH)
             .expect("system time after unix epoch")
             .as_millis()
-    }
-
-    #[derive(Default)]
-    struct Writer {
-        parts: Vec<u8>,
-    }
-
-    impl Writer {
-        fn new() -> Self {
-            Self { parts: Vec::new() }
-        }
-
-        fn write_raw(&mut self, bytes: &[u8]) {
-            self.parts.extend_from_slice(bytes);
-        }
-
-        fn write_u8(&mut self, value: u8) {
-            self.parts.push(value);
-        }
-
-        fn write_u64(&mut self, value: u64) {
-            self.parts.extend_from_slice(&value.to_le_bytes());
-        }
-
-        fn write_uleb128(&mut self, mut value: usize) {
-            while value >= 0x80 {
-                self.parts.push(((value & 0x7f) as u8) | 0x80);
-                value >>= 7;
-            }
-            self.parts.push((value & 0x7f) as u8);
-        }
-
-        fn write_vector(&mut self, bytes: &[u8]) {
-            self.write_uleb128(bytes.len());
-            self.write_raw(bytes);
-        }
-
-        fn finish(self) -> Vec<u8> {
-            self.parts
-        }
     }
 
     #[cfg(unix)]
@@ -3910,12 +4055,14 @@ pub mod vault_ek_derivation_v2 {
 ///
 /// The wire-level sigma protocol is identical to V1 (Schnorr-style proof of knowledge of `dk`
 /// with `vault_ek` as the generator). What changes is the SOURCE of inputs. The aggregator
-/// path still re-uses `ca_local::aggregate_registration_commitment`, `registration_challenge`,
-/// and `verify_registration_proof` because those operate on inputs (commitments / responses /
-/// vault_ek_hex), not on the share file.
+/// path re-uses the public verifier in `crate::registration_verifier`
+/// (`aggregate_registration_commitment`, `registration_challenge_scalar`,
+/// `verify_registration_proof`) because those operate on inputs (commitments / responses /
+/// vault_ek_hex), not on the share file. Codex M2a P1: this module MUST NOT import from
+/// `crate::ca_local` — that namespace is reserved for unit/local-smoke fixtures only.
 pub mod ca_registration_v2 {
     use crate::ca_dkg_v2::load_ca_dkg_v2_share;
-    use crate::ca_local::{
+    use crate::registration_verifier::{
         aggregate_registration_commitment, registration_challenge_scalar, verify_registration_proof,
         RegistrationCommitmentInput, RegistrationResponseInput,
     };
@@ -4955,7 +5102,9 @@ pub mod ca_registration_v2 {
 // =================================================================================================
 pub mod vault_state_v2 {
     use crate::ca_dkg_v2::load_ca_dkg_v2_share;
-    use crate::ca_local::verify_registration_proof;
+    // Codex M2a P1: V2 production code MUST NOT import from `crate::ca_local`. The public
+    // sigma verifier + Fiat-Shamir challenge live in `crate::registration_verifier`.
+    use crate::registration_verifier::verify_registration_proof;
     use crate::mpc_spdz_adapter::is_safe_id;
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
     use serde::{Deserialize, Serialize};

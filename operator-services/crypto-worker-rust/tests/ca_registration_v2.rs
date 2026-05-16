@@ -20,7 +20,9 @@ use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
 };
 use eunoma_crypto_worker::{
-    ca_local::{
+    // Codex M2a P1: V2 production code paths (and tests asserting V2 behaviour) MUST import
+    // the public verifier surface from `registration_verifier`, NOT from `ca_local`.
+    registration_verifier::{
         verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
     },
     ca_registration_v2::{
@@ -499,9 +501,9 @@ fn v2_threshold_sigma_passes_local_verifier() {
     // public helpers exposed by ca_local. Easier path: hit the V1 `registration_challenge`
     // helper directly (same Lagrange + Fiat-Shamir math, share-independent).
     let aggregate_commitment =
-        eunoma_crypto_worker::ca_local::aggregate_registration_commitment(&commitments)
+        eunoma_crypto_worker::registration_verifier::aggregate_registration_commitment(&commitments)
             .expect("aggregate commitments");
-    let challenge_hex = eunoma_crypto_worker::ca_local::registration_challenge(
+    let challenge_hex = eunoma_crypto_worker::registration_verifier::registration_challenge(
         &vault_ek_hex,
         &sender,
         &asset,
@@ -640,9 +642,9 @@ fn aggregate_proof_invalid_when_response_tampered() {
         })
         .collect();
     let aggregate_commitment =
-        eunoma_crypto_worker::ca_local::aggregate_registration_commitment(&commitments)
+        eunoma_crypto_worker::registration_verifier::aggregate_registration_commitment(&commitments)
             .expect("aggregate commitments");
-    let challenge_hex = eunoma_crypto_worker::ca_local::registration_challenge(
+    let challenge_hex = eunoma_crypto_worker::registration_verifier::registration_challenge(
         &vault_ek_hex,
         &sender,
         &asset,

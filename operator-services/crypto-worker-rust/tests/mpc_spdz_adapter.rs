@@ -442,7 +442,9 @@ fn real_mp_spdz_inversion_passes_registration_sigma() {
         .collect();
     assert_eq!(vault_ek_point, h_point * dk.invert());
 
-    // Build a registration sigma proof under dk and verify via ca_local::verify_registration_proof.
+    // Build a registration sigma proof under dk and verify via
+    // registration_verifier::verify_registration_proof (Codex M2a P1: V2 tests import the
+    // public verifier from `registration_verifier`, NOT `ca_local`).
     let mut rng = ChaCha20Rng::seed_from_u64(0x5EAF_FF11);
     let mut buf = [0u8; 64];
     rng.fill_bytes(&mut buf);
@@ -457,7 +459,7 @@ fn real_mp_spdz_inversion_passes_registration_sigma() {
     let sender_address_hex = "01".repeat(32);
     let asset_type_hex = "02".repeat(32);
     let chain_id: u8 = 4;
-    let challenge = eunoma_crypto_worker::ca_local::registration_challenge_scalar(
+    let challenge = eunoma_crypto_worker::registration_verifier::registration_challenge_scalar(
         &vault_ek_hex,
         &sender_address_hex,
         &asset_type_hex,
@@ -468,7 +470,7 @@ fn real_mp_spdz_inversion_passes_registration_sigma() {
     let response = nonce + challenge * dk;
     let response_hex = scalar_hex(&response);
 
-    eunoma_crypto_worker::ca_local::verify_registration_proof(
+    eunoma_crypto_worker::registration_verifier::verify_registration_proof(
         &vault_ek_hex,
         &sender_address_hex,
         &asset_type_hex,
