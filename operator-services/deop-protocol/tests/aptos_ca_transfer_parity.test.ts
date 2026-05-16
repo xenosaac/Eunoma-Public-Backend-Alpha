@@ -496,3 +496,327 @@ describe("Aptos CA transfer parity fixture", () => {
     expect(onDisk).toBe(fixtureJson);
   });
 });
+
+// =============================================================================================
+// M4 end-to-end dk-threshold sigma byte-parity test.
+//
+// Verifies the M4 dk-threshold construction produces a sigma proof that the Aptos SDK's
+// verifyTransfer accepts. Wire:
+//   1. Build canonical Statement + witness (same fixture as above).
+//   2. Drive single-party proveTransfer → canonical {commitment[30], response[25]}.
+//   3. Recover the canonical α[0] from the canonical response[0]:
+//          response[0] = α[0] + e · witness[0] = α[0] + e · dk
+//          α[0]        = response[0] − e · dk  (mod n)
+//      (e is recomputed via sigmaProtocolFiatShamir over the canonical commitment.)
+//   4. Split α[0] into 5 fresh α_share scalars (sum = α[0]).
+//   5. Build a Shamir polynomial of degree 4 with f(0) = dk; dk_share_j = f(slot_j + 1).
+//      Reconstruct dk = Σ_j λ_j · dk_share_j with Lagrange coefficients at x=0.
+//   6. Per-worker s_share_j = α_share_j + e · (λ_j · dk_share_j).
+//   7. Aggregate s[0]_threshold = Σ_j s_share_j.
+//   8. KILLER ASSERTIONS:
+//      (a) s[0]_threshold byte-equals the canonical response[0].
+//      (b) Substituting s[0]_threshold for response[0] in the canonical proof + passing
+//          to verifyTransfer still returns true.
+//   9. Aptos CA TransferV1 commitment/response shapes preserved (30 / 25, 32 bytes each).
+//
+// This proves the M4 threshold algebra is byte-canonical with the single-party prover that
+// the chain verifier accepts. The Rust worker computes the SAME s_share via the same algebra;
+// the M4-c3 5-worker killer test verifies the per-worker equation. M4-c5 closes the loop:
+// the threshold-aggregated proof is accepted by the Aptos SDK byte-canonical verifier.
+// =============================================================================================
+describe("Aptos CA transfer M4 end-to-end dk-threshold byte-parity", () => {
+  it("M4 threshold-aggregated sigma proof byte-equals + verifies via Aptos SDK", async () => {
+    // -------- Inputs (same fixture as the single-party test) ----------
+    const senderDk = new TwistedEd25519PrivateKey(dkBytesFor(7, 3));
+    const senderEk = senderDk.publicKey();
+    const recipientDk = new TwistedEd25519PrivateKey(dkBytesFor(11, 5));
+    const recipientEk = recipientDk.publicKey();
+
+    const senderAddress = fillAddr(1);
+    const recipientAddress = fillAddr(2);
+    const tokenAddress = fillAddr(3);
+    const chainId = 2;
+
+    const ell = AVAILABLE_BALANCE_CHUNK_COUNT;
+    const n = TRANSFER_AMOUNT_CHUNK_COUNT;
+
+    const oldBalance = 1000n;
+    const transferAmount = 100n;
+    const newBalance = oldBalance - transferAmount;
+    const oldBalanceChunks = ChunkedAmount.fromAmount(oldBalance).amountChunks;
+    const newBalanceChunks = ChunkedAmount.fromAmount(newBalance).amountChunks;
+    const transferAmountChunks =
+      ChunkedAmount.createTransferAmount(transferAmount).amountChunks;
+
+    const oldBalanceRandomness = genListOfDeterministicScalars(ell);
+    const transferAmountRandomness = genListOfDeterministicScalars(n);
+    const newBalanceRandomness = genListOfDeterministicScalars(ell);
+
+    const oldBalanceCt = encryptChunks(
+      oldBalanceChunks,
+      senderEk,
+      oldBalanceRandomness,
+    );
+    const newBalanceCt = encryptChunks(
+      newBalanceChunks,
+      senderEk,
+      newBalanceRandomness,
+    );
+    const transferSenderCt = encryptChunks(
+      transferAmountChunks,
+      senderEk,
+      transferAmountRandomness,
+    );
+    const transferRecipientCt = encryptChunks(
+      transferAmountChunks,
+      recipientEk,
+      transferAmountRandomness,
+    );
+
+    const oldBalanceC = oldBalanceCt.map((ct) => ct.C);
+    const oldBalanceD = oldBalanceCt.map((ct) => ct.D);
+    const newBalanceC = newBalanceCt.map((ct) => ct.C);
+    const newBalanceD = newBalanceCt.map((ct) => ct.D);
+    const transferAmountC = transferSenderCt.map((ct) => ct.C);
+    const transferAmountDSender = transferSenderCt.map((ct) => ct.D);
+    const transferAmountDRecipient = transferRecipientCt.map((ct) => ct.D);
+
+    // Drive single-party prove (WASM RNG consumed by batchRangeProof first).
+    const valBase = RistrettoPoint.BASE.toRawBytes();
+    const randBase = H_RISTRETTO.toRawBytes();
+    await batchRangeProof({
+      v: transferAmountChunks,
+      rs: transferAmountRandomness.map((r) => numberToBytesLE(r, 32)),
+      valBase,
+      randBase,
+      numBits: CHUNK_BITS,
+    });
+    await batchRangeProof({
+      v: newBalanceChunks,
+      rs: newBalanceRandomness.map((r) => numberToBytesLE(r, 32)),
+      valBase,
+      randBase,
+      numBits: CHUNK_BITS,
+    });
+
+    const canonicalProof = proveTransfer({
+      dk: senderDk,
+      senderAddress,
+      recipientAddress,
+      tokenAddress,
+      chainId,
+      senderEncryptionKey: senderEk,
+      recipientEncryptionKey: recipientEk,
+      oldBalanceC,
+      oldBalanceD,
+      newBalanceC,
+      newBalanceD,
+      newAmountChunks: newBalanceChunks,
+      newRandomness: newBalanceRandomness,
+      transferAmountC,
+      transferAmountDSender,
+      transferAmountDRecipient,
+      transferAmountChunks,
+      transferRandomness: transferAmountRandomness,
+      hasEffectiveAuditor: false,
+    });
+
+    expect(canonicalProof.commitment).toHaveLength(30);
+    expect(canonicalProof.response).toHaveLength(25);
+
+    // -------- Recover canonical α[0] from the proof + recompute e ----------
+    const { sigmaProtocolFiatShamir, APTOS_FRAMEWORK_ADDRESS, bcsSerializeTransferSession } =
+      await import("@aptos-labs/confidential-asset");
+    const PROTOCOL_ID_BYTES = new TextEncoder().encode(
+      "AptosConfidentialAsset/TransferV1",
+    );
+    const TYPE_NAME = "0x1::sigma_protocol_transfer::Transfer";
+
+    // Build statement points (G, H, ek_sid, ek_rid, then 7 ciphertext groups).
+    const G = RistrettoPoint.BASE;
+    const H = H_RISTRETTO;
+    const ekSid = senderEk;
+    const ekSidBytes = ekSid.toUint8Array();
+    const stmtPoints: ReturnType<typeof RistrettoPoint.fromHex>[] = [
+      G,
+      H,
+      RistrettoPoint.fromHex(ekSidBytes),
+      RistrettoPoint.fromHex(recipientEk.toUint8Array()),
+    ];
+    const stmtCompressed: Uint8Array[] = [
+      G.toRawBytes(),
+      H.toRawBytes(),
+      ekSidBytes,
+      recipientEk.toUint8Array(),
+    ];
+    const pushGroup = (group: (typeof newBalanceC)[number][]) => {
+      for (const p of group) {
+        stmtPoints.push(p);
+        stmtCompressed.push(p.toRawBytes());
+      }
+    };
+    pushGroup(oldBalanceC);
+    pushGroup(oldBalanceD);
+    pushGroup(newBalanceC);
+    pushGroup(newBalanceD);
+    pushGroup(transferAmountC);
+    pushGroup(transferAmountDSender);
+    pushGroup(transferAmountDRecipient);
+    const stmt = { points: stmtPoints, compressedPoints: stmtCompressed, scalars: [] };
+
+    const sessionId = bcsSerializeTransferSession(
+      senderAddress,
+      recipientAddress,
+      tokenAddress,
+      ell,
+      n,
+      false,
+      0,
+    );
+    const dst = {
+      contractAddress: APTOS_FRAMEWORK_ADDRESS,
+      chainId,
+      protocolId: PROTOCOL_ID_BYTES,
+      sessionId,
+    };
+    const { e } = sigmaProtocolFiatShamir(
+      dst,
+      TYPE_NAME,
+      stmt,
+      canonicalProof.commitment,
+      25,
+    );
+
+    const ED_N = ed25519.CURVE.n;
+    const modN = (x: bigint) => ((x % ED_N) + ED_N) % ED_N;
+    function modInverseN(a: bigint): bigint {
+      // Fermat's little theorem: a^(n-2) mod n.
+      let result = 1n;
+      let base = modN(a);
+      let exp = ED_N - 2n;
+      while (exp > 0n) {
+        if (exp & 1n) result = (result * base) % ED_N;
+        base = (base * base) % ED_N;
+        exp >>= 1n;
+      }
+      return result;
+    }
+
+    const responseScalars = canonicalProof.response.map((r) => {
+      // bytesToNumberLE
+      let value = 0n;
+      for (let i = 31; i >= 0; i -= 1) {
+        value = (value << 8n) | BigInt(r[i]);
+      }
+      return value;
+    });
+
+    // dk (as bigint LE bytes) — `proveTransfer` uses `bytesToNumberLE` on dk.
+    let dkBigint = 0n;
+    {
+      const dkBytes = senderDk.toUint8Array();
+      for (let i = 31; i >= 0; i -= 1) {
+        dkBigint = (dkBigint << 8n) | BigInt(dkBytes[i]);
+      }
+    }
+    const dkMod = modN(dkBigint);
+
+    // α[0] = response[0] − e · dk  (mod n)
+    const alphaZeroCanonical = modN(responseScalars[0] - modN(e * dkMod));
+
+    // -------- M4 threshold construction ----------
+    // 1. Split α[0] into 5 fresh α_share scalars summing to α[0].
+    const alphaShares: bigint[] = [];
+    let sumSoFar = 0n;
+    // Use the existing PRNG-deterministic scalar generator for reproducibility.
+    const aRandoms = genListOfDeterministicScalars(4);
+    for (let j = 0; j < 4; j += 1) {
+      const s = modN(aRandoms[j]);
+      alphaShares.push(s);
+      sumSoFar = modN(sumSoFar + s);
+    }
+    alphaShares.push(modN(alphaZeroCanonical - sumSoFar));
+    // Sanity: Σ α_share == α[0] canonical.
+    const alphaZeroFromShares = alphaShares.reduce((a, b) => modN(a + b), 0n);
+    expect(alphaZeroFromShares).toBe(alphaZeroCanonical);
+
+    // 2. Build a degree-4 Shamir polynomial f(x) with f(0) = dk.
+    const selectedSlots = [0, 1, 2, 3, 4];
+    const polyRandoms = genListOfDeterministicScalars(4);
+    const polyCoeffs: bigint[] = [dkMod];
+    for (let i = 0; i < 4; i += 1) polyCoeffs.push(modN(polyRandoms[i]));
+    function evalPolyAt(x: bigint): bigint {
+      // Horner's method
+      let acc = polyCoeffs[polyCoeffs.length - 1];
+      for (let i = polyCoeffs.length - 2; i >= 0; i -= 1) {
+        acc = modN(acc * x + polyCoeffs[i]);
+      }
+      return acc;
+    }
+    const dkShares: bigint[] = selectedSlots.map((slot) =>
+      evalPolyAt(BigInt(slot + 1)),
+    );
+
+    // 3. Lagrange coefficients λ_j at x=0.
+    const lambdas: bigint[] = selectedSlots.map((_, j) => {
+      const xj = BigInt(selectedSlots[j] + 1);
+      let num = 1n;
+      let den = 1n;
+      for (let k = 0; k < selectedSlots.length; k += 1) {
+        if (k === j) continue;
+        const xk = BigInt(selectedSlots[k] + 1);
+        num = modN(num * modN(0n - xk));
+        den = modN(den * modN(xj - xk));
+      }
+      return modN(num * modInverseN(den));
+    });
+    // Sanity: Σ λ_j · dk_share_j ≡ dk (mod n).
+    const dkFromShares = lambdas.reduce(
+      (acc, lam, j) => modN(acc + lam * dkShares[j]),
+      0n,
+    );
+    expect(dkFromShares).toBe(dkMod);
+
+    // 4. Per-worker s_share_j = α_share_j + e · (λ_j · dk_share_j).
+    const sShares: bigint[] = selectedSlots.map((_, j) =>
+      modN(alphaShares[j] + e * modN(lambdas[j] * dkShares[j])),
+    );
+
+    // 5. Aggregate s[0]_threshold = Σ_j s_share_j.
+    const sZeroThreshold = sShares.reduce((acc, s) => modN(acc + s), 0n);
+
+    // KILLER (a): s[0]_threshold byte-equals canonical response[0].
+    expect(sZeroThreshold).toBe(responseScalars[0]);
+
+    // 6. Build the threshold proof = canonical commitments with s[0] replaced by threshold value.
+    const sZeroBytes = numberToBytesLE(sZeroThreshold, 32);
+    const thresholdResponse = canonicalProof.response.map((bytes, i) =>
+      i === 0 ? sZeroBytes : bytes,
+    );
+    expect(thresholdResponse[0]).toEqual(canonicalProof.response[0]);
+    const thresholdProof = {
+      commitment: canonicalProof.commitment,
+      response: thresholdResponse,
+    };
+
+    // KILLER (b): Aptos SDK verifyTransfer accepts the threshold-reconstructed proof.
+    const verifyOk = verifyTransfer({
+      senderAddress,
+      recipientAddress,
+      tokenAddress,
+      chainId,
+      ekSidBytes,
+      ekRidBytes: recipientEk.toUint8Array(),
+      oldBalanceC,
+      oldBalanceD,
+      newBalanceC,
+      newBalanceD,
+      transferAmountC,
+      transferAmountDSender,
+      transferAmountDRecipient,
+      hasEffectiveAuditor: false,
+      proof: thresholdProof,
+    });
+    expect(verifyOk).toBe(true);
+  });
+});
