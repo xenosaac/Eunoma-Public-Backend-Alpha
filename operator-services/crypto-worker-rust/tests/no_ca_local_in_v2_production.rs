@@ -24,6 +24,7 @@
 //   1. `pub mod vault_ek_derivation_v2`
 //   2. `pub mod ca_registration_v2`
 //   3. `pub mod vault_state_v2`
+//   4. `pub mod mpcca_withdraw_v2`
 //
 // Adding a new V2 module that derives from CA state? Add its module-name to
 // `V2_PRODUCTION_MODULES` below and the test will start enforcing the invariant on it.
@@ -34,6 +35,7 @@ const V2_PRODUCTION_MODULES: &[&str] = &[
     "vault_ek_derivation_v2",
     "ca_registration_v2",
     "vault_state_v2",
+    "mpcca_withdraw_v2",
 ];
 
 #[test]

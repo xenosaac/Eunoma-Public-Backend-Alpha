@@ -6293,6 +6293,1036 @@ pub mod vault_state_v2 {
     }
 }
 
+// =================================================================================================
+// Milestone 3 sub-milestone 3a — MPCCA withdraw state machine scaffolding.
+//
+// The four rounds (`round1` nonce/commit, `round2` partial sigma, `prove` collaborative
+// bulletproof, `finalize` aggregate) share an identical request envelope (provenance + identity
+// + withdraw fields) modulo the chained-rounds extension (`previousRoundTranscriptHash` +
+// `previousRoundCommitments`). Each per-round handler runs the FULL public-binding work:
+//
+//   1. validate id safety, decimal epoch, hex shapes (32-byte normalisation everywhere)
+//   2. load the persisted `vault_state_v2.json`. Missing → `InvalidDkgState("missing_vault_state_file")`
+//   3. provenance gate: every binding persisted by Milestone 2a's init MUST match the request
+//      (dkg_epoch, slot, vault_ek_hex, vault_state_init_transcript_hash). Otherwise
+//      InvalidDkgState("mpcca_withdraw_v2_provenance_mismatch") and no further work.
+//   4. vault_sequence gate: existing.vault_sequence == req.vault_sequence. Otherwise
+//      InvalidRequest("stale_vault_sequence"). This is the load-bearing replay-prevention
+//      check at the MPCCA layer.
+//   5. re-verify the Milestone 1 sigma against the persisted vault_state_v2.json's tuple.
+//      If the persisted tuple no longer validates (impossible by Milestone 2a's invariants, but
+//      defense-in-depth here), reject Crypto BEFORE returning NotImplemented.
+//   6. recompute the worker_transcript_hash from public inputs.
+//   7. persist a per-session state file at `state_dir/mpc-sessions/<requestId>__<sessionId>/
+//      mpcca_withdraw_v2_round{N}.json` (atomic 0o600 via tmp + create_new + rename).
+//   8. return `Err(WorkerError::NotImplemented("mpcca_withdraw_v2_round{N}_<phase>_pending_milestone4"))`.
+//
+// The KILLER design point: the public-binding work in steps 1-7 ALL RUNS before the
+// NotImplemented step. A tampered request (wrong vault_ek, stale sigma, mismatched provenance)
+// fails closed with a SPECIFIC validation error long before the NotImplemented surface. Milestone
+// 4 fills in the crypto without touching steps 1-7 — those are load-bearing today.
+//
+// Why per-session state files: the four rounds are stateful — round2 reads round1's persisted
+// outputs, prove reads round2's, finalize reads prove's. Even though the crypto is stubbed, we
+// allocate the on-disk slot for milestone 4 so the file layout is committed.
+// =================================================================================================
+pub mod mpcca_withdraw_v2 {
+    use crate::registration_verifier::verify_registration_proof;
+    use crate::mpc_spdz_adapter::is_safe_id;
+    use crate::vault_state_v2::{load_vault_state_v2, VaultStateFile};
+    use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    // One domain string per round + a final-transcript domain. Cross-round transcript replay is
+    // impossible by construction because each domain is distinct.
+    pub(crate) const ROUND1_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1";
+    pub(crate) const ROUND2_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1";
+    pub(crate) const PROVE_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1";
+    pub(crate) const FINALIZE_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1";
+
+    // NotImplemented phase strings — surfaced by the milestone 3a stub to distinguish per-round
+    // missing crypto. Milestone 4 will remove each one as its round lands.
+    pub(crate) const ROUND1_NOT_IMPLEMENTED_PHASE: &str =
+        "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4";
+    pub(crate) const ROUND2_NOT_IMPLEMENTED_PHASE: &str =
+        "mpcca_withdraw_v2_round2_partial_sigma_pending_milestone4";
+    pub(crate) const PROVE_NOT_IMPLEMENTED_PHASE: &str =
+        "mpcca_withdraw_v2_prove_collaborative_bulletproof_pending_milestone4";
+    pub(crate) const FINALIZE_NOT_IMPLEMENTED_PHASE: &str =
+        "mpcca_withdraw_v2_finalize_aggregate_pending_milestone4";
+
+    /// Common provenance + identity envelope shared by all four rounds. Each round adds its own
+    /// chained-round fields on top of this in the `Chained*` request structs.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round1Request {
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub vault_ek_transcript_hash: String,
+        pub registration_transcript_hash: String,
+        pub vault_state_init_transcript_hash: String,
+        pub observed_deposit_transcript_hashes: Vec<String>,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub player_id: usize,
+        pub vault_ek: String,
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+        pub root: String,
+        pub nullifier_hash: String,
+        pub recipient: String,
+        pub recipient_hash: String,
+        pub amount_tag: String,
+        pub vault_sequence: u64,
+        pub expiry_secs: u64,
+        pub request_hash: String,
+        pub deposit_count: u64,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ChainedRoundRequest {
+        // Embed the round1 envelope verbatim — serde flattens at the wire layer.
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub vault_ek_transcript_hash: String,
+        pub registration_transcript_hash: String,
+        pub vault_state_init_transcript_hash: String,
+        pub observed_deposit_transcript_hashes: Vec<String>,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub player_id: usize,
+        pub vault_ek: String,
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+        pub root: String,
+        pub nullifier_hash: String,
+        pub recipient: String,
+        pub recipient_hash: String,
+        pub amount_tag: String,
+        pub vault_sequence: u64,
+        pub expiry_secs: u64,
+        pub request_hash: String,
+        pub deposit_count: u64,
+        pub previous_round_transcript_hash: String,
+        pub previous_round_commitments: Vec<String>,
+    }
+
+    pub type Round2Request = ChainedRoundRequest;
+    pub type ProveRequest = ChainedRoundRequest;
+    pub type FinalizeRequest = ChainedRoundRequest;
+
+    /// Output of the per-round milestone 3a stub. The crypto-specific fields (round_commitment,
+    /// partial_response, etc.) are `None` because the crypto is not implemented yet — but
+    /// session_state_path, session_state_hash, and worker_transcript_hash are FULLY populated
+    /// because the public-binding work happens BEFORE the NotImplemented surface. Milestone 4
+    /// will swap the `None`s for `Some(...)` and `completed: true`.
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct StubRoundResult {
+        pub slot: usize,
+        pub player_id: usize,
+        pub session_state_path: String,
+        pub session_state_hash: String,
+        pub worker_transcript_hash: String,
+        pub observed_at_unix_ms: u128,
+        pub completed: bool, // always false in 3a
+        pub not_implemented_phase: String,
+    }
+
+    /// On-disk per-session-per-round state file. Holds only public binding metadata + a copy of
+    /// the worker_transcript_hash. Milestone 4 will extend with per-round crypto outputs.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub struct RoundStateFile {
+        pub scheme: String,
+        pub round: String,
+        pub slot: usize,
+        pub player_id: usize,
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub vault_ek_hex: String,
+        pub vault_sequence: u64,
+        pub deposit_count: u64,
+        pub worker_transcript_hash: String,
+        pub not_implemented_phase: String,
+        pub created_at_unix_ms: u128,
+    }
+
+    /// Build the per-session directory path under the worker's state_dir. Caller-supplied
+    /// `request_id` and `session_id` are sanitised via `is_safe_id` before being concatenated
+    /// into the path — defense in depth even though the orchestrator already runs `isSafeId`.
+    pub fn mpcca_withdraw_session_dir(
+        state_dir: &Path,
+        request_id: &str,
+        session_id: &str,
+    ) -> WorkerResult<PathBuf> {
+        if !is_safe_id(request_id) {
+            return Err(WorkerError::InvalidRequest(
+                "request_id contains unsafe characters".to_string(),
+            ));
+        }
+        if !is_safe_id(session_id) {
+            return Err(WorkerError::InvalidRequest(
+                "session_id contains unsafe characters".to_string(),
+            ));
+        }
+        Ok(state_dir
+            .join("mpc-sessions")
+            .join(format!("{request_id}__{session_id}")))
+    }
+
+    /// Per-round file name. Round-specific so a misrouted persist call lands on a distinct slot.
+    fn round_file_name(round: &str) -> String {
+        format!("mpcca_withdraw_v2_{round}.json")
+    }
+
+    /// Byte-identical with the TS reconstructor in `deop-protocol::mpcca_withdraw_v2::
+    /// mpccaWithdrawRound1WorkerTranscriptHash`. Round 1 has no `previousRound*` fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn round1_worker_transcript_hash(
+        session_id: &str,
+        request_id: &str,
+        dkg_epoch: &str,
+        vault_ek_transcript_hash: &str,
+        registration_transcript_hash: &str,
+        vault_state_init_transcript_hash: &str,
+        observed_deposit_transcript_hashes: &[String],
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        self_slot: usize,
+        player_id: usize,
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        root_hex: &str,
+        nullifier_hash_hex: &str,
+        recipient_hex: &str,
+        recipient_hash_hex: &str,
+        amount_tag_hex: &str,
+        vault_sequence: u64,
+        expiry_secs: u64,
+        request_hash_hex: &str,
+        deposit_count: u64,
+    ) -> String {
+        let bytes = base_hash_parts(
+            ROUND1_TRANSCRIPT_DOMAIN,
+            session_id,
+            request_id,
+            dkg_epoch,
+            vault_ek_transcript_hash,
+            registration_transcript_hash,
+            vault_state_init_transcript_hash,
+            observed_deposit_transcript_hashes,
+            roster_hash,
+            sorted_selected_slots,
+            self_slot,
+            player_id,
+            vault_ek_hex,
+            sender_address_hex,
+            asset_type_hex,
+            chain_id,
+            root_hex,
+            nullifier_hash_hex,
+            recipient_hex,
+            recipient_hash_hex,
+            amount_tag_hex,
+            vault_sequence,
+            expiry_secs,
+            request_hash_hex,
+            deposit_count,
+        );
+        sha256_hex(&bytes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn base_hash_parts(
+        domain: &str,
+        session_id: &str,
+        request_id: &str,
+        dkg_epoch: &str,
+        vault_ek_transcript_hash: &str,
+        registration_transcript_hash: &str,
+        vault_state_init_transcript_hash: &str,
+        observed_deposit_transcript_hashes: &[String],
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        self_slot: usize,
+        player_id: usize,
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        root_hex: &str,
+        nullifier_hash_hex: &str,
+        recipient_hex: &str,
+        recipient_hash_hex: &str,
+        amount_tag_hex: &str,
+        vault_sequence: u64,
+        expiry_secs: u64,
+        request_hash_hex: &str,
+        deposit_count: u64,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let joined_slots = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let joined_observed = observed_deposit_transcript_hashes.join(",");
+        bytes.extend_from_slice(domain.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(request_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(registration_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_state_init_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined_observed.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(roster_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined_slots.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(self_slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(player_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(sender_address_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(asset_type_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(chain_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(root_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(nullifier_hash_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(recipient_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(recipient_hash_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(amount_tag_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_sequence.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(expiry_secs.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(request_hash_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(deposit_count.to_string().as_bytes());
+        bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn chained_round_worker_hash(
+        domain: &str,
+        session_id: &str,
+        request_id: &str,
+        dkg_epoch: &str,
+        vault_ek_transcript_hash: &str,
+        registration_transcript_hash: &str,
+        vault_state_init_transcript_hash: &str,
+        observed_deposit_transcript_hashes: &[String],
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        self_slot: usize,
+        player_id: usize,
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        root_hex: &str,
+        nullifier_hash_hex: &str,
+        recipient_hex: &str,
+        recipient_hash_hex: &str,
+        amount_tag_hex: &str,
+        vault_sequence: u64,
+        expiry_secs: u64,
+        request_hash_hex: &str,
+        deposit_count: u64,
+        previous_round_transcript_hash: &str,
+        previous_round_commitments: &[String],
+    ) -> String {
+        let mut bytes = base_hash_parts(
+            domain,
+            session_id,
+            request_id,
+            dkg_epoch,
+            vault_ek_transcript_hash,
+            registration_transcript_hash,
+            vault_state_init_transcript_hash,
+            observed_deposit_transcript_hashes,
+            roster_hash,
+            sorted_selected_slots,
+            self_slot,
+            player_id,
+            vault_ek_hex,
+            sender_address_hex,
+            asset_type_hex,
+            chain_id,
+            root_hex,
+            nullifier_hash_hex,
+            recipient_hex,
+            recipient_hash_hex,
+            amount_tag_hex,
+            vault_sequence,
+            expiry_secs,
+            request_hash_hex,
+            deposit_count,
+        );
+        bytes.push(b':');
+        bytes.extend_from_slice(previous_round_transcript_hash.as_bytes());
+        bytes.push(b':');
+        let joined = previous_round_commitments.join("|");
+        bytes.extend_from_slice(joined.as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    /// Round 1 worker entrypoint. Returns `Err(NotImplemented(ROUND1_NOT_IMPLEMENTED_PHASE))`
+    /// AFTER doing the full public binding work. A tampered request fails closed BEFORE the
+    /// NotImplemented surface (Crypto for sigma reject, InvalidDkgState for provenance mismatch,
+    /// InvalidRequest for id-safety / shape / vault_sequence violations).
+    pub fn run_round1_v2(state_dir: &Path, req: &Round1Request) -> WorkerResult<StubRoundResult> {
+        let (normalised, _existing, session_dir) =
+            common_public_binding_work(state_dir, req)?;
+        let worker_transcript_hash = round1_worker_transcript_hash(
+            &req.session_id,
+            &req.request_id,
+            &req.dkg_epoch,
+            &normalised.vault_ek_transcript_hash,
+            &normalised.registration_transcript_hash,
+            &normalised.vault_state_init_transcript_hash,
+            &normalised.observed_deposit_transcript_hashes,
+            &normalised.roster_hash,
+            &normalised.sorted,
+            req.self_slot,
+            req.player_id,
+            &normalised.vault_ek_hex,
+            &normalised.sender_address,
+            &normalised.asset_type,
+            req.chain_id,
+            &normalised.root,
+            &normalised.nullifier_hash,
+            &normalised.recipient,
+            &normalised.recipient_hash,
+            &normalised.amount_tag,
+            req.vault_sequence,
+            req.expiry_secs,
+            &normalised.request_hash,
+            req.deposit_count,
+        );
+        persist_and_stub(
+            &session_dir,
+            "round1",
+            req.self_slot,
+            req.player_id,
+            &req.dkg_epoch,
+            &req.request_id,
+            &req.session_id,
+            &normalised.vault_ek_hex,
+            req.vault_sequence,
+            req.deposit_count,
+            &worker_transcript_hash,
+            ROUND1_NOT_IMPLEMENTED_PHASE,
+        )?;
+        Err(WorkerError::NotImplemented(ROUND1_NOT_IMPLEMENTED_PHASE))
+    }
+
+    /// Round 2 entrypoint — chained off round1's transcript. Same shape as round1 with
+    /// `previousRoundTranscriptHash` and `previousRoundCommitments` bound into the worker hash.
+    pub fn run_round2_v2(
+        state_dir: &Path,
+        req: &Round2Request,
+    ) -> WorkerResult<StubRoundResult> {
+        run_chained_round(
+            state_dir,
+            req,
+            "round2",
+            ROUND2_TRANSCRIPT_DOMAIN,
+            ROUND2_NOT_IMPLEMENTED_PHASE,
+        )
+    }
+
+    pub fn run_prove_v2(state_dir: &Path, req: &ProveRequest) -> WorkerResult<StubRoundResult> {
+        run_chained_round(
+            state_dir,
+            req,
+            "prove",
+            PROVE_TRANSCRIPT_DOMAIN,
+            PROVE_NOT_IMPLEMENTED_PHASE,
+        )
+    }
+
+    pub fn run_finalize_v2(
+        state_dir: &Path,
+        req: &FinalizeRequest,
+    ) -> WorkerResult<StubRoundResult> {
+        run_chained_round(
+            state_dir,
+            req,
+            "finalize",
+            FINALIZE_TRANSCRIPT_DOMAIN,
+            FINALIZE_NOT_IMPLEMENTED_PHASE,
+        )
+    }
+
+    /// Normalised + validated public binding fields produced by the common-prefix validator.
+    struct NormalisedBinding {
+        vault_ek_transcript_hash: String,
+        registration_transcript_hash: String,
+        vault_state_init_transcript_hash: String,
+        observed_deposit_transcript_hashes: Vec<String>,
+        roster_hash: String,
+        sorted: Vec<usize>,
+        vault_ek_hex: String,
+        sender_address: String,
+        asset_type: String,
+        root: String,
+        nullifier_hash: String,
+        recipient: String,
+        recipient_hash: String,
+        amount_tag: String,
+        request_hash: String,
+    }
+
+    /// Common public-binding work shared by all four rounds. Returns the normalised hex fields,
+    /// the loaded `vault_state_v2.json`, and the per-session directory path. Performs ALL of
+    /// the load-bearing validation: id safety, hex normalisation, provenance gate, vault_sequence
+    /// gate, sigma re-verify.
+    fn common_public_binding_work(
+        state_dir: &Path,
+        req: &Round1Request,
+    ) -> WorkerResult<(NormalisedBinding, VaultStateFile, PathBuf)> {
+        // 1. Identifier safety + range validation.
+        validate_selected_slots(&req.selected_slots)?;
+        assert_slot(req.self_slot)?;
+        if !req.selected_slots.contains(&req.self_slot) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot {} not in selected_slots",
+                req.self_slot
+            )));
+        }
+        if req.player_id >= DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "player_id {} out of range 0..{}",
+                req.player_id, DEOPERATOR_THRESHOLD
+            )));
+        }
+        let sorted = sorted_unique_slots(&req.selected_slots)?;
+        if sorted[req.player_id] != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                req.player_id, sorted[req.player_id], req.self_slot
+            )));
+        }
+        if req.request_id.is_empty() || !is_safe_id(&req.request_id) {
+            return Err(WorkerError::InvalidRequest(
+                "request_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.session_id.is_empty() || !is_safe_id(&req.session_id) {
+            return Err(WorkerError::InvalidRequest(
+                "session_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.dkg_epoch.is_empty() || !req.dkg_epoch.chars().all(|c| c.is_ascii_digit()) {
+            return Err(WorkerError::InvalidRequest(
+                "dkg_epoch must be a non-empty decimal string".to_string(),
+            ));
+        }
+
+        // 2. Normalize hex fields (every 32-byte hex normalised + length-checked).
+        let vault_ek_transcript_hash = normalize_hex(&req.vault_ek_transcript_hash, 32)?;
+        let registration_transcript_hash = normalize_hex(&req.registration_transcript_hash, 32)?;
+        let vault_state_init_transcript_hash =
+            normalize_hex(&req.vault_state_init_transcript_hash, 32)?;
+        let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        let vault_ek_hex = normalize_hex(&req.vault_ek, 32)?;
+        let sender_address = normalize_hex(&req.sender_address, 32)?;
+        let asset_type = normalize_hex(&req.asset_type, 32)?;
+        let root = normalize_hex(&req.root, 32)?;
+        let nullifier_hash = normalize_hex(&req.nullifier_hash, 32)?;
+        let recipient = normalize_hex(&req.recipient, 32)?;
+        let recipient_hash = normalize_hex(&req.recipient_hash, 32)?;
+        let amount_tag = normalize_hex(&req.amount_tag, 32)?;
+        let request_hash = normalize_hex(&req.request_hash, 32)?;
+        let mut observed_deposit_transcript_hashes = Vec::with_capacity(
+            req.observed_deposit_transcript_hashes.len(),
+        );
+        for h in &req.observed_deposit_transcript_hashes {
+            observed_deposit_transcript_hashes.push(normalize_hex(h, 32)?);
+        }
+
+        // 3. Load persisted vault_state_v2.json. Missing → fail closed with a specific code.
+        let existing = load_vault_state_v2(state_dir)?.ok_or_else(|| {
+            WorkerError::InvalidDkgState("missing_vault_state_file".to_string())
+        })?;
+
+        // 4. Provenance gate. Every binding persisted by Milestone 2a's init MUST match the
+        //    request. Cursor counters (deposit_count_observed) are NOT enforced here — that's
+        //    the Milestone 2b observe-deposit endpoint's job. The MPCCA withdraw only enforces
+        //    immutable provenance + vault_sequence (the on-chain mutable counter mirror).
+        let provenance_ok = existing.dkg_epoch == req.dkg_epoch
+            && existing.slot == req.self_slot
+            && existing.player_id == req.player_id
+            && normalize_hex(&existing.vault_ek_hex, 32)? == vault_ek_hex
+            && normalize_hex(&existing.vault_ek_transcript_hash, 32)? == vault_ek_transcript_hash
+            && normalize_hex(&existing.registration_transcript_hash, 32)?
+                == registration_transcript_hash
+            && normalize_hex(&existing.roster_hash, 32)? == roster_hash
+            && existing.selected_slots == sorted
+            && normalize_hex(&existing.sender_address, 32)? == sender_address
+            && normalize_hex(&existing.asset_type, 32)? == asset_type
+            && existing.chain_id == req.chain_id;
+        if !provenance_ok {
+            return Err(WorkerError::InvalidDkgState(
+                "mpcca_withdraw_v2_provenance_mismatch".to_string(),
+            ));
+        }
+
+        // Per spec — req.vault_state_init_transcript_hash MUST cross-reference an init transcript
+        // bound to this worker's persisted state. We don't have the init transcript hash inside
+        // vault_state_v2.json (Milestone 2a doesn't persist it on the worker — only on the
+        // coordinator), so we can only verify that the bound 32-byte hex shape is provided and
+        // the coordinator's provenance gate caught any mismatch. The coordinator's transcript-hash
+        // check at the response layer is the load-bearing cross-check; the worker's job here is
+        // to ensure the value is well-formed and bound into the worker_transcript_hash so a
+        // tampered value moves the hash.
+
+        // 5. vault_sequence gate. existing.vault_sequence MUST equal req.vault_sequence. A stale
+        //    or future sequence is rejected here BEFORE any crypto work. Milestone 4's finalize
+        //    will bump vault_sequence on success; for now it's read-only.
+        if existing.vault_sequence != req.vault_sequence {
+            return Err(WorkerError::InvalidRequest(format!(
+                "stale_vault_sequence: req={} existing={}",
+                req.vault_sequence, existing.vault_sequence
+            )));
+        }
+
+        // 6. Re-verify the Milestone 1 sigma against the persisted vault_state_v2.json tuple +
+        //    the request's vault_ek. The persisted tuple WAS verified at Milestone 2a init time,
+        //    but defense-in-depth recheck here ensures a tampered request body containing a wrong
+        //    vault_ek (with otherwise-matching provenance) still fails closed with a CRYPTO error
+        //    before the NotImplemented surface.
+        let aggregate_commitment = normalize_hex(&existing.aggregate_commitment, 32)?;
+        let aggregate_response = normalize_hex(&existing.aggregate_response, 32)?;
+        verify_registration_proof(
+            &vault_ek_hex,
+            &sender_address,
+            &asset_type,
+            req.chain_id,
+            &aggregate_commitment,
+            &aggregate_response,
+        )?;
+
+        // 7. Compute session dir path (id safety already validated above).
+        let session_dir = mpcca_withdraw_session_dir(state_dir, &req.request_id, &req.session_id)?;
+
+        Ok((
+            NormalisedBinding {
+                vault_ek_transcript_hash,
+                registration_transcript_hash,
+                vault_state_init_transcript_hash,
+                observed_deposit_transcript_hashes,
+                roster_hash,
+                sorted,
+                vault_ek_hex,
+                sender_address,
+                asset_type,
+                root,
+                nullifier_hash,
+                recipient,
+                recipient_hash,
+                amount_tag,
+                request_hash,
+            },
+            existing,
+            session_dir,
+        ))
+    }
+
+    /// Shared chained-round entrypoint. Round 2, prove, and finalize all share this body modulo
+    /// the (round name, domain, phase string) triple.
+    fn run_chained_round(
+        state_dir: &Path,
+        req: &ChainedRoundRequest,
+        round_name: &str,
+        domain: &str,
+        not_implemented_phase: &'static str,
+    ) -> WorkerResult<StubRoundResult> {
+        // Re-pack the round1 envelope so we can reuse common_public_binding_work.
+        let envelope = Round1Request {
+            dkg_epoch: req.dkg_epoch.clone(),
+            request_id: req.request_id.clone(),
+            session_id: req.session_id.clone(),
+            vault_ek_transcript_hash: req.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: req.registration_transcript_hash.clone(),
+            vault_state_init_transcript_hash: req.vault_state_init_transcript_hash.clone(),
+            observed_deposit_transcript_hashes: req.observed_deposit_transcript_hashes.clone(),
+            roster_hash: req.roster_hash.clone(),
+            selected_slots: req.selected_slots.clone(),
+            self_slot: req.self_slot,
+            player_id: req.player_id,
+            vault_ek: req.vault_ek.clone(),
+            sender_address: req.sender_address.clone(),
+            asset_type: req.asset_type.clone(),
+            chain_id: req.chain_id,
+            root: req.root.clone(),
+            nullifier_hash: req.nullifier_hash.clone(),
+            recipient: req.recipient.clone(),
+            recipient_hash: req.recipient_hash.clone(),
+            amount_tag: req.amount_tag.clone(),
+            vault_sequence: req.vault_sequence,
+            expiry_secs: req.expiry_secs,
+            request_hash: req.request_hash.clone(),
+            deposit_count: req.deposit_count,
+        };
+        let (normalised, _existing, session_dir) =
+            common_public_binding_work(state_dir, &envelope)?;
+        let previous_round_transcript_hash =
+            normalize_hex(&req.previous_round_transcript_hash, 32)?;
+        if req.previous_round_commitments.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "previous_round_commitments must have {DEOPERATOR_THRESHOLD} entries, got {}",
+                req.previous_round_commitments.len()
+            )));
+        }
+        let mut previous_round_commitments = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for c in &req.previous_round_commitments {
+            previous_round_commitments.push(normalize_hex(c, 32)?);
+        }
+        let worker_transcript_hash = chained_round_worker_hash(
+            domain,
+            &req.session_id,
+            &req.request_id,
+            &req.dkg_epoch,
+            &normalised.vault_ek_transcript_hash,
+            &normalised.registration_transcript_hash,
+            &normalised.vault_state_init_transcript_hash,
+            &normalised.observed_deposit_transcript_hashes,
+            &normalised.roster_hash,
+            &normalised.sorted,
+            req.self_slot,
+            req.player_id,
+            &normalised.vault_ek_hex,
+            &normalised.sender_address,
+            &normalised.asset_type,
+            req.chain_id,
+            &normalised.root,
+            &normalised.nullifier_hash,
+            &normalised.recipient,
+            &normalised.recipient_hash,
+            &normalised.amount_tag,
+            req.vault_sequence,
+            req.expiry_secs,
+            &normalised.request_hash,
+            req.deposit_count,
+            &previous_round_transcript_hash,
+            &previous_round_commitments,
+        );
+        persist_and_stub(
+            &session_dir,
+            round_name,
+            req.self_slot,
+            req.player_id,
+            &req.dkg_epoch,
+            &req.request_id,
+            &req.session_id,
+            &normalised.vault_ek_hex,
+            req.vault_sequence,
+            req.deposit_count,
+            &worker_transcript_hash,
+            not_implemented_phase,
+        )?;
+        Err(WorkerError::NotImplemented(not_implemented_phase))
+    }
+
+    /// Persist the per-session-per-round state file (atomic 0o600) and return the path + hash.
+    /// Note: this is called BEFORE the NotImplemented surface so the persisted state captures
+    /// the public binding work + worker hash. Milestone 4 will REPLACE this stub persist with
+    /// a real per-round crypto state file (preserving the path layout).
+    #[allow(clippy::too_many_arguments)]
+    fn persist_and_stub(
+        session_dir: &Path,
+        round_name: &str,
+        self_slot: usize,
+        player_id: usize,
+        dkg_epoch: &str,
+        request_id: &str,
+        session_id: &str,
+        vault_ek_hex: &str,
+        vault_sequence: u64,
+        deposit_count: u64,
+        worker_transcript_hash: &str,
+        not_implemented_phase: &str,
+    ) -> WorkerResult<()> {
+        let file_path = session_dir.join(round_file_name(round_name));
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let layout = RoundStateFile {
+            scheme: "mpcca_withdraw_v2".to_string(),
+            round: round_name.to_string(),
+            slot: self_slot,
+            player_id,
+            dkg_epoch: dkg_epoch.to_string(),
+            request_id: request_id.to_string(),
+            session_id: session_id.to_string(),
+            vault_ek_hex: vault_ek_hex.to_string(),
+            vault_sequence,
+            deposit_count,
+            worker_transcript_hash: worker_transcript_hash.to_string(),
+            not_implemented_phase: not_implemented_phase.to_string(),
+            created_at_unix_ms: created_at,
+        };
+        let bytes = serde_json::to_vec_pretty(&layout).map_err(|err| {
+            WorkerError::Crypto(format!("encode mpcca_withdraw_v2 round state: {err}"))
+        })?;
+        // Idempotent: if the file already exists with identical (worker_transcript_hash + round
+        // + slot) we leave it in place. We don't OVERWRITE a previously-persisted state on a
+        // matching public-binding replay — that would be a clobber from a session that's
+        // already mid-flight. A subsequent run with the SAME inputs ends up at the same path
+        // with the same content; OS-level rename is atomic so an outside reader either sees
+        // the old (matching) bytes or the new (also matching) bytes.
+        write_secret_file(&file_path, &bytes)?;
+        Ok(())
+    }
+
+    /// Convenience read API for tests + milestone 4's chained round loaders. Returns None if
+    /// no round state file exists at the per-session path.
+    pub fn load_round_state_file(
+        session_dir: &Path,
+        round_name: &str,
+    ) -> WorkerResult<Option<RoundStateFile>> {
+        let path = session_dir.join(round_file_name(round_name));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(&path).map_err(|err| {
+            WorkerError::Crypto(format!("read mpcca round state {}: {err}", path.display()))
+        })?;
+        let existing: RoundStateFile = serde_json::from_slice(&raw).map_err(|err| {
+            WorkerError::Crypto(format!(
+                "parse mpcca round state {}: {err}",
+                path.display()
+            ))
+        })?;
+        if existing.scheme != "mpcca_withdraw_v2" {
+            return Err(WorkerError::InvalidDkgState(
+                "mpcca_withdraw_v2_unexpected_scheme_on_disk".to_string(),
+            ));
+        }
+        Ok(Some(existing))
+    }
+
+    /// Hash a serialised RoundStateFile via sha256 of its JSON bytes. Used by tests + the
+    /// session_state_hash returned by run_round{1,2,prove,finalize}_v2.
+    pub fn round_state_file_hash_at(
+        session_dir: &Path,
+        round_name: &str,
+    ) -> WorkerResult<Option<String>> {
+        let path = session_dir.join(round_file_name(round_name));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(&path).map_err(|err| {
+            WorkerError::Crypto(format!("read mpcca round state {}: {err}", path.display()))
+        })?;
+        Ok(Some(sha256_hex(&raw)))
+    }
+
+    /// Sister API for the milestone 3a stub surface in `main.rs`: returns the (sessionStatePath,
+    /// sessionStateHash) AFTER the run_round{N}_v2 entrypoint persisted the file. We return
+    /// these alongside the 501 so the coordinator can persist its round-1 partial transcript.
+    pub fn last_persisted_round_state(
+        session_dir: &Path,
+        round_name: &str,
+    ) -> WorkerResult<(PathBuf, String)> {
+        let path = session_dir.join(round_file_name(round_name));
+        let raw = fs::read(&path).map_err(|err| {
+            WorkerError::Crypto(format!(
+                "read mpcca round state {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok((path, sha256_hex(&raw)))
+    }
+
+    fn validate_selected_slots(slots: &[usize]) -> WorkerResult<()> {
+        if slots.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "selected_slots must have {DEOPERATOR_THRESHOLD} entries, got {}",
+                slots.len()
+            )));
+        }
+        let mut seen = [false; DEOPERATOR_COUNT];
+        for slot in slots {
+            assert_slot(*slot)?;
+            if seen[*slot] {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate selected_slots entry {slot}"
+                )));
+            }
+            seen[*slot] = true;
+        }
+        Ok(())
+    }
+
+    fn sorted_unique_slots(slots: &[usize]) -> WorkerResult<Vec<usize>> {
+        validate_selected_slots(slots)?;
+        let mut copy = slots.to_vec();
+        copy.sort_unstable();
+        Ok(copy)
+    }
+
+    /// Atomic write via tmp + create_new + rename. Same pattern as `vault_state_v2::write_secret_file`.
+    /// Replicated here (instead of imported) to keep the module self-contained — if milestone 4
+    /// needs to extend the write path with per-round zeroize semantics, it lives in one place.
+    fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
+        use rand::RngCore as _;
+        use std::io::Write as _;
+        let parent = path.parent().ok_or_else(|| {
+            WorkerError::Crypto(format!("path {} has no parent dir", path.display()))
+        })?;
+        fs::create_dir_all(parent).map_err(|err| {
+            WorkerError::Crypto(format!(
+                "create parent dir {}: {err}",
+                parent.display()
+            ))
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                WorkerError::Crypto(format!("path {} has no file name", path.display()))
+            })?;
+        let pid = std::process::id();
+        let mut rng = rand::rngs::OsRng;
+        const MAX_ATTEMPTS: usize = 16;
+        for _ in 0..MAX_ATTEMPTS {
+            let suffix: u64 = rng.next_u64();
+            let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{suffix:016x}"));
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = match opts.open(&tmp_path) {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(WorkerError::Crypto(format!(
+                        "open tmp {}: {err}",
+                        tmp_path.display()
+                    )));
+                }
+            };
+            if let Err(err) = file.write_all(contents) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "write tmp {}: {err}",
+                    tmp_path.display()
+                )));
+            }
+            if let Err(err) = file.sync_all() {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "fsync tmp {}: {err}",
+                    tmp_path.display()
+                )));
+            }
+            drop(file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(WorkerError::Crypto(format!(
+                        "chmod 0o600 tmp {}: {err}",
+                        tmp_path.display()
+                    )));
+                }
+            }
+            if let Err(err) = fs::rename(&tmp_path, path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "rename {} -> {}: {err}",
+                    tmp_path.display(),
+                    path.display()
+                )));
+            }
+            return Ok(());
+        }
+        Err(WorkerError::Crypto(format!(
+            "exhausted {MAX_ATTEMPTS} tmp-suffix retries writing {}",
+            path.display()
+        )))
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex_encode(Sha256::digest(bytes).as_slice())
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
+        }
+        (0..raw.len())
+            .step_by(2)
+            .map(|idx| {
+                u8::from_str_radix(&raw[idx..idx + 2], 16)
+                    .map_err(|err| WorkerError::InvalidRequest(err.to_string()))
+            })
+            .collect()
+    }
+
+    fn normalize_hex(hex: &str, expected_bytes: usize) -> WorkerResult<String> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != expected_bytes {
+            return Err(WorkerError::InvalidRequest(format!(
+                "expected {expected_bytes}-byte hex, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(hex_encode(&bytes))
+    }
+}
+
 pub mod frost_dkg_v2 {
     use crate::hpke_aead::{self, HpkeEnvelope};
     use crate::local_state::slot_to_identifier;

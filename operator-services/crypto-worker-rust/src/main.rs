@@ -39,6 +39,16 @@ use eunoma_crypto_worker::vault_state_v2::{
     observe_deposit_v2 as run_vault_state_v2_observe_deposit, InitRequest as VaultStateV2InitRequest,
     ObserveDepositRequest as VaultStateV2ObserveDepositRequest,
 };
+use eunoma_crypto_worker::mpcca_withdraw_v2::{
+    last_persisted_round_state as mpcca_last_persisted_round_state,
+    mpcca_withdraw_session_dir,
+    run_finalize_v2 as run_mpcca_withdraw_finalize_v2,
+    run_prove_v2 as run_mpcca_withdraw_prove_v2,
+    run_round1_v2 as run_mpcca_withdraw_round1_v2,
+    run_round2_v2 as run_mpcca_withdraw_round2_v2,
+    ChainedRoundRequest as MpccaWithdrawChainedRoundRequest,
+    Round1Request as MpccaWithdrawRound1Request,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -168,6 +178,27 @@ async fn main() {
         .route(
             "/worker/v2/vault_state/observe_deposit",
             post(vault_state_v2_observe_deposit),
+        )
+        // Milestone 3a — MPCCA withdraw state machine scaffolding. Each per-round handler does
+        // the FULL public binding work (id safety, hex normalisation, provenance gate against
+        // vault_state_v2.json, vault_sequence gate, Milestone 1 sigma re-verify) BEFORE
+        // returning NotImplemented with a per-round phase string. Milestone 4 fills the crypto
+        // in without re-touching the public binding.
+        .route(
+            "/worker/v2/mpcca/withdraw/round1",
+            post(mpcca_withdraw_round1),
+        )
+        .route(
+            "/worker/v2/mpcca/withdraw/round2",
+            post(mpcca_withdraw_round2),
+        )
+        .route(
+            "/worker/v2/mpcca/withdraw/prove",
+            post(mpcca_withdraw_prove),
+        )
+        .route(
+            "/worker/v2/mpcca/withdraw/finalize",
+            post(mpcca_withdraw_finalize),
         )
         .with_state(app_state);
 
@@ -1008,6 +1039,211 @@ async fn vault_state_v2_observe_deposit(
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => worker_error_response(err),
     }
+}
+
+// Milestone 3a — `/worker/v2/mpcca/withdraw/{round1,round2,prove,finalize}`. Each handler
+// invokes the corresponding library function. The library function ALWAYS does the full
+// public-binding work BEFORE returning `Err(WorkerError::NotImplemented(<phase>))`. We surface
+// the public binding outputs (sessionStatePath, sessionStateHash, workerTranscriptHash)
+// alongside the 501 so the coordinator can persist its round-N partial transcript even though
+// the crypto is pending.
+//
+// The KILLER design: a request that fails the provenance gate, the vault_sequence gate, or the
+// sigma re-verify gets a SPECIFIC validation error (InvalidDkgState / InvalidRequest / Crypto)
+// — NOT NotImplemented. Milestone 4 fills the crypto in; the public binding errors stay
+// load-bearing.
+async fn mpcca_withdraw_round1(
+    State(state): State<AppState>,
+    Json(body): Json<MpccaWithdrawRound1Request>,
+) -> (StatusCode, Json<Value>) {
+    let request_id = body.request_id.clone();
+    let session_id = body.session_id.clone();
+    let self_slot = body.self_slot;
+    let player_id = body.player_id;
+    match run_mpcca_withdraw_round1_v2(&state.state_dir, &body) {
+        Ok(_result) => {
+            // Should never happen under milestone 3a — the stub ALWAYS returns NotImplemented.
+            // If milestone 4 lands the crypto and forgets to update this surface, we want a
+            // load-bearing assert here.
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "mpcca_withdraw_v2_stub_unexpectedly_returned_ok",
+                    "message": "milestone 3a stub returned Ok; this is a wire-shape regression"
+                })),
+            )
+        }
+        Err(eunoma_crypto_worker::WorkerError::NotImplemented(phase)) => {
+            mpcca_not_implemented_response(
+                &state.state_dir,
+                &request_id,
+                &session_id,
+                self_slot,
+                player_id,
+                "round1",
+                phase,
+            )
+        }
+        Err(err) => worker_error_response(err),
+    }
+}
+
+async fn mpcca_withdraw_round2(
+    State(state): State<AppState>,
+    Json(body): Json<MpccaWithdrawChainedRoundRequest>,
+) -> (StatusCode, Json<Value>) {
+    let request_id = body.request_id.clone();
+    let session_id = body.session_id.clone();
+    let self_slot = body.self_slot;
+    let player_id = body.player_id;
+    match run_mpcca_withdraw_round2_v2(&state.state_dir, &body) {
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "mpcca_withdraw_v2_stub_unexpectedly_returned_ok",
+                "message": "milestone 3a stub returned Ok; this is a wire-shape regression"
+            })),
+        ),
+        Err(eunoma_crypto_worker::WorkerError::NotImplemented(phase)) => {
+            mpcca_not_implemented_response(
+                &state.state_dir,
+                &request_id,
+                &session_id,
+                self_slot,
+                player_id,
+                "round2",
+                phase,
+            )
+        }
+        Err(err) => worker_error_response(err),
+    }
+}
+
+async fn mpcca_withdraw_prove(
+    State(state): State<AppState>,
+    Json(body): Json<MpccaWithdrawChainedRoundRequest>,
+) -> (StatusCode, Json<Value>) {
+    let request_id = body.request_id.clone();
+    let session_id = body.session_id.clone();
+    let self_slot = body.self_slot;
+    let player_id = body.player_id;
+    match run_mpcca_withdraw_prove_v2(&state.state_dir, &body) {
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "mpcca_withdraw_v2_stub_unexpectedly_returned_ok",
+                "message": "milestone 3a stub returned Ok; this is a wire-shape regression"
+            })),
+        ),
+        Err(eunoma_crypto_worker::WorkerError::NotImplemented(phase)) => {
+            mpcca_not_implemented_response(
+                &state.state_dir,
+                &request_id,
+                &session_id,
+                self_slot,
+                player_id,
+                "prove",
+                phase,
+            )
+        }
+        Err(err) => worker_error_response(err),
+    }
+}
+
+async fn mpcca_withdraw_finalize(
+    State(state): State<AppState>,
+    Json(body): Json<MpccaWithdrawChainedRoundRequest>,
+) -> (StatusCode, Json<Value>) {
+    let request_id = body.request_id.clone();
+    let session_id = body.session_id.clone();
+    let self_slot = body.self_slot;
+    let player_id = body.player_id;
+    match run_mpcca_withdraw_finalize_v2(&state.state_dir, &body) {
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "mpcca_withdraw_v2_stub_unexpectedly_returned_ok",
+                "message": "milestone 3a stub returned Ok; this is a wire-shape regression"
+            })),
+        ),
+        Err(eunoma_crypto_worker::WorkerError::NotImplemented(phase)) => {
+            mpcca_not_implemented_response(
+                &state.state_dir,
+                &request_id,
+                &session_id,
+                self_slot,
+                player_id,
+                "finalize",
+                phase,
+            )
+        }
+        Err(err) => worker_error_response(err),
+    }
+}
+
+/// Surfaces the 501 response shape: HTTP 501 + body carrying the public binding outputs
+/// (sessionStatePath, sessionStateHash, workerTranscriptHash) read back from the file the
+/// library function persisted before returning NotImplemented. The coordinator parses this
+/// shape and asserts the per-slot transcript hashes agree.
+fn mpcca_not_implemented_response(
+    state_dir: &std::path::Path,
+    request_id: &str,
+    session_id: &str,
+    self_slot: usize,
+    player_id: usize,
+    round_name: &str,
+    phase: &'static str,
+) -> (StatusCode, Json<Value>) {
+    // Compute the per-session dir + read back the persisted round state file. The library
+    // function already validated id safety, so mpcca_withdraw_session_dir should succeed here.
+    let session_dir = match mpcca_withdraw_session_dir(state_dir, request_id, session_id) {
+        Ok(dir) => dir,
+        Err(err) => return worker_error_response(err),
+    };
+    let (session_state_path, session_state_hash) =
+        match mpcca_last_persisted_round_state(&session_dir, round_name) {
+            Ok(pair) => pair,
+            Err(err) => return worker_error_response(err),
+        };
+    // Read the persisted file to lift its worker_transcript_hash field.
+    let raw = match std::fs::read(&session_state_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return worker_error_response(eunoma_crypto_worker::WorkerError::Crypto(
+                format!("read mpcca round state {}: {err}", session_state_path.display()),
+            ));
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(err) => {
+            return worker_error_response(eunoma_crypto_worker::WorkerError::Crypto(format!(
+                "parse mpcca round state: {err}"
+            )));
+        }
+    };
+    let worker_transcript_hash = parsed
+        .get("worker_transcript_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let observed_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "slot": self_slot,
+            "playerId": player_id,
+            "sessionStatePath": session_state_path.display().to_string(),
+            "sessionStateHash": session_state_hash,
+            "workerTranscriptHash": worker_transcript_hash,
+            "observedAtUnixMs": observed_at_unix_ms,
+            "completed": false,
+            "notImplementedPhase": phase,
+        })),
+    )
 }
 
 fn vault_ek_error_response(
