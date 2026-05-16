@@ -4025,6 +4025,30 @@ pub mod ca_registration_v2 {
         pub ok: bool,
     }
 
+    /// Aggregation request — share-independent public compute over already-published
+    /// commitments + responses. The verifier worker runs this so the coordinator gets back
+    /// a fully-verified `(aggregateCommitment, challenge, aggregateResponse)` tuple in one
+    /// round-trip after collecting per-slot round1+round2 results.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct AggregateRequest {
+        pub vault_ek: String,
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+        pub commitments: Vec<RegistrationCommitmentInput>,
+        pub responses: Vec<RegistrationResponseInput>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct AggregateResult {
+        pub aggregate_commitment: String,
+        pub challenge: String,
+        pub aggregate_response: String,
+        pub proof_hash: String,
+    }
+
     /// On-disk shape for the per-session nonce file. Mode 0o600. Lives at
     /// `state_dir/mpc-sessions/<request_id>__<session_id>/ca_registration_v2_nonce.json`.
     #[derive(Debug, Serialize, Deserialize)]
@@ -4458,6 +4482,49 @@ pub mod ca_registration_v2 {
             &req.aggregate_response,
         )?;
         Ok(VerifyResult { ok: true })
+    }
+
+    /// One-shot aggregator: Lagrange-aggregate commitments, derive Fiat-Shamir challenge,
+    /// Lagrange-aggregate responses, then locally verify. The coordinator hits this on the
+    /// verifier-slot worker AFTER collecting all 5 round1+round2 results. Pure public
+    /// compute — no share file access.
+    ///
+    /// Fail-closed: if `verify_registration_proof(...)` fails (the public equation `vault_ek
+    /// * agg_response == agg_commitment + h * challenge` doesn't hold), returns an error.
+    /// The coordinator translates that into a 502 `aggregate_proof_invalid` response.
+    pub fn run_aggregate_v2(req: &AggregateRequest) -> WorkerResult<AggregateResult> {
+        let aggregate_commitment = aggregate_registration_commitment(&req.commitments)?;
+        let challenge_scalar = registration_challenge_scalar(
+            &req.vault_ek,
+            &req.sender_address,
+            &req.asset_type,
+            req.chain_id,
+            &aggregate_commitment,
+        )?;
+        let challenge_hex = scalar_hex(&challenge_scalar);
+        let aggregate_response = aggregate_responses_v2(&req.responses)?;
+        verify_registration_proof(
+            &req.vault_ek,
+            &req.sender_address,
+            &req.asset_type,
+            req.chain_id,
+            &aggregate_commitment,
+            &aggregate_response,
+        )?;
+        let proof_hash = sha256_hex(
+            [
+                hex_decode(&aggregate_commitment)?.as_slice(),
+                hex_decode(&aggregate_response)?.as_slice(),
+            ]
+            .concat()
+            .as_slice(),
+        );
+        Ok(AggregateResult {
+            aggregate_commitment,
+            challenge: challenge_hex,
+            aggregate_response,
+            proof_hash,
+        })
     }
 
     /// Coordinator-side helpers exposed for the orchestrator: aggregate commitments via

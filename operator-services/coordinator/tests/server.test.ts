@@ -1483,4 +1483,467 @@ describe("coordinator", () => {
     const firstRes = await firstPromise;
     expect(firstRes.statusCode).toBe(503);
   });
+
+  // =============================================================================================
+  // Milestone 1: V2 threshold CA registration sigma tests.
+  //
+  // The orchestrator routes /v2/derive/ca_registration/start -> round1 fan-out -> challenge
+  // helper -> round2 fan-out -> aggregate-and-verify. Tests assert: (a) concurrent fan-out
+  // for round1 and round2 (Promise.all not sequential), (b) aggregate_proof_invalid maps to
+  // 502, (c) lock contention returns 409.
+  // =============================================================================================
+  it("ca_registration_v2 concurrent fan-out — round1 and round2 each in flight to all 5 slots", async () => {
+    const { caRegistrationV2Round1WorkerTranscriptHash, caRegistrationV2Round2WorkerTranscriptHash } =
+      await import("@eunoma/deop-protocol");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const vaultEk = h32("c");
+    const senderAddress = h32("d");
+    const assetType = h32("e");
+    const chainId = 2;
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    // Worker stubs return placeholder hex bodies; the coordinator's worker-hash cross-check
+    // computes the expected hash from public inputs and compares it to the stub's
+    // returned value — so the stub MUST mirror the canonical computation.
+    let round1InFlight = 0;
+    let round1Peak = 0;
+    let round2InFlight = 0;
+    let round2Peak = 0;
+    let releaseRound1: () => void = () => {};
+    const round1Barrier = new Promise<void>((resolve) => {
+      releaseRound1 = resolve;
+    });
+    let releaseRound2: () => void = () => {};
+    const round2Barrier = new Promise<void>((resolve) => {
+      releaseRound2 = resolve;
+    });
+
+    const round1NonceIdBySlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      round1NonceIdBySlot[slot] = h32(String((slot + 6) % 16).slice(-1) || "f").slice(0, 64);
+    }
+    const round1CommitmentBySlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      round1CommitmentBySlot[slot] = h32(String((slot % 9) + 1));
+    }
+    const round2ResponseBySlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      round2ResponseBySlot[slot] = h32(String((slot % 7) + 1).padStart(1, "0"));
+    }
+    const challengeFromAggregator = h32("3");
+    const finalAggregateCommitment = h32("4");
+    const finalAggregateResponse = h32("5");
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path.endsWith("/ca_registration/round1")) {
+          round1InFlight += 1;
+          round1Peak = Math.max(round1Peak, round1InFlight);
+          if (round1InFlight === 5) queueMicrotask(() => releaseRound1());
+          await round1Barrier;
+          round1InFlight -= 1;
+          const commitmentHex = round1CommitmentBySlot[slot];
+          const nonceId = round1NonceIdBySlot[slot];
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const workerHash = caRegistrationV2Round1WorkerTranscriptHash({
+            sessionId: (body as Record<string, unknown>).sessionId as string,
+            requestId: (body as Record<string, unknown>).requestId as string,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashHex,
+            rosterHash: rosterHashHex,
+            sortedSelectedSlots: expectedSelectedSlots,
+            selfSlot: slot,
+            playerId,
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            commitmentHex,
+            nonceId,
+          });
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              commitmentHex,
+              commitmentHash: h32("a"),
+              nonceId,
+              workerTranscriptHash: workerHash,
+            },
+          };
+        }
+        if (path.endsWith("/ca/registration/challenge")) {
+          // Interim aggregator: returns aggregateCommitment + challenge.
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              aggregateCommitment: finalAggregateCommitment,
+              challenge: challengeFromAggregator,
+            },
+          };
+        }
+        if (path.endsWith("/ca_registration/round2")) {
+          round2InFlight += 1;
+          round2Peak = Math.max(round2Peak, round2InFlight);
+          if (round2InFlight === 5) queueMicrotask(() => releaseRound2());
+          await round2Barrier;
+          round2InFlight -= 1;
+          const responseHex = round2ResponseBySlot[slot];
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const enc = new TextEncoder();
+          // Mirror the canonical response-hash computation: sha256(bytes(responseHex))
+          const { sha256 } = await import("@noble/hashes/sha256");
+          const { bytesToHex, hexToBytes } = await import("@noble/hashes/utils");
+          const responseHash = bytesToHex(sha256(hexToBytes(responseHex)));
+          const workerHash = caRegistrationV2Round2WorkerTranscriptHash({
+            sessionId: (body as Record<string, unknown>).sessionId as string,
+            requestId: (body as Record<string, unknown>).requestId as string,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashHex,
+            sortedSelectedSlots: expectedSelectedSlots,
+            selfSlot: slot,
+            playerId,
+            nonceId: round1NonceIdBySlot[slot],
+            challenge: challengeFromAggregator,
+            responseHash,
+          });
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              responseHex,
+              responseHash,
+              workerTranscriptHash: workerHash,
+            },
+          };
+        }
+        if (path.endsWith("/ca_registration/aggregate")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              aggregateCommitment: finalAggregateCommitment,
+              aggregateResponse: finalAggregateResponse,
+              challenge: challengeFromAggregator,
+              proofHash: h32("9"),
+            },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path", path } };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/ca_registration/start",
+      payload: {
+        requestId: "ca-reg-v2-concurrent",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.accepted).toBe(true);
+    expect(body.vaultEk).toBe(vaultEk);
+    expect(body.aggregateCommitment).toBe(finalAggregateCommitment);
+    expect(body.aggregateResponse).toBe(finalAggregateResponse);
+    expect(body.challenge).toBe(challengeFromAggregator);
+    expect(body.selectedSlots).toEqual(expectedSelectedSlots);
+    expect(body.selectionRationale).toBe("coordinator-chosen");
+    expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+
+    // Killer assertions: BOTH rounds must have hit peak-5 in-flight (concurrent fan-out).
+    expect(round1Peak).toBe(5);
+    expect(round2Peak).toBe(5);
+  });
+
+  it("ca_registration_v2 returns 502 aggregate_proof_invalid when verifier rejects", async () => {
+    const { caRegistrationV2Round1WorkerTranscriptHash, caRegistrationV2Round2WorkerTranscriptHash } =
+      await import("@eunoma/deop-protocol");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const vaultEk = h32("c");
+    const senderAddress = h32("d");
+    const assetType = h32("e");
+    const chainId = 2;
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const challenge = h32("3");
+
+    const round1NonceIdBySlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      round1NonceIdBySlot[slot] = h32(String((slot + 6) % 16).slice(-1) || "f").slice(0, 64);
+    }
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path.endsWith("/ca_registration/round1")) {
+          const commitmentHex = h32(String((slot % 9) + 1));
+          const nonceId = round1NonceIdBySlot[slot];
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const workerHash = caRegistrationV2Round1WorkerTranscriptHash({
+            sessionId: (body as Record<string, unknown>).sessionId as string,
+            requestId: (body as Record<string, unknown>).requestId as string,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashHex,
+            rosterHash: rosterHashHex,
+            sortedSelectedSlots: expectedSelectedSlots,
+            selfSlot: slot,
+            playerId,
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            commitmentHex,
+            nonceId,
+          });
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              commitmentHex,
+              commitmentHash: h32("a"),
+              nonceId,
+              workerTranscriptHash: workerHash,
+            },
+          };
+        }
+        if (path.endsWith("/ca/registration/challenge")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { aggregateCommitment: h32("4"), challenge },
+          };
+        }
+        if (path.endsWith("/ca_registration/round2")) {
+          const responseHex = h32(String((slot % 7) + 1));
+          const { sha256 } = await import("@noble/hashes/sha256");
+          const { bytesToHex, hexToBytes } = await import("@noble/hashes/utils");
+          const responseHash = bytesToHex(sha256(hexToBytes(responseHex)));
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const workerHash = caRegistrationV2Round2WorkerTranscriptHash({
+            sessionId: (body as Record<string, unknown>).sessionId as string,
+            requestId: (body as Record<string, unknown>).requestId as string,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashHex,
+            sortedSelectedSlots: expectedSelectedSlots,
+            selfSlot: slot,
+            playerId,
+            nonceId: round1NonceIdBySlot[slot],
+            challenge,
+            responseHash,
+          });
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { slot, responseHex, responseHash, workerTranscriptHash: workerHash },
+          };
+        }
+        if (path.endsWith("/ca_registration/aggregate")) {
+          // Verifier rejects with the canonical "registration sigma proof verification failed"
+          // message that the orchestrator looks for to map to aggregate_proof_invalid.
+          return {
+            slot,
+            ok: false,
+            statusCode: 400,
+            body: {
+              error: "worker_error",
+              message: "Crypto(\"registration sigma proof verification failed\")",
+            },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/ca_registration/start",
+      payload: {
+        requestId: "ca-reg-v2-invalid",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+      },
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("aggregate_proof_invalid");
+  });
+
+  it("ca_registration_v2 returns 409 ca_registration_v2_in_flight on concurrent start", async () => {
+    const { caRegistrationV2Round1WorkerTranscriptHash, caRegistrationV2Round2WorkerTranscriptHash } =
+      await import("@eunoma/deop-protocol");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const vaultEk = h32("c");
+    const senderAddress = h32("d");
+    const assetType = h32("e");
+    const chainId = 2;
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const challenge = h32("3");
+    const aggregateCommitment = h32("4");
+
+    const round1NonceIdBySlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      round1NonceIdBySlot[slot] = h32(String((slot + 6) % 16).slice(-1) || "f").slice(0, 64);
+    }
+
+    let releaseFirst: () => void = () => {};
+    const firstHold = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let round1Started = 0;
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path.endsWith("/ca_registration/round1")) {
+          round1Started += 1;
+          await firstHold;
+          const commitmentHex = h32(String((slot % 9) + 1));
+          const nonceId = round1NonceIdBySlot[slot];
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const workerHash = caRegistrationV2Round1WorkerTranscriptHash({
+            sessionId: (body as Record<string, unknown>).sessionId as string,
+            requestId: (body as Record<string, unknown>).requestId as string,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashHex,
+            rosterHash: rosterHashHex,
+            sortedSelectedSlots: expectedSelectedSlots,
+            selfSlot: slot,
+            playerId,
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            commitmentHex,
+            nonceId,
+          });
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              commitmentHex,
+              commitmentHash: h32("a"),
+              nonceId,
+              workerTranscriptHash: workerHash,
+            },
+          };
+        }
+        if (path.endsWith("/ca/registration/challenge")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { aggregateCommitment, challenge },
+          };
+        }
+        if (path.endsWith("/ca_registration/round2")) {
+          const responseHex = h32(String((slot % 7) + 1));
+          const { sha256 } = await import("@noble/hashes/sha256");
+          const { bytesToHex, hexToBytes } = await import("@noble/hashes/utils");
+          const responseHash = bytesToHex(sha256(hexToBytes(responseHex)));
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const workerHash = caRegistrationV2Round2WorkerTranscriptHash({
+            sessionId: (body as Record<string, unknown>).sessionId as string,
+            requestId: (body as Record<string, unknown>).requestId as string,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashHex,
+            sortedSelectedSlots: expectedSelectedSlots,
+            selfSlot: slot,
+            playerId,
+            nonceId: round1NonceIdBySlot[slot],
+            challenge,
+            responseHash,
+          });
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { slot, responseHex, responseHash, workerTranscriptHash: workerHash },
+          };
+        }
+        if (path.endsWith("/ca_registration/aggregate")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              aggregateCommitment,
+              aggregateResponse: h32("5"),
+              challenge,
+              proofHash: h32("9"),
+            },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+
+    const firstPromise = server.inject({
+      method: "POST",
+      url: "/v2/derive/ca_registration/start",
+      payload: {
+        requestId: "ca-reg-v2-lock-1",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+      },
+    });
+    while (round1Started < 5) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    // First request is blocked at round1 barrier; the lock is held. Second start MUST 409.
+    const secondRes = await server.inject({
+      method: "POST",
+      url: "/v2/derive/ca_registration/start",
+      payload: {
+        requestId: "ca-reg-v2-lock-2",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+      },
+    });
+    expect(secondRes.statusCode).toBe(409);
+    expect(secondRes.json().error).toBe("ca_registration_v2_in_flight");
+
+    releaseFirst();
+    const firstRes = await firstPromise;
+    expect(firstRes.statusCode).toBe(200);
+  });
 });

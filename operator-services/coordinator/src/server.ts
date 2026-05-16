@@ -1,10 +1,14 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import {
+  assembleCaRegistrationV2Transcript,
   assembleVaultEkTranscript,
+  CaRegistrationV2Error,
   DEOPERATOR_COUNT,
   DEOPERATOR_THRESHOLD,
   ForbiddenPlaintextFieldError,
   caDkgV2RosterHash,
+  caRegistrationV2Round1WorkerTranscriptHash,
+  caRegistrationV2Round2WorkerTranscriptHash,
   frostDkgV2RosterHash,
   lagrangeCoefficientsAtZero,
   parseCaRegistrationAggregateRequest,
@@ -15,6 +19,8 @@ import {
   parseCaRegistrationNonceCommitResult,
   parseCaRegistrationPartialRequest,
   parseCaRegistrationPartialResult,
+  parseCaRegistrationV2Round1Response,
+  parseCaRegistrationV2Round2Response,
   parseCaDkgV2Roster,
   parseFrostDkgV2Roster,
   parseDkgRoundRequest,
@@ -31,6 +37,7 @@ import {
   validateRoster,
   VaultEkDerivationError,
   type CaDkgV2Roster,
+  type CaRegistrationV2Contribution,
   type DeoperatorRoster,
   type FrostDkgV2Roster,
   type FrostRound1Broadcast,
@@ -124,6 +131,42 @@ export function buildCoordinatorServer(
     return {
       release: () => {
         vaultEkInFlight = null;
+        resolveHeld();
+      },
+    };
+  }
+
+  // Milestone 1: separate session lock for /v2/derive/ca_registration/start. We keep it
+  // distinct from the vault_ek lock because CA registration does NOT spawn MASCOT
+  // subprocesses (no fixed-port collision) — concurrent CA registrations are safe
+  // independent of in-flight vault_ek derivations. But we still want single-session-at-a-
+  // time semantics inside the CA registration surface itself so two concurrent registrations
+  // under the same vault_ek can't interleave round1/round2 files on the same workers.
+  let caRegistrationV2InFlight: Promise<unknown> | null = null;
+  const caRegistrationV2LockAcquireTimeoutMs = 100;
+  async function acquireCaRegistrationV2Lock(): Promise<{ release: () => void } | "busy"> {
+    const start = Date.now();
+    while (caRegistrationV2InFlight !== null) {
+      if (Date.now() - start > caRegistrationV2LockAcquireTimeoutMs) {
+        return "busy";
+      }
+      try {
+        await Promise.race([
+          caRegistrationV2InFlight,
+          new Promise((resolve) => setTimeout(resolve, 25)),
+        ]);
+      } catch {
+        // Holder failed; loop re-checks.
+      }
+    }
+    let resolveHeld: (value: void) => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      resolveHeld = resolve;
+    });
+    caRegistrationV2InFlight = held;
+    return {
+      release: () => {
+        caRegistrationV2InFlight = null;
         resolveHeld();
       },
     };
@@ -746,6 +789,561 @@ export function buildCoordinatorServer(
         return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
       }
       if (err instanceof VaultEkDerivationError) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // =============================================================================================
+  // Milestone 1: V2 threshold CA registration sigma orchestrator.
+  //
+  // Flow:
+  //   1. Validate request body + roster + selectedSlots (lowest-5 by default; selectedSlots
+  //      override allowed for failover/recovery — strict 5-of-7 over current CA DKG V2 roster).
+  //   2. Acquire CA-registration-specific session lock; 409 on contention.
+  //   3. Round1 fan-out (Promise.all over 5 selected slots):
+  //      POST /worker/v2/derive/ca_registration/round1 to each slot's deop-node.
+  //      Each worker draws r_i, persists nonce file (0o600), returns
+  //      `(commitmentHex, commitmentHash, nonceId, workerTranscriptHash)`.
+  //   4. Aggregate-commitments + challenge: hit the verifier-slot worker's
+  //      `/worker/v2/derive/ca_registration/aggregate` with all commitments + responses
+  //      (responses haven't been computed yet — we do round2 next, then a SECOND aggregate
+  //      call for the final tuple). Actually: do a first cheap call that computes the
+  //      aggregate commitment + challenge ONLY (we re-use the V1 worker
+  //      `/worker/v2/ca/registration/challenge` for that — share-independent public compute).
+  //      Then round2 fan-out, then the FINAL aggregate-and-verify call.
+  //   5. Round2 fan-out with the challenge → 5 responses.
+  //   6. Final aggregate-and-verify via `/worker/v2/derive/ca_registration/aggregate` (does
+  //      Lagrange on commitments + responses + Fiat-Shamir challenge + verify in one shot).
+  //   7. Persist transcript artifact under `state_root/coordinator/ca_registration_v2/`
+  //      atomically with mode 0o600.
+  //   8. Return `{ requestId, dkgEpoch, vaultEk, aggregateCommitment, aggregateResponse,
+  //      challenge, transcriptHash, transcriptPath }`.
+  //
+  // Failure modes (per acceptance criteria):
+  //   - 409 ca_registration_v2_in_flight (lock contention)
+  //   - 400 forbidden_plaintext_field / under_quorum / duplicate_slot / etc.
+  //   - 502 round1_forward_failed / round2_forward_failed / aggregate_forward_failed
+  //   - 502 aggregate_proof_invalid (verify equation fails — public algebra disagreement)
+  // =============================================================================================
+  server.post("/v2/derive/ca_registration/start", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+
+      const dkgEpoch =
+        typeof raw.dkgEpoch === "string" && raw.dkgEpoch.length > 0 ? raw.dkgEpoch : undefined;
+      if (!dkgEpoch || !/^[0-9]+$/.test(dkgEpoch)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "dkgEpoch must be a non-empty decimal string",
+        });
+      }
+      if (dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          message: `request.dkgEpoch ${dkgEpoch} does not match caDkgV2Roster.dkgEpoch ${dkgRoster.dkgEpoch}`,
+        });
+      }
+      const caDkgTranscriptHashInput = raw.caDkgTranscriptHash;
+      if (typeof caDkgTranscriptHashInput !== "string" || caDkgTranscriptHashInput.length === 0) {
+        return reply.code(400).send({
+          error: "no_ca_dkg_v2_record_for_dkg_epoch",
+          message:
+            "caDkgTranscriptHash is required; supply the value from the CA DKG V2 artifact",
+        });
+      }
+      const vaultEk = raw.vaultEk;
+      if (typeof vaultEk !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(vaultEk)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "vaultEk must be a 32-byte hex string (Phase 2-derived public point)",
+        });
+      }
+      const senderAddress = raw.senderAddress;
+      if (
+        typeof senderAddress !== "string" ||
+        !/^(0x)?[0-9a-fA-F]{64}$/.test(senderAddress)
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "senderAddress must be a 32-byte hex string",
+        });
+      }
+      const assetType = raw.assetType;
+      if (typeof assetType !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(assetType)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "assetType must be a 32-byte hex string",
+        });
+      }
+      const chainIdRaw = raw.chainId;
+      if (
+        !Number.isInteger(chainIdRaw) ||
+        (chainIdRaw as number) < 0 ||
+        (chainIdRaw as number) > 255
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "chainId must be a u8",
+        });
+      }
+      const chainId = chainIdRaw as number;
+
+      requestId =
+        typeof raw.requestId === "string" && raw.requestId.length > 0
+          ? raw.requestId
+          : `ca-registration-v2-${Date.now()}`;
+
+      // Slot selection: either caller-supplied (validated against current roster) or
+      // coordinator-chosen lowest 5. Both shapes feed the same downstream pipeline.
+      let selectedSlots: number[];
+      let selectionRationale: "caller-supplied" | "coordinator-chosen";
+      if (raw.selectedSlots !== undefined) {
+        if (
+          !Array.isArray(raw.selectedSlots) ||
+          raw.selectedSlots.length !== DEOPERATOR_THRESHOLD
+        ) {
+          return reply.code(400).send({
+            error: "invalid_request",
+            message: `selectedSlots must have ${DEOPERATOR_THRESHOLD} entries`,
+          });
+        }
+        const seen = new Set<number>();
+        const arr: number[] = [];
+        for (const slot of raw.selectedSlots) {
+          if (
+            !Number.isInteger(slot) ||
+            (slot as number) < 0 ||
+            (slot as number) >= DEOPERATOR_COUNT
+          ) {
+            return reply.code(400).send({
+              error: "invalid_request",
+              message: `selectedSlots entry ${slot} out of range`,
+            });
+          }
+          if (seen.has(slot as number)) {
+            return reply.code(400).send({
+              error: "duplicate_slot",
+              message: `duplicate selectedSlots entry ${slot}`,
+            });
+          }
+          seen.add(slot as number);
+          arr.push(slot as number);
+        }
+        const rosterSlots = new Set(dkgRoster.nodes.map((node) => node.slot));
+        for (const slot of arr) {
+          if (!rosterSlots.has(slot)) {
+            return reply.code(400).send({
+              error: "unknown_slot",
+              message: `selectedSlots entry ${slot} is not in caDkgV2Roster`,
+            });
+          }
+        }
+        selectedSlots = arr;
+        selectionRationale = "caller-supplied";
+      } else {
+        selectedSlots = lowestEligibleSlots(dkgRoster, DEOPERATOR_THRESHOLD);
+        selectionRationale = "coordinator-chosen";
+      }
+      const sortedSelectedSlots = [...selectedSlots].sort((a, b) => a - b);
+      const sessionId = requestId;
+
+      const lock = await acquireCaRegistrationV2Lock();
+      if (lock === "busy") {
+        return reply.code(409).send({
+          error: "ca_registration_v2_in_flight",
+          requestId,
+          message: "another ca_registration_v2 session is in progress; retry shortly",
+        });
+      }
+
+      try {
+        // ---------- Round 1: nonce-commit fan-out (concurrent) ----------
+        const round1Bodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
+          dkgEpoch,
+          requestId: requestId!,
+          sessionId,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selfSlot: slot,
+          playerId: ordinalIndex,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+        }));
+        const round1Forwarded = await Promise.all(
+          sortedSelectedSlots.map((slot, ordinalIndex) =>
+            singleNodeForwarder(
+              "/worker/v2/derive/ca_registration/round1",
+              round1Bodies[ordinalIndex],
+              dkgRoster,
+              slot,
+            ).then(
+              (value) => ({ kind: "value" as const, slot, value }),
+              (reason) => ({ kind: "rejected" as const, slot, reason }),
+            ),
+          ),
+        );
+        const round1ResponsesBySlot = new Map<number, ReturnType<typeof parseCaRegistrationV2Round1Response>>();
+        for (const res of round1Forwarded) {
+          if (res.kind === "rejected") {
+            return reply.code(502).send({
+              error: "round1_forward_rejected",
+              slot: res.slot,
+              requestId,
+              reason:
+                res.reason instanceof Error ? res.reason.message : String(res.reason),
+            });
+          }
+          if (!res.value.ok || !res.value.body) {
+            return reply.code(502).send({
+              error: "round1_forward_failed",
+              slot: res.slot,
+              statusCode: res.value.statusCode,
+              body: res.value.body,
+              requestId,
+            });
+          }
+          let parsed;
+          try {
+            parsed = parseCaRegistrationV2Round1Response(res.value.body);
+          } catch (err) {
+            return reply.code(502).send({
+              error: "round1_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: err instanceof Error ? err.message : "unknown",
+            });
+          }
+          // Defense in depth: cross-check worker_transcript_hash matches our TS-side reconstruction.
+          const expectedWorkerHash = caRegistrationV2Round1WorkerTranscriptHash({
+            sessionId,
+            requestId: requestId!,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashInput,
+            rosterHash: dkgRosterHash,
+            sortedSelectedSlots,
+            selfSlot: res.slot,
+            playerId: sortedSelectedSlots.indexOf(res.slot),
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            commitmentHex: parsed.commitmentHex,
+            nonceId: parsed.nonceId,
+          });
+          if (parsed.workerTranscriptHash !== expectedWorkerHash) {
+            return reply.code(502).send({
+              error: "round1_worker_transcript_hash_mismatch",
+              slot: res.slot,
+              requestId,
+              expected: expectedWorkerHash,
+              actual: parsed.workerTranscriptHash,
+            });
+          }
+          round1ResponsesBySlot.set(res.slot, parsed);
+        }
+
+        // ---------- Compute aggregate commitment + challenge ----------
+        // Hit the verifier-slot worker's aggregate endpoint with PLACEHOLDER responses
+        // (zero scalars) just to get the aggregateCommitment + challenge. We don't have
+        // real responses yet — we need the challenge BEFORE round2. We can't use the
+        // unified aggregate endpoint (which also runs verify), so we use the V1
+        // /worker/v2/ca/registration/challenge endpoint which does aggregate-commitment +
+        // challenge ONLY (share-independent public compute, identical math).
+        const verifierSlot = sortedSelectedSlots[0];
+        const commitmentsForAggregate = sortedSelectedSlots.map((slot) => ({
+          slot,
+          commitment: round1ResponsesBySlot.get(slot)!.commitmentHex,
+        }));
+        const challengeForwarded = await singleNodeForwarder(
+          "/worker/v2/ca/registration/challenge",
+          {
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            commitments: commitmentsForAggregate,
+          },
+          dkgRoster,
+          verifierSlot,
+        );
+        if (!challengeForwarded.ok || !challengeForwarded.body) {
+          return reply.code(502).send({
+            error: "challenge_forward_failed",
+            slot: verifierSlot,
+            statusCode: challengeForwarded.statusCode,
+            body: challengeForwarded.body,
+            requestId,
+          });
+        }
+        const challengeBody = challengeForwarded.body as Record<string, unknown>;
+        const aggregateCommitmentInterim =
+          typeof challengeBody.aggregateCommitment === "string"
+            ? challengeBody.aggregateCommitment
+            : undefined;
+        const challenge =
+          typeof challengeBody.challenge === "string" ? challengeBody.challenge : undefined;
+        if (!aggregateCommitmentInterim || !challenge) {
+          return reply.code(502).send({
+            error: "challenge_returned_incomplete",
+            slot: verifierSlot,
+            requestId,
+          });
+        }
+
+        // ---------- Round 2: partial-response fan-out (concurrent) ----------
+        const round2Bodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
+          dkgEpoch,
+          requestId: requestId!,
+          sessionId,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selfSlot: slot,
+          playerId: ordinalIndex,
+          nonceId: round1ResponsesBySlot.get(slot)!.nonceId,
+          challenge,
+        }));
+        const round2Forwarded = await Promise.all(
+          sortedSelectedSlots.map((slot, ordinalIndex) =>
+            singleNodeForwarder(
+              "/worker/v2/derive/ca_registration/round2",
+              round2Bodies[ordinalIndex],
+              dkgRoster,
+              slot,
+            ).then(
+              (value) => ({ kind: "value" as const, slot, value }),
+              (reason) => ({ kind: "rejected" as const, slot, reason }),
+            ),
+          ),
+        );
+        const round2ResponsesBySlot = new Map<number, ReturnType<typeof parseCaRegistrationV2Round2Response>>();
+        for (const res of round2Forwarded) {
+          if (res.kind === "rejected") {
+            return reply.code(502).send({
+              error: "round2_forward_rejected",
+              slot: res.slot,
+              requestId,
+              reason:
+                res.reason instanceof Error ? res.reason.message : String(res.reason),
+            });
+          }
+          if (!res.value.ok || !res.value.body) {
+            return reply.code(502).send({
+              error: "round2_forward_failed",
+              slot: res.slot,
+              statusCode: res.value.statusCode,
+              body: res.value.body,
+              requestId,
+            });
+          }
+          let parsed;
+          try {
+            parsed = parseCaRegistrationV2Round2Response(res.value.body);
+          } catch (err) {
+            return reply.code(502).send({
+              error: "round2_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: err instanceof Error ? err.message : "unknown",
+            });
+          }
+          const expectedWorkerHash = caRegistrationV2Round2WorkerTranscriptHash({
+            sessionId,
+            requestId: requestId!,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashInput,
+            sortedSelectedSlots,
+            selfSlot: res.slot,
+            playerId: sortedSelectedSlots.indexOf(res.slot),
+            nonceId: round1ResponsesBySlot.get(res.slot)!.nonceId,
+            challenge,
+            responseHash: parsed.responseHash,
+          });
+          if (parsed.workerTranscriptHash !== expectedWorkerHash) {
+            return reply.code(502).send({
+              error: "round2_worker_transcript_hash_mismatch",
+              slot: res.slot,
+              requestId,
+              expected: expectedWorkerHash,
+              actual: parsed.workerTranscriptHash,
+            });
+          }
+          round2ResponsesBySlot.set(res.slot, parsed);
+        }
+
+        // ---------- Final aggregate + verify ----------
+        const responsesForAggregate = sortedSelectedSlots.map((slot) => ({
+          slot,
+          response: round2ResponsesBySlot.get(slot)!.responseHex,
+        }));
+        const aggregateForwarded = await singleNodeForwarder(
+          "/worker/v2/derive/ca_registration/aggregate",
+          {
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            commitments: commitmentsForAggregate,
+            responses: responsesForAggregate,
+          },
+          dkgRoster,
+          verifierSlot,
+        );
+        if (!aggregateForwarded.ok || !aggregateForwarded.body) {
+          // The worker returns a non-200 specifically on `verify_registration_proof`
+          // failure (the public equation didn't hold). Map this to 502
+          // aggregate_proof_invalid for the operator-runbook contract.
+          const body = aggregateForwarded.body as Record<string, unknown> | undefined;
+          if (
+            body &&
+            typeof body.message === "string" &&
+            body.message.includes("registration sigma proof verification failed")
+          ) {
+            return reply.code(502).send({
+              error: "aggregate_proof_invalid",
+              slot: verifierSlot,
+              requestId,
+              message: body.message,
+            });
+          }
+          return reply.code(502).send({
+            error: "aggregate_forward_failed",
+            slot: verifierSlot,
+            statusCode: aggregateForwarded.statusCode,
+            body: aggregateForwarded.body,
+            requestId,
+          });
+        }
+        const aggregateBody = aggregateForwarded.body as Record<string, unknown>;
+        const aggregateCommitment =
+          typeof aggregateBody.aggregateCommitment === "string"
+            ? aggregateBody.aggregateCommitment
+            : undefined;
+        const aggregateResponse =
+          typeof aggregateBody.aggregateResponse === "string"
+            ? aggregateBody.aggregateResponse
+            : undefined;
+        const aggregateChallenge =
+          typeof aggregateBody.challenge === "string" ? aggregateBody.challenge : undefined;
+        if (!aggregateCommitment || !aggregateResponse || !aggregateChallenge) {
+          return reply.code(502).send({
+            error: "aggregate_returned_incomplete",
+            slot: verifierSlot,
+            requestId,
+          });
+        }
+        // Cross-check: aggregate commitment + challenge from round-2-prep must match the
+        // values from the final aggregate call. If they differ, the verifier worker
+        // disagreed with itself between calls — fail closed.
+        if (
+          aggregateCommitment.toLowerCase() !== aggregateCommitmentInterim.toLowerCase()
+        ) {
+          return reply.code(502).send({
+            error: "aggregate_commitment_mismatch_between_calls",
+            requestId,
+            interim: aggregateCommitmentInterim,
+            final: aggregateCommitment,
+          });
+        }
+        if (aggregateChallenge.toLowerCase() !== challenge.toLowerCase()) {
+          return reply.code(502).send({
+            error: "challenge_mismatch_between_calls",
+            requestId,
+            interim: challenge,
+            final: aggregateChallenge,
+          });
+        }
+
+        // ---------- Build + persist transcript artifact ----------
+        const perSlotContributions: CaRegistrationV2Contribution[] = sortedSelectedSlots.map(
+          (slot) => ({
+            slot,
+            commitmentHex: round1ResponsesBySlot.get(slot)!.commitmentHex,
+            responseHex: round2ResponsesBySlot.get(slot)!.responseHex,
+            workerRound1TranscriptHash: round1ResponsesBySlot.get(slot)!.workerTranscriptHash,
+            workerRound2TranscriptHash: round2ResponsesBySlot.get(slot)!.workerTranscriptHash,
+          }),
+        );
+        const transcript = assembleCaRegistrationV2Transcript({
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          verifierSlot,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment,
+          aggregateResponse,
+          challenge,
+          perSlotContributions,
+        });
+        const transcriptArtifact = {
+          ...transcript,
+          selectionRationale,
+          requestId,
+          createdAtUnixMs: Date.now(),
+        };
+
+        let transcriptPath: string | undefined;
+        if (opts.stateRoot) {
+          const dir = join(opts.stateRoot, "coordinator", "ca_registration_v2");
+          transcriptPath = join(dir, `${dkgEpoch}__${requestId}.json`);
+          await writeTranscriptArtifactAtomic(transcriptPath, transcriptArtifact);
+        }
+        await store.recordPartialArtifact({
+          requestId,
+          sessionId,
+          rosterHash: dkgRosterHash,
+          slot: verifierSlot,
+          artifactKind: "ca-registration",
+          artifactHash: transcript.transcriptHash,
+          transcriptHash: transcript.transcriptHash,
+        });
+        await store.markComplete(requestId);
+
+        return reply.code(200).send({
+          accepted: true,
+          requestId,
+          dkgEpoch,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selectionRationale,
+          verifierSlot,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment,
+          aggregateResponse,
+          challenge,
+          transcriptHash: transcript.transcriptHash,
+          transcriptPath,
+        });
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      if (requestId) await store.markAborted(requestId);
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof CaRegistrationV2Error) {
         return reply.code(400).send({ error: err.code, message: err.message });
       }
       return reply.code(400).send({

@@ -29,7 +29,9 @@ use eunoma_crypto_worker::vault_ek_derivation_v2::{
 };
 use eunoma_crypto_worker::ca_registration_v2::{
     create_registration_nonce_commitment_v2, create_registration_partial_response_v2,
-    run_verify_v2 as run_ca_registration_v2_verify, Round1Request as CaRegistrationV2Round1Request,
+    run_aggregate_v2 as run_ca_registration_v2_aggregate,
+    run_verify_v2 as run_ca_registration_v2_verify, AggregateRequest as CaRegistrationV2AggregateRequest,
+    Round1Request as CaRegistrationV2Round1Request,
     Round2Request as CaRegistrationV2Round2Request, VerifyRequest as CaRegistrationV2VerifyRequest,
 };
 use serde::Deserialize;
@@ -134,6 +136,10 @@ async fn main() {
         .route(
             "/worker/v2/derive/ca_registration/verify",
             post(ca_registration_v2_verify),
+        )
+        .route(
+            "/worker/v2/derive/ca_registration/aggregate",
+            post(ca_registration_v2_aggregate),
         )
         .with_state(app_state);
 
@@ -902,6 +908,15 @@ async fn ca_registration_v2_verify(
     Json(body): Json<CaRegistrationV2VerifyRequest>,
 ) -> (StatusCode, Json<Value>) {
     match run_ca_registration_v2_verify(&body) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => worker_error_response(err),
+    }
+}
+
+async fn ca_registration_v2_aggregate(
+    Json(body): Json<CaRegistrationV2AggregateRequest>,
+) -> (StatusCode, Json<Value>) {
+    match run_ca_registration_v2_aggregate(&body) {
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => worker_error_response(err),
     }
