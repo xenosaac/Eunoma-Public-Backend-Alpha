@@ -5447,6 +5447,26 @@ pub mod vault_state_v2 {
     /// digest. ALL 5 workers + the coordinator MUST agree on this single value — it's what
     /// downstream MPCCA withdraw rounds gate on.
     pub(crate) const FINAL_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_STATE_V2_FINAL_V1";
+    /// Codex M3a P1 v4 (canonical vault_state_hash): replaces the pre-v4 definition of
+    /// `vault_state_hash = sha256(on-disk file bytes)`. The pre-v4 value MUTATED on finalize
+    /// (which sets `init_transcript_hash`) and on observe-deposit (which bumps
+    /// `deposit_count_observed`). A coordinator re-running init across a partial-finalize
+    /// boundary would receive DIFFERENT `vault_state_hash` values from finalized vs not-yet-
+    /// finalized slots; the recomputed FINAL_V1 transcript hash would diverge from the
+    /// original; already-finalized workers would then reject the new final hash via
+    /// `vault_state_v2_finalize_already_pinned_with_different_value`. Recovery from a
+    /// partial finalize was IMPOSSIBLE.
+    ///
+    /// v4 fix: define `vault_state_hash` as a hash over a CANONICAL SUBSET of immutable
+    /// fields — everything that's frozen at init time + `worker_transcript_hash` (which is
+    /// itself frozen at init). EXCLUDED fields: `init_transcript_hash`, `deposit_count_observed`,
+    /// `vault_sequence`, `created_at_unix_ms` (immutable but not part of the binding —
+    /// timing skew across worker boots shouldn't perturb the hash).
+    ///
+    /// The on-disk file STILL contains every field for state-machine + audit, but the HASH
+    /// returned to the coordinator is now byte-stable across init → finalize → observe-deposit
+    /// → withdraw lifecycles. This is the load-bearing fix for partial-finalize recovery.
+    pub(crate) const VAULT_STATE_HASH_DOMAIN: &str = "EUNOMA_VAULT_STATE_V2_STATE_HASH_V1";
     pub(crate) const VAULT_STATE_FILE_NAME: &str = "vault_state_v2.json";
 
     /// Request shape for `/worker/v2/vault_state/init`. Each of the 5 selected workers receives
@@ -5729,6 +5749,84 @@ pub mod vault_state_v2 {
         sha256_hex(&bytes)
     }
 
+    /// Codex M3a P1 v4 (canonical vault_state_hash): hash a CANONICAL SUBSET of the on-disk
+    /// `VaultStateFile` consisting ONLY of fields that are immutable across the init/finalize/
+    /// observe-deposit lifecycle. The output is what `init_vault_state_v2`,
+    /// `finalize_vault_state_v2`, and `observe_deposit_v2` return as `vault_state_hash` — and
+    /// what the coordinator pins into per-slot finalize contributions when rebuilding the
+    /// FINAL_V1 transcript.
+    ///
+    /// EXCLUDED fields (mutate across lifecycle):
+    ///   - `init_transcript_hash` (mutated by finalize)
+    ///   - `deposit_count_observed` (mutated by observe-deposit)
+    ///   - `vault_sequence` (mutated by withdraw, future M3b/M4)
+    ///   - `created_at_unix_ms` (immutable, but a per-boot timestamp shouldn't bind into a
+    ///     hash that must be reproducible from public state)
+    ///
+    /// INCLUDED fields (all frozen at init time):
+    ///   - scheme, slot, player_id
+    ///   - dkg_epoch
+    ///   - ca_dkg_transcript_hash, vault_ek_transcript_hash, registration_transcript_hash,
+    ///     roster_hash
+    ///   - selected_slots (sorted at write time)
+    ///   - vault_ek_hex, sender_address, asset_type, chain_id
+    ///   - aggregate_commitment, aggregate_response, challenge
+    ///   - worker_transcript_hash (frozen at init by `init_worker_transcript_hash` — same
+    ///     value across init replays regardless of finalize state)
+    ///
+    /// Domain-separated by `VAULT_STATE_HASH_DOMAIN` so the output cannot be confused with
+    /// `worker_transcript_hash` (`INIT_TRANSCRIPT_DOMAIN`) or the final aggregated transcript
+    /// (`FINAL_TRANSCRIPT_DOMAIN`).
+    ///
+    /// Pre-v4 behaviour: `sha256_hex(&serde_json::to_vec_pretty(&layout))` — i.e. the SHA-256
+    /// of the on-disk JSON byte buffer. That value mutated on every finalize / observe-deposit,
+    /// making partial-finalize recovery impossible (codex M3a P1 v4 finding).
+    pub fn compute_vault_state_hash_canonical(file: &VaultStateFile) -> String {
+        let joined = file
+            .selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(VAULT_STATE_HASH_DOMAIN.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.scheme.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.player_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.ca_dkg_transcript_hash.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.vault_ek_transcript_hash.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.registration_transcript_hash.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.roster_hash.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.vault_ek_hex.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.sender_address.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.asset_type.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.chain_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.aggregate_commitment.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.aggregate_response.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.challenge.to_lowercase().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(file.worker_transcript_hash.to_lowercase().as_bytes());
+        sha256_hex(&bytes)
+    }
+
     /// Codex M3a P1 (regression fix): request for `/worker/v2/vault_state/init/finalize`. The
     /// coordinator computes the FINAL transcript hash by aggregating the 5 per-slot init
     /// contributions, then fans this body out to all 5 selected workers so each worker can
@@ -5920,11 +6018,6 @@ pub mod vault_state_v2 {
                     "vault_state_v2 file present but load returned None".to_string(),
                 )
             })?;
-            // Re-read raw bytes for the idempotent vault_state_hash. The migration in
-            // `load_vault_state_v2` may have rewritten them, so we re-fetch them post-migration.
-            let raw = fs::read(&file_path).map_err(|err| {
-                WorkerError::Crypto(format!("read existing vault_state_v2 file: {err}"))
-            })?;
             if existing.scheme != "vault_state_v2" {
                 return Err(WorkerError::InvalidDkgState(
                     "vault_state_v2_unexpected_scheme_on_disk".to_string(),
@@ -5950,7 +6043,16 @@ pub mod vault_state_v2 {
                     "vault_state_v2_already_initialized_with_different_inputs".to_string(),
                 ));
             }
-            let vault_state_hash = sha256_hex(&raw);
+            // Codex M3a P1 v4 (canonical vault_state_hash): hash the immutable subset of
+            // `existing`, NOT the raw file bytes. Pre-v4, this hashed the on-disk JSON buffer
+            // — which mutated whenever `finalize_vault_state_v2` set `init_transcript_hash`
+            // or `observe_deposit_v2` bumped `deposit_count_observed`. A coordinator re-running
+            // init after a partial finalize would receive DIFFERENT vault_state_hash values
+            // from finalized vs not-yet-finalized slots, so the recomputed FINAL_V1 transcript
+            // would diverge from the original and already-finalized workers would reject the
+            // retry. With v4 the value is byte-stable across the full init/finalize/observe
+            // lifecycle, so partial-finalize recovery is now genuinely retryable.
+            let vault_state_hash = compute_vault_state_hash_canonical(&existing);
             // Codex M3a P1 v3 (partial-finalize recovery): return the FROZEN per-slot
             // `worker_transcript_hash` from disk. This value is set at init time and NEVER
             // overwritten — not by finalize, not by observe_deposit. A coordinator re-running
@@ -6034,15 +6136,19 @@ pub mod vault_state_v2 {
             // "tampered request".
             init_transcript_hash: None,
         };
-        // pretty-print so the file is human-auditable. JSON canonicalisation isn't needed for
-        // the integrity hash because `vault_state_hash` is over the EXACT byte buffer the worker
-        // both wrote AND returned (and 2b will compute it again on read), so any future caller
-        // that wants to verify integrity can read the file byte-for-byte and re-hash.
+        // pretty-print so the file is human-auditable. Codex M3a P1 v4: the `vault_state_hash`
+        // returned to the caller is NO LONGER the SHA-256 of the on-disk byte buffer (that
+        // mutated on finalize / observe-deposit and made partial-finalize recovery impossible).
+        // It's now computed via `compute_vault_state_hash_canonical` over the IMMUTABLE field
+        // subset — byte-stable across the full init/finalize/observe lifecycle.
         let bytes = serde_json::to_vec_pretty(&layout)
             .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;
         write_secret_file(&file_path, &bytes)?;
 
-        let vault_state_hash = sha256_hex(&bytes);
+        // Codex M3a P1 v4 (canonical vault_state_hash): compute over the IMMUTABLE field
+        // subset of `layout` so init replays after finalize/observe-deposit return the same
+        // value. See `compute_vault_state_hash_canonical` for the field list.
+        let vault_state_hash = compute_vault_state_hash_canonical(&layout);
         Ok(InitResult {
             slot: req.self_slot,
             player_id: req.player_id,
@@ -6305,12 +6411,13 @@ pub mod vault_state_v2 {
         match existing.init_transcript_hash.as_deref() {
             Some(persisted) if persisted.to_lowercase() == claimed_final.to_lowercase() => {
                 // Idempotent replay: same canonical value. No write.
-                let raw = fs::read(&file_path).map_err(|err| {
-                    WorkerError::Crypto(format!(
-                        "read vault_state_v2 file for idempotent finalize: {err}"
-                    ))
-                })?;
-                let vault_state_hash = sha256_hex(&raw);
+                // Codex M3a P1 v4 (canonical vault_state_hash): compute over the immutable
+                // field subset rather than re-reading the file bytes. The immutable subset of
+                // `existing` is unchanged between the first finalize write and this replay, so
+                // the hash matches what the first finalize returned. The pre-v4 sha256(raw)
+                // would also have matched here in isolation — but the broader cross-slot
+                // partial-finalize recovery story required the canonical form everywhere.
+                let vault_state_hash = compute_vault_state_hash_canonical(&existing);
                 return Ok(FinalizeResult {
                     slot: req.self_slot,
                     player_id: req.player_id,
@@ -6365,7 +6472,12 @@ pub mod vault_state_v2 {
         // by design). The provenance + identity gates above guarantee the new content is a
         // strict supersession that only touches `init_transcript_hash`.
         write_secret_file_replace(&file_path, &bytes)?;
-        let vault_state_hash = sha256_hex(&bytes);
+        // Codex M3a P1 v4 (canonical vault_state_hash): compute over the IMMUTABLE field
+        // subset of `updated`. `init_transcript_hash` is EXCLUDED from the canonical hash —
+        // it just landed on this slot but other slots in the cluster may not have finalized
+        // yet, and a coordinator re-running init must collect the SAME vault_state_hash from
+        // every slot regardless of finalize state. See `compute_vault_state_hash_canonical`.
+        let vault_state_hash = compute_vault_state_hash_canonical(&updated);
         Ok(FinalizeResult {
             slot: req.self_slot,
             player_id: req.player_id,
@@ -6802,7 +6914,12 @@ pub mod vault_state_v2 {
         // is a strict supersession of the existing file.
         write_secret_file_replace(&file_path, &bytes)?;
 
-        let vault_state_hash = sha256_hex(&bytes);
+        // Codex M3a P1 v4 (canonical vault_state_hash): EXCLUDES `deposit_count_observed`,
+        // so observe-deposit's cursor bump leaves `vault_state_hash` unchanged across calls.
+        // The OBSERVE_TRANSCRIPT_DOMAIN-rooted `worker_transcript_hash` returned below DOES
+        // bind the new cursor — that's the per-observe domain. The vault-state binding stays
+        // stable for partial-finalize recovery.
+        let vault_state_hash = compute_vault_state_hash_canonical(&updated);
         let worker_transcript_hash = observe_worker_transcript_hash(
             &req.session_id,
             &req.request_id,
