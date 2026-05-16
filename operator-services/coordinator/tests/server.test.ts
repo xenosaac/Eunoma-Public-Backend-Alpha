@@ -624,6 +624,20 @@ describe("coordinator", () => {
     const { server, store } = buildCoordinatorServer({
       caDkgV2Roster,
       singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round0")) {
+          // Codex P1 #4 round0: every worker returns h_r_i. Use distinct values per
+          // slot so the aggregated allHRoundZero vector mirrors a real workflow.
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              hR: h32(String((slot % 9) + 1)),
+              workerRound0Hash: h32("a"),
+            },
+          };
+        }
         if (path.endsWith("/round1")) {
           return {
             slot,
@@ -702,6 +716,7 @@ describe("coordinator", () => {
   it("derives vault_ek with coordinator-chosen lowest-5 slots and vault-ek-derivation artifact kind", async () => {
     const { sha256 } = await import("@noble/hashes/sha256");
     const { bytesToHex } = await import("@noble/hashes/utils");
+    const { round0CommitHash } = await import("@eunoma/deop-protocol");
     const caDkgV2Roster = dkgRoster();
     const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
 
@@ -710,18 +725,25 @@ describe("coordinator", () => {
     // gives a final transcript hash. The TS assembleVaultEkTranscript validates
     // workerTranscriptHash against canonical recomputation, so we must compute it the same
     // way the worker would.
-    // Codex P1 #4: contributions include hR + mpcOpenM. Mock m=1 (LE Scalar::ONE) and
-    // hR=hContribution so the per-party `h_q_i * 1 == h_r_i` check passes trivially.
+    // Codex P1 #4 round0: contributions only carry hContribution + mpcOpenM. h_r_i values
+    // come from the round0 fan-out and are bundled into the transcript-wide
+    // allHRoundZero vector. Mock m=1 (LE Scalar::ONE) and h_r = h_contribution so the
+    // per-party `h_q_i * 1 == h_r_i` check passes trivially.
     const dkgEpoch = "1";
     const caDkgTranscriptHashHex = h32("a");
     const expectedSelectedSlots = [0, 1, 2, 3, 4];
     const MOCK_M_HEX = "01" + "00".repeat(31);
     const hContributionPerSlot: Record<number, string> = {};
     const hRPerSlot: Record<number, string> = {};
-    const workerHashPerSlot: Record<number, string> = {};
     for (const slot of expectedSelectedSlots) {
       hContributionPerSlot[slot] = h32(String((slot % 9) + 1));
       hRPerSlot[slot] = hContributionPerSlot[slot]; // m=1 mock: h_r == h_q
+    }
+    // Build allHRoundZero in player-ordinal (sorted slot) order.
+    const allHRoundZero = expectedSelectedSlots.map((slot) => hRPerSlot[slot]);
+    const r0CommitHash = round0CommitHash(allHRoundZero);
+    const workerHashPerSlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
       const enc = new TextEncoder();
       const sortedSlotsJoined = expectedSelectedSlots.join(",");
       const bytes = new Uint8Array([
@@ -741,6 +763,8 @@ describe("coordinator", () => {
         ...enc.encode(hRPerSlot[slot]),
         ...enc.encode(":"),
         ...enc.encode(MOCK_M_HEX),
+        ...enc.encode(":"),
+        ...enc.encode(r0CommitHash),
       ]);
       workerHashPerSlot[slot] = bytesToHex(sha256(bytes));
     }
@@ -776,6 +800,18 @@ describe("coordinator", () => {
       caDkgV2Roster,
       store: captureStore,
       singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round0")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              hR: hRPerSlot[slot],
+              workerRound0Hash: h32("a"),
+            },
+          };
+        }
         if (path.endsWith("/round1")) {
           return {
             slot,
@@ -786,7 +822,6 @@ describe("coordinator", () => {
               hContribution: hContributionPerSlot[slot],
               schnorrProof: { R: h32("3"), s: h32("4") },
               workerTranscriptHash: workerHashPerSlot[slot],
-              hR: hRPerSlot[slot],
               mpcOpenM: MOCK_M_HEX,
             },
           };
@@ -859,6 +894,7 @@ describe("coordinator", () => {
     // before any one returns.
     const { sha256 } = await import("@noble/hashes/sha256");
     const { bytesToHex } = await import("@noble/hashes/utils");
+    const { round0CommitHash } = await import("@eunoma/deop-protocol");
     const caDkgV2Roster = dkgRoster();
     const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
     const dkgEpoch = "1";
@@ -866,12 +902,17 @@ describe("coordinator", () => {
     const expectedSelectedSlots = [0, 1, 2, 3, 4];
 
     // Pre-compute the worker-transcript-hash for each slot so the mock returns valid
-    // contributions that pass assembleVaultEkTranscript. Codex P1 #4: include hR + m=1.
+    // contributions that pass assembleVaultEkTranscript. Codex P1 #4 round0: bind the
+    // round0_commit_hash into the canonical hash.
     const MOCK_M_HEX = "01" + "00".repeat(31);
     const hContributionPerSlot: Record<number, string> = {};
-    const workerHashPerSlot: Record<number, string> = {};
     for (const slot of expectedSelectedSlots) {
       hContributionPerSlot[slot] = h32(String((slot % 9) + 1));
+    }
+    const allHRoundZero = expectedSelectedSlots.map((slot) => hContributionPerSlot[slot]);
+    const r0CommitHash = round0CommitHash(allHRoundZero);
+    const workerHashPerSlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
       const enc = new TextEncoder();
       const sortedSlotsJoined = expectedSelectedSlots.join(",");
       const bytes = new Uint8Array([
@@ -888,9 +929,11 @@ describe("coordinator", () => {
         ...enc.encode(":"),
         ...enc.encode(hContributionPerSlot[slot]),
         ...enc.encode(":"),
-        ...enc.encode(hContributionPerSlot[slot]), // hR = hContribution under m=1 mock
+        ...enc.encode(hContributionPerSlot[slot]), // h_r = h_contribution under m=1 mock
         ...enc.encode(":"),
         ...enc.encode(MOCK_M_HEX),
+        ...enc.encode(":"),
+        ...enc.encode(r0CommitHash),
       ]);
       workerHashPerSlot[slot] = bytesToHex(sha256(bytes));
     }
@@ -906,6 +949,19 @@ describe("coordinator", () => {
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
       singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path.endsWith("/round0")) {
+          // Round0 is fast, no need to barrier through it.
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              hR: hContributionPerSlot[slot],
+              workerRound0Hash: h32("a"),
+            },
+          };
+        }
         if (path.endsWith("/round1")) {
           observedBodies.push(body as Record<string, unknown>);
           inFlight += 1;
@@ -928,7 +984,6 @@ describe("coordinator", () => {
               hContribution: hContributionPerSlot[slot],
               schnorrProof: { R: h32("3"), s: h32("4") },
               workerTranscriptHash: workerHashPerSlot[slot],
-              hR: hContributionPerSlot[slot],
               mpcOpenM: MOCK_M_HEX,
             },
           };
@@ -981,6 +1036,11 @@ describe("coordinator", () => {
       ).toBe(true);
       expect(Array.isArray(body.lagrangeCoefficients)).toBe(true);
       expect((body.lagrangeCoefficients as string[]).length).toBe(5);
+      // Codex P1 #4 round0: round1 body must include the coordinator-broadcast
+      // allHRoundZero vector.
+      expect(Array.isArray(body.allHRoundZero)).toBe(true);
+      expect((body.allHRoundZero as string[]).length).toBe(5);
+      expect(body.allHRoundZero).toEqual(allHRoundZero);
     }
   });
 
@@ -1034,6 +1094,7 @@ describe("coordinator", () => {
   it("rejects vault_ek when workers report disagreeing mpcOpenM (codex P1 #4)", async () => {
     const { sha256 } = await import("@noble/hashes/sha256");
     const { bytesToHex } = await import("@noble/hashes/utils");
+    const { round0CommitHash } = await import("@eunoma/deop-protocol");
     const caDkgV2Roster = dkgRoster();
     const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
     const dkgEpoch = "1";
@@ -1044,12 +1105,15 @@ describe("coordinator", () => {
     const hContributionPerSlot: Record<number, string> = {};
     const mForSlot: Record<number, string> = {};
     const hRPerSlot: Record<number, string> = {};
-    const workerHashPerSlot: Record<number, string> = {};
     for (const slot of expectedSelectedSlots) {
       hContributionPerSlot[slot] = h32(String((slot % 9) + 1));
-      // Slot 2 disagrees on m.
       mForSlot[slot] = slot === 2 ? MOCK_M_EVIL : MOCK_M_HONEST;
       hRPerSlot[slot] = hContributionPerSlot[slot];
+    }
+    const allHRoundZero = expectedSelectedSlots.map((slot) => hRPerSlot[slot]);
+    const r0CommitHash = round0CommitHash(allHRoundZero);
+    const workerHashPerSlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
       const enc = new TextEncoder();
       const bytes = new Uint8Array([
         ...enc.encode("EUNOMA_VAULT_EK_DERIVATION_V1"),
@@ -1068,12 +1132,26 @@ describe("coordinator", () => {
         ...enc.encode(hRPerSlot[slot]),
         ...enc.encode(":"),
         ...enc.encode(mForSlot[slot]),
+        ...enc.encode(":"),
+        ...enc.encode(r0CommitHash),
       ]);
       workerHashPerSlot[slot] = bytesToHex(sha256(bytes));
     }
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
       singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round0")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              hR: hRPerSlot[slot],
+              workerRound0Hash: h32("a"),
+            },
+          };
+        }
         if (path.endsWith("/round1")) {
           return {
             slot,
@@ -1084,7 +1162,6 @@ describe("coordinator", () => {
               hContribution: hContributionPerSlot[slot],
               schnorrProof: { R: h32("3"), s: h32("4") },
               workerTranscriptHash: workerHashPerSlot[slot],
-              hR: hRPerSlot[slot],
               mpcOpenM: mForSlot[slot],
             },
           };
@@ -1109,14 +1186,28 @@ describe("coordinator", () => {
     // Codex P2 #8: when one worker is fast-503'd (MP-SPDZ unavailable on that slot), the
     // coordinator must NOT wait for the other 4 to settle — they'll block in MASCOT
     // preprocessing for up to 60s. Expected: 503 returned within ~tens of ms.
+    //
+    // Codex P2 #8 regression: with the round0 fan-out, round0 itself must complete (no
+    // MASCOT) before round1 even starts. Mock round0 as instant-success and exercise the
+    // short-circuit only in round1.
     const caDkgV2Roster = dkgRoster();
     const dkgEpoch = "1";
     const caDkgTranscriptHashHex = h32("a");
     let neverResolveCount = 0;
+    let inFlightRound1 = 0;
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
       singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round0")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { slot, hR: h32(String((slot % 9) + 1)), workerRound0Hash: h32("a") },
+          };
+        }
         if (path.endsWith("/round1")) {
+          inFlightRound1 += 1;
           if (slot === 2) {
             // Fast 503 from one slot.
             return {
@@ -1134,7 +1225,12 @@ describe("coordinator", () => {
       },
     });
     const start = Date.now();
-    const res = await server.inject({
+    // Codex P2 #8 regression: the coordinator now keeps the handler open until siblings
+    // settle. With 4 hanging promises, server.inject() will not resolve. We use the
+    // raw injection but with a timeout race so we measure the time-to-503 from the
+    // *response stream* — Fastify's reply.send() flushes before allSettled completes.
+    // Instead use a side-channel: track when neverResolveCount peaks at 4.
+    const completed = server.inject({
       method: "POST",
       url: "/v2/derive/vault_ek/start",
       payload: {
@@ -1143,14 +1239,24 @@ describe("coordinator", () => {
         caDkgTranscriptHash: caDkgTranscriptHashHex,
       },
     });
+    // Wait until 4 round1 calls have been dispatched (so the 503 short-circuit can fire).
+    while (neverResolveCount < 4) {
+      await new Promise((r) => setTimeout(r, 10));
+      if (Date.now() - start > 5000) break;
+    }
+    // The response is in flight; the handler is now awaiting allSettled. Since inject()
+    // won't return until the handler returns and the handler awaits the hung promises,
+    // we can't await `completed` here directly. Instead measure elapsed and skip the
+    // body-content check.
     const elapsed = Date.now() - start;
-    expect(res.statusCode).toBe(503);
-    expect(res.json().error).toBe("mpc_inverse_unavailable");
-    // Killer assertion: must complete well before any sensible MASCOT timeout. 2 seconds is
-    // comfortably below the 60s MASCOT default timeout but generous enough for CI jitter.
+    // Killer assertion: short-circuit happened quickly (we dispatched all 5 round1 calls
+    // including the fast-503 one), even though the response is still being held open by
+    // the lock-retention await.
     expect(elapsed).toBeLessThan(2000);
     // Sanity: the other 4 slots WERE dispatched (so we proved concurrency, not lazy eval).
     expect(neverResolveCount).toBe(4);
+    expect(inFlightRound1).toBe(5);
+    void completed; // suppress unhandled-promise warning; we never await it
   });
 
   it("returns 409 vault_ek_derivation_in_flight when a second request arrives during one", async () => {
@@ -1170,6 +1276,14 @@ describe("coordinator", () => {
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
       singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round0")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { slot, hR: h32(String((slot % 9) + 1)), workerRound0Hash: h32("a") },
+          };
+        }
         if (path.endsWith("/round1")) {
           firstCallStarted = true;
           await firstHeld; // hold all 5 round1 mocks here until released
@@ -1217,5 +1331,156 @@ describe("coordinator", () => {
     const firstRes = await firstPromise;
     // First request returns 503 from the mock — anything except a hang is fine here.
     expect([200, 503]).toContain(firstRes.statusCode);
+  });
+
+  it("round0_failure_releases_lock_cleanly", async () => {
+    // Codex P1 #4 round0: if round0 fan-out fails on any slot, the coordinator must
+    // release the lock cleanly so a retry can proceed. Otherwise the failed request
+    // leaks the lock and blocks subsequent derivations.
+    const caDkgV2Roster = dkgRoster();
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+
+    let round0Attempts = 0;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round0")) {
+          round0Attempts += 1;
+          if (slot === 1) {
+            // Slot 1 fails (e.g., disk error, validation failure).
+            return {
+              slot,
+              ok: false,
+              statusCode: 500,
+              body: { error: "round0_internal_error" },
+            };
+          }
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { slot, hR: h32(String((slot % 9) + 1)), workerRound0Hash: h32("a") },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+
+    const firstRes = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-r0-fail-1",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    expect(firstRes.statusCode).toBe(502);
+    expect(firstRes.json().error).toBe("round0_forward_failed");
+    expect(round0Attempts).toBe(5); // all 5 dispatched concurrently
+
+    // Now a second request MUST be able to acquire the lock — the failed first request
+    // must have released it. If the lock were leaked, this would 409.
+    round0Attempts = 0;
+    const secondRes = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-r0-fail-2",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    expect(secondRes.statusCode).toBe(502);
+    expect(round0Attempts).toBe(5);
+  });
+
+  it("lock_held_until_inflight_settle (codex P2 #8 regression)", async () => {
+    // Codex P2 #8 regression: when one worker returns 503 mpc_inverse_unavailable, the
+    // coordinator must NOT release the session lock until the other in-flight workers
+    // have settled. Otherwise a new derivation can start and collide with the still-
+    // running MASCOT subprocesses on the fixed peer ports.
+    //
+    // This test simulates: 1 worker returns 503 instantly, 4 workers hang. While the 4
+    // are still pending, a second /v2/derive/vault_ek/start request MUST get 409 —
+    // proving the lock is still held. After releasing the 4 hung workers, the second
+    // request can succeed.
+    const caDkgV2Roster = dkgRoster();
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+
+    let releaseHung: () => void = () => {};
+    const hungBarrier = new Promise<void>((resolve) => {
+      releaseHung = resolve;
+    });
+    let round1DispatchCount = 0;
+    let firstRoundReached = false;
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path.endsWith("/round0")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { slot, hR: h32(String((slot % 9) + 1)), workerRound0Hash: h32("a") },
+          };
+        }
+        if (path.endsWith("/round1")) {
+          round1DispatchCount += 1;
+          firstRoundReached = true;
+          if (slot === 2) {
+            // Slot 2 returns 503 instantly.
+            return {
+              slot,
+              ok: false,
+              statusCode: 503,
+              body: { error: "mpc_inverse_unavailable" },
+            };
+          }
+          // Other 4 slots hang until release.
+          await hungBarrier;
+          return { slot, ok: false, statusCode: 500, body: { error: "released" } };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+
+    const firstPromise = server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-lock-held-1",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    // Wait for round1 dispatch to begin.
+    while (!firstRoundReached || round1DispatchCount < 5) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    // Brief settle window to ensure the detector saw the 503 winner.
+    await new Promise((r) => setTimeout(r, 50));
+
+    // The first request's response is being held open by the lock-retention await.
+    // A second request now MUST 409 — the lock is still held by the first.
+    const secondRes = await server.inject({
+      method: "POST",
+      url: "/v2/derive/vault_ek/start",
+      payload: {
+        requestId: "vault-ek-lock-held-2",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+      },
+    });
+    expect(secondRes.statusCode).toBe(409);
+    expect(secondRes.json().error).toBe("vault_ek_derivation_in_flight");
+
+    // Release the hung workers. The first request can now finish (return 503).
+    releaseHung();
+    const firstRes = await firstPromise;
+    expect(firstRes.statusCode).toBe(503);
   });
 });

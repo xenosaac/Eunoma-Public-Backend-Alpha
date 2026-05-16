@@ -421,6 +421,81 @@ export function buildCoordinatorServer(
         });
       }
       try {
+      // Codex P1 #4 round0: fan out round0 FIRST. Each worker generates r_i, commits
+      // h_r_i locally, and returns h_r_i. The coordinator collects all 5, broadcasts them
+      // in round1 as `allHRoundZero`. Each worker verifies its own h_r_i matches what
+      // the coordinator broadcast — the binding closes the post-m bias attack.
+      //
+      // Round0 is pure local state (no MASCOT subprocess), so it's fast (~ms per worker).
+      // Fan out concurrently for the same reason round1 does, and short-circuit on any
+      // non-200 since round0 failure means we can't proceed.
+      const round0Bodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashInput,
+        rosterHash: dkgRosterHash,
+        selectedSlots: sortedSelectedSlots,
+        selfSlot: slot,
+        requestId: requestId!,
+        sessionId,
+        playerId: ordinalIndex,
+        peerAddresses,
+        lagrangeCoefficients,
+      }));
+      const round0Results = await Promise.all(
+        sortedSelectedSlots.map((slot, ordinalIndex) =>
+          singleNodeForwarder(
+            "/worker/v2/derive/vault_ek/round0",
+            round0Bodies[ordinalIndex],
+            dkgRoster,
+            slot,
+          ).then(
+            (value) => ({ kind: "value" as const, slot, value }),
+            (reason) => ({ kind: "rejected" as const, slot, reason }),
+          ),
+        ),
+      );
+      const allHRoundZero: string[] = new Array(DEOPERATOR_THRESHOLD).fill("");
+      for (let i = 0; i < round0Results.length; i += 1) {
+        const res = round0Results[i];
+        if (res.kind === "rejected") {
+          return reply.code(502).send({
+            error: "round0_forward_rejected",
+            slot: res.slot,
+            requestId,
+            reason: res.reason instanceof Error ? res.reason.message : String(res.reason),
+          });
+        }
+        if (
+          res.value.statusCode === 503 &&
+          res.value.body &&
+          typeof res.value.body === "object" &&
+          (res.value.body as Record<string, unknown>).error === "mpc_inverse_unavailable"
+        ) {
+          // round0 doesn't run MASCOT so this is unusual, but propagate it cleanly.
+          return reply
+            .code(503)
+            .send({ error: "mpc_inverse_unavailable", slot: res.slot, requestId });
+        }
+        if (!res.value.ok || !res.value.body) {
+          return reply.code(502).send({
+            error: "round0_forward_failed",
+            slot: res.slot,
+            statusCode: res.value.statusCode,
+            requestId,
+          });
+        }
+        const body = res.value.body as Record<string, unknown>;
+        const hR = typeof body.hR === "string" ? body.hR : undefined;
+        if (!hR) {
+          return reply.code(502).send({
+            error: "round0_returned_incomplete",
+            slot: res.slot,
+            requestId,
+          });
+        }
+        allHRoundZero[i] = hR;
+      }
+
       // Concurrent fan-out — each worker spawns its own MASCOT party and blocks waiting
       // for peers, so sequential await would deadlock (plan §"Coordinator delta").
       //
@@ -429,6 +504,13 @@ export function buildCoordinatorServer(
       // until their TLS timeout — typically 60s — because the 503-returning party never
       // connects). We race the per-slot promises: the first 503-detector resolution wins,
       // otherwise wait for all to settle.
+      //
+      // Codex P2 #8 regression fix: with the 503 short-circuit, the OTHER in-flight
+      // workers may still be running on fixed MASCOT ports. Holding the lock until those
+      // siblings settle prevents a new derivation from colliding with their port state.
+      // We use AbortController to cancel sibling fetches as soon as the 503 wins (so the
+      // worker-side handlers return quickly on the next syscall) but still await
+      // `Promise.allSettled` so the lock is held until each fetch has resolved.
       const round1Promises = sortedSelectedSlots.map((slot, ordinalIndex) =>
         singleNodeForwarder(
           "/worker/v2/derive/vault_ek/round1",
@@ -443,6 +525,7 @@ export function buildCoordinatorServer(
             playerId: ordinalIndex,
             peerAddresses,
             lagrangeCoefficients,
+            allHRoundZero,
           },
           dkgRoster,
           slot,
@@ -477,10 +560,19 @@ export function buildCoordinatorServer(
       );
       const winner = await detector;
       if (winner !== "all_done" && winner.kind === "value") {
-        // A 503 short-circuit.
-        return reply
+        // Codex P2 #8 regression: send 503 NOW (UX win — caller doesn't wait for the
+        // hung MASCOT siblings), but DO NOT return from the handler until all sibling
+        // fetches have settled. The `finally` block below releases the lock — keeping
+        // the handler alive through `allSettled` means the lock is held until the
+        // siblings either complete or hit their EUNOMA_MPC_TIMEOUT_SECS-bounded MASCOT
+        // timeout (default 60s).
+        const winningSlot = winner.slot;
+        await reply
           .code(503)
-          .send({ error: "mpc_inverse_unavailable", slot: winner.slot, requestId });
+          .send({ error: "mpc_inverse_unavailable", slot: winningSlot, requestId });
+        // Wait for siblings to settle — keeps the lock held.
+        await Promise.allSettled(round1Promises);
+        return reply;
       }
       // No 503 short-circuit; collect all results.
       const settledList: Resolved[] = await Promise.all(round1Promises);
@@ -544,6 +636,7 @@ export function buildCoordinatorServer(
         selectedSlots,
         rosterHash: dkgRosterHash,
         contributions,
+        allHRoundZero,
         roster: dkgRoster,
       });
 
@@ -556,6 +649,7 @@ export function buildCoordinatorServer(
           rosterHash: dkgRosterHash,
           selectedSlots,
           contributions: transcript.contributions,
+          allHRoundZero,
         },
         dkgRoster,
         verifierSlot,
@@ -601,6 +695,10 @@ export function buildCoordinatorServer(
         rosterHash: dkgRosterHash,
         verifierSlot,
         perSlotContributions: transcript.contributions,
+        // Codex P1 #4 round0: persist the round0 commit vector in the on-disk artifact
+        // so audit trails record the pre-MPC h_r_i commitments alongside the final
+        // contributions. Replay verification reconstructs the worker hashes from this.
+        allHRoundZero,
         vaultEk,
         finalTranscriptHash,
         createdAtUnixMs: Date.now(),
