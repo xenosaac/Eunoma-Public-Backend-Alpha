@@ -52,6 +52,7 @@ import {
 } from "@eunoma/deop-protocol";
 import { sha256, bytesToHex } from "@eunoma/shared";
 import { HttpError, requireBearer } from "@eunoma/shared";
+import { assertNoForbiddenPlaintextFields } from "@eunoma/deop-protocol";
 import { mkdir, rename, writeFile, chmod, readdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
@@ -1494,6 +1495,10 @@ export function buildCoordinatorServer(
     const raw = (req.body ?? {}) as Record<string, unknown>;
     let requestId: string | undefined;
     try {
+      // Forbidden-plaintext-field guard runs FIRST on the raw body. Catches any extra fields
+      // named secret/blind/dkShare/nullifier/etc. before any downstream code touches them.
+      // Mirrors the ca_registration_v2 orchestrator pattern.
+      assertNoForbiddenPlaintextFields(raw);
       const dkgRoster = raw.caDkgV2Roster
         ? parseCaDkgV2Roster(raw.caDkgV2Roster)
         : requireCaDkgV2Roster(opts.caDkgV2Roster);

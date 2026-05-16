@@ -1099,4 +1099,213 @@ describe("deoperator node", () => {
       globalThis.fetch = oldFetch;
     }
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Milestone 2 sub-milestone 2a: vault_state_v2/init passthrough — rosterHash + selfSlot gate,
+  // forbidden-field guard.
+  // ---------------------------------------------------------------------------------------------
+  it("vault_state_v2 init passthrough rejects mismatched rosterHash before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/vault_state/init",
+        payload: {
+          dkgEpoch: "1",
+          requestId: "vs-init-bogus",
+          sessionId: "vs-init-bogus",
+          caDkgTranscriptHash: h32("a"),
+          vaultEkTranscriptHash: h32("b"),
+          registrationTranscriptHash: h32("c"),
+          rosterHash: h32("9"), // bogus
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 0,
+          playerId: 0,
+          vaultEk: h32("d"),
+          senderAddress: h32("e"),
+          assetType: h32("f"),
+          chainId: 2,
+          aggregateCommitment: h32("1"),
+          aggregateResponse: h32("2"),
+          challenge: h32("3"),
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_state_v2 init passthrough rejects wrong selfSlot before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/vault_state/init",
+        payload: {
+          dkgEpoch: "1",
+          requestId: "vs-init-wrong-slot",
+          sessionId: "vs-init-wrong-slot",
+          caDkgTranscriptHash: h32("a"),
+          vaultEkTranscriptHash: h32("b"),
+          registrationTranscriptHash: h32("c"),
+          rosterHash: caDkgV2RosterHash(caDkgV2Roster),
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 4, // wrong: this node is slot 0
+          playerId: 4,
+          vaultEk: h32("d"),
+          senderAddress: h32("e"),
+          assetType: h32("f"),
+          chainId: 2,
+          aggregateCommitment: h32("1"),
+          aggregateResponse: h32("2"),
+          challenge: h32("3"),
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_state_v2 init passthrough rejects forbidden plaintext fields", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/vault_state/init",
+        payload: {
+          dkgEpoch: "1",
+          requestId: "vs-init-fb",
+          sessionId: "vs-init-fb",
+          caDkgTranscriptHash: h32("a"),
+          vaultEkTranscriptHash: h32("b"),
+          registrationTranscriptHash: h32("c"),
+          rosterHash: caDkgV2RosterHash(caDkgV2Roster),
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 0,
+          playerId: 0,
+          vaultEk: h32("d"),
+          senderAddress: h32("e"),
+          assetType: h32("f"),
+          chainId: 2,
+          aggregateCommitment: h32("1"),
+          aggregateResponse: h32("2"),
+          challenge: h32("3"),
+          dkShare: h32("9"), // FORBIDDEN
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("forbidden_plaintext_field");
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_state_v2 init passthrough forwards to local worker on valid body", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let forwardedPath: string | undefined;
+    let forwardedBody: Record<string, unknown> | undefined;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      forwardedPath = (url as URL | string).toString();
+      if (init?.body) forwardedBody = JSON.parse(init.body as string);
+      return new Response(
+        JSON.stringify({
+          slot: 0,
+          playerId: 0,
+          vaultStatePath: "/tmp/slot-0/vault_state_v2.json",
+          vaultStateHash: h32("a"),
+          workerTranscriptHash: h32("b"),
+          vaultSequence: 0,
+          depositCountObserved: 0,
+          createdAtUnixMs: 1_700_000_000_000,
+          initialized: true,
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const validBody = {
+        dkgEpoch: "1",
+        requestId: "vs-init-ok",
+        sessionId: "vs-init-ok",
+        caDkgTranscriptHash: h32("a"),
+        vaultEkTranscriptHash: h32("b"),
+        registrationTranscriptHash: h32("c"),
+        rosterHash: caDkgV2RosterHash(caDkgV2Roster),
+        selectedSlots: [0, 1, 2, 3, 4],
+        selfSlot: 0,
+        playerId: 0,
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        aggregateCommitment: h32("1"),
+        aggregateResponse: h32("2"),
+        challenge: h32("3"),
+      };
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/vault_state/init",
+        payload: validBody,
+      });
+      expect(res.statusCode).toBe(200);
+      expect(forwardedPath).toContain("/worker/v2/vault_state/init");
+      expect(forwardedBody?.selfSlot).toBe(0);
+      const body = res.json();
+      expect(body.initialized).toBe(true);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
 });

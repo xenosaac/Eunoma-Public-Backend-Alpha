@@ -2267,4 +2267,493 @@ describe("coordinator", () => {
     expect(res.json().error).toBe("vault_ek_provenance_mismatch");
     expect(workerCalled).toBe(false);
   });
+
+  // =============================================================================================
+  // Milestone 2 sub-milestone 2a: vault-state share initialization orchestrator tests.
+  // =============================================================================================
+  it("vault_state_v2 init concurrent fan-out to all 5 selected slots", async () => {
+    const { vaultStateV2InitWorkerTranscriptHash } = await import("@eunoma/deop-protocol");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const vaultEkTranscriptHash = h32("b");
+    const registrationTranscriptHash = h32("c");
+    const vaultEk = h32("d");
+    const senderAddress = h32("e");
+    const assetType = h32("f");
+    const chainId = 2;
+    const aggregateCommitment = h32("1");
+    const aggregateResponse = h32("2");
+    const challenge = h32("3");
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    let initInFlight = 0;
+    let initPeak = 0;
+    let releaseInit: () => void = () => {};
+    const initBarrier = new Promise<void>((resolve) => {
+      releaseInit = resolve;
+    });
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path !== "/worker/v2/vault_state/init") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path", path } };
+        }
+        initInFlight += 1;
+        initPeak = Math.max(initPeak, initInFlight);
+        if (initInFlight === 5) queueMicrotask(() => releaseInit());
+        await initBarrier;
+        initInFlight -= 1;
+
+        const playerId = expectedSelectedSlots.indexOf(slot);
+        const vaultStateHash = h32(String((slot + 5) % 9));
+        const workerTranscriptHash = vaultStateV2InitWorkerTranscriptHash({
+          sessionId: (body as Record<string, unknown>).sessionId as string,
+          requestId: (body as Record<string, unknown>).requestId as string,
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashHex,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          rosterHash: rosterHashHex,
+          sortedSelectedSlots: expectedSelectedSlots,
+          selfSlot: slot,
+          playerId,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment,
+          aggregateResponse,
+          challenge,
+          vaultSequence: 0,
+          depositCountObserved: 0,
+        });
+        return {
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {
+            slot,
+            playerId,
+            vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+            vaultStateHash,
+            workerTranscriptHash,
+            vaultSequence: 0,
+            depositCountObserved: 0,
+            createdAtUnixMs: 1_700_000_000_000 + slot,
+            initialized: true,
+          },
+        };
+      },
+    });
+
+    // No stateRoot configured → caller must supply *TranscriptHash and the sigma tuple inline.
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/init",
+      payload: {
+        requestId: "vault-state-concurrent",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+        vaultEkTranscriptHash,
+        registrationTranscriptHash,
+        aggregateCommitment,
+        aggregateResponse,
+        challenge,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.accepted).toBe(true);
+    expect(body.selectedSlots).toEqual(expectedSelectedSlots);
+    expect(body.selectionRationale).toBe("coordinator-chosen");
+    expect(body.vaultEk).toBe(vaultEk);
+    expect(body.vaultEkTranscriptHash).toBe(vaultEkTranscriptHash);
+    expect(body.registrationTranscriptHash).toBe(registrationTranscriptHash);
+    expect(body.aggregateCommitment).toBe(aggregateCommitment);
+    expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.perSlotContributions).toHaveLength(5);
+    // KILLER ASSERTION: concurrent fan-out — all 5 workers in flight simultaneously.
+    expect(initPeak).toBe(5);
+  });
+
+  it("vault_state_v2 init returns 502 worker_transcript_hash_mismatch on tampered worker reply", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path !== "/worker/v2/vault_state/init") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
+        }
+        return {
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {
+            slot,
+            playerId: slot,
+            vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+            vaultStateHash: h32("a"),
+            // Tamper: return a transcript hash that DOESN'T match the TS-side reconstruction.
+            workerTranscriptHash: h32(String((slot % 9) + 1)),
+            vaultSequence: 0,
+            depositCountObserved: 0,
+            createdAtUnixMs: 1_700_000_000_000,
+            initialized: true,
+          },
+        };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/init",
+      payload: {
+        requestId: "vault-state-tamper",
+        dkgEpoch,
+        caDkgTranscriptHash: h32("a"),
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        vaultEkTranscriptHash: h32("b"),
+        registrationTranscriptHash: h32("c"),
+        aggregateCommitment: h32("1"),
+        aggregateResponse: h32("2"),
+        challenge: h32("3"),
+      },
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("worker_transcript_hash_mismatch");
+  });
+
+  it("vault_state_v2 init returns 409 vault_state_v2_init_in_flight on concurrent calls", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const dkgEpoch = "1";
+
+    let releaseHung: () => void = () => {};
+    const hungBarrier = new Promise<void>((resolve) => {
+      releaseHung = resolve;
+    });
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (_path, _body, _roster, slot) => {
+        // First call hangs forever (until released).
+        await hungBarrier;
+        return { slot, ok: false, statusCode: 500, body: {} };
+      },
+    });
+
+    const payload = {
+      dkgEpoch,
+      caDkgTranscriptHash: h32("a"),
+      vaultEk: h32("d"),
+      senderAddress: h32("e"),
+      assetType: h32("f"),
+      chainId: 2,
+      vaultEkTranscriptHash: h32("b"),
+      registrationTranscriptHash: h32("c"),
+      aggregateCommitment: h32("1"),
+      aggregateResponse: h32("2"),
+      challenge: h32("3"),
+    };
+    const firstPromise = server.inject({
+      method: "POST",
+      url: "/v2/vault_state/init",
+      payload: { requestId: "vault-state-lock-1", ...payload },
+    });
+    // Allow first call's microtasks to run + acquire the lock.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const secondRes = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/init",
+      payload: { requestId: "vault-state-lock-2", ...payload },
+    });
+    expect(secondRes.statusCode).toBe(409);
+    expect(secondRes.json().error).toBe("vault_state_v2_init_in_flight");
+
+    releaseHung();
+    await firstPromise;
+  });
+
+  it("vault_state_v2 init rejects forbidden plaintext fields recursively", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/init",
+      payload: {
+        dkgEpoch: "1",
+        caDkgTranscriptHash: h32("a"),
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        vaultEkTranscriptHash: h32("b"),
+        registrationTranscriptHash: h32("c"),
+        aggregateCommitment: h32("1"),
+        aggregateResponse: h32("2"),
+        challenge: h32("3"),
+        metadata: { dkShare: "leak" },
+      },
+    });
+    // Note: dkShare is recursed into via the body parser at the orchestrator level — but the
+    // orchestrator currently doesn't call parseVaultStateV2InitRequest on the OUTER body
+    // (it does its own shape validation). The recursive forbidden-field guard fires from the
+    // deop-protocol assembleVaultStateV2InitTranscript path which the orchestrator goes
+    // through. Either way the request must be rejected.
+    expect(res.statusCode).toBeGreaterThanOrEqual(400);
+    expect(res.statusCode).toBeLessThan(500);
+  });
+
+  it("vault_state_v2 init rejects stale dkgEpoch", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/init",
+      payload: {
+        dkgEpoch: "999", // doesn't match roster.dkgEpoch == "1"
+        caDkgTranscriptHash: h32("a"),
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        vaultEkTranscriptHash: h32("b"),
+        registrationTranscriptHash: h32("c"),
+        aggregateCommitment: h32("1"),
+        aggregateResponse: h32("2"),
+        challenge: h32("3"),
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("stale_dkg_epoch");
+  });
+
+  it("vault_state_v2 init resolves provenance from persisted transcripts when stateRoot configured", async () => {
+    const { vaultStateV2InitWorkerTranscriptHash } = await import("@eunoma/deop-protocol");
+    const { mkdtemp, writeFile, mkdir, readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-vault-state-"));
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const vaultEk = h32("d");
+    const senderAddress = h32("e");
+    const assetType = h32("f");
+    const chainId = 2;
+    const persistedVaultEkTranscriptHash = h32("7");
+    const persistedRegistrationTranscriptHash = h32("8");
+    const persistedAggCommitment = h32("4");
+    const persistedAggResponse = h32("5");
+    const persistedChallenge = h32("6");
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+
+    const phase2Dir = join(stateRoot, "coordinator", "vault_ek_derivation");
+    await mkdir(phase2Dir, { recursive: true });
+    await writeFile(
+      join(phase2Dir, `${dkgEpoch}__phase2.json`),
+      JSON.stringify(
+        {
+          scheme: "vault_ek_derivation_v1",
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashHex,
+          selectedSlots: expectedSelectedSlots,
+          selectionRationale: "coordinator-chosen",
+          rosterHash: rosterHashHex,
+          verifierSlot: 0,
+          perSlotContributions: [],
+          vaultEk,
+          finalTranscriptHash: persistedVaultEkTranscriptHash,
+          createdAtUnixMs: 1_700_000_000_000,
+        },
+        null,
+        2,
+      ),
+      { mode: 0o600 },
+    );
+
+    const m1Dir = join(stateRoot, "coordinator", "ca_registration_v2");
+    await mkdir(m1Dir, { recursive: true });
+    await writeFile(
+      join(m1Dir, `${dkgEpoch}__milestone1.json`),
+      JSON.stringify(
+        {
+          scheme: "ca_registration_v2",
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashHex,
+          rosterHash: rosterHashHex,
+          selectedSlots: expectedSelectedSlots,
+          verifierSlot: 0,
+          vaultEk,
+          vaultEkTranscriptHash: persistedVaultEkTranscriptHash,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment: persistedAggCommitment,
+          aggregateResponse: persistedAggResponse,
+          challenge: persistedChallenge,
+          perSlotContributions: [],
+          transcriptHash: persistedRegistrationTranscriptHash,
+          createdAtUnixMs: 1_700_000_000_000,
+        },
+        null,
+        2,
+      ),
+      { mode: 0o600 },
+    );
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path !== "/worker/v2/vault_state/init") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
+        }
+        const playerId = expectedSelectedSlots.indexOf(slot);
+        const vaultStateHash = h32(String((slot + 5) % 9));
+        const workerTranscriptHash = vaultStateV2InitWorkerTranscriptHash({
+          sessionId: (body as Record<string, unknown>).sessionId as string,
+          requestId: (body as Record<string, unknown>).requestId as string,
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashHex,
+          vaultEkTranscriptHash: persistedVaultEkTranscriptHash,
+          registrationTranscriptHash: persistedRegistrationTranscriptHash,
+          rosterHash: rosterHashHex,
+          sortedSelectedSlots: expectedSelectedSlots,
+          selfSlot: slot,
+          playerId,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment: persistedAggCommitment,
+          aggregateResponse: persistedAggResponse,
+          challenge: persistedChallenge,
+          vaultSequence: 0,
+          depositCountObserved: 0,
+        });
+        return {
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {
+            slot,
+            playerId,
+            vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+            vaultStateHash,
+            workerTranscriptHash,
+            vaultSequence: 0,
+            depositCountObserved: 0,
+            createdAtUnixMs: 1_700_000_000_000,
+            initialized: true,
+          },
+        };
+      },
+    });
+
+    // Caller supplies NEITHER aggregate fields NOR transcript hashes — coordinator resolves
+    // all of them from the persisted transcripts on disk.
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/init",
+      payload: {
+        requestId: "vault-state-provenance-ok",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.accepted).toBe(true);
+    // KILLER ASSERTION: coordinator resolved BOTH provenance entries from disk.
+    expect(body.vaultEkTranscriptHash).toBe(persistedVaultEkTranscriptHash);
+    expect(body.registrationTranscriptHash).toBe(persistedRegistrationTranscriptHash);
+    expect(body.aggregateCommitment).toBe(persistedAggCommitment);
+    expect(body.aggregateResponse).toBe(persistedAggResponse);
+    expect(body.challenge).toBe(persistedChallenge);
+    // KILLER ASSERTION: transcript artifact persisted to disk.
+    expect(typeof body.transcriptPath).toBe("string");
+    const artifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
+    expect(artifact.scheme).toBe("vault_state_v2");
+    expect(artifact.vaultEk).toBe(vaultEk);
+    expect(artifact.perSlotContributions).toHaveLength(5);
+  });
+
+  it("vault_state_v2 init returns 400 ca_registration_provenance_unknown when stateRoot present but no Milestone 1 transcript", async () => {
+    const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-vault-state-no-m1-"));
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const vaultEk = h32("d");
+    const caDkgTranscriptHashHex = h32("a");
+    const persistedVaultEkTranscriptHash = h32("7");
+
+    // Phase 2 transcript exists but Milestone 1 does NOT.
+    const phase2Dir = join(stateRoot, "coordinator", "vault_ek_derivation");
+    await mkdir(phase2Dir, { recursive: true });
+    await writeFile(
+      join(phase2Dir, `${dkgEpoch}__phase2.json`),
+      JSON.stringify(
+        {
+          scheme: "vault_ek_derivation_v1",
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashHex,
+          selectedSlots: [0, 1, 2, 3, 4],
+          rosterHash: rosterHashHex,
+          verifierSlot: 0,
+          perSlotContributions: [],
+          vaultEk,
+          finalTranscriptHash: persistedVaultEkTranscriptHash,
+          createdAtUnixMs: 1_700_000_000_000,
+        },
+        null,
+        2,
+      ),
+      { mode: 0o600 },
+    );
+
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async () => {
+        workerCalled = true;
+        return { slot: 0, ok: true, statusCode: 200, body: {} };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/init",
+      payload: {
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("ca_registration_provenance_unknown");
+    expect(workerCalled).toBe(false);
+  });
 });
