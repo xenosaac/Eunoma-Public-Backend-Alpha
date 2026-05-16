@@ -3105,6 +3105,8 @@ pub mod mpc_inverse_adapter {
 
 pub mod mpc_spdz_adapter;
 
+pub mod transfer_sigma_reference;
+
 // =================================================================================================
 // Codex M3a P2 #2: atomic write helper applied uniformly across V2 production sites.
 //
