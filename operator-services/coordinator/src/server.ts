@@ -3817,6 +3817,34 @@ export function buildCoordinatorServer(
               message: `tx ${relayerResult.txHash} did not confirm within ${opts.chainConfirmationTimeoutMs ?? 30_000}ms`,
             });
           }
+          // Codex M5b P1 #3: confirmed=true but success=false means the chain ran the
+          // tx and ABORTED (e.g. MOVE_ABORT, OUT_OF_GAS). Previously the route returned
+          // 200 completed: true with the failed vmStatus only logged in the artifact.
+          // Fail closed with a 502 chain_execution_failed surfacing vmStatus so operators
+          // see the exact abort reason. Persist the artifact with completed: false so
+          // retries (P2 #1) are NOT short-circuited as idempotent.
+          if (confirmation.success === false) {
+            const transcriptHash = await persistSubmitTranscript({
+              completed: false,
+              simulated: false,
+              txHash: relayerResult.txHash,
+              chainSuccess: false,
+              chainVmStatus: confirmation.vmStatus,
+              chainConfirmationError: "chain_execution_failed",
+            });
+            return reply.code(502).send({
+              error: "chain_execution_failed",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              txHash: relayerResult.txHash,
+              vmStatus: confirmation.vmStatus,
+              transcriptHash,
+              transcriptPath: submitTranscriptPath,
+              message:
+                `tx ${relayerResult.txHash} confirmed on-chain with failed execution` +
+                (confirmation.vmStatus ? ` (vmStatus=${confirmation.vmStatus})` : ""),
+            });
+          }
         }
         // 9. Persist the success submit-transcript artifact.
         const submitTranscriptHash = await persistSubmitTranscript({

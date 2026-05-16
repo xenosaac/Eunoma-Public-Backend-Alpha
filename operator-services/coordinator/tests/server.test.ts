@@ -4622,6 +4622,51 @@ describe("coordinator", () => {
       expect(res.json().error).toBe("invalid_request");
     });
 
+    // KILLER (Codex M5b P1 #3): a confirmed-but-failed chain execution surfaces as 502
+    // chain_execution_failed with vmStatus, NOT a 200 success. The submit artifact must
+    // also record completed: false so P2 #1 retry idempotency does not short-circuit on
+    // a failed attempt.
+    it("submit_route_502s_on_chain_execution_failed_with_vmstatus", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-chain-fail-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-chain-fail");
+      // Chain returns confirmed=true, success=false, vmStatus="MOVE_ABORT".
+      const fakeChainFetch: typeof fetch = async () =>
+        new Response(
+          JSON.stringify({ success: false, vm_status: "MOVE_ABORT: code=42" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => ({
+          accepted: true,
+          txHash: "0x" + "ab".repeat(32),
+          simulated: false, // REAL submission → coordinator must poll
+        }),
+        chainNodeUrl: "http://127.0.0.1:8080",
+        chainFetch: fakeChainFetch,
+        chainConfirmationTimeoutMs: 1000,
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-chain-fail" },
+      });
+      expect(res.statusCode).toBe(502);
+      const body = res.json();
+      expect(body.error).toBe("chain_execution_failed");
+      expect(body.vmStatus).toBe("MOVE_ABORT: code=42");
+      expect(body.txHash).toBe("0x" + "ab".repeat(32));
+      expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+      // Persisted artifact must record completed=false + the vmStatus so retries are
+      // NOT short-circuited as idempotent against a failed attempt.
+      const { readFile } = await import("node:fs/promises");
+      const artifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
+      expect(artifact.completed).toBe(false);
+      expect(artifact.chainSuccess).toBe(false);
+      expect(artifact.chainVmStatus).toBe("MOVE_ABORT: code=42");
+    });
+
     // KILLER (Codex M5b P1 #2): the loader enforces that the on-disk transcript's
     // embedded (dkgEpoch, requestId) matches the request tuple. Previously a transcript
     // file copied under a different filename would pass shape validation and could be
