@@ -47,7 +47,13 @@ import type { HpkeEnvelope } from "./types.js";
  */
 export const EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1";
 export const EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2 = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2";
-export const EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1";
+/**
+ * M4 Commit 1: round2 transcript-hash domain bumped V1→V2. The chained-round body now
+ * binds Aptos CA TransferV1 Statement input fields via the round2 worker_transcript_hash;
+ * any pre-M4 V1 artifact deserialised against the V2 binding fails closed at the
+ * coordinator's worker-hash cross-check.
+ */
+export const EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V2 = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V2";
 export const EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1";
 export const EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1";
 export const EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1";
@@ -568,7 +574,7 @@ export function mpccaWithdrawRound2WorkerTranscriptHash(args: {
   previousRoundTranscriptHash: string;
   previousRoundCommitments: string[];
 }): HexString {
-  return chainedRoundHash(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1, args);
+  return chainedRoundHash(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V2, args);
 }
 
 export function mpccaWithdrawProveWorkerTranscriptHash(args: {

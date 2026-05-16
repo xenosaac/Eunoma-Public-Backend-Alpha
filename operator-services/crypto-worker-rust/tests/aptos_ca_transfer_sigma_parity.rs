@@ -10,13 +10,16 @@
 use std::{fs, path::PathBuf};
 
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::{
+    constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, traits::Identity,
+};
 use eunoma_crypto_worker::transfer_sigma_reference::{
     bcs_fiat_shamir_inputs, bcs_serialize_transfer_session, build_statement,
     prng_next_scalar_list, prove_transfer_single_party, sigma_fiat_shamir_seed,
     threshold::{
         aggregate_threshold_sigma_commitments, aggregate_threshold_sigma_responses,
         compute_threshold_sigma_partial_commitment, compute_threshold_sigma_response_share,
-        COMMITMENT_LEN, WITNESS_LEN,
+        derive_dk_base_points, COMMITMENT_LEN, WITNESS_LEN,
     },
     verify_transfer_single_party, CounterPrng, DomainSeparator, SigmaProtocolProof,
     TransferStatementInputs, APTOS_FRAMEWORK_ADDRESS, PROTOCOL_ID, TYPE_NAME,
@@ -776,4 +779,148 @@ fn threshold_sigma_arbitrary_share_decomposition_byte_parity() {
             "arbitrary-split response[{i}] disagrees with M4a fixture"
         );
     }
+}
+
+// =============================================================================
+// M4 Commit 1 — derive_dk_base_points: programmatic BASE_DK_SET inspection
+// =============================================================================
+//
+// `derive_dk_base_points` runs `psi_transfer` with the unit witness vector
+// `α = [1, 0, 0, ..., 0]`. By linearity of psi in α (PSI LINEARITY CHECK in
+// `transfer_sigma_reference.rs`), the output isolates the witness[0]-dependent
+// contributions at every position; non-identity outputs identify the indices
+// where dk contributes, and the output values are exactly the public base
+// points multiplying dk at those positions.
+//
+// For the Aptos CA `TransferV1` (ell=8, n=4, no auditor), the two dk-bearing
+// positions are:
+//
+//   index  0 (sigmaProtocolTransfer.ts:316 / lib.rs psi_transfer step 1):
+//          base = ek_sid (= statement.points[IDX_EK_SID])
+//
+//   index 17 (sigmaProtocolTransfer.ts:343 / lib.rs psi_transfer step 4
+//             balance equation, dk-component):
+//          base = Σ_i (b_pow_ell[i] · old_R[i])
+//                 = Σ_i (2^(16·i) · statement.old_balance_d[i])
+//
+// These tests use the committed M4a fixture so they DOUBLY assert (a) that
+// the indices match the analytical answer and (b) that the recovered base
+// points match the canonical bases as built from the same fixture data.
+
+fn b_pow_ell(count: usize) -> Vec<Scalar> {
+    let b = Scalar::from(1u64 << 16);
+    let mut out = Vec::with_capacity(count);
+    out.push(Scalar::ONE);
+    for i in 1..count {
+        out.push(out[i - 1] * b);
+    }
+    out
+}
+
+#[test]
+fn derive_dk_base_points_indices_are_zero_and_seventeen() {
+    let (_fix, statement, _dst, _witness, _alpha) = build_threshold_test_context();
+    let pts = derive_dk_base_points(&statement, 8, 4, false, 0).expect("derive");
+    let indices: Vec<usize> = pts.iter().map(|p| p.index).collect();
+    assert_eq!(
+        indices,
+        vec![0_usize, 17_usize],
+        "BASE_DK_SET indices MUST be exactly {{0, 17}} for the Aptos CA TransferV1 shape"
+    );
+    // No identity bases sneak through.
+    let identity = RistrettoPoint::identity();
+    for p in &pts {
+        assert_ne!(p.base, identity, "dk base at index {} is identity", p.index);
+    }
+}
+
+#[test]
+fn derive_dk_base_points_bases_match_canonical_ek_sid_and_old_r_combined() {
+    let (fix, statement, _dst, _witness, _alpha) = build_threshold_test_context();
+    let pts = derive_dk_base_points(&statement, 8, 4, false, 0).expect("derive");
+    assert_eq!(pts.len(), 2);
+
+    // Position 0 → base == ek_sid.
+    let expected_ek_sid_bytes = hex_32(&fix.statement.sender_ek);
+    let actual_idx0 = pts
+        .iter()
+        .find(|p| p.index == 0)
+        .expect("index 0 missing");
+    let actual_idx0_bytes = actual_idx0.base.compress().to_bytes();
+    assert_eq!(
+        hex_encode(&actual_idx0_bytes),
+        hex_encode(&expected_ek_sid_bytes),
+        "index 0 base point MUST equal the sender ek_sid (= statement.points[IDX_EK_SID])"
+    );
+
+    // Position 17 → base == Σ_i (b_pow_ell[i] · old_R[i])
+    // where old_R[i] = statement.old_balance_d[i].
+    let ell = fix.params.ell;
+    let powers = b_pow_ell(ell);
+    let mut expected = RistrettoPoint::identity();
+    for (i, comp_hex) in fix.ciphertexts.old_balance_d.iter().enumerate() {
+        let comp = hex_32(comp_hex);
+        let point = curve25519_dalek::ristretto::CompressedRistretto(comp)
+            .decompress()
+            .expect("decompress old_balance_d");
+        expected += point * powers[i];
+    }
+    // Sanity: the user-supplied (compressed) old_balance_d byte order parses
+    // to the same point set the statement holds; we double-check this by
+    // referencing statement.points[12..20] (start_idx_old_r(ell) = 12).
+    for i in 0..ell {
+        let stmt_p = statement.points[12 + i];
+        let parsed = curve25519_dalek::ristretto::CompressedRistretto(hex_32(
+            &fix.ciphertexts.old_balance_d[i],
+        ))
+        .decompress()
+        .expect("decompress");
+        assert_eq!(
+            stmt_p, parsed,
+            "statement.points[12+{i}] disagrees with old_balance_d[{i}]"
+        );
+    }
+    let actual_idx17 = pts
+        .iter()
+        .find(|p| p.index == 17)
+        .expect("index 17 missing");
+    let actual_idx17_bytes = actual_idx17.base.compress().to_bytes();
+    assert_eq!(
+        hex_encode(&actual_idx17_bytes),
+        hex_encode(&expected.compress().to_bytes()),
+        "index 17 base point MUST equal Σ_i (b_pow_ell[i] · old_balance_d[i])"
+    );
+
+    // Tertiary defense-in-depth: scaling each derived base by a fresh α gives
+    // the dk-only psi output for α_unit = [α, 0, ..., 0]. Run the threshold
+    // partial-commitment API on this exact witness and assert the same.
+    let alpha_scalar = Scalar::from(0x5a5a_5a5a_u64);
+    let mut alpha_unit = [Scalar::ZERO; WITNESS_LEN];
+    alpha_unit[0] = alpha_scalar;
+    let a_partial =
+        compute_threshold_sigma_partial_commitment(&alpha_unit, &statement, 8, 4, false, 0)
+            .expect("compute partial commitment for alpha-unit");
+    let identity = RistrettoPoint::identity();
+    for (idx, point) in a_partial.iter().enumerate() {
+        if idx == 0 || idx == 17 {
+            let expected = pts
+                .iter()
+                .find(|p| p.index == idx)
+                .expect("base")
+                .base
+                * alpha_scalar;
+            assert_eq!(
+                *point, expected,
+                "psi(α_unit)[{idx}] != α · base — derive_dk_base_points base is wrong"
+            );
+        } else {
+            assert_eq!(
+                *point, identity,
+                "psi(α_unit) leaked a non-identity at index {idx} — dk leaks outside BASE_DK_SET"
+            );
+        }
+    }
+    // Suppress unused-import warning for `RISTRETTO_BASEPOINT_POINT`; the import
+    // exists so future tests can reference G without a fresh use statement.
+    let _ = RISTRETTO_BASEPOINT_POINT;
 }

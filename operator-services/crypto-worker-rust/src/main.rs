@@ -51,6 +51,7 @@ use eunoma_crypto_worker::mpcca_withdraw_v2::{
     run_round2_v2 as run_mpcca_withdraw_round2_v2,
     ChainedRoundRequest as MpccaWithdrawChainedRoundRequest,
     Round1Request as MpccaWithdrawRound1Request,
+    Round2Request as MpccaWithdrawRound2Request,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1022,21 +1023,26 @@ async fn mpcca_withdraw_round1(
 
 async fn mpcca_withdraw_round2(
     State(state): State<AppState>,
-    Json(body): Json<MpccaWithdrawChainedRoundRequest>,
+    Json(body): Json<MpccaWithdrawRound2Request>,
 ) -> (StatusCode, Json<Value>) {
-    let request_id = body.request_id.clone();
-    let session_id = body.session_id.clone();
-    let self_slot = body.self_slot;
-    let player_id = body.player_id;
+    let request_id = body.base.request_id.clone();
+    let session_id = body.base.session_id.clone();
+    let self_slot = body.base.self_slot;
+    let player_id = body.base.player_id;
     match run_mpcca_withdraw_round2_v2(&state.state_dir, &body) {
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "mpcca_withdraw_v2_stub_unexpectedly_returned_ok",
-                "message": "milestone 3a stub returned Ok; this is a wire-shape regression"
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(result).unwrap_or_else(|err| {
+                json!({
+                    "error": "mpcca_withdraw_v2_serialize_error",
+                    "message": err.to_string(),
+                })
             })),
         ),
         Err(eunoma_crypto_worker::WorkerError::NotImplemented(phase)) => {
+            // Defensive: M4 commit 1 should not surface NotImplemented for round2 — but if
+            // a regression re-introduces it, preserve the M3a 501 response shape so
+            // coordinator behavior stays consistent.
             mpcca_not_implemented_response(
                 &state.state_dir,
                 &request_id,

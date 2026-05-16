@@ -909,4 +909,82 @@ pub mod threshold {
         }
         acc
     }
+
+    /// (idx, base_point) pair identifying a single psi-output position where
+    /// witness[0] = dk contributes, together with the public base point that
+    /// multiplies dk at that position. M4 Commit 1: workers contribute only
+    /// `α_share_j[0] · base` at each of these positions.
+    #[derive(Debug, Clone)]
+    pub struct DkBasePoint {
+        pub index: usize,
+        pub base: RistrettoPoint,
+    }
+
+    /// Programmatically derive the set of psi base points where witness[0] (= dk)
+    /// contributes, for the public Statement built from `stmt`.
+    ///
+    /// Method: psi_transfer is linear in α (see PSI LINEARITY CHECK above).
+    /// Calling psi with the unit vector α = [1, 0, 0, ..., 0] therefore isolates
+    /// the dk-component at every output position; any position that is NOT the
+    /// identity point is a position where witness[0] contributes, with the base
+    /// equal to the output value (because α[0] = 1 leaves the base unscaled).
+    ///
+    /// For the Aptos CA `TransferV1` (ell=8, n=4, no auditor) this returns
+    /// exactly 2 positions: {0, 17}. Position 0's base is `ek_sid` (since the
+    /// first psi output is `ek_sid * dk`). Position 17 is the balance equation,
+    /// whose dk-coefficient is `Σ_i (b_pow_ell[i] · old_R[i])`.
+    ///
+    /// Callers MUST scale each `base` by `α_share_j[0]` to produce the partial
+    /// dk-base commitment that aggregates (across the 5 selected workers) into
+    /// the full `A[idx]` slot of the Σ-protocol commitment vector.
+    ///
+    /// Fail-closed if any constraint is violated (auditor branches forbidden,
+    /// ell/n mismatch, no output detected — the last case is impossible for the
+    /// canonical Aptos CA shape but defends against future shape regressions).
+    pub fn derive_dk_base_points(
+        statement: &Statement,
+        ell: usize,
+        n: usize,
+        has_effective_auditor: bool,
+        num_voluntary_auditors: usize,
+    ) -> WorkerResult<Vec<DkBasePoint>> {
+        if 1 + 2 * ell + 2 * n != WITNESS_LEN {
+            return Err(WorkerError::InvalidRequest(format!(
+                "derive_dk_base_points is fixed to ell=8, n=4 (1 + 2*ell + 2*n = 25); got ell={ell}, n={n}"
+            )));
+        }
+        let mut unit = [Scalar::ZERO; WITNESS_LEN];
+        unit[0] = Scalar::ONE;
+        let pts = psi_transfer(
+            statement,
+            &unit,
+            ell,
+            n,
+            has_effective_auditor,
+            num_voluntary_auditors,
+        )?;
+        if pts.len() != COMMITMENT_LEN {
+            return Err(WorkerError::InvalidRequest(format!(
+                "psi_transfer returned {} points; expected {COMMITMENT_LEN}",
+                pts.len()
+            )));
+        }
+        let identity = RistrettoPoint::identity();
+        let mut out = Vec::new();
+        for (idx, p) in pts.iter().enumerate() {
+            if *p != identity {
+                out.push(DkBasePoint {
+                    index: idx,
+                    base: *p,
+                });
+            }
+        }
+        if out.is_empty() {
+            return Err(WorkerError::InvalidRequest(
+                "derive_dk_base_points: no dk-bearing positions detected — psi shape regression"
+                    .to_string(),
+            ));
+        }
+        Ok(out)
+    }
 }

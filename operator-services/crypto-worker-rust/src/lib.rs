@@ -7125,17 +7125,26 @@ pub mod vault_state_v2 {
 // allocate the on-disk slot for milestone 4 so the file layout is committed.
 // =================================================================================================
 pub mod mpcca_withdraw_v2 {
-    use crate::ca_dkg_v2::{load_hpke_keypair_for_slot, HpkeKeypairFile};
+    use crate::ca_dkg_v2::{load_ca_dkg_v2_share, load_hpke_keypair_for_slot, HpkeKeypairFile};
     use crate::h_ristretto;
     use crate::hpke_aead;
     pub use crate::hpke_aead::HpkeEnvelope;
-    use crate::registration_verifier::verify_registration_proof;
     use crate::mpc_spdz_adapter::is_safe_id;
+    use crate::registration_verifier::{
+        lagrange_coefficients_at_zero, verify_registration_proof,
+    };
+    use crate::transfer_sigma_reference::{
+        build_statement,
+        threshold::{derive_dk_base_points, DkBasePoint},
+        Statement, TransferStatementInputs,
+    };
     use crate::vault_state_v2::{load_vault_state_v2, VaultStateFile};
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
     use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-    use curve25519_dalek::ristretto::CompressedRistretto;
+    use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
     use curve25519_dalek::scalar::Scalar;
+    use curve25519_dalek::traits::Identity;
+    use rand::rngs::OsRng;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -7151,17 +7160,35 @@ pub mod mpcca_withdraw_v2 {
     // artifacts deserialised against the V2 domain will fail closed at the worker-hash mismatch
     // gate.
     pub(crate) const ROUND1_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2";
-    pub(crate) const ROUND2_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1";
+    /// M4 Commit 1: round2 binding now includes Aptos CA TransferV1 Statement input fields
+    /// (recipient_ek + 6 ciphertext vectors). Bumped V1→V2 so any pre-M4 chained-round
+    /// transcript artifact deserialised against the V2 binding fails closed at the
+    /// worker-hash mismatch gate.
+    pub(crate) const ROUND2_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V2";
     pub(crate) const PROVE_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1";
     pub(crate) const FINALIZE_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1";
+
+    /// M4 Commit 1: round2 at-rest HPKE seal `info` string. LOCKED — any change is a
+    /// wire-protocol break and must bump the version suffix.
+    pub(crate) const HPKE_INFO_ROUND2_AT_REST: &[u8] = b"EUNOMA_M4_ROUND2_AT_REST_V1";
+
+    /// Aptos CA TransferV1 chunked-balance parameter. Locked to ell=8, n=4 (no auditor).
+    /// These values match the canonical M4a fixture + transfer_sigma_reference's threshold
+    /// module + sigmaProtocolTransfer.ts.
+    pub(crate) const ROUND2_ELL: usize = 8;
+    pub(crate) const ROUND2_N: usize = 4;
 
     /// M1 AAD domain — byte-identical to the TS constant `EUNOMA_M1_AMOUNT_INGRESS_V1`.
     pub(crate) const M1_INGRESS_AAD_DOMAIN: &str = "EUNOMA_M1_AMOUNT_INGRESS_V1";
 
     // NotImplemented phase strings — surfaced by the milestone 3a stub to distinguish per-round
-    // missing crypto. Milestone 4 will remove each one as its round lands.
+    // missing crypto. Milestone 4 removes each one as its round lands. Kept here as a
+    // searchable registry of the historical stub strings; M4 commits 1 + 3 + 4 will retire
+    // ROUND2/PROVE/FINALIZE in turn.
+    #[allow(dead_code)]
     pub(crate) const ROUND1_NOT_IMPLEMENTED_PHASE: &str =
         "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4";
+    #[allow(dead_code)]
     pub(crate) const ROUND2_NOT_IMPLEMENTED_PHASE: &str =
         "mpcca_withdraw_v2_round2_partial_sigma_pending_milestone4";
     pub(crate) const PROVE_NOT_IMPLEMENTED_PHASE: &str =
@@ -7259,7 +7286,42 @@ pub mod mpcca_withdraw_v2 {
         pub previous_round_commitments: Vec<String>,
     }
 
-    pub type Round2Request = ChainedRoundRequest;
+    /// Round 2 (M4 commit 1) request. Extends `ChainedRoundRequest` with the Aptos CA
+    /// `TransferV1` Statement input fields needed for the worker to (a) reconstruct the
+    /// public Statement and (b) programmatically derive the BASE_DK_SET via psi_transfer
+    /// inspection.
+    ///
+    /// Wire shape: every base ChainedRoundRequest field at top level (via `serde(flatten)`)
+    /// plus the new Statement fields. The user's pre-computed sigma α-commitments / response
+    /// shares / Bulletproof bytes are NOT carried here — those are M4 commit 2's coordinator-
+    /// orchestration concern. Commit 1's worker contract is purely the dk-component partial.
+    ///
+    /// All hex fields MUST be 32-byte compressed Ristretto points (sender_ek = vault_ek is
+    /// already validated by the chained-round provenance gate; recipient_ek + ciphertext
+    /// vectors are new and validated in `build_transfer_statement_from_round2_request`).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round2Request {
+        #[serde(flatten)]
+        pub base: ChainedRoundRequest,
+        /// Recipient encryption key (`ek_rid`). 32-byte compressed Ristretto hex.
+        pub recipient_ek: String,
+        /// Old balance Pedersen commitments `C[i] = G·old_a[i] + H·old_r[i]`. 8 × 32-byte hex.
+        pub old_balance_c: Vec<String>,
+        /// Old balance ElGamal D-component `D[i] = ek_sid · old_r[i]`. 8 × 32-byte hex.
+        pub old_balance_d: Vec<String>,
+        /// New balance Pedersen commitments. 8 × 32-byte hex.
+        pub new_balance_c: Vec<String>,
+        /// New balance ElGamal D-component. 8 × 32-byte hex.
+        pub new_balance_d: Vec<String>,
+        /// Transfer-amount Pedersen commitments. 4 × 32-byte hex.
+        pub transfer_amount_c: Vec<String>,
+        /// Transfer-amount ElGamal D-component (sender). 4 × 32-byte hex.
+        pub transfer_amount_d_sender: Vec<String>,
+        /// Transfer-amount ElGamal D-component (recipient). 4 × 32-byte hex.
+        pub transfer_amount_d_recipient: Vec<String>,
+    }
+
     pub type ProveRequest = ChainedRoundRequest;
     pub type FinalizeRequest = ChainedRoundRequest;
 
@@ -7298,6 +7360,59 @@ pub mod mpcca_withdraw_v2 {
         /// Equals `worker_transcript_hash`. Named explicitly so the M1 binding contract is
         /// searchable across the codebase.
         pub ingress_transcript_hash: String,
+    }
+
+    /// M4 Commit 1 — worker's dk-base partial commitment at a single psi-output index.
+    /// `commitment_hex` = `α_share_j[0] · base`, where `base` is the public point at the
+    /// canonical BASE_DK_SET position (programmatically derived via `derive_dk_base_points`).
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round2DkPartial {
+        pub index: usize,
+        pub commitment_hex: String,
+    }
+
+    /// M4 Commit 1 — round 2 result. The worker contributes ONLY the dk-component of the
+    /// sigma commitment vector A. Returned points cover exactly the BASE_DK_SET indices
+    /// (= {0, 17} for the canonical Aptos CA TransferV1 shape).
+    ///
+    /// `dk_base_indices_used` mirrors `partial_dk_commitments[*].index` so consumers can
+    /// validate the canonical set without parsing per-entry.
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round2DkResult {
+        pub slot: usize,
+        pub player_id: usize,
+        pub session_state_path: String,
+        pub session_state_hash: String,
+        pub worker_transcript_hash: String,
+        pub observed_at_unix_ms: u128,
+        pub completed: bool, // always true under M4 commit 1
+        pub partial_dk_commitments: Vec<Round2DkPartial>,
+        pub dk_base_indices_used: Vec<usize>,
+    }
+
+    /// File written by the worker after a successful M4 commit-1 round 2. Holds public
+    /// partial dk-base commitments + an HPKE-encrypted-at-rest envelope sealing
+    /// `α_share_j[0]` under the worker's own HPKE pubkey. M4 commit 3 (finalize) re-opens
+    /// this file to consume `α_share_j[0]` for the response-share computation.
+    ///
+    /// Privacy contract: `α_share_j[0]` NEVER appears in plaintext on disk; only the
+    /// HPKE seal lives here.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round2StateFile {
+        pub scheme: String,
+        pub slot: usize,
+        pub player_id: usize,
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub partial_dk_commitments: Vec<Round2DkPartial>,
+        pub dk_base_indices_used: Vec<usize>,
+        pub worker_transcript_hash: String,
+        pub encrypted_alpha_envelope: HpkeEnvelope,
+        pub created_at_unix_ms: u128,
     }
 
     /// On-disk per-session-per-round state file. Holds only public binding metadata + a copy of
@@ -7920,6 +8035,311 @@ pub mod mpcca_withdraw_v2 {
         hpke_aead::seal(recipient_public_key_hex, HPKE_INFO_INGRESS, aad, plaintext)
     }
 
+    // =============================================================================================
+    // M4 Commit 1 — round2 helpers (dk-component threshold contribution)
+    // =============================================================================================
+
+    /// Normalised public Aptos CA TransferV1 Statement input fields, validated for canonical
+    /// 32-byte Ristretto compression and the canonical {ell=8, n=4} vector lengths.
+    struct Round2StatementInputs {
+        recipient_ek: String,
+        old_balance_c: Vec<String>,
+        old_balance_d: Vec<String>,
+        new_balance_c: Vec<String>,
+        new_balance_d: Vec<String>,
+        transfer_amount_c: Vec<String>,
+        transfer_amount_d_sender: Vec<String>,
+        transfer_amount_d_recipient: Vec<String>,
+    }
+
+    fn normalise_round2_statement_inputs(req: &Round2Request) -> WorkerResult<Round2StatementInputs> {
+        let recipient_ek = normalize_hex(&req.recipient_ek, 32).map_err(|err| {
+            WorkerError::InvalidRequest(format!("round2 recipient_ek: {err:?}"))
+        })?;
+        let old_balance_c = normalise_round2_hex_vec(&req.old_balance_c, ROUND2_ELL, "old_balance_c")?;
+        let old_balance_d = normalise_round2_hex_vec(&req.old_balance_d, ROUND2_ELL, "old_balance_d")?;
+        let new_balance_c = normalise_round2_hex_vec(&req.new_balance_c, ROUND2_ELL, "new_balance_c")?;
+        let new_balance_d = normalise_round2_hex_vec(&req.new_balance_d, ROUND2_ELL, "new_balance_d")?;
+        let transfer_amount_c =
+            normalise_round2_hex_vec(&req.transfer_amount_c, ROUND2_N, "transfer_amount_c")?;
+        let transfer_amount_d_sender = normalise_round2_hex_vec(
+            &req.transfer_amount_d_sender,
+            ROUND2_N,
+            "transfer_amount_d_sender",
+        )?;
+        let transfer_amount_d_recipient = normalise_round2_hex_vec(
+            &req.transfer_amount_d_recipient,
+            ROUND2_N,
+            "transfer_amount_d_recipient",
+        )?;
+        Ok(Round2StatementInputs {
+            recipient_ek,
+            old_balance_c,
+            old_balance_d,
+            new_balance_c,
+            new_balance_d,
+            transfer_amount_c,
+            transfer_amount_d_sender,
+            transfer_amount_d_recipient,
+        })
+    }
+
+    fn normalise_round2_hex_vec(
+        items: &[String],
+        expected_len: usize,
+        label: &'static str,
+    ) -> WorkerResult<Vec<String>> {
+        if items.len() != expected_len {
+            return Err(WorkerError::InvalidRequest(format!(
+                "round2 {label}: expected {expected_len} entries, got {}",
+                items.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(expected_len);
+        for (i, hex) in items.iter().enumerate() {
+            let norm = normalize_hex(hex, 32).map_err(|err| {
+                WorkerError::InvalidRequest(format!("round2 {label}[{i}]: {err:?}"))
+            })?;
+            out.push(norm);
+        }
+        Ok(out)
+    }
+
+    /// Canonical sha256 hex of the normalised Round2 Statement input fields. Byte-equal
+    /// across TS↔Rust so the coordinator's worker_transcript_hash cross-check holds.
+    ///
+    /// Layout (utf8 bytes, then sha256):
+    /// ```text
+    /// recipient_ek_hex
+    /// || ":" || old_balance_c[0]|...|old_balance_c[7]
+    /// || ":" || old_balance_d[0]|...|old_balance_d[7]
+    /// || ":" || new_balance_c[0]|...|new_balance_c[7]
+    /// || ":" || new_balance_d[0]|...|new_balance_d[7]
+    /// || ":" || transfer_amount_c[0]|...|transfer_amount_c[3]
+    /// || ":" || transfer_amount_d_sender[0]|...|transfer_amount_d_sender[3]
+    /// || ":" || transfer_amount_d_recipient[0]|...|transfer_amount_d_recipient[3]
+    /// ```
+    fn statement_inputs_hash_hex(inputs: &Round2StatementInputs) -> String {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(inputs.recipient_ek.as_bytes());
+        for group in [
+            &inputs.old_balance_c,
+            &inputs.old_balance_d,
+            &inputs.new_balance_c,
+            &inputs.new_balance_d,
+            &inputs.transfer_amount_c,
+            &inputs.transfer_amount_d_sender,
+            &inputs.transfer_amount_d_recipient,
+        ] {
+            bytes.push(b':');
+            let joined = group.join("|");
+            bytes.extend_from_slice(joined.as_bytes());
+        }
+        sha256_hex(&bytes)
+    }
+
+    /// Round 2 (M4 commit 1) worker_transcript_hash = sha256(chained_hash || ":" || statement_inputs_hash).
+    /// Byte-equal across TS↔Rust.
+    fn round2_v2_worker_transcript_hash(chained_hash_hex: &str, statement_inputs_hash_hex: &str) -> String {
+        let mut bytes = Vec::with_capacity(chained_hash_hex.len() + 1 + statement_inputs_hash_hex.len());
+        bytes.extend_from_slice(chained_hash_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(statement_inputs_hash_hex.as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    /// Build the public Statement for the Aptos CA TransferV1 sigma protocol from the normalised
+    /// Round2 inputs. `sender_ek_hex` is the binding's vault_ek (already validated upstream).
+    fn build_round2_statement(
+        inputs: &Round2StatementInputs,
+        sender_ek_hex: &str,
+    ) -> WorkerResult<Statement> {
+        let sender_ek = hex_to_bytes32(sender_ek_hex)?;
+        let recipient_ek = hex_to_bytes32(&inputs.recipient_ek)?;
+        let old_balance_c = hex_vec_to_bytes32_vec(&inputs.old_balance_c)?;
+        let old_balance_d = hex_vec_to_bytes32_vec(&inputs.old_balance_d)?;
+        let new_balance_c = hex_vec_to_bytes32_vec(&inputs.new_balance_c)?;
+        let new_balance_d = hex_vec_to_bytes32_vec(&inputs.new_balance_d)?;
+        let transfer_amount_c = hex_vec_to_bytes32_vec(&inputs.transfer_amount_c)?;
+        let transfer_amount_d_sender = hex_vec_to_bytes32_vec(&inputs.transfer_amount_d_sender)?;
+        let transfer_amount_d_recipient =
+            hex_vec_to_bytes32_vec(&inputs.transfer_amount_d_recipient)?;
+        let statement_inputs = TransferStatementInputs {
+            sender_ek,
+            recipient_ek,
+            old_balance_c,
+            old_balance_d,
+            new_balance_c,
+            new_balance_d,
+            transfer_amount_c,
+            transfer_amount_d_sender,
+            transfer_amount_d_recipient,
+        };
+        build_statement(&statement_inputs)
+    }
+
+    fn hex_to_bytes32(hex: &str) -> WorkerResult<[u8; 32]> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != 32 {
+            return Err(WorkerError::InvalidRequest(format!(
+                "expected 32-byte hex, got {} bytes",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+
+    fn hex_vec_to_bytes32_vec(items: &[String]) -> WorkerResult<Vec<[u8; 32]>> {
+        let mut out = Vec::with_capacity(items.len());
+        for hex in items {
+            out.push(hex_to_bytes32(hex)?);
+        }
+        Ok(out)
+    }
+
+    /// Canonical Ed25519 scalar decoder (rejects non-canonical encodings). Distinct name from
+    /// `scalar_from_hex` in other modules to avoid cross-module symbol confusion.
+    fn scalar_from_hex_local(hex: &str) -> WorkerResult<Scalar> {
+        let bytes = hex_to_bytes32(hex)?;
+        let opt = Scalar::from_canonical_bytes(bytes);
+        if opt.is_none().into() {
+            return Err(WorkerError::InvalidRequest(
+                "non-canonical Ed25519 scalar".to_string(),
+            ));
+        }
+        Ok(opt.unwrap())
+    }
+
+    /// CSPRNG-backed nonzero scalar. Rejection-samples zero; in practice the rejection branch
+    /// never fires (probability ~2^-252) but the loop guarantees the guarantee.
+    fn generate_nonzero_scalar(rng: &mut OsRng) -> Scalar {
+        loop {
+            let s = Scalar::random(rng);
+            if s != Scalar::ZERO {
+                return s;
+            }
+        }
+    }
+
+    /// AAD for the round2 at-rest HPKE seal. Binds `(scheme, sessionId, requestId, selfSlot)`
+    /// so the at-rest envelope cannot be misrouted across sessions.
+    fn round2_at_rest_aad(session_id: &str, request_id: &str, self_slot: usize) -> Vec<u8> {
+        format!(
+            "scheme=mpcca_withdraw_v2_round2|session={session_id}|request={request_id}|slot={self_slot}"
+        )
+        .into_bytes()
+    }
+
+    /// Seal `α_share_j[0]` under the slot's own HPKE pubkey with the round2 at-rest AAD.
+    /// Returns the envelope ready for `Round2StateFile.encrypted_alpha_envelope`. The caller
+    /// MUST zeroize the stack-frame copy of α after this returns.
+    fn seal_round2_alpha_at_rest(
+        keypair: &HpkeKeypairFile,
+        session_id: &str,
+        request_id: &str,
+        self_slot: usize,
+        alpha: &Scalar,
+    ) -> WorkerResult<HpkeEnvelope> {
+        let mut plaintext = Vec::with_capacity(32);
+        plaintext.extend_from_slice(&alpha.to_bytes());
+        let aad = round2_at_rest_aad(session_id, request_id, self_slot);
+        let env = hpke_aead::seal(&keypair.public_key, HPKE_INFO_ROUND2_AT_REST, &aad, &plaintext)?;
+        plaintext.zeroize();
+        Ok(env)
+    }
+
+    /// Per-session file name for the M4 commit-1 round2 dk-state file.
+    fn round2_dk_state_file_name() -> &'static str {
+        "mpcca_withdraw_v2_round2_dk.json"
+    }
+
+    /// Persist the Round2StateFile to disk with mode 0o600. The file holds only public
+    /// partial commitments + an HPKE-encrypted-at-rest envelope sealing `α_share_j[0]`.
+    fn persist_round2_dk_state(
+        session_dir: &Path,
+        file: &Round2StateFile,
+    ) -> WorkerResult<()> {
+        let path = session_dir.join(round2_dk_state_file_name());
+        let json = serde_json::to_string_pretty(file)
+            .map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, json.as_bytes()).map_err(|err| WorkerError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&tmp, permissions)
+                .map_err(|err| WorkerError::Io(err.to_string()))?;
+        }
+        fs::rename(&tmp, &path).map_err(|err| WorkerError::Io(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Convenience read API for tests + M4 commit-3 finalize. Returns None if no round2
+    /// dk-state file exists at the per-session path.
+    pub fn load_round2_dk_state_file(
+        session_dir: &Path,
+    ) -> WorkerResult<Option<Round2StateFile>> {
+        let path = session_dir.join(round2_dk_state_file_name());
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(&path).map_err(|err| {
+            WorkerError::Crypto(format!("read mpcca round2 dk state {}: {err}", path.display()))
+        })?;
+        let existing: Round2StateFile = serde_json::from_slice(&raw).map_err(|err| {
+            WorkerError::Crypto(format!(
+                "parse mpcca round2 dk state {}: {err}",
+                path.display()
+            ))
+        })?;
+        if existing.scheme != "mpcca_withdraw_v2_round2_dk" {
+            return Err(WorkerError::InvalidDkgState(
+                "mpcca_withdraw_v2_round2_dk_unexpected_scheme_on_disk".to_string(),
+            ));
+        }
+        Ok(Some(existing))
+    }
+
+    /// Test-friendly Round2 statement-inputs hash builder so TS↔Rust byte-parity tests can
+    /// invoke the canonical hashing without exposing the internal struct.
+    pub fn round2_statement_inputs_hash_hex_for_test(
+        recipient_ek_hex: &str,
+        old_balance_c: &[String],
+        old_balance_d: &[String],
+        new_balance_c: &[String],
+        new_balance_d: &[String],
+        transfer_amount_c: &[String],
+        transfer_amount_d_sender: &[String],
+        transfer_amount_d_recipient: &[String],
+    ) -> WorkerResult<String> {
+        let inputs = Round2StatementInputs {
+            recipient_ek: normalize_hex(recipient_ek_hex, 32)?,
+            old_balance_c: normalise_round2_hex_vec(old_balance_c, ROUND2_ELL, "old_balance_c")?,
+            old_balance_d: normalise_round2_hex_vec(old_balance_d, ROUND2_ELL, "old_balance_d")?,
+            new_balance_c: normalise_round2_hex_vec(new_balance_c, ROUND2_ELL, "new_balance_c")?,
+            new_balance_d: normalise_round2_hex_vec(new_balance_d, ROUND2_ELL, "new_balance_d")?,
+            transfer_amount_c: normalise_round2_hex_vec(
+                transfer_amount_c,
+                ROUND2_N,
+                "transfer_amount_c",
+            )?,
+            transfer_amount_d_sender: normalise_round2_hex_vec(
+                transfer_amount_d_sender,
+                ROUND2_N,
+                "transfer_amount_d_sender",
+            )?,
+            transfer_amount_d_recipient: normalise_round2_hex_vec(
+                transfer_amount_d_recipient,
+                ROUND2_N,
+                "transfer_amount_d_recipient",
+            )?,
+        };
+        Ok(statement_inputs_hash_hex(&inputs))
+    }
+
     /// Test-friendly AAD builder. Re-exports the canonical AAD construction so integration
     /// tests can build the exact bytes used by `decrypt_and_verify_ingress_share`.
     #[allow(clippy::too_many_arguments)]
@@ -8135,8 +8555,9 @@ pub mod mpcca_withdraw_v2 {
         persist_ingress_state(&session_dir, &ingress_file)?;
 
         // Persist the round1 state file (M1 success: completed = true, no NotImplemented phase).
-        let session_state_path = persist_round1_completed(
+        let session_state_path = persist_round_completed(
             &session_dir,
+            "round1",
             req.self_slot,
             req.player_id,
             &req.dkg_epoch,
@@ -8176,10 +8597,17 @@ pub mod mpcca_withdraw_v2 {
         Ok(sha256_hex(&bytes))
     }
 
-    /// Persist the M1 round1 state file with completed: true. Returns the absolute path.
+    /// Persist a per-round RoundStateFile (M3a-shape compat) with `completed: true`
+    /// (i.e. `not_implemented_phase = ""`). Returns the absolute path.
+    ///
+    /// Used by both M1 round1 (ingress) and M4 commit-1 round2 (dk-threshold). Each round's
+    /// distinct phase semantics live in its own dedicated state file (e.g. IngressStateFile
+    /// for round1, Round2StateFile for round2); this RoundStateFile carries only the public
+    /// binding metadata that M3a's coordinator cross-check reads.
     #[allow(clippy::too_many_arguments)]
-    fn persist_round1_completed(
+    fn persist_round_completed(
         session_dir: &Path,
+        round_name: &str,
         self_slot: usize,
         player_id: usize,
         dkg_epoch: &str,
@@ -8193,7 +8621,7 @@ pub mod mpcca_withdraw_v2 {
     ) -> WorkerResult<PathBuf> {
         let file = RoundStateFile {
             scheme: "mpcca_withdraw_v2".to_string(),
-            round: "round1".to_string(),
+            round: round_name.to_string(),
             slot: self_slot,
             player_id,
             dkg_epoch: dkg_epoch.to_string(),
@@ -8203,12 +8631,12 @@ pub mod mpcca_withdraw_v2 {
             vault_sequence,
             deposit_count,
             worker_transcript_hash: worker_transcript_hash.to_string(),
-            // Empty string sentinel for "M1 round1 completed, no NotImplemented phase".
+            // Empty string sentinel for "round completed, no NotImplemented phase".
             not_implemented_phase: String::new(),
             created_at_unix_ms: now_millis_local(),
             observed_deposit_transcript_hashes: observed_deposit_transcript_hashes.to_vec(),
         };
-        let path = session_dir.join(round_file_name("round1"));
+        let path = session_dir.join(round_file_name(round_name));
         let json =
             serde_json::to_string_pretty(&file).map_err(|err| WorkerError::Serde(err.to_string()))?;
         let tmp = path.with_extension("tmp");
@@ -8224,19 +8652,187 @@ pub mod mpcca_withdraw_v2 {
         Ok(path)
     }
 
-    /// Round 2 entrypoint — chained off round1's transcript. Same shape as round1 with
-    /// `previousRoundTranscriptHash` and `previousRoundCommitments` bound into the worker hash.
+    /// Round 2 entrypoint (M4 Commit 1) — dk-component threshold contribution.
+    ///
+    /// Worker contract:
+    ///   1. Run the shared chained-round public binding (sigma re-verify, provenance gate,
+    ///      vault_sequence gate, observed-deposit ordering enforcement).
+    ///   2. Validate the user-supplied Aptos CA TransferV1 Statement input fields
+    ///      (recipient_ek + 6 ciphertext vectors of the canonical lengths {8, 8, 8, 8, 4, 4, 4}).
+    ///   3. Compute the round2 worker_transcript_hash that binds the base chained envelope
+    ///      AND the Statement input fields (defense-in-depth: a tampered ciphertext at round2
+    ///      changes the per-slot hash and the coordinator's cross-check rejects it).
+    ///   4. Load `ca_dkg_share_v2.json` and validate `(slot, dkg_epoch)` match the request.
+    ///   5. Recompute Lagrange λ_j at x=0 over sorted selectedSlots.
+    ///   6. Build the public Statement from the request fields.
+    ///   7. Programmatically derive BASE_DK_SET via `derive_dk_base_points` (psi_transfer
+    ///      inspection over the unit witness vector α=[1,0,...,0]).
+    ///   8. Generate `α_share_j[0]: Scalar` via CSPRNG. Zero-reject (goal.md decision #9).
+    ///   9. For each (idx, base) in BASE_DK_SET, compute `α_share_j[0] · base` →
+    ///      `partial_dk_commitments[idx]`. These aggregate (across the 5 selected workers)
+    ///      into the dk-component of the full sigma commitment vector A.
+    ///   10. HPKE-seal `α_share_j[0]` at-rest under the worker's own HPKE pubkey, with
+    ///       info `EUNOMA_M4_ROUND2_AT_REST_V1` and AAD binding session/request/slot.
+    ///       Zeroize the stack-frame copy of α_share_j[0] immediately after sealing.
+    ///   11. Persist `mpcca_withdraw_v2_round2_dk.json` (public partials + at-rest envelope).
+    ///   12. Persist `mpcca_withdraw_v2_round2.json` (RoundStateFile, completed=true).
+    ///   13. Return `Round2DkResult` with the partial commitments and indices used.
+    ///
+    /// Privacy contract: `α_share_j[0]` NEVER appears in plaintext on disk; no plaintext
+    /// witness component (chunks, amount, balance) reaches the worker. `dk_share_j` is
+    /// read from disk and used in computing the worker's Lagrange-weighted dk-contribution
+    /// only at M4 commit 3 (finalize). At commit 1 (round2), we only need the public bases
+    /// derived from the Statement.
     pub fn run_round2_v2(
         state_dir: &Path,
         req: &Round2Request,
-    ) -> WorkerResult<StubRoundResult> {
-        run_chained_round(
-            state_dir,
-            req,
+    ) -> WorkerResult<Round2DkResult> {
+        // 1. Shared chained-round public binding.
+        let binding = chained_round_public_binding(state_dir, &req.base)?;
+
+        // 2. Validate Statement input fields (lengths + 32-byte hex canonicalisation).
+        let stmt_inputs = normalise_round2_statement_inputs(req)?;
+
+        // 3. Compute round2 worker_transcript_hash: base chained hash + Statement-inputs hash.
+        let statement_inputs_hash_hex = statement_inputs_hash_hex(&stmt_inputs);
+        let worker_transcript_hash =
+            round2_v2_worker_transcript_hash(&binding.chained_hash, &statement_inputs_hash_hex);
+
+        // 4. Load ca_dkg_share_v2.json + slot/dkg_epoch validation.
+        let share = load_ca_dkg_v2_share(state_dir)?;
+        if share.slot != req.base.self_slot {
+            return Err(WorkerError::InvalidDkgState(format!(
+                "ca_dkg_share_v2 slot {} does not match self_slot {}",
+                share.slot, req.base.self_slot
+            )));
+        }
+        if share.dkg_epoch != req.base.dkg_epoch {
+            return Err(WorkerError::InvalidDkgState(format!(
+                "ca_dkg_share_v2 dkg_epoch {} does not match request {}",
+                share.dkg_epoch, req.base.dkg_epoch
+            )));
+        }
+        // dk_share_j is loaded and verified by load_ca_dkg_v2_share (Pedersen-share verify).
+        // We don't use it at round2 (only the public Lagrange coefficient is bound here for
+        // defense-in-depth — M4 commit 3 will consume dk_share_j × λ_j in the response share).
+        // Trigger the secret-byte read to surface a "missing share" failure here rather than
+        // at finalize where rolling back is harder.
+        let _dk_share_scalar = scalar_from_hex_local(&share.dk_share)
+            .map_err(|_| WorkerError::Crypto("round2_dk_share_non_canonical".to_string()))?;
+
+        // 5. Recompute Lagrange λ_j over sorted selectedSlots — sanity that the polynomial
+        // is well-defined for the selected quorum (we don't use λ_j at round2 directly, but
+        // failing here is preferable to surfacing the same problem at finalize).
+        let lambdas = lagrange_coefficients_at_zero(&binding.normalised.sorted)?;
+        let lambda_j = lambdas[req.base.player_id];
+        if lambda_j == Scalar::ZERO {
+            // Mathematically impossible for distinct slot ids in [0..7) but defends against
+            // future refactors that mis-thread the player_id ↔ slot mapping.
+            return Err(WorkerError::Crypto(
+                "round2_lagrange_coefficient_zero".to_string(),
+            ));
+        }
+        let _ = lambda_j; // used in commit 3, not commit 1
+
+        // 6. Build the public Statement from request fields.
+        let statement = build_round2_statement(&stmt_inputs, &binding.normalised.vault_ek_hex)?;
+
+        // 7. Programmatically derive BASE_DK_SET (canonical positions {0, 17} for the
+        // Aptos CA TransferV1 shape).
+        let dk_bases = derive_dk_base_points(&statement, ROUND2_ELL, ROUND2_N, false, 0)?;
+        if dk_bases.is_empty() {
+            return Err(WorkerError::Crypto(
+                "round2_dk_base_set_empty".to_string(),
+            ));
+        }
+
+        // 8. Generate α_share_j[0] via CSPRNG; zero-reject.
+        let mut rng = OsRng;
+        let mut alpha_share = generate_nonzero_scalar(&mut rng);
+
+        // 9. Compute partial dk-base commitments: α_share_j[0] · base for each (idx, base).
+        let mut partial_dk_commitments: Vec<Round2DkPartial> = Vec::with_capacity(dk_bases.len());
+        let mut dk_base_indices_used: Vec<usize> = Vec::with_capacity(dk_bases.len());
+        for DkBasePoint { index, base } in &dk_bases {
+            let partial_point: RistrettoPoint = base * alpha_share;
+            // Defense-in-depth: a zero partial means α_share or base was zero. Base is
+            // public + non-identity (derive_dk_base_points filters identity), and α_share
+            // already rejected zero — so this branch is impossible. We still surface a
+            // distinct error to make any future regression visible.
+            if partial_point == RistrettoPoint::identity() {
+                alpha_share.zeroize();
+                return Err(WorkerError::Crypto(
+                    "round2_partial_dk_commitment_identity".to_string(),
+                ));
+            }
+            let commitment_hex = hex_encode(partial_point.compress().as_bytes());
+            partial_dk_commitments.push(Round2DkPartial {
+                index: *index,
+                commitment_hex,
+            });
+            dk_base_indices_used.push(*index);
+        }
+
+        // 10. HPKE-seal α_share_j[0] at-rest. Zeroize stack copy immediately after.
+        let keypair = load_hpke_keypair_for_slot(state_dir, req.base.self_slot)?;
+        let encrypted_alpha_envelope = seal_round2_alpha_at_rest(
+            &keypair,
+            &req.base.session_id,
+            &req.base.request_id,
+            req.base.self_slot,
+            &alpha_share,
+        )?;
+        alpha_share.zeroize();
+
+        // 11. Persist Round2StateFile (mpcca_withdraw_v2_round2_dk.json) with public partials
+        // + at-rest envelope.
+        let now = now_millis_local();
+        let round2_state = Round2StateFile {
+            scheme: "mpcca_withdraw_v2_round2_dk".to_string(),
+            slot: req.base.self_slot,
+            player_id: req.base.player_id,
+            dkg_epoch: req.base.dkg_epoch.clone(),
+            request_id: req.base.request_id.clone(),
+            session_id: req.base.session_id.clone(),
+            partial_dk_commitments: partial_dk_commitments.clone(),
+            dk_base_indices_used: dk_base_indices_used.clone(),
+            worker_transcript_hash: worker_transcript_hash.clone(),
+            encrypted_alpha_envelope,
+            created_at_unix_ms: now,
+        };
+        fs::create_dir_all(&binding.session_dir)
+            .map_err(|err| WorkerError::Io(err.to_string()))?;
+        persist_round2_dk_state(&binding.session_dir, &round2_state)?;
+
+        // 12. Persist round2 RoundStateFile (M3a-shape compat, completed marker is empty
+        // not_implemented_phase).
+        let session_state_path = persist_round_completed(
+            &binding.session_dir,
             "round2",
-            ROUND2_TRANSCRIPT_DOMAIN,
-            ROUND2_NOT_IMPLEMENTED_PHASE,
-        )
+            req.base.self_slot,
+            req.base.player_id,
+            &req.base.dkg_epoch,
+            &req.base.request_id,
+            &req.base.session_id,
+            &binding.normalised.vault_ek_hex,
+            req.base.vault_sequence,
+            req.base.deposit_count,
+            &worker_transcript_hash,
+            &binding.normalised.observed_deposit_transcript_hashes,
+        )?;
+        let session_state_hash = file_sha256_hex(&session_state_path)?;
+
+        Ok(Round2DkResult {
+            slot: req.base.self_slot,
+            player_id: req.base.player_id,
+            session_state_path: session_state_path.display().to_string(),
+            session_state_hash,
+            worker_transcript_hash,
+            observed_at_unix_ms: now,
+            completed: true,
+            partial_dk_commitments,
+            dk_base_indices_used,
+        })
     }
 
     pub fn run_prove_v2(state_dir: &Path, req: &ProveRequest) -> WorkerResult<StubRoundResult> {
@@ -8512,16 +9108,30 @@ pub mod mpcca_withdraw_v2 {
         ))
     }
 
-    /// Shared chained-round entrypoint. Round 2, prove, and finalize all share this body modulo
-    /// the (round name, domain, phase string) triple.
-    fn run_chained_round(
+    /// Output of `chained_round_public_binding`: the normalised public binding fields, the
+    /// loaded vault_state_v2.json, the per-session dir, and the BASE chained-round transcript
+    /// hash computed against the **ROUND2 V1 domain** (used by ProveRequest + FinalizeRequest
+    /// stub paths). Round2's M4 commit-1 path extends this base hash with the Statement-input
+    /// fields to produce its final worker_transcript_hash.
+    struct ChainedRoundBinding {
+        normalised: NormalisedBinding,
+        #[allow(dead_code)]
+        existing: VaultStateFile,
+        session_dir: PathBuf,
+        /// SHA-256 hex of the chained-round transcript bytes including
+        /// `previous_round_transcript_hash` and `previous_round_commitments`, hashed under
+        /// the caller-supplied domain. Round2 extends this with the Statement-input hash;
+        /// prove/finalize stubs persist this directly.
+        chained_hash: String,
+    }
+
+    /// Run the shared chained-round binding work and compute the chained worker_transcript_hash
+    /// for the given `domain`. Does NOT persist anything; the caller decides which file layout
+    /// to write.
+    fn chained_round_public_binding(
         state_dir: &Path,
         req: &ChainedRoundRequest,
-        round_name: &str,
-        domain: &str,
-        not_implemented_phase: &'static str,
-    ) -> WorkerResult<StubRoundResult> {
-        // Re-pack the round1 envelope so we can reuse common_public_binding_work.
+    ) -> WorkerResult<ChainedRoundBinding> {
         let envelope = Round1Request {
             dkg_epoch: req.dkg_epoch.clone(),
             request_id: req.request_id.clone(),
@@ -8530,10 +9140,6 @@ pub mod mpcca_withdraw_v2 {
             registration_transcript_hash: req.registration_transcript_hash.clone(),
             vault_state_init_transcript_hash: req.vault_state_init_transcript_hash.clone(),
             observed_deposit_transcript_hashes: req.observed_deposit_transcript_hashes.clone(),
-            // Codex M3a P2 #1 v2: forward the cursor mapping into the round1 envelope so
-            // common_public_binding_work enforces strict monotonic ordering for chained
-            // rounds too — a tampered ordering can't slip past round1 by being
-            // reintroduced at round2/prove/finalize.
             observed_deposit_cursors: req.observed_deposit_cursors.clone(),
             roster_hash: req.roster_hash.clone(),
             selected_slots: req.selected_slots.clone(),
@@ -8552,16 +9158,11 @@ pub mod mpcca_withdraw_v2 {
             expiry_secs: req.expiry_secs,
             request_hash: req.request_hash.clone(),
             deposit_count: req.deposit_count,
-            // M1 ingress fields are round1-only — chained rounds inherit nothing from them
-            // because the M3a chained-stub path runs against the un-ingressed envelope. M4
-            // will load the M1 (a_i, b_i) shares from the worker-local session state file,
-            // NOT from the wire body, so leaving these empty here is safe.
             amount_commitment: String::new(),
             per_share_commitments: Vec::new(),
             ingress_envelopes: Vec::new(),
         };
-        let (normalised, _existing, session_dir) =
-            common_public_binding_work(state_dir, &envelope)?;
+        let (normalised, existing, session_dir) = common_public_binding_work(state_dir, &envelope)?;
         let previous_round_transcript_hash =
             normalize_hex(&req.previous_round_transcript_hash, 32)?;
         if req.previous_round_commitments.len() != DEOPERATOR_THRESHOLD {
@@ -8574,8 +9175,13 @@ pub mod mpcca_withdraw_v2 {
         for c in &req.previous_round_commitments {
             previous_round_commitments.push(normalize_hex(c, 32)?);
         }
-        let worker_transcript_hash = chained_round_worker_hash(
-            domain,
+        // The chained-round hash is computed under ROUND2_TRANSCRIPT_DOMAIN by default —
+        // both round2 and the chained-round stub path use it. Round2 commit 1's worker hash
+        // extends this with the Statement-input hash; the prove/finalize stub passes this
+        // through to persist_and_stub directly (they additionally re-hash with their own
+        // domain via run_chained_round, see below).
+        let chained_hash = chained_round_worker_hash(
+            ROUND2_TRANSCRIPT_DOMAIN,
             &req.session_id,
             &req.request_id,
             &req.dkg_epoch,
@@ -8603,20 +9209,84 @@ pub mod mpcca_withdraw_v2 {
             &previous_round_transcript_hash,
             &previous_round_commitments,
         );
+        Ok(ChainedRoundBinding {
+            normalised,
+            existing,
+            session_dir,
+            chained_hash,
+        })
+    }
+
+    /// Shared chained-round stub entrypoint for prove + finalize (round2 has its own M4
+    /// commit-1 path). Computes the per-round chained worker_transcript_hash under the
+    /// caller-supplied domain, persists the M3a-shape RoundStateFile, and surfaces a
+    /// NotImplemented signal so the coordinator's per-round handlers can fan out a 501.
+    fn run_chained_round(
+        state_dir: &Path,
+        req: &ChainedRoundRequest,
+        round_name: &str,
+        domain: &str,
+        not_implemented_phase: &'static str,
+    ) -> WorkerResult<StubRoundResult> {
+        let binding = chained_round_public_binding(state_dir, req)?;
+        // Re-hash under the caller-supplied domain so each chained round has a distinct
+        // worker_transcript_hash. The common binding helper returned the ROUND2 domain
+        // hash; if the caller asked for PROVE or FINALIZE we recompute with their domain
+        // by re-running chained_round_worker_hash with the same fields. The cost is one
+        // SHA-256 — negligible.
+        let previous_round_transcript_hash =
+            normalize_hex(&req.previous_round_transcript_hash, 32)?;
+        let mut previous_round_commitments = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for c in &req.previous_round_commitments {
+            previous_round_commitments.push(normalize_hex(c, 32)?);
+        }
+        let worker_transcript_hash = if domain == ROUND2_TRANSCRIPT_DOMAIN {
+            binding.chained_hash.clone()
+        } else {
+            chained_round_worker_hash(
+                domain,
+                &req.session_id,
+                &req.request_id,
+                &req.dkg_epoch,
+                &binding.normalised.vault_ek_transcript_hash,
+                &binding.normalised.registration_transcript_hash,
+                &binding.normalised.vault_state_init_transcript_hash,
+                &binding.normalised.observed_deposit_transcript_hashes,
+                &binding.normalised.roster_hash,
+                &binding.normalised.sorted,
+                req.self_slot,
+                req.player_id,
+                &binding.normalised.vault_ek_hex,
+                &binding.normalised.sender_address,
+                &binding.normalised.asset_type,
+                req.chain_id,
+                &binding.normalised.root,
+                &binding.normalised.nullifier_hash,
+                &binding.normalised.recipient,
+                &binding.normalised.recipient_hash,
+                &binding.normalised.amount_tag,
+                req.vault_sequence,
+                req.expiry_secs,
+                &binding.normalised.request_hash,
+                req.deposit_count,
+                &previous_round_transcript_hash,
+                &previous_round_commitments,
+            )
+        };
         persist_and_stub(
-            &session_dir,
+            &binding.session_dir,
             round_name,
             req.self_slot,
             req.player_id,
             &req.dkg_epoch,
             &req.request_id,
             &req.session_id,
-            &normalised.vault_ek_hex,
+            &binding.normalised.vault_ek_hex,
             req.vault_sequence,
             req.deposit_count,
             &worker_transcript_hash,
             not_implemented_phase,
-            &normalised.observed_deposit_transcript_hashes,
+            &binding.normalised.observed_deposit_transcript_hashes,
         )?;
         Err(WorkerError::NotImplemented(not_implemented_phase))
     }
