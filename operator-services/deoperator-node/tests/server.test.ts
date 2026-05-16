@@ -908,4 +908,189 @@ describe("deoperator node", () => {
       globalThis.fetch = oldFetch;
     }
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Codex P1 #3: forbidden-plaintext-field guard on every V2 worker passthrough.
+  //
+  // Without `assertNoForbiddenPlaintextFields` at the deop-node boundary, extra fields
+  // like `dkShare`, `blindShare`, `secret`, `nullifier`, etc. would be forwarded to the
+  // worker — violating the TS/API plaintext invariant. Worker would ignore them, but
+  // the boundary check is the defense-in-depth that catches them before they propagate.
+  // ---------------------------------------------------------------------------------------------
+  it("ca_registration_v2 passthroughs reject forbidden plaintext fields before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const validRosterHash = caDkgV2RosterHash(caDkgV2Roster);
+      // All five V2 ca_registration routes must reject a body that smuggles a forbidden
+      // field. The deop-protocol `FORBIDDEN_FIELD_NAMES` set covers amount*, blind,
+      // secret*, vaultdk*, nullifier*, dkinv*, invshare, inverseshare (case-insensitive,
+      // dashes/underscores stripped). We rotate through the categories to confirm each
+      // route's guard fires.
+      const routes: Array<[string, Record<string, unknown>]> = [
+        [
+          "/worker/v2/derive/ca_registration/round1",
+          {
+            dkgEpoch: "1",
+            requestId: "fb-r1",
+            sessionId: "fb-r1",
+            caDkgTranscriptHash: h32("a"),
+            rosterHash: validRosterHash,
+            selectedSlots: [0, 1, 2, 3, 4],
+            selfSlot: 0,
+            playerId: 0,
+            vaultEk: h32("c"),
+            senderAddress: h32("e"),
+            assetType: h32("f"),
+            chainId: 2,
+            secret: h32("9"), // FORBIDDEN (matches `secret`)
+          },
+        ],
+        [
+          "/worker/v2/derive/ca_registration/round2",
+          {
+            dkgEpoch: "1",
+            requestId: "fb-r2",
+            sessionId: "fb-r2",
+            caDkgTranscriptHash: h32("a"),
+            rosterHash: validRosterHash,
+            selectedSlots: [0, 1, 2, 3, 4],
+            selfSlot: 0,
+            playerId: 0,
+            nonceId: h32("1"),
+            challenge: h32("3"),
+            blind: h32("9"), // FORBIDDEN (matches `blind`)
+          },
+        ],
+        [
+          "/worker/v2/derive/ca_registration/challenge",
+          {
+            vaultEk: h32("c"),
+            senderAddress: h32("d"),
+            assetType: h32("e"),
+            chainId: 2,
+            commitments: [0, 1, 2, 3, 4].map((slot) => ({ slot, commitment: h32("4") })),
+            vault_dk: h32("9"), // FORBIDDEN (normalizes to `vaultdk`)
+          },
+        ],
+        [
+          "/worker/v2/derive/ca_registration/verify",
+          {
+            vaultEk: h32("c"),
+            senderAddress: h32("d"),
+            assetType: h32("e"),
+            chainId: 2,
+            aggregateCommitment: h32("4"),
+            aggregateResponse: h32("5"),
+            nullifier: h32("9"), // FORBIDDEN
+          },
+        ],
+        [
+          "/worker/v2/derive/ca_registration/aggregate",
+          {
+            vaultEk: h32("c"),
+            senderAddress: h32("d"),
+            assetType: h32("e"),
+            chainId: 2,
+            commitments: [0, 1, 2, 3, 4].map((slot) => ({ slot, commitment: h32("4") })),
+            responses: [0, 1, 2, 3, 4].map((slot) => ({ slot, response: h32("5") })),
+            vaultDk: h32("9"), // FORBIDDEN (lowercased = `vaultdk`)
+          },
+        ],
+      ];
+      for (const [url, payload] of routes) {
+        const res = await server.inject({ method: "POST", url, payload });
+        expect(res.statusCode, `${url} should reject forbidden field`).toBe(400);
+        const body = res.json();
+        expect(body.error, `${url} should report forbidden_plaintext_field`).toBe(
+          "forbidden_plaintext_field",
+        );
+      }
+      expect(workerCalled, "worker must NOT be called on forbidden-field rejection").toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_ek_v2 passthroughs reject forbidden plaintext fields before forwarding", async () => {
+    // Codex P1 #3 audit: same guard on the Phase 2 vault_ek passthroughs.
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const validRosterHash = caDkgV2RosterHash(caDkgV2Roster);
+      const routes: Array<[string, Record<string, unknown>]> = [
+        [
+          "/worker/v2/derive/vault_ek/round0",
+          {
+            dkgEpoch: "1",
+            requestId: "ve-r0",
+            sessionId: "ve-r0",
+            caDkgTranscriptHash: h32("a"),
+            rosterHash: validRosterHash,
+            selectedSlots: [0, 1, 2, 3, 4],
+            selfSlot: 0,
+            playerId: 0,
+            dkInv: h32("9"), // FORBIDDEN — `dkinv` matches the forbidden set
+          },
+        ],
+        [
+          "/worker/v2/derive/vault_ek/round1",
+          {
+            dkgEpoch: "1",
+            requestId: "ve-r1",
+            sessionId: "ve-r1",
+            caDkgTranscriptHash: h32("a"),
+            rosterHash: validRosterHash,
+            selectedSlots: [0, 1, 2, 3, 4],
+            selfSlot: 0,
+            playerId: 0,
+            invShare: h32("9"), // FORBIDDEN
+          },
+        ],
+        [
+          "/worker/v2/derive/vault_ek/verify",
+          {
+            dkgEpoch: "1",
+            rosterHash: validRosterHash,
+            inverseShare: h32("9"), // FORBIDDEN
+          },
+        ],
+      ];
+      for (const [url, payload] of routes) {
+        const res = await server.inject({ method: "POST", url, payload });
+        expect(res.statusCode, `${url} should reject forbidden field`).toBe(400);
+        const body = res.json();
+        expect(body.error, `${url} should report forbidden_plaintext_field`).toBe(
+          "forbidden_plaintext_field",
+        );
+      }
+      expect(workerCalled, "worker must NOT be called on forbidden-field rejection").toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
 });

@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { CryptoWorkerUnavailableError, type CryptoWorker } from "@eunoma/crypto-worker-client";
 import {
   ForbiddenPlaintextFieldError,
+  assertNoForbiddenPlaintextFields,
   caDkgV2RosterHash,
   frostDkgV2RosterHash,
   parseAbortEvidenceRequest,
@@ -309,9 +310,16 @@ export function buildDeoperatorNodeServer(
   // Codex P1 #4 round0: pre-MPC commitment passthrough. Mirrors round1's roster + slot
   // assertion pattern; without it a stale-roster or wrong-slot request could persist
   // a round0 commitment under this node's state_dir.
+  //
+  // Codex P1 #3 (audit): every V2 worker passthrough runs `assertNoForbiddenPlaintextFields`
+  // on the request body BEFORE forwarding. Skipping the parser at this boundary would
+  // let extra fields named `dkShare`, `blindShare`, `secret`, `nullifier`, etc. flow to
+  // the worker — violating the TS/API plaintext invariant even if the worker itself
+  // ignores them.
   server.post("/worker/v2/derive/vault_ek/round0", async (req, reply) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
       const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
       assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
       const selfSlot = body.selfSlot;
@@ -327,6 +335,7 @@ export function buildDeoperatorNodeServer(
   server.post("/worker/v2/derive/vault_ek/round1", async (req, reply) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
       const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
       assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
       const selfSlot = body.selfSlot;
@@ -342,6 +351,7 @@ export function buildDeoperatorNodeServer(
   server.post("/worker/v2/derive/vault_ek/verify", async (req, reply) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
       const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
       assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
       // /verify body has no `selfSlot` — coordinator picks the verifier; trust the
@@ -355,10 +365,15 @@ export function buildDeoperatorNodeServer(
   // Milestone 1: V2 threshold CA registration passthroughs. Mirror the vault_ek
   // round0/round1 pattern — assert rosterHash + (for round1/round2) selfSlot before
   // forwarding so a stale-roster or wrong-slot request can't persist a nonce file under
-  // this node's state_dir.
+  // this node's state_dir. Codex P1 #3: every route also runs
+  // `assertNoForbiddenPlaintextFields(body)` BEFORE forwarding — without it, extra
+  // fields named `dkShare`, `blindShare`, `secret`, etc. would slip past the
+  // TS/API boundary, even on the share-independent /challenge, /verify, /aggregate
+  // routes.
   server.post("/worker/v2/derive/ca_registration/round1", async (req, reply) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
       const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
       assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
       const selfSlot = body.selfSlot;
@@ -374,6 +389,7 @@ export function buildDeoperatorNodeServer(
   server.post("/worker/v2/derive/ca_registration/round2", async (req, reply) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
       const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
       assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
       const selfSlot = body.selfSlot;
@@ -392,17 +408,35 @@ export function buildDeoperatorNodeServer(
     // selfSlot binding — same shape as /verify and /aggregate. Replaces the V1
     // `/worker/v2/ca/registration/challenge` route that this deop-node never
     // allowlisted.
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+    } catch (err) {
+      return sendError(reply, err);
+    }
     return forwardToWorker("/worker/v2/derive/ca_registration/challenge", req.body, reply);
   });
   server.post("/worker/v2/derive/ca_registration/verify", async (req, reply) => {
     // /verify body has no selfSlot — coordinator picks the verifier. The roster-hash
     // gate binds it to our configured roster.
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+    } catch (err) {
+      return sendError(reply, err);
+    }
     return forwardToWorker("/worker/v2/derive/ca_registration/verify", req.body, reply);
   });
   server.post("/worker/v2/derive/ca_registration/aggregate", async (req, reply) => {
     // /aggregate is share-independent public compute over already-published commitments
     // + responses. No selfSlot binding required — the coordinator targets the verifier
     // slot. Forward directly to the local worker.
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+    } catch (err) {
+      return sendError(reply, err);
+    }
     return forwardToWorker("/worker/v2/derive/ca_registration/aggregate", req.body, reply);
   });
 
