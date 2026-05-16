@@ -4915,6 +4915,550 @@ pub mod ca_registration_v2 {
     }
 }
 
+// =================================================================================================
+// Milestone 2 sub-milestone 2a — per-deoperator vault state share initialization.
+//
+// After Phase 2 (vault_ek derivation) and Milestone 1 (V2 threshold registration sigma), each of
+// the 5 selected deoperators must provision a per-vault state file that pins:
+//   - the Phase 2-derived `vault_ek` public point
+//   - the Milestone 1 (aggregateCommitment, aggregateResponse, challenge, registrationTranscriptHash) tuple
+//   - the chain-side `vault_sequence` cursor (starts at 0; bumps on each accepted deposit/withdraw)
+//   - the per-worker `deposit_count_observed` cursor (starts at 0; sub-milestone 2b will bump it)
+//
+// No secret material — this file is mode 0o600 anyway because it sits next to the worker's CA DKG
+// V2 share, but its CONTENTS contain only public points, hashes, and decimal counters. Mirrors the
+// Phase 2 round0 pattern: idempotent re-call returns the same `vault_state_v2.json` bytes, fresh
+// re-init under a different `(dkg_epoch, vault_ek, registration_transcript_hash)` is REJECTED
+// (returns `vault_state_v2_already_initialized_with_different_inputs`) — the operator must rotate
+// the DKG epoch + re-derive vault_ek + re-run Milestone 1 before re-initialising.
+//
+// Transcript shape — byte-identical with `deop-protocol::vault_state_v2`:
+//   "EUNOMA_VAULT_STATE_V2_INIT_V1"
+//   || ":" || session_id || ":" || request_id
+//   || ":" || dkg_epoch
+//   || ":" || ca_dkg_transcript_hash (norm lower hex)
+//   || ":" || vault_ek_transcript_hash (Phase 2)
+//   || ":" || registration_transcript_hash (Milestone 1)
+//   || ":" || roster_hash (norm lower hex)
+//   || ":" || joined(sorted_selected_slots, ",")
+//   || ":" || self_slot || ":" || player_id
+//   || ":" || vault_ek (norm lower hex)
+//   || ":" || sender_address (norm lower hex)
+//   || ":" || asset_type (norm lower hex)
+//   || ":" || chain_id (decimal)
+//   || ":" || aggregate_commitment (norm lower hex)
+//   || ":" || aggregate_response (norm lower hex)
+//   || ":" || challenge (norm lower hex)
+//   || ":" || vault_sequence (decimal)
+//   || ":" || deposit_count_observed (decimal)
+//   → sha256 → lowercase hex.
+// =================================================================================================
+pub mod vault_state_v2 {
+    use crate::ca_dkg_v2::load_ca_dkg_v2_share;
+    use crate::ca_local::verify_registration_proof;
+    use crate::mpc_spdz_adapter::is_safe_id;
+    use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    pub(crate) const INIT_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_STATE_V2_INIT_V1";
+    pub(crate) const VAULT_STATE_FILE_NAME: &str = "vault_state_v2.json";
+
+    /// Request shape for `/worker/v2/vault_state/init`. Each of the 5 selected workers receives
+    /// the same payload (modulo `self_slot` / `player_id`). The coordinator has already
+    /// (a) verified Phase 2 + Milestone 1 provenance against persisted transcripts, and
+    /// (b) recomputed `vaultEkTranscriptHash` and `registrationTranscriptHash` from those
+    /// artifacts. The worker re-binds them into its on-disk vault-state file so any future
+    /// MPCCA round can cross-check.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct InitRequest {
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub ca_dkg_transcript_hash: String,
+        /// Phase 2 vault_ek derivation transcript hash. Bound into the worker transcript so any
+        /// MPCCA derivation that consumes this state can verify it descends from a real Phase 2
+        /// run by the coordinator.
+        pub vault_ek_transcript_hash: String,
+        /// Milestone 1 CA registration transcript hash. Likewise bound.
+        pub registration_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub player_id: usize,
+        /// Phase 2-derived public point H * dk^-1. 32-byte hex.
+        pub vault_ek: String,
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+        /// Milestone 1 aggregate sigma commitment (32-byte hex).
+        pub aggregate_commitment: String,
+        /// Milestone 1 aggregate sigma response (32-byte hex scalar).
+        pub aggregate_response: String,
+        /// Milestone 1 Fiat-Shamir challenge (32-byte hex scalar).
+        pub challenge: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct InitResult {
+        pub slot: usize,
+        pub player_id: usize,
+        pub vault_state_path: String,
+        pub vault_state_hash: String,
+        pub worker_transcript_hash: String,
+        pub vault_sequence: u64,
+        pub deposit_count_observed: u64,
+        pub created_at_unix_ms: u128,
+        /// `true` when this call materialised a new file; `false` on idempotent replay.
+        pub initialized: bool,
+    }
+
+    /// On-disk shape for the per-worker vault-state file. Mode 0o600 (no secret material, but
+    /// the directory layout mirrors `ca_dkg_share_v2.json` so we keep the same posture).
+    /// Persisted at `state_dir/vault_state_v2.json`.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub struct VaultStateFile {
+        pub scheme: String,
+        pub slot: usize,
+        pub player_id: usize,
+        pub dkg_epoch: String,
+        pub ca_dkg_transcript_hash: String,
+        pub vault_ek_transcript_hash: String,
+        pub registration_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub vault_ek_hex: String,
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+        pub aggregate_commitment: String,
+        pub aggregate_response: String,
+        pub challenge: String,
+        /// Mirrors the on-chain `BridgeVault.vault_sequence`. Starts at 0; bumps on each accepted
+        /// withdraw.
+        pub vault_sequence: u64,
+        /// Per-worker cursor — number of confirmed deposit events this worker has observed for
+        /// this vault. Starts at 0; sub-milestone 2b will increment.
+        pub deposit_count_observed: u64,
+        pub created_at_unix_ms: u128,
+    }
+
+    fn vault_state_file_path(state_dir: &Path) -> PathBuf {
+        state_dir.join(VAULT_STATE_FILE_NAME)
+    }
+
+    /// Compute the per-worker init transcript hash. Byte-identical with the TS reconstructor in
+    /// `deop-protocol::vault_state_v2::vaultStateV2InitWorkerTranscriptHash`.
+    pub fn init_worker_transcript_hash(
+        session_id: &str,
+        request_id: &str,
+        dkg_epoch: &str,
+        ca_dkg_transcript_hash: &str,
+        vault_ek_transcript_hash: &str,
+        registration_transcript_hash: &str,
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        self_slot: usize,
+        player_id: usize,
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        aggregate_commitment_hex: &str,
+        aggregate_response_hex: &str,
+        challenge_hex: &str,
+        vault_sequence: u64,
+        deposit_count_observed: u64,
+    ) -> String {
+        let joined = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(INIT_TRANSCRIPT_DOMAIN.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(request_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(ca_dkg_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(registration_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(roster_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(self_slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(player_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(sender_address_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(asset_type_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(chain_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(aggregate_commitment_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(aggregate_response_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(challenge_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_sequence.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(deposit_count_observed.to_string().as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    /// Worker entrypoint for `/worker/v2/vault_state/init`. Validates the (Phase 2, Milestone 1,
+    /// CA DKG V2 share) bindings, then writes `vault_state_v2.json` atomically with mode 0o600.
+    /// Idempotent: a subsequent call with the SAME `(dkg_epoch, vault_ek, vault_ek_transcript_hash,
+    /// registration_transcript_hash, sender_address, asset_type, chain_id, aggregate_commitment,
+    /// aggregate_response, challenge)` returns the same response (with `initialized: false`); a
+    /// call with ANY of these changed is rejected `vault_state_v2_already_initialized_with_different_inputs`
+    /// — operator must rotate epoch + re-derive.
+    pub fn init_vault_state_v2(state_dir: &Path, req: &InitRequest) -> WorkerResult<InitResult> {
+        validate_selected_slots(&req.selected_slots)?;
+        assert_slot(req.self_slot)?;
+        if !req.selected_slots.contains(&req.self_slot) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot {} not in selected_slots",
+                req.self_slot
+            )));
+        }
+        if req.player_id >= DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "player_id {} out of range 0..{}",
+                req.player_id, DEOPERATOR_THRESHOLD
+            )));
+        }
+        let sorted = sorted_unique_slots(&req.selected_slots)?;
+        if sorted[req.player_id] != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                req.player_id, sorted[req.player_id], req.self_slot
+            )));
+        }
+        if req.request_id.is_empty() || !is_safe_id(&req.request_id) {
+            return Err(WorkerError::InvalidRequest(
+                "request_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.session_id.is_empty() || !is_safe_id(&req.session_id) {
+            return Err(WorkerError::InvalidRequest(
+                "session_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.dkg_epoch.is_empty() || !req.dkg_epoch.chars().all(|c| c.is_ascii_digit()) {
+            return Err(WorkerError::InvalidRequest(
+                "dkg_epoch must be a non-empty decimal string".to_string(),
+            ));
+        }
+
+        let ca_transcript = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
+        let vault_ek_transcript = normalize_hex(&req.vault_ek_transcript_hash, 32)?;
+        let registration_transcript = normalize_hex(&req.registration_transcript_hash, 32)?;
+        let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        let vault_ek_hex = normalize_hex(&req.vault_ek, 32)?;
+        let sender = normalize_hex(&req.sender_address, 32)?;
+        let asset = normalize_hex(&req.asset_type, 32)?;
+        let aggregate_commitment = normalize_hex(&req.aggregate_commitment, 32)?;
+        let aggregate_response = normalize_hex(&req.aggregate_response, 32)?;
+        let challenge = normalize_hex(&req.challenge, 32)?;
+
+        // Cross-check: the supplied Milestone 1 sigma tuple MUST satisfy the public verify
+        // equation against this vault_ek. We refuse to persist a forged tuple. This is the
+        // same equation the coordinator+verifier worker already enforces, but doing it again
+        // here means a node that booted from a corrupted state-dir can still detect that the
+        // tuple it was handed is bogus before it commits to disk.
+        verify_registration_proof(
+            &vault_ek_hex,
+            &sender,
+            &asset,
+            req.chain_id,
+            &aggregate_commitment,
+            &aggregate_response,
+        )?;
+
+        // Cross-check: V2 share must exist and bind to (dkg_epoch, slot, ca_dkg_transcript_hash).
+        // We don't use the dk_share value itself — only the metadata — so no secret material is
+        // touched in this path.
+        let share = load_ca_dkg_v2_share(state_dir)?;
+        if share.slot != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 slot {} does not match self_slot {}",
+                share.slot, req.self_slot
+            )));
+        }
+        if share.dkg_epoch != req.dkg_epoch {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 dkg_epoch {} does not match request {}",
+                share.dkg_epoch, req.dkg_epoch
+            )));
+        }
+        if share.transcript_hash.to_lowercase() != ca_transcript {
+            return Err(WorkerError::InvalidRequest(
+                "ca_dkg_transcript_hash does not match local share".to_string(),
+            ));
+        }
+
+        let file_path = vault_state_file_path(state_dir);
+        if file_path.exists() {
+            // Idempotency replay: every field bound into the transcript must match. Any
+            // mismatch → `vault_state_v2_already_initialized_with_different_inputs`. We reject
+            // even cursor-bump attempts via this endpoint: 2b will have its own dedicated
+            // endpoint with its own cursor-monotonicity check.
+            let raw = fs::read(&file_path).map_err(|err| {
+                WorkerError::Crypto(format!("read existing vault_state_v2 file: {err}"))
+            })?;
+            let existing: VaultStateFile = serde_json::from_slice(&raw).map_err(|err| {
+                WorkerError::Crypto(format!("parse vault_state_v2 file: {err}"))
+            })?;
+            if existing.scheme != "vault_state_v2" {
+                return Err(WorkerError::InvalidDkgState(
+                    "vault_state_v2_unexpected_scheme_on_disk".to_string(),
+                ));
+            }
+            if existing.dkg_epoch != req.dkg_epoch
+                || existing.slot != req.self_slot
+                || existing.player_id != req.player_id
+                || normalize_hex(&existing.ca_dkg_transcript_hash, 32)? != ca_transcript
+                || normalize_hex(&existing.vault_ek_transcript_hash, 32)? != vault_ek_transcript
+                || normalize_hex(&existing.registration_transcript_hash, 32)? != registration_transcript
+                || normalize_hex(&existing.roster_hash, 32)? != roster_hash
+                || existing.selected_slots != sorted
+                || normalize_hex(&existing.vault_ek_hex, 32)? != vault_ek_hex
+                || normalize_hex(&existing.sender_address, 32)? != sender
+                || normalize_hex(&existing.asset_type, 32)? != asset
+                || existing.chain_id != req.chain_id
+                || normalize_hex(&existing.aggregate_commitment, 32)? != aggregate_commitment
+                || normalize_hex(&existing.aggregate_response, 32)? != aggregate_response
+                || normalize_hex(&existing.challenge, 32)? != challenge
+            {
+                return Err(WorkerError::InvalidDkgState(
+                    "vault_state_v2_already_initialized_with_different_inputs".to_string(),
+                ));
+            }
+            let vault_state_hash = sha256_hex(&raw);
+            let worker_transcript_hash = init_worker_transcript_hash(
+                &req.session_id,
+                &req.request_id,
+                &req.dkg_epoch,
+                &ca_transcript,
+                &vault_ek_transcript,
+                &registration_transcript,
+                &roster_hash,
+                &sorted,
+                req.self_slot,
+                req.player_id,
+                &vault_ek_hex,
+                &sender,
+                &asset,
+                req.chain_id,
+                &aggregate_commitment,
+                &aggregate_response,
+                &challenge,
+                existing.vault_sequence,
+                existing.deposit_count_observed,
+            );
+            return Ok(InitResult {
+                slot: req.self_slot,
+                player_id: req.player_id,
+                vault_state_path: file_path.display().to_string(),
+                vault_state_hash,
+                worker_transcript_hash,
+                vault_sequence: existing.vault_sequence,
+                deposit_count_observed: existing.deposit_count_observed,
+                created_at_unix_ms: existing.created_at_unix_ms,
+                initialized: false,
+            });
+        }
+
+        // Fresh init.
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let layout = VaultStateFile {
+            scheme: "vault_state_v2".to_string(),
+            slot: req.self_slot,
+            player_id: req.player_id,
+            dkg_epoch: req.dkg_epoch.clone(),
+            ca_dkg_transcript_hash: ca_transcript.clone(),
+            vault_ek_transcript_hash: vault_ek_transcript.clone(),
+            registration_transcript_hash: registration_transcript.clone(),
+            roster_hash: roster_hash.clone(),
+            selected_slots: sorted.clone(),
+            vault_ek_hex: vault_ek_hex.clone(),
+            sender_address: sender.clone(),
+            asset_type: asset.clone(),
+            chain_id: req.chain_id,
+            aggregate_commitment: aggregate_commitment.clone(),
+            aggregate_response: aggregate_response.clone(),
+            challenge: challenge.clone(),
+            vault_sequence: 0,
+            deposit_count_observed: 0,
+            created_at_unix_ms: created_at,
+        };
+        // pretty-print so the file is human-auditable. JSON canonicalisation isn't needed for
+        // the integrity hash because `vault_state_hash` is over the EXACT byte buffer the worker
+        // both wrote AND returned (and 2b will compute it again on read), so any future caller
+        // that wants to verify integrity can read the file byte-for-byte and re-hash.
+        let bytes = serde_json::to_vec_pretty(&layout)
+            .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;
+        write_secret_file(&file_path, &bytes)?;
+
+        let vault_state_hash = sha256_hex(&bytes);
+        let worker_transcript_hash = init_worker_transcript_hash(
+            &req.session_id,
+            &req.request_id,
+            &req.dkg_epoch,
+            &ca_transcript,
+            &vault_ek_transcript,
+            &registration_transcript,
+            &roster_hash,
+            &sorted,
+            req.self_slot,
+            req.player_id,
+            &vault_ek_hex,
+            &sender,
+            &asset,
+            req.chain_id,
+            &aggregate_commitment,
+            &aggregate_response,
+            &challenge,
+            0,
+            0,
+        );
+        Ok(InitResult {
+            slot: req.self_slot,
+            player_id: req.player_id,
+            vault_state_path: file_path.display().to_string(),
+            vault_state_hash,
+            worker_transcript_hash,
+            vault_sequence: 0,
+            deposit_count_observed: 0,
+            created_at_unix_ms: created_at,
+            initialized: true,
+        })
+    }
+
+    /// Pure helper: read + parse the on-disk vault-state file for the given state_dir. Returns
+    /// `Ok(None)` if the file does not exist; `Err` on any parse/IO failure. Used by 2b's
+    /// observer (forthcoming) to read the cursor without going through the HTTP endpoint.
+    pub fn load_vault_state_v2(state_dir: &Path) -> WorkerResult<Option<VaultStateFile>> {
+        let file_path = vault_state_file_path(state_dir);
+        if !file_path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(&file_path)
+            .map_err(|err| WorkerError::Crypto(format!("read vault_state_v2 file: {err}")))?;
+        let existing: VaultStateFile = serde_json::from_slice(&raw)
+            .map_err(|err| WorkerError::Crypto(format!("parse vault_state_v2 file: {err}")))?;
+        if existing.scheme != "vault_state_v2" {
+            return Err(WorkerError::InvalidDkgState(
+                "vault_state_v2_unexpected_scheme_on_disk".to_string(),
+            ));
+        }
+        Ok(Some(existing))
+    }
+
+    fn validate_selected_slots(slots: &[usize]) -> WorkerResult<()> {
+        if slots.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "selected_slots must have {DEOPERATOR_THRESHOLD} entries, got {}",
+                slots.len()
+            )));
+        }
+        let mut seen = [false; DEOPERATOR_COUNT];
+        for slot in slots {
+            assert_slot(*slot)?;
+            if seen[*slot] {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate selected_slots entry {slot}"
+                )));
+            }
+            seen[*slot] = true;
+        }
+        Ok(())
+    }
+
+    fn sorted_unique_slots(slots: &[usize]) -> WorkerResult<Vec<usize>> {
+        validate_selected_slots(slots)?;
+        let mut copy = slots.to_vec();
+        copy.sort_unstable();
+        Ok(copy)
+    }
+
+    fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
+        use std::io::Write as _;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(path)
+            .map_err(|err| WorkerError::Crypto(format!("open {}: {err}", path.display())))?;
+        file.write_all(contents)
+            .map_err(|err| WorkerError::Crypto(format!("write {}: {err}", path.display())))?;
+        Ok(())
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex_encode(Sha256::digest(bytes).as_slice())
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
+        }
+        (0..raw.len())
+            .step_by(2)
+            .map(|idx| {
+                u8::from_str_radix(&raw[idx..idx + 2], 16)
+                    .map_err(|err| WorkerError::InvalidRequest(err.to_string()))
+            })
+            .collect()
+    }
+
+    fn normalize_hex(hex: &str, expected_bytes: usize) -> WorkerResult<String> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != expected_bytes {
+            return Err(WorkerError::InvalidRequest(format!(
+                "expected {expected_bytes}-byte hex, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(hex_encode(&bytes))
+    }
+}
+
 pub mod frost_dkg_v2 {
     use crate::hpke_aead::{self, HpkeEnvelope};
     use crate::local_state::slot_to_identifier;

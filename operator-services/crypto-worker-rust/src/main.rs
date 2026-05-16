@@ -34,6 +34,9 @@ use eunoma_crypto_worker::ca_registration_v2::{
     Round1Request as CaRegistrationV2Round1Request,
     Round2Request as CaRegistrationV2Round2Request, VerifyRequest as CaRegistrationV2VerifyRequest,
 };
+use eunoma_crypto_worker::vault_state_v2::{
+    init_vault_state_v2 as run_vault_state_v2_init, InitRequest as VaultStateV2InitRequest,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -150,6 +153,13 @@ async fn main() {
         .route(
             "/worker/v2/derive/ca_registration/aggregate",
             post(ca_registration_v2_aggregate),
+        )
+        // Milestone 2a — per-worker vault-state share initialisation. Bound to (Phase 2
+        // vault_ek, Milestone 1 sigma tuple, CA DKG V2 share metadata). No secret material on
+        // the wire; the worker re-verifies the Milestone 1 public equation before persisting.
+        .route(
+            "/worker/v2/vault_state/init",
+            post(vault_state_v2_init),
         )
         .with_state(app_state);
 
@@ -956,6 +966,20 @@ async fn ca_registration_v2_aggregate(
     Json(body): Json<CaRegistrationV2AggregateRequest>,
 ) -> (StatusCode, Json<Value>) {
     match run_ca_registration_v2_aggregate(&body) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => worker_error_response(err),
+    }
+}
+
+// Milestone 2a — `/worker/v2/vault_state/init`. The Phase 2 + Milestone 1 transcripts have
+// already been cross-checked by the coordinator before this call lands; the worker re-verifies
+// the Milestone 1 public equation here against its supplied `vault_ek` so a deop-node tricked
+// into proxying a bogus tuple still fails closed on the worker side.
+async fn vault_state_v2_init(
+    State(state): State<AppState>,
+    Json(body): Json<VaultStateV2InitRequest>,
+) -> (StatusCode, Json<Value>) {
+    match run_vault_state_v2_init(&state.state_dir, &body) {
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => worker_error_response(err),
     }
