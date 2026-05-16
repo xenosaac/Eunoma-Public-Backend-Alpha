@@ -5376,6 +5376,12 @@ pub mod vault_state_v2 {
     use std::path::{Path, PathBuf};
 
     pub(crate) const INIT_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_STATE_V2_INIT_V1";
+    /// Codex M3a P1 (regression fix): the coordinator's FINAL init transcript hash binds the
+    /// (public inputs) + (sorted per-slot contributions) tuple. This is the byte-identical
+    /// TS-side `assembleVaultStateV2InitTranscript` / `vaultStateV2InitFinalTranscriptHash`
+    /// digest. ALL 5 workers + the coordinator MUST agree on this single value — it's what
+    /// downstream MPCCA withdraw rounds gate on.
+    pub(crate) const FINAL_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_STATE_V2_FINAL_V1";
     pub(crate) const VAULT_STATE_FILE_NAME: &str = "vault_state_v2.json";
 
     /// Request shape for `/worker/v2/vault_state/init`. Each of the 5 selected workers receives
@@ -5548,6 +5554,150 @@ pub mod vault_state_v2 {
         bytes.push(b':');
         bytes.extend_from_slice(deposit_count_observed.to_string().as_bytes());
         sha256_hex(&bytes)
+    }
+
+    /// Codex M3a P1 (regression fix): per-slot init contribution that participates in the
+    /// coordinator's FINAL transcript hash. Byte-identical with the TS
+    /// `VaultStateV2InitContribution` shape in deop-protocol.
+    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FinalizeContribution {
+        pub slot: usize,
+        pub vault_state_hash: String,
+        pub worker_transcript_hash: String,
+        pub vault_sequence: u64,
+        pub deposit_count_observed: u64,
+        pub initialized: bool,
+    }
+
+    /// Codex M3a P1 (regression fix): compute the coordinator's FINAL init transcript hash.
+    /// Byte-identical with the TS `vaultStateV2InitFinalTranscriptHash` helper in
+    /// `deop-protocol::vault_state_v2`. The single canonical value every worker MUST persist
+    /// as `init_transcript_hash` so the downstream MPCCA withdraw cross-check matches the
+    /// coordinator's request body.
+    ///
+    /// `sorted_contributions` MUST already be sorted by `slot` ascending — the caller
+    /// (finalize_vault_state_v2) sorts before invoking this helper.
+    pub fn final_transcript_hash(
+        dkg_epoch: &str,
+        ca_dkg_transcript_hash: &str,
+        vault_ek_transcript_hash: &str,
+        registration_transcript_hash: &str,
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        aggregate_commitment_hex: &str,
+        aggregate_response_hex: &str,
+        challenge_hex: &str,
+        sorted_contributions: &[FinalizeContribution],
+    ) -> String {
+        let joined = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FINAL_TRANSCRIPT_DOMAIN.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(ca_dkg_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(registration_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(roster_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(sender_address_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(asset_type_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(chain_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(aggregate_commitment_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(aggregate_response_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(challenge_hex.as_bytes());
+        for c in sorted_contributions {
+            bytes.push(b':');
+            bytes.extend_from_slice(c.slot.to_string().as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(c.vault_state_hash.as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(c.worker_transcript_hash.as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(c.vault_sequence.to_string().as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(c.deposit_count_observed.to_string().as_bytes());
+            bytes.push(b'|');
+            bytes.extend_from_slice(if c.initialized { b"1" } else { b"0" });
+        }
+        sha256_hex(&bytes)
+    }
+
+    /// Codex M3a P1 (regression fix): request for `/worker/v2/vault_state/init/finalize`. The
+    /// coordinator computes the FINAL transcript hash by aggregating the 5 per-slot init
+    /// contributions, then fans this body out to all 5 selected workers so each worker can
+    /// (a) re-derive the same final hash locally and assert byte-equality with the supplied
+    /// value, (b) UPDATE its persisted `vault_state_v2.json` to pin `init_transcript_hash =
+    /// finalTranscriptHash`. After finalize, the worker rejects any MPCCA withdraw round body
+    /// whose `vault_state_init_transcript_hash` differs from this canonical value.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FinalizeRequest {
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub ca_dkg_transcript_hash: String,
+        pub vault_ek_transcript_hash: String,
+        pub registration_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub player_id: usize,
+        pub vault_ek: String,
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+        pub aggregate_commitment: String,
+        pub aggregate_response: String,
+        pub challenge: String,
+        /// Sorted by `slot` ascending — the worker re-sorts defensively before hashing so the
+        /// order of incoming contributions doesn't affect the digest.
+        pub per_slot_contributions: Vec<FinalizeContribution>,
+        /// The coordinator's claimed final transcript hash. Worker re-derives the same digest
+        /// from public inputs + sorted contributions and asserts byte-equality BEFORE
+        /// persisting. A mismatch fails closed with
+        /// `InvalidDkgState("vault_state_v2_finalize_hash_mismatch")`.
+        pub final_transcript_hash: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FinalizeResult {
+        pub slot: usize,
+        pub player_id: usize,
+        pub vault_state_path: String,
+        /// Sha256 of the post-finalize `vault_state_v2.json` byte buffer. Coordinator can pin
+        /// this in its persisted artifact so an auditor can verify the post-finalize file
+        /// matches.
+        pub vault_state_hash: String,
+        /// The pinned `init_transcript_hash` value — byte-equal to the request's
+        /// `final_transcript_hash`. Coordinator asserts byte-equality with its own computed
+        /// final hash as defense in depth (catches a worker that returns a tampered value).
+        pub init_transcript_hash: String,
+        /// `true` when this call materialised a change; `false` on idempotent replay (the
+        /// persisted `init_transcript_hash` already equalled the request's value).
+        pub finalized: bool,
     }
 
     /// Worker entrypoint for `/worker/v2/vault_state/init`. Validates the (Phase 2, Milestone 1,
@@ -5815,6 +5965,319 @@ pub mod vault_state_v2 {
             deposit_count_observed: 0,
             created_at_unix_ms: created_at,
             initialized: true,
+        })
+    }
+
+    /// Codex M3a P1 (regression fix): worker entrypoint for `/worker/v2/vault_state/init/finalize`.
+    ///
+    /// Background: pre-fix, each worker persisted its OWN per-slot `worker_transcript_hash` as
+    /// `init_transcript_hash` in `vault_state_v2.json`. The coordinator then sent the FINAL
+    /// aggregated init artifact transcriptHash (a DIFFERENT value, binding all 5 contributions
+    /// + the FINAL_V1 domain) to every worker in MPCCA withdraw round1. The two values never
+    /// matched → ALL legitimate withdraws failed closed with
+    /// `vault_state_init_transcript_hash_mismatch`. This was a P1 prod regression.
+    ///
+    /// The fix: introduce a second fan-out from the coordinator AFTER it has collected all 5
+    /// per-slot init responses + computed the final transcript hash. Each worker:
+    ///   1. Re-derives the final transcript hash locally from the supplied
+    ///      `per_slot_contributions` (sorted by slot) + public inputs, using the SAME
+    ///      `EUNOMA_VAULT_STATE_V2_FINAL_V1` domain and field order as the TS
+    ///      `vaultStateV2InitFinalTranscriptHash` helper.
+    ///   2. Asserts byte-equality between the locally-derived hash and the
+    ///      `final_transcript_hash` claimed in the request body. A mismatch fails closed with
+    ///      `InvalidDkgState("vault_state_v2_finalize_hash_mismatch")` — a coordinator that
+    ///      lied about either the contributions or the digest cannot tamper this worker's
+    ///      persisted state.
+    ///   3. UPDATES the persisted `vault_state_v2.json` with `init_transcript_hash =
+    ///      final_transcript_hash`. The persisted file is the source of truth the MPCCA
+    ///      withdraw cross-check reads at the round1/2/prove/finalize gates.
+    ///   4. Re-binds the public inputs (dkg_epoch, vault_ek, etc.) against the persisted file
+    ///      to refuse a finalize call against a state that was initialised for a different
+    ///      vault.
+    ///
+    /// Idempotency: a re-finalize with the SAME `final_transcript_hash` returns `finalized=false`
+    /// and leaves the file unchanged. A re-finalize with a DIFFERENT value fails closed with
+    /// `vault_state_v2_finalize_already_pinned_with_different_value` so an operator cannot
+    /// silently swap the canonical init binding mid-vault-lifetime.
+    pub fn finalize_vault_state_v2(
+        state_dir: &Path,
+        req: &FinalizeRequest,
+    ) -> WorkerResult<FinalizeResult> {
+        validate_selected_slots(&req.selected_slots)?;
+        assert_slot(req.self_slot)?;
+        if !req.selected_slots.contains(&req.self_slot) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot {} not in selected_slots",
+                req.self_slot
+            )));
+        }
+        if req.player_id >= DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "player_id {} out of range 0..{}",
+                req.player_id, DEOPERATOR_THRESHOLD
+            )));
+        }
+        let sorted = sorted_unique_slots(&req.selected_slots)?;
+        if sorted[req.player_id] != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                req.player_id, sorted[req.player_id], req.self_slot
+            )));
+        }
+        if req.request_id.is_empty() || !is_safe_id(&req.request_id) {
+            return Err(WorkerError::InvalidRequest(
+                "request_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.session_id.is_empty() || !is_safe_id(&req.session_id) {
+            return Err(WorkerError::InvalidRequest(
+                "session_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.dkg_epoch.is_empty() || !req.dkg_epoch.chars().all(|c| c.is_ascii_digit()) {
+            return Err(WorkerError::InvalidRequest(
+                "dkg_epoch must be a non-empty decimal string".to_string(),
+            ));
+        }
+
+        // Strict hex normalisation everywhere — same defense-in-depth posture as init.
+        let ca_transcript = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
+        let vault_ek_transcript = normalize_hex(&req.vault_ek_transcript_hash, 32)?;
+        let registration_transcript = normalize_hex(&req.registration_transcript_hash, 32)?;
+        let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        let vault_ek_hex = normalize_hex(&req.vault_ek, 32)?;
+        let sender = normalize_hex(&req.sender_address, 32)?;
+        let asset = normalize_hex(&req.asset_type, 32)?;
+        let aggregate_commitment = normalize_hex(&req.aggregate_commitment, 32)?;
+        let aggregate_response = normalize_hex(&req.aggregate_response, 32)?;
+        let challenge = normalize_hex(&req.challenge, 32)?;
+        let claimed_final = normalize_hex(&req.final_transcript_hash, 32)?;
+
+        // Per-slot contributions: must have exactly DEOPERATOR_THRESHOLD entries; slot values
+        // must equal `sorted` (no duplicates, no extras, no missing slots); hex fields
+        // normalised. Sort defensively so the hash is order-independent on the wire.
+        if req.per_slot_contributions.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "per_slot_contributions must have {DEOPERATOR_THRESHOLD} entries, got {}",
+                req.per_slot_contributions.len()
+            )));
+        }
+        let mut contribs: Vec<FinalizeContribution> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for c in &req.per_slot_contributions {
+            if !sorted.contains(&c.slot) {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "contribution slot {} not in selected_slots",
+                    c.slot
+                )));
+            }
+            contribs.push(FinalizeContribution {
+                slot: c.slot,
+                vault_state_hash: normalize_hex(&c.vault_state_hash, 32)?,
+                worker_transcript_hash: normalize_hex(&c.worker_transcript_hash, 32)?,
+                vault_sequence: c.vault_sequence,
+                deposit_count_observed: c.deposit_count_observed,
+                initialized: c.initialized,
+            });
+        }
+        contribs.sort_by_key(|c| c.slot);
+        // Reject duplicate slots: after sort, adjacent slots being equal is a duplicate.
+        for window in contribs.windows(2) {
+            if window[0].slot == window[1].slot {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate per_slot_contributions slot {}",
+                    window[0].slot
+                )));
+            }
+        }
+        // Verify coverage: contribs slots match sorted selected slots exactly.
+        for (i, slot) in sorted.iter().enumerate() {
+            if contribs[i].slot != *slot {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "per_slot_contributions slot {} at index {} does not match selected_slots[{}]={}",
+                    contribs[i].slot, i, i, slot
+                )));
+            }
+        }
+
+        // KILLER cross-check: re-derive the final transcript hash from public inputs +
+        // sorted contributions and assert byte-equality with the coordinator's claim.
+        let local_final = final_transcript_hash(
+            &req.dkg_epoch,
+            &ca_transcript,
+            &vault_ek_transcript,
+            &registration_transcript,
+            &roster_hash,
+            &sorted,
+            &vault_ek_hex,
+            &sender,
+            &asset,
+            req.chain_id,
+            &aggregate_commitment,
+            &aggregate_response,
+            &challenge,
+            &contribs,
+        );
+        if local_final.to_lowercase() != claimed_final.to_lowercase() {
+            return Err(WorkerError::InvalidDkgState(
+                "vault_state_v2_finalize_hash_mismatch".to_string(),
+            ));
+        }
+
+        // Load the persisted vault_state_v2.json. Missing → finalize is meaningless.
+        let file_path = vault_state_file_path(state_dir);
+        let existing = load_vault_state_v2(state_dir)?.ok_or_else(|| {
+            WorkerError::InvalidDkgState("missing_vault_state_file".to_string())
+        })?;
+        // Provenance gate: refuse a finalize whose public inputs don't match the persisted
+        // init bindings. This catches a coordinator that fans this finalize body to the wrong
+        // worker or a state_dir initialised for a different vault.
+        if existing.dkg_epoch != req.dkg_epoch
+            || existing.slot != req.self_slot
+            || existing.player_id != req.player_id
+            || normalize_hex(&existing.ca_dkg_transcript_hash, 32)? != ca_transcript
+            || normalize_hex(&existing.vault_ek_transcript_hash, 32)? != vault_ek_transcript
+            || normalize_hex(&existing.registration_transcript_hash, 32)?
+                != registration_transcript
+            || normalize_hex(&existing.roster_hash, 32)? != roster_hash
+            || existing.selected_slots != sorted
+            || normalize_hex(&existing.vault_ek_hex, 32)? != vault_ek_hex
+            || normalize_hex(&existing.sender_address, 32)? != sender
+            || normalize_hex(&existing.asset_type, 32)? != asset
+            || existing.chain_id != req.chain_id
+            || normalize_hex(&existing.aggregate_commitment, 32)? != aggregate_commitment
+            || normalize_hex(&existing.aggregate_response, 32)? != aggregate_response
+            || normalize_hex(&existing.challenge, 32)? != challenge
+        {
+            return Err(WorkerError::InvalidDkgState(
+                "vault_state_v2_finalize_provenance_mismatch".to_string(),
+            ));
+        }
+
+        // Cross-check this slot's per-init worker_transcript_hash matches what was returned at
+        // init time. We compare against a freshly-computed init transcript hash from the
+        // persisted file (using cursor values 0,0 — pre-finalize they're always 0 by init
+        // semantics). A mismatch here means the supplied per_slot_contributions[self_slot] was
+        // tampered.
+        let self_contrib = &contribs[req.player_id];
+        if self_contrib.slot != req.self_slot {
+            return Err(WorkerError::InvalidRequest(
+                "self_slot_contribution_mismatch".to_string(),
+            ));
+        }
+        let expected_self_init = init_worker_transcript_hash(
+            &req.session_id,
+            &req.request_id,
+            &req.dkg_epoch,
+            &ca_transcript,
+            &vault_ek_transcript,
+            &registration_transcript,
+            &roster_hash,
+            &sorted,
+            req.self_slot,
+            req.player_id,
+            &vault_ek_hex,
+            &sender,
+            &asset,
+            req.chain_id,
+            &aggregate_commitment,
+            &aggregate_response,
+            &challenge,
+            existing.vault_sequence,
+            existing.deposit_count_observed,
+        );
+        if self_contrib.worker_transcript_hash.to_lowercase() != expected_self_init.to_lowercase()
+        {
+            return Err(WorkerError::InvalidDkgState(
+                "vault_state_v2_finalize_self_contribution_mismatch".to_string(),
+            ));
+        }
+
+        // Idempotency: if persisted init_transcript_hash already equals the claimed final,
+        // no-op and return. If it differs, we are switching identities — fail closed unless
+        // the persisted value is the legacy per-slot worker hash (no Some(_) at all means
+        // legacy or never-finalized; we accept that by writing the canonical value).
+        match existing.init_transcript_hash.as_deref() {
+            Some(persisted) if persisted.to_lowercase() == claimed_final.to_lowercase() => {
+                // Idempotent replay: same canonical value. No write.
+                let raw = fs::read(&file_path).map_err(|err| {
+                    WorkerError::Crypto(format!(
+                        "read vault_state_v2 file for idempotent finalize: {err}"
+                    ))
+                })?;
+                let vault_state_hash = sha256_hex(&raw);
+                return Ok(FinalizeResult {
+                    slot: req.self_slot,
+                    player_id: req.player_id,
+                    vault_state_path: file_path.display().to_string(),
+                    vault_state_hash,
+                    init_transcript_hash: claimed_final.to_lowercase(),
+                    finalized: false,
+                });
+            }
+            Some(persisted) => {
+                // Already-pinned with a DIFFERENT canonical value. Refuse to switch — a fresh
+                // re-init would be required, which is intentional friction.
+                //
+                // NOTE: the pre-fix init path persisted the per-slot worker_transcript_hash
+                // here. Such files exist in pre-finalize state, and finalize SHOULD be allowed
+                // to overwrite them with the canonical final hash. We detect that case by
+                // re-computing the per-slot init hash from public inputs and accepting the
+                // overwrite if the persisted value matches that AND differs from the canonical
+                // final. Without this allowance, the regression fix can't roll out against any
+                // already-initialised vault.
+                let legacy_per_slot = expected_self_init.clone();
+                if persisted.to_lowercase() != legacy_per_slot.to_lowercase() {
+                    return Err(WorkerError::InvalidDkgState(
+                        "vault_state_v2_finalize_already_pinned_with_different_value"
+                            .to_string(),
+                    ));
+                }
+                // Fall through: persisted == legacy per-slot init hash; overwrite with the
+                // canonical final.
+            }
+            None => {
+                // Never finalized (and the init path that wrote this file pre-dates the
+                // finalize-as-separate-round design — i.e. legacy file). Overwrite.
+            }
+        }
+
+        // Build the updated file. Only `init_transcript_hash` changes.
+        let updated = VaultStateFile {
+            scheme: existing.scheme.clone(),
+            slot: existing.slot,
+            player_id: existing.player_id,
+            dkg_epoch: existing.dkg_epoch.clone(),
+            ca_dkg_transcript_hash: existing.ca_dkg_transcript_hash.clone(),
+            vault_ek_transcript_hash: existing.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: existing.registration_transcript_hash.clone(),
+            roster_hash: existing.roster_hash.clone(),
+            selected_slots: existing.selected_slots.clone(),
+            vault_ek_hex: existing.vault_ek_hex.clone(),
+            sender_address: existing.sender_address.clone(),
+            asset_type: existing.asset_type.clone(),
+            chain_id: existing.chain_id,
+            aggregate_commitment: existing.aggregate_commitment.clone(),
+            aggregate_response: existing.aggregate_response.clone(),
+            challenge: existing.challenge.clone(),
+            vault_sequence: existing.vault_sequence,
+            deposit_count_observed: existing.deposit_count_observed,
+            created_at_unix_ms: existing.created_at_unix_ms,
+            init_transcript_hash: Some(claimed_final.to_lowercase()),
+        };
+        let bytes = serde_json::to_vec_pretty(&updated)
+            .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;
+        // Finalize OVERWRITES the existing file (the no-clobber primitive would reject this
+        // by design). The provenance + identity gates above guarantee the new content is a
+        // strict supersession that only touches `init_transcript_hash`.
+        write_secret_file_replace(&file_path, &bytes)?;
+        let vault_state_hash = sha256_hex(&bytes);
+        Ok(FinalizeResult {
+            slot: req.self_slot,
+            player_id: req.player_id,
+            vault_state_path: file_path.display().to_string(),
+            vault_state_hash,
+            init_transcript_hash: claimed_final.to_lowercase(),
+            finalized: true,
         })
     }
 

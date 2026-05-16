@@ -35,8 +35,11 @@ use eunoma_crypto_worker::ca_registration_v2::{
     Round2Request as CaRegistrationV2Round2Request, VerifyRequest as CaRegistrationV2VerifyRequest,
 };
 use eunoma_crypto_worker::vault_state_v2::{
+    finalize_vault_state_v2 as run_vault_state_v2_finalize,
     init_vault_state_v2 as run_vault_state_v2_init,
-    observe_deposit_v2 as run_vault_state_v2_observe_deposit, InitRequest as VaultStateV2InitRequest,
+    observe_deposit_v2 as run_vault_state_v2_observe_deposit,
+    FinalizeRequest as VaultStateV2FinalizeRequest,
+    InitRequest as VaultStateV2InitRequest,
     ObserveDepositRequest as VaultStateV2ObserveDepositRequest,
 };
 use eunoma_crypto_worker::mpcca_withdraw_v2::{
@@ -174,6 +177,19 @@ async fn main() {
         .route(
             "/worker/v2/vault_state/init",
             post(vault_state_v2_init),
+        )
+        // Codex M3a P1 (regression fix): vault_state_v2 init finalize. Coordinator fans this
+        // round out AFTER collecting all 5 per-slot init contributions + computing the FINAL
+        // transcript hash. Each worker re-derives the final hash locally, asserts byte-
+        // equality with the coordinator's claim, then UPDATES its persisted
+        // `vault_state_v2.json` to pin `init_transcript_hash = finalTranscriptHash`. This is
+        // the ONLY value MPCCA withdraw rounds will accept downstream — without this round,
+        // the coordinator's request body's `vaultStateInitTranscriptHash` (= the final hash)
+        // would NEVER match a worker's persisted per-slot init hash, and every legitimate
+        // withdraw would fail closed with `vault_state_init_transcript_hash_mismatch`.
+        .route(
+            "/worker/v2/vault_state/init/finalize",
+            post(vault_state_v2_init_finalize),
         )
         // Milestone 2b — confirmed-deposit observer. Strict cursor monotonicity over the
         // worker's persisted deposit_count_observed counter. No secret material on the wire.
@@ -937,6 +953,22 @@ async fn vault_state_v2_init(
     Json(body): Json<VaultStateV2InitRequest>,
 ) -> (StatusCode, Json<Value>) {
     match run_vault_state_v2_init(&state.state_dir, &body) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => worker_error_response(err),
+    }
+}
+
+// Codex M3a P1 (regression fix) — `/worker/v2/vault_state/init/finalize`. Runs AFTER the
+// init fan-out. The coordinator passes the aggregated FINAL transcript hash plus the 5
+// per-slot init contributions. Worker re-derives the hash, asserts byte-equality, then
+// UPDATES `init_transcript_hash` in the persisted `vault_state_v2.json` to the canonical
+// final hash so subsequent MPCCA withdraw rounds cross-check against the SAME value the
+// coordinator already pinned in its persisted init artifact.
+async fn vault_state_v2_init_finalize(
+    State(state): State<AppState>,
+    Json(body): Json<VaultStateV2FinalizeRequest>,
+) -> (StatusCode, Json<Value>) {
+    match run_vault_state_v2_finalize(&state.state_dir, &body) {
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => worker_error_response(err),
     }
