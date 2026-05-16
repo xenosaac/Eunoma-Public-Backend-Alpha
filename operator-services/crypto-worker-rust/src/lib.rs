@@ -3133,53 +3133,109 @@ pub mod mpc_spdz_adapter;
 // state file, vault_ek_derivation_v2 round0.json. Each call site documents its idempotency
 // contract.
 // =================================================================================================
-pub(crate) mod atomic_io {
+pub mod atomic_io {
     use crate::{WorkerError, WorkerResult};
     use std::fs;
     use std::path::Path;
 
-    /// Tmp + create_new + rename with a pre-rename byte-equality idempotency gate.
+    /// Codex M3a P2 #2 v2 (TOCTOU close-out): truly-atomic no-clobber write.
     ///
-    /// `context` is a string tag bound into the InvalidDkgState code so the caller can
-    /// distinguish a vault_state_v2 collision from a mpcca_withdraw_v2 session state
-    /// collision in error logs. Convention: snake_case module-or-file-name (e.g.
-    /// "vault_state_v2", "ca_registration_v2_nonce_file").
+    /// Pre-fix shape (M3a P2 #2 v1) was `path.exists()` check → tmp write → plain
+    /// `fs::rename(tmp, target)`. That left a window where two writers both observed
+    /// `path.exists() == false`, both wrote tmp files, and the later `rename` clobbered
+    /// the earlier one. The race window is microseconds in practice but the contract
+    /// said "fail closed for the loser" — `rename(2)` never fails closed, so the loser
+    /// silently overwrote the winner.
+    ///
+    /// Fix: use POSIX `link(2)` via `std::fs::hard_link(tmp, target)`. `link(2)` is the
+    /// canonical atomic create-only primitive: it succeeds iff the target did not exist
+    /// at the moment the kernel processed the syscall, otherwise it returns `EEXIST`
+    /// (Rust `io::ErrorKind::AlreadyExists`). There is NO race window — the kernel
+    /// performs the existence check + creation in a single critical section.
+    ///
+    /// On `link` success: target is now a hard link to the same inode as tmp; we
+    /// unlink tmp and the file persists at `target`.
+    /// On `link` AlreadyExists: another writer beat us. Read the existing target and
+    /// compare for byte-equal idempotency. Match → return Ok (race winner won fairly).
+    /// Mismatch → return InvalidDkgState(<context>_already_exists_with_different_content),
+    /// which is the fail-closed contract the original docstring promised.
+    ///
+    /// `context` is a snake_case tag bound into the error code so callers can
+    /// distinguish a vault_state_v2 collision from a mpcca_withdraw_v2 session-state
+    /// collision in logs.
     pub fn write_atomic_no_clobber(
         path: &Path,
         contents: &[u8],
         context: &str,
     ) -> WorkerResult<()> {
-        if path.exists() {
-            let existing = fs::read(path).map_err(|err| {
-                WorkerError::Crypto(format!(
-                    "{context}: read existing {} for idempotency check: {err}",
-                    path.display()
-                ))
-            })?;
-            if existing == contents {
-                // Byte-identical — idempotent replay. Nothing to do.
-                return Ok(());
-            }
-            return Err(WorkerError::InvalidDkgState(format!(
-                "{context}_already_exists_with_different_content"
-            )));
-        }
-        write_atomic_tmp_then_rename(path, contents, context)
+        write_atomic_link_no_clobber(path, contents, context)
     }
 
-    /// Same tmp + create_new + rename without the pre-check. Used by callers that want
-    /// to OVERWRITE an existing file unconditionally (rare — only the auto-migration path
-    /// in `load_vault_state_v2` uses this, and only after re-asserting that the new
-    /// content embeds the persisted bindings verbatim).
+    /// Tmp + rename, no existence check — used by callers that WANT to overwrite an
+    /// existing file (observe_deposit cursor bump, finalize hash pin). The upstream
+    /// caller is responsible for any content-equality / provenance assertion before
+    /// invoking this.
     pub fn write_atomic_replace(path: &Path, contents: &[u8], context: &str) -> WorkerResult<()> {
         write_atomic_tmp_then_rename(path, contents, context)
     }
 
-    fn write_atomic_tmp_then_rename(
+    /// Truly-atomic no-clobber write via `link(2)`. See `write_atomic_no_clobber` above
+    /// for the contract; this is the implementation.
+    fn write_atomic_link_no_clobber(
         path: &Path,
         contents: &[u8],
         context: &str,
     ) -> WorkerResult<()> {
+        let (tmp_path, _file_name) = write_tmp_file(path, contents, context)?;
+        // KILLER: `hard_link(2)` atomic create-only. Failure with AlreadyExists is the
+        // signal that another writer beat us; ANY other error is propagated.
+        match fs::hard_link(&tmp_path, path) {
+            Ok(()) => {
+                // Success: target is now a hard link to tmp's inode. Unlink tmp so the
+                // file ends up at `path` only.
+                let _ = fs::remove_file(&tmp_path);
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Race lost (or idempotent replay). Read the existing target and compare.
+                // The tmp file is no longer needed regardless of the comparison outcome.
+                let read_result = fs::read(path);
+                let _ = fs::remove_file(&tmp_path);
+                let existing = read_result.map_err(|read_err| {
+                    WorkerError::Crypto(format!(
+                        "{context}: read existing {} for idempotency check: {read_err}",
+                        path.display()
+                    ))
+                })?;
+                if existing == contents {
+                    // Byte-identical: race winner wrote the SAME content as us; this is
+                    // an idempotent replay. The persisted file matches what we wanted.
+                    Ok(())
+                } else {
+                    Err(WorkerError::InvalidDkgState(format!(
+                        "{context}_already_exists_with_different_content"
+                    )))
+                }
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(WorkerError::Crypto(format!(
+                    "{context}: hard_link {} -> {}: {err}",
+                    tmp_path.display(),
+                    path.display()
+                )))
+            }
+        }
+    }
+
+    /// Write `contents` to a unique tmp file in `path`'s parent dir, mode 0o600,
+    /// fsynced. Returns `(tmp_path, file_name)` so the caller can decide whether to
+    /// link-atomic into place or rename-replace.
+    fn write_tmp_file(
+        path: &Path,
+        contents: &[u8],
+        context: &str,
+    ) -> WorkerResult<(std::path::PathBuf, String)> {
         use rand::RngCore as _;
         use std::io::Write as _;
         let parent = path.parent().ok_or_else(|| {
@@ -3248,20 +3304,29 @@ pub(crate) mod atomic_io {
                     )));
                 }
             }
-            if let Err(err) = fs::rename(&tmp_path, path) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "{context}: rename {} -> {}: {err}",
-                    tmp_path.display(),
-                    path.display()
-                )));
-            }
-            return Ok(());
+            return Ok((tmp_path, file_name.to_string()));
         }
         Err(WorkerError::Crypto(format!(
             "{context}: exhausted {MAX_ATTEMPTS} tmp-suffix retries writing {}",
             path.display()
         )))
+    }
+
+    fn write_atomic_tmp_then_rename(
+        path: &Path,
+        contents: &[u8],
+        context: &str,
+    ) -> WorkerResult<()> {
+        let (tmp_path, _file_name) = write_tmp_file(path, contents, context)?;
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(WorkerError::Crypto(format!(
+                "{context}: rename {} -> {}: {err}",
+                tmp_path.display(),
+                path.display()
+            )));
+        }
+        Ok(())
     }
 }
 
