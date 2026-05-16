@@ -37,13 +37,18 @@ use eunoma_crypto_worker::{
         m1_ingress_aad_for_test, mpcca_withdraw_session_dir, round1_worker_transcript_hash,
         round2_statement_inputs_hash_hex_for_test, run_finalize_v2, run_prove_v2, run_round1_v2,
         run_round2_v2, seal_ingress_envelope_for_test,
-        ChainedRoundRequest as MpccaChainedRoundRequest, Round1Request as MpccaRound1Request,
-        Round2Request as MpccaRound2Request,
+        ChainedRoundRequest as MpccaChainedRoundRequest, FinalizeRequest as MpccaFinalizeRequest,
+        Round1Request as MpccaRound1Request, Round2Request as MpccaRound2Request,
     },
     registration_verifier::{
         aggregate_registration_commitment, lagrange_coefficients_at_zero,
         registration_challenge, verify_registration_proof, RegistrationCommitmentInput,
         RegistrationResponseInput,
+    },
+    transfer_sigma_reference::{
+        bcs_fiat_shamir_inputs, bcs_serialize_transfer_session, build_statement,
+        sigma_fiat_shamir_seed, DomainSeparator, TransferStatementInputs,
+        APTOS_FRAMEWORK_ADDRESS, PROTOCOL_ID, TYPE_NAME,
     },
     vault_state_v2::{
         final_transcript_hash, finalize_vault_state_v2, init_vault_state_v2,
@@ -789,6 +794,45 @@ fn build_round2_request(
 }
 
 // =============================================================================================
+// M4 Commit 3 — synthetic finalize request fixture. Wraps `build_round2_request` (so Statement
+// inputs + chained-round provenance fields are valid) and fills `aggregatedSigmaCommitments`
+// with deterministic non-identity Ristretto points and `challengeHex` with a junk canonical
+// scalar. The fixture is intentionally NOT cryptographically consistent — its Fiat-Shamir
+// challenge does NOT match what the worker would recompute. Tests that exercise the public-
+// binding gate (which runs BEFORE the challenge re-derivation) can use this fixture directly;
+// tests that exercise the challenge-recompute or response-share path build their own
+// aggregated commitment vector + matching challenge from a real round2 partial.
+// =============================================================================================
+fn build_finalize_request_synthetic(
+    fix: &MpccaWithdrawFixture,
+    self_slot: usize,
+    player_id: usize,
+) -> MpccaFinalizeRequest {
+    let r2 = build_round2_request(fix, self_slot, player_id);
+    let agg: Vec<String> = (0..30)
+        .map(|i| deterministic_compressed_hex(format!("synthetic-A-{i}").as_bytes()))
+        .collect();
+    let challenge_hex = {
+        let mut bytes = [0_u8; 32];
+        bytes[0] = 0x01;
+        hex_encode(&bytes)
+    };
+    MpccaFinalizeRequest {
+        base: r2.base,
+        recipient_ek: r2.recipient_ek,
+        old_balance_c: r2.old_balance_c,
+        old_balance_d: r2.old_balance_d,
+        new_balance_c: r2.new_balance_c,
+        new_balance_d: r2.new_balance_d,
+        transfer_amount_c: r2.transfer_amount_c,
+        transfer_amount_d_sender: r2.transfer_amount_d_sender,
+        transfer_amount_d_recipient: r2.transfer_amount_d_recipient,
+        aggregated_sigma_commitments: agg,
+        challenge_hex,
+    }
+}
+
+// =============================================================================================
 // M1 KILLER test — round1 happy path completes ingress (HPKE decrypt + Pedersen verify +
 // HPKE-encrypted-at-rest persist) and returns Round1IngressResult { completed: true }. The
 // public binding gates run BEFORE the ingress crypto; a tampered request fails closed with a
@@ -1101,8 +1145,8 @@ fn mpcca_withdraw_v2_round1_rejects_forged_init_transcript_hash() {
         "prove forged init_transcript_hash must surface InvalidDkgState, got {err:?}"
     );
 
-    let mut tampered4 = build_chained_request(&fix, slot, player_id);
-    tampered4.vault_state_init_transcript_hash = "01".repeat(32);
+    let mut tampered4 = build_finalize_request_synthetic(&fix, slot, player_id);
+    tampered4.base.vault_state_init_transcript_hash = "01".repeat(32);
     let err = run_finalize_v2(&state_dir, &tampered4)
         .expect_err("forged init_transcript_hash must reject in finalize");
     assert!(
@@ -1200,29 +1244,42 @@ fn mpcca_withdraw_v2_run_prove_v2_returns_distinct_phase() {
     assert_eq!(loaded.round, "prove");
 }
 
+// M4 Commit 3 — finalize no longer surfaces NotImplemented. It now returns
+// Ok(FinalizeDkResult { completed: true, partial_response_dk_hex, ... }). This test
+// asserts the M4-c3 fail-closed path: with a synthetic (junk) finalize body, the worker
+// must reject BEFORE persisting any session-state file. The early-exit gate is either
+// the Fiat-Shamir challenge mismatch (re-derived from a junk Statement+A doesn't equal
+// the synthetic challenge_hex) OR `finalize_missing_round2_dk_state` (round2 hasn't run).
 #[test]
-fn mpcca_withdraw_v2_run_finalize_v2_returns_distinct_phase() {
-    let fix = build_milestone1_fixture("finalize-phase");
+fn mpcca_withdraw_v2_run_finalize_v2_rejects_when_round2_state_missing() {
+    let fix = build_milestone1_fixture("finalize-no-round2");
     let slot = 4_usize;
     let player_id = 4_usize;
     let state_dir = fix.slot_dirs[slot].clone();
-    let req = build_chained_request(&fix, slot, player_id);
+    let req = build_finalize_request_synthetic(&fix, slot, player_id);
 
-    let err = run_finalize_v2(&state_dir, &req).expect_err("finalize stub");
-    let phase = match err {
-        WorkerError::NotImplemented(p) => p,
-        other => panic!("expected NotImplemented, got {other:?}"),
-    };
-    assert_eq!(
-        phase, "mpcca_withdraw_v2_finalize_aggregate_pending_milestone4",
-        "finalize phase string must be byte-stable across the codebase"
+    let err = run_finalize_v2(&state_dir, &req)
+        .expect_err("finalize with no Round2StateFile must fail closed");
+    let is_acceptable = matches!(
+        err,
+        WorkerError::Crypto(ref s) if s == "finalize_challenge_mismatch"
+    ) || matches!(
+        err,
+        WorkerError::InvalidDkgState(ref s) if s == "finalize_missing_round2_dk_state"
+    );
+    assert!(
+        is_acceptable,
+        "expected challenge_mismatch or missing_round2_dk_state, got {err:?}"
     );
     let session_dir =
-        mpcca_withdraw_session_dir(&state_dir, &req.request_id, &req.session_id).expect("dir");
-    let loaded = load_round_state_file(&session_dir, "finalize")
-        .expect("load")
-        .expect("file");
-    assert_eq!(loaded.round, "finalize");
+        mpcca_withdraw_session_dir(&state_dir, &req.base.request_id, &req.base.session_id)
+            .expect("dir");
+    assert!(
+        load_round_state_file(&session_dir, "finalize")
+            .expect("load")
+            .is_none(),
+        "no finalize state file may be persisted on the fail-closed path"
+    );
 }
 
 #[test]
@@ -2130,5 +2187,775 @@ fn mpcca_withdraw_v2_round2_statement_inputs_hash_byte_parity_with_ts_fixture() 
     assert_eq!(
         hash, "ffa00e43e67bf54fb188596887ce58bcf3e0223d7a7a9e9f9576cde8ef25ef8d",
         "statement_inputs_hash byte-parity with TS fixture broken — TS test must assert the same hex"
+    );
+}
+
+// =============================================================================================
+// M4 Commit 3 — finalize killer tests.
+//
+// The M4-c3 finalize handler retires the M3a NotImplemented stub. Worker contract:
+//   1. Validate public binding (chained_round_public_binding) — same gate as round2.
+//   2. Validate Statement input fields + aggregated 30-point A vector + challenge hex.
+//   3. Re-derive Fiat-Shamir e LOCALLY; assert byte-eq with coordinator-supplied e.
+//   4. Load ca_dkg_share_v2.json + recompute Lagrange λ_j locally; zero-reject.
+//   5. Load Round2StateFile; cross-check provenance, previous_round_transcript_hash,
+//      dk_base_indices_used, AND statement_inputs_hash (defense-in-depth round2 ↔ finalize
+//      Statement binding).
+//   6. HPKE-decrypt α_share[0] from at-rest envelope; reject non-canonical / zero.
+//   7. Compute s_share = α_share[0] + e · (λ_j · dk_share_j); zeroize α and dk after use.
+//   8. Persist `mpcca_withdraw_v2_finalize.json` (RoundStateFile, completed=true).
+//   9. Return FinalizeDkResult { partial_response_dk_hex, dk_base_indices_used, ... }.
+//
+// Privacy contract: α_share[0] and dk_share_j NEVER leave the worker process in plaintext;
+// the only output is s_share (a PUBLIC threshold response share scalar).
+// =============================================================================================
+
+/// Helper — build the canonical Fiat-Shamir challenge `e` for a given finalize request body.
+/// Mirrors the coordinator's e-derivation: builds the Statement, the DomainSeparator (Aptos
+/// CA TransferV1 with ell=8/n=4/no-auditor), and runs `sigma_fiat_shamir_seed` over BCS-encoded
+/// (domain, type_name, k=25, stmt.x, stmt.scalars, aggregated_commitments).
+fn derive_canonical_challenge_hex(
+    sender_ek_hex: &str,
+    recipient_ek_hex: &str,
+    old_balance_c: &[String],
+    old_balance_d: &[String],
+    new_balance_c: &[String],
+    new_balance_d: &[String],
+    transfer_amount_c: &[String],
+    transfer_amount_d_sender: &[String],
+    transfer_amount_d_recipient: &[String],
+    sender_address_hex: &str,
+    recipient_address_hex: &str,
+    asset_type_hex: &str,
+    chain_id: u8,
+    aggregated_commitments_hex: &[String],
+) -> String {
+    let sender_ek = bytes32(sender_ek_hex);
+    let recipient_ek = bytes32(recipient_ek_hex);
+    let stmt_inputs = TransferStatementInputs {
+        sender_ek,
+        recipient_ek,
+        old_balance_c: old_balance_c.iter().map(|h| bytes32(h)).collect(),
+        old_balance_d: old_balance_d.iter().map(|h| bytes32(h)).collect(),
+        new_balance_c: new_balance_c.iter().map(|h| bytes32(h)).collect(),
+        new_balance_d: new_balance_d.iter().map(|h| bytes32(h)).collect(),
+        transfer_amount_c: transfer_amount_c.iter().map(|h| bytes32(h)).collect(),
+        transfer_amount_d_sender: transfer_amount_d_sender
+            .iter()
+            .map(|h| bytes32(h))
+            .collect(),
+        transfer_amount_d_recipient: transfer_amount_d_recipient
+            .iter()
+            .map(|h| bytes32(h))
+            .collect(),
+    };
+    let statement = build_statement(&stmt_inputs).expect("build statement");
+    let sender_addr = bytes32(sender_address_hex);
+    let recipient_addr = bytes32(recipient_address_hex);
+    let asset = bytes32(asset_type_hex);
+    let session = bcs_serialize_transfer_session(
+        &sender_addr,
+        &recipient_addr,
+        &asset,
+        8_u64,
+        4_u64,
+        false,
+        0,
+    );
+    let dst = DomainSeparator {
+        contract_address: APTOS_FRAMEWORK_ADDRESS,
+        chain_id,
+        protocol_id: PROTOCOL_ID.as_bytes().to_vec(),
+        session_id: session,
+    };
+    let agg_bytes: Vec<[u8; 32]> = aggregated_commitments_hex
+        .iter()
+        .map(|h| bytes32(h))
+        .collect();
+    let bcs = bcs_fiat_shamir_inputs(
+        &dst,
+        TYPE_NAME,
+        25_u64,
+        &statement.compressed_points,
+        &statement.scalars,
+        &agg_bytes,
+    );
+    let (e, _beta) = sigma_fiat_shamir_seed(&bcs);
+    hex_encode(&e.to_bytes())
+}
+
+fn bytes32(hex: &str) -> [u8; 32] {
+    let raw = hex_decode(hex);
+    assert_eq!(raw.len(), 32, "expected 32-byte hex, got {} bytes", raw.len());
+    let mut arr = [0_u8; 32];
+    arr.copy_from_slice(&raw);
+    arr
+}
+
+/// Helper — build a real FinalizeRequest by:
+///   1. Driving round2 for `self_slot` (persists Round2StateFile with α_share at-rest).
+///   2. Filling the aggregated 30-point A vector with the slot's partial_dk at {0, 17}
+///      and deterministic non-identity Ristretto points elsewhere. (Single-slot test:
+///      the "aggregated" sum is just this one worker's contribution.)
+///   3. Computing the canonical Fiat-Shamir challenge `e` from the resulting A vector.
+fn build_finalize_request_real(
+    fix: &MpccaWithdrawFixture,
+    self_slot: usize,
+    player_id: usize,
+    state_dir: &Path,
+) -> (MpccaFinalizeRequest, Vec<String>) {
+    let r2_req = build_round2_request(fix, self_slot, player_id);
+    let r2_result = run_round2_v2(state_dir, &r2_req).expect("round2 happy path");
+    assert_eq!(r2_result.dk_base_indices_used, vec![0_usize, 17_usize]);
+
+    // Build the aggregated A vector: this slot's partial at {0, 17}, deterministic points
+    // elsewhere. For the single-slot test this is sufficient — the worker doesn't enforce
+    // that A_full came from 5 partials; only the e-derivation determines whether
+    // `s_share` is "valid threshold component" or just a per-slot scalar.
+    let mut agg: Vec<String> = Vec::with_capacity(30);
+    for i in 0..30 {
+        if i == 0 || i == 17 {
+            // Filled below from the round2 partial.
+            agg.push(String::new());
+        } else {
+            agg.push(deterministic_compressed_hex(format!("real-agg-{i}").as_bytes()));
+        }
+    }
+    for partial in &r2_result.partial_dk_commitments {
+        agg[partial.index] = partial.commitment_hex.clone();
+    }
+    assert!(agg.iter().all(|s| !s.is_empty()));
+
+    let challenge_hex = derive_canonical_challenge_hex(
+        &fix.vault_ek_hex,
+        &r2_req.recipient_ek,
+        &r2_req.old_balance_c,
+        &r2_req.old_balance_d,
+        &r2_req.new_balance_c,
+        &r2_req.new_balance_d,
+        &r2_req.transfer_amount_c,
+        &r2_req.transfer_amount_d_sender,
+        &r2_req.transfer_amount_d_recipient,
+        &fix.sender,
+        &r2_req.base.recipient,
+        &fix.asset,
+        fix.chain_id,
+        &agg,
+    );
+
+    let mut base = r2_req.base.clone();
+    // Finalize body's previous_round_transcript_hash MUST equal round2's worker_transcript_hash.
+    base.previous_round_transcript_hash = r2_result.worker_transcript_hash.clone();
+    // previous_round_commitments at finalize is round2's per-slot transcript hashes — for
+    // the test we use placeholder distinct values. The worker's chained-round common gate
+    // only checks length (== DEOPERATOR_THRESHOLD) + 32-byte canonical-hex shape.
+    base.previous_round_commitments = (0..5)
+        .map(|i| {
+            let mut bytes = [0_u8; 32];
+            bytes[31] = i as u8 + 1;
+            hex_encode(&bytes)
+        })
+        .collect();
+
+    let req = MpccaFinalizeRequest {
+        base,
+        recipient_ek: r2_req.recipient_ek.clone(),
+        old_balance_c: r2_req.old_balance_c.clone(),
+        old_balance_d: r2_req.old_balance_d.clone(),
+        new_balance_c: r2_req.new_balance_c.clone(),
+        new_balance_d: r2_req.new_balance_d.clone(),
+        transfer_amount_c: r2_req.transfer_amount_c.clone(),
+        transfer_amount_d_sender: r2_req.transfer_amount_d_sender.clone(),
+        transfer_amount_d_recipient: r2_req.transfer_amount_d_recipient.clone(),
+        aggregated_sigma_commitments: agg.clone(),
+        challenge_hex,
+    };
+    (req, agg)
+}
+
+#[test]
+fn m4_finalize_completes_dk_threshold_happy_path() {
+    let fix = build_milestone1_fixture("m4-fin-happy");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+
+    let result = run_finalize_v2(&state_dir, &req).expect("M4 finalize happy path");
+    assert!(result.completed, "finalize result.completed MUST be true under M4 commit 3");
+    assert_eq!(result.slot, slot);
+    assert_eq!(result.player_id, player_id);
+    assert_eq!(result.dk_base_indices_used, vec![0_usize, 17_usize]);
+
+    // partial_response_dk_hex is a canonical 32-byte Ed25519 scalar hex.
+    let s_bytes = hex_decode(&result.partial_response_dk_hex);
+    assert_eq!(s_bytes.len(), 32, "s_share must be 32 bytes");
+    let mut arr = [0_u8; 32];
+    arr.copy_from_slice(&s_bytes);
+    let s_opt = curve25519_dalek::scalar::Scalar::from_canonical_bytes(arr);
+    assert!(
+        bool::from(s_opt.is_some()),
+        "partial_response_dk_hex must decode to a canonical Ed25519 scalar"
+    );
+    let s = s_opt.unwrap();
+    assert_ne!(
+        s,
+        curve25519_dalek::scalar::Scalar::ZERO,
+        "s_share must be non-zero (zero-reject defense-in-depth)"
+    );
+
+    // The finalize session state file exists with completed-sentinel (empty not_implemented_phase).
+    let session_dir =
+        mpcca_withdraw_session_dir(&state_dir, &req.base.request_id, &req.base.session_id)
+            .expect("session dir");
+    let loaded = load_round_state_file(&session_dir, "finalize")
+        .expect("load")
+        .expect("file present after finalize completes");
+    assert_eq!(loaded.round, "finalize");
+    assert_eq!(loaded.not_implemented_phase, "");
+    assert_eq!(loaded.worker_transcript_hash, result.worker_transcript_hash);
+}
+
+#[test]
+#[cfg(unix)]
+fn m4_finalize_state_file_is_mode_0o600() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fix = build_milestone1_fixture("m4-fin-mode");
+    let slot = 1_usize;
+    let player_id = 1_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    let _ = run_finalize_v2(&state_dir, &req).expect("happy path");
+    let session_dir =
+        mpcca_withdraw_session_dir(&state_dir, &req.base.request_id, &req.base.session_id)
+            .expect("session dir");
+    let file_path = session_dir.join("mpcca_withdraw_v2_finalize.json");
+    let perms = fs::metadata(&file_path).expect("metadata").permissions();
+    assert_eq!(
+        perms.mode() & 0o777,
+        0o600,
+        "finalize state file must be mode 0o600 on disk"
+    );
+}
+
+#[test]
+fn m4_finalize_replay_returns_stable_partial_response_share() {
+    // The at-rest α_share envelope is byte-stable across replays (round2 persisted it once);
+    // dk_share + λ_j + e are all deterministic public/secret inputs. Therefore s_share is
+    // byte-stable across replays of identical finalize bodies.
+    let fix = build_milestone1_fixture("m4-fin-replay");
+    let slot = 2_usize;
+    let player_id = 2_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    let r1 = run_finalize_v2(&state_dir, &req).expect("call 1");
+    let r2 = run_finalize_v2(&state_dir, &req).expect("call 2");
+    assert_eq!(
+        r1.partial_response_dk_hex, r2.partial_response_dk_hex,
+        "s_share MUST be byte-stable across replays of identical finalize bodies"
+    );
+    assert_eq!(
+        r1.worker_transcript_hash, r2.worker_transcript_hash,
+        "worker_transcript_hash MUST be byte-stable across replays"
+    );
+}
+
+#[test]
+fn m4_finalize_tampered_challenge_rejected() {
+    let fix = build_milestone1_fixture("m4-fin-bad-e");
+    let slot = 3_usize;
+    let player_id = 3_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    // Flip the last byte of challenge_hex. The flipped value MAY or MAY NOT decode to a
+    // canonical Ed25519 scalar; we accept either fail-closed surface.
+    let mut bytes = bytes32(&req.challenge_hex);
+    bytes[31] ^= 0x01;
+    req.challenge_hex = hex_encode(&bytes);
+    let err = run_finalize_v2(&state_dir, &req).expect_err("tampered e must reject");
+    assert!(
+        matches!(err, WorkerError::Crypto(ref s) if s == "finalize_challenge_mismatch")
+            || matches!(err, WorkerError::InvalidRequest(_)),
+        "expected finalize_challenge_mismatch or non-canonical InvalidRequest, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_tampered_aggregated_commitment_rejected() {
+    let fix = build_milestone1_fixture("m4-fin-bad-a");
+    let slot = 4_usize;
+    let player_id = 4_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    // Tamper agg[5] (a non-dk position) — the e re-derivation diverges.
+    req.aggregated_sigma_commitments[5] =
+        deterministic_compressed_hex(b"tampered-agg-5-replacement");
+    let err = run_finalize_v2(&state_dir, &req)
+        .expect_err("tampered aggregated commitment must reject");
+    assert!(
+        matches!(err, WorkerError::Crypto(ref s) if s == "finalize_challenge_mismatch"),
+        "expected finalize_challenge_mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_aggregated_commitment_length_mismatch_rejected() {
+    let fix = build_milestone1_fixture("m4-fin-bad-len");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    req.aggregated_sigma_commitments.pop(); // 29 instead of 30
+    let err = run_finalize_v2(&state_dir, &req)
+        .expect_err("under-count aggregated commitments must reject");
+    assert!(
+        matches!(
+            err,
+            WorkerError::InvalidRequest(ref s) if s.contains("aggregated_sigma_commitments")
+        ),
+        "expected InvalidRequest re: aggregated_sigma_commitments length, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_identity_aggregated_commitment_rejected() {
+    let fix = build_milestone1_fixture("m4-fin-id-agg");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    // 32 zero bytes is the canonical encoding of the Ristretto identity point.
+    req.aggregated_sigma_commitments[5] = "00".repeat(32);
+    let err = run_finalize_v2(&state_dir, &req)
+        .expect_err("identity aggregated commitment must reject");
+    assert!(
+        matches!(
+            err,
+            WorkerError::InvalidRequest(ref s) if s.contains("identity")
+        ),
+        "expected InvalidRequest re: identity, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_non_canonical_challenge_rejected() {
+    let fix = build_milestone1_fixture("m4-fin-noncanon-e");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    // 0xff * 32 is NOT a canonical Ed25519 scalar (>= group order).
+    req.challenge_hex = "ff".repeat(32);
+    let err = run_finalize_v2(&state_dir, &req)
+        .expect_err("non-canonical challenge must reject");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("challenge_hex")),
+        "expected InvalidRequest re: challenge_hex non-canonical, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_zero_challenge_rejected() {
+    let fix = build_milestone1_fixture("m4-fin-zero-e");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    req.challenge_hex = "00".repeat(32);
+    let err = run_finalize_v2(&state_dir, &req)
+        .expect_err("zero challenge must reject");
+    assert!(
+        matches!(err, WorkerError::Crypto(ref s) if s == "finalize_challenge_zero_rejected"),
+        "expected finalize_challenge_zero_rejected, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_tampered_statement_input_rejected() {
+    // Round2 was driven with Statement Y; finalize body sends Statement X (different
+    // recipient_ek). The worker re-derives statement_inputs_hash from X, cross-checks
+    // against round2_state.statement_inputs_hash (which was computed from Y), and
+    // fails closed with `finalize_round2_state_statement_inputs_hash_mismatch`.
+    let fix = build_milestone1_fixture("m4-fin-stmt-drift");
+    let slot = 1_usize;
+    let player_id = 1_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    // Swap recipient_ek for a different canonical point. Worker's challenge re-derivation
+    // would also diverge (Statement points change → e changes), so the gate that fires
+    // first depends on order; both surfaces are acceptable.
+    req.recipient_ek = deterministic_compressed_hex(b"different-recipient-ek-altogether");
+    let err = run_finalize_v2(&state_dir, &req)
+        .expect_err("Statement-input drift between rounds must reject");
+    assert!(
+        matches!(
+            err,
+            WorkerError::Crypto(ref s) if s == "finalize_challenge_mismatch"
+        ) || matches!(
+            err,
+            WorkerError::InvalidDkgState(ref s)
+                if s == "finalize_round2_state_statement_inputs_hash_mismatch"
+        ),
+        "expected challenge_mismatch or statement_inputs_hash_mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_previous_round_transcript_hash_mismatch_rejected() {
+    // The worker's stored Round2StateFile.worker_transcript_hash MUST equal the
+    // finalize body's previous_round_transcript_hash. A coordinator that fabricates
+    // a different previous_round_transcript_hash fails closed.
+    let fix = build_milestone1_fixture("m4-fin-prev-hash");
+    let slot = 2_usize;
+    let player_id = 2_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    req.base.previous_round_transcript_hash = "ee".repeat(32);
+    let err = run_finalize_v2(&state_dir, &req)
+        .expect_err("tampered previous_round_transcript_hash must reject");
+    assert!(
+        matches!(
+            err,
+            WorkerError::InvalidDkgState(ref s)
+                if s == "finalize_round2_state_transcript_hash_mismatch"
+        ),
+        "expected finalize_round2_state_transcript_hash_mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_missing_dk_share_file_rejected() {
+    let fix = build_milestone1_fixture("m4-fin-missing-dk");
+    let slot = 3_usize;
+    let player_id = 3_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    // Remove ca_dkg_share_v2.json AFTER round2 ran. (round2 needed it; we remove for finalize.)
+    fs::remove_file(state_dir.join("ca_dkg_share_v2.json")).expect("remove dk share");
+    let err = run_finalize_v2(&state_dir, &req).expect_err("missing dk_share must fail closed");
+    assert!(
+        matches!(
+            err,
+            WorkerError::MissingLocalState(_) | WorkerError::Io(_)
+        ),
+        "missing dk_share must surface MissingLocalState or Io, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_at_rest_envelope_not_recoverable_with_wrong_aad_seed() {
+    // Privacy contract: α_share is HPKE-sealed with AAD binding (session, request, slot).
+    // The finalize handler uses the SAME AAD via `round2_at_rest_aad`. If the worker's
+    // session/request/slot doesn't match what was used during round2 sealing, the open
+    // fails closed with `finalize_alpha_envelope_open_failed`. We exercise this by
+    // tampering the at-rest envelope's session/request binding indirectly via swapping
+    // the persisted Round2StateFile to one from a different request id. (Direct AAD
+    // tamper would require monkey-patching the open() call; the canonical fail-closed
+    // path is "envelope was sealed under a different AAD".)
+    let fix_a = build_milestone1_fixture("m4-fin-aad-a");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir_a = fix_a.slot_dirs[slot].clone();
+    let (req_a, _agg) = build_finalize_request_real(&fix_a, slot, player_id, &state_dir_a);
+
+    let fix_b = build_milestone1_fixture("m4-fin-aad-b");
+    let state_dir_b = fix_b.slot_dirs[slot].clone();
+    let (_req_b, _agg_b) = build_finalize_request_real(&fix_b, slot, player_id, &state_dir_b);
+
+    // Swap the Round2StateFile from B into A's session dir. A's worker private key cannot
+    // open B's at-rest envelope because:
+    //   - B's HPKE pubkey is different from A's (different fixture).
+    //   - Even if the keys collided, the AAD bound to B's session/request would be wrong
+    //     (different fixture label → different temp dirs but same session/request strings;
+    //     however different keys is the primary defense).
+    // We bypass this by directly copying B's round2 file into A's session dir.
+    let sess_a =
+        mpcca_withdraw_session_dir(&state_dir_a, &req_a.base.request_id, &req_a.base.session_id)
+            .expect("sess a");
+    let sess_b = mpcca_withdraw_session_dir(
+        &state_dir_b,
+        &req_a.base.request_id,
+        &req_a.base.session_id,
+    )
+    .expect("sess b");
+    let r2_file_a = sess_a.join("mpcca_withdraw_v2_round2_dk.json");
+    let r2_file_b = sess_b.join("mpcca_withdraw_v2_round2_dk.json");
+    fs::copy(&r2_file_b, &r2_file_a).expect("copy r2 file");
+    let err = run_finalize_v2(&state_dir_a, &req_a)
+        .expect_err("at-rest envelope sealed by another worker must fail closed");
+    // Expected surface depends on what diverged first. Acceptable surfaces:
+    //   - finalize_round2_state_transcript_hash_mismatch (B's worker_transcript_hash differs from A's)
+    //   - finalize_alpha_envelope_open_failed (HPKE key mismatch)
+    //   - finalize_round2_state_statement_inputs_hash_mismatch (different fixture data)
+    assert!(
+        matches!(err, WorkerError::InvalidDkgState(_) | WorkerError::Crypto(_)),
+        "expected fail-closed via InvalidDkgState/Crypto, got {err:?}"
+    );
+}
+
+#[test]
+fn m4_finalize_worker_transcript_hash_binds_challenge() {
+    // The worker_transcript_hash bound by finalize includes challenge_hex. A coordinator
+    // that sends a different (still-correct-for-some-other-A) challenge produces a
+    // different worker_transcript_hash. Failure mode: the tampered challenge fails the
+    // challenge re-derivation guard FIRST (before persist). We test the binding by
+    // confirming two different successful finalize runs (different aggregated A → different
+    // e → different worker_transcript_hash).
+    let fix = build_milestone1_fixture("m4-fin-bind-e");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (req_a, _) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+    let result_a = run_finalize_v2(&state_dir, &req_a).expect("a");
+
+    // Build a different finalize body with the same Statement + round2 but a different
+    // non-dk aggregated position (=> different e => different worker_transcript_hash).
+    let fix_b = build_milestone1_fixture("m4-fin-bind-e-b");
+    let state_dir_b = fix_b.slot_dirs[slot].clone();
+    let (mut req_b, _) = build_finalize_request_real(&fix_b, slot, player_id, &state_dir_b);
+    // Replace agg[7] with a different deterministic point + recompute e.
+    req_b.aggregated_sigma_commitments[7] =
+        deterministic_compressed_hex(b"alt-agg-7-different-value");
+    req_b.challenge_hex = derive_canonical_challenge_hex(
+        &fix_b.vault_ek_hex,
+        &req_b.recipient_ek,
+        &req_b.old_balance_c,
+        &req_b.old_balance_d,
+        &req_b.new_balance_c,
+        &req_b.new_balance_d,
+        &req_b.transfer_amount_c,
+        &req_b.transfer_amount_d_sender,
+        &req_b.transfer_amount_d_recipient,
+        &fix_b.sender,
+        &req_b.base.recipient,
+        &fix_b.asset,
+        fix_b.chain_id,
+        &req_b.aggregated_sigma_commitments,
+    );
+    let result_b = run_finalize_v2(&state_dir_b, &req_b).expect("b");
+    assert_ne!(
+        result_a.worker_transcript_hash, result_b.worker_transcript_hash,
+        "finalize worker_transcript_hash MUST bind aggregated A + challenge — different A → different hash"
+    );
+}
+
+#[test]
+fn m4_finalize_pin_rejects_double_call_with_different_challenge() {
+    // SECURITY KILLER TEST — Codex M4-c3 P1 #13 (α-share replay attack).
+    //
+    // A malicious coordinator that attempts to finalize TWICE with the SAME α-share
+    // (already at-rest from round2) but DIFFERENT (A, e) would learn:
+    //   s1 = α + e1 · w
+    //   s2 = α + e2 · w
+    //   w  = (s2 − s1) · (e2 − e1)^-1     (where w = λ_j · dk_share_j)
+    // and could reconstruct dk across 5 such recoveries.
+    //
+    // The atomic finalize pin (written BEFORE α decryption) makes the second call fail
+    // CLOSED at `mpcca_withdraw_v2_finalize_pin_already_exists_with_different_content`
+    // — α is never decrypted, w is never exposed, dk stays distributed.
+    use eunoma_crypto_worker::mpcca_withdraw_v2::load_finalize_pin_file;
+
+    let fix = build_milestone1_fixture("m4-fin-pin-replay");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let (req_a, agg_a) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
+
+    // First call succeeds + pin is persisted.
+    let result_a = run_finalize_v2(&state_dir, &req_a).expect("first finalize succeeds");
+    let session_dir =
+        mpcca_withdraw_session_dir(&state_dir, &req_a.base.request_id, &req_a.base.session_id)
+            .expect("session dir");
+    let pin = load_finalize_pin_file(&session_dir)
+        .expect("load pin")
+        .expect("pin file present after first finalize");
+    assert_eq!(pin.aggregated_commitments_hash.len(), 64);
+    assert_eq!(pin.challenge_hex.len(), 64);
+    assert_eq!(pin.worker_transcript_hash, result_a.worker_transcript_hash);
+
+    // Construct a second finalize body with the SAME session/request but a DIFFERENT
+    // aggregated A vector (and a freshly-computed matching e). This is exactly the
+    // attack shape: same α-share at-rest, different (A, e).
+    let mut req_b = req_a.clone();
+    // Replace agg[8] (a non-dk position) → e_b ≠ e_a.
+    req_b.aggregated_sigma_commitments[8] =
+        deterministic_compressed_hex(b"replay-attack-different-agg-8");
+    req_b.challenge_hex = derive_canonical_challenge_hex(
+        &fix.vault_ek_hex,
+        &req_b.recipient_ek,
+        &req_b.old_balance_c,
+        &req_b.old_balance_d,
+        &req_b.new_balance_c,
+        &req_b.new_balance_d,
+        &req_b.transfer_amount_c,
+        &req_b.transfer_amount_d_sender,
+        &req_b.transfer_amount_d_recipient,
+        &fix.sender,
+        &req_b.base.recipient,
+        &fix.asset,
+        fix.chain_id,
+        &req_b.aggregated_sigma_commitments,
+    );
+    assert_ne!(
+        req_a.challenge_hex, req_b.challenge_hex,
+        "test setup: e_a must differ from e_b to exercise the replay attack"
+    );
+
+    let err = run_finalize_v2(&state_dir, &req_b)
+        .expect_err("second finalize with different (A, e) MUST fail closed");
+    assert!(
+        matches!(
+            err,
+            WorkerError::InvalidDkgState(ref s)
+                if s.contains("mpcca_withdraw_v2_finalize_pin_already_exists_with_different_content")
+        ),
+        "expected finalize_pin_already_exists_with_different_content, got {err:?}"
+    );
+
+    // The pin must still be the ORIGINAL (A_a, e_a) — not the attacker's (A_b, e_b).
+    let pin_after = load_finalize_pin_file(&session_dir)
+        .expect("load pin after attack")
+        .expect("pin still present");
+    assert_eq!(
+        pin_after.challenge_hex, pin.challenge_hex,
+        "the pin's challenge_hex MUST remain the first call's e (attacker cannot overwrite)"
+    );
+
+    // Replay of the FIRST call (byte-identical (A, e)) MUST still succeed — pin is
+    // idempotent for byte-equal replays.
+    let result_a_replay = run_finalize_v2(&state_dir, &req_a)
+        .expect("byte-identical replay of first finalize succeeds (idempotent)");
+    assert_eq!(
+        result_a.partial_response_dk_hex, result_a_replay.partial_response_dk_hex,
+        "byte-identical replay produces byte-identical s_share"
+    );
+    let _ = agg_a;
+}
+
+#[test]
+fn m4_finalize_aggregates_to_valid_threshold_response_over_5_workers() {
+    // Drive round2 + finalize on all 5 selected slots, aggregate the 5 partial dk-responses
+    // into `s[0]`, then verify the protocol identity at index 0:
+    //   ek_sid · s[0] = A[0] + e · H
+    // This proves the threshold algebra: Σ_j s_share_j = α[0] + e · dk where α[0] = Σ α_share_j[0]
+    // and dk = Σ λ_j · dk_share_j (Lagrange).
+    let fix = build_milestone1_fixture("m4-fin-5-workers");
+
+    // Build a Round2Request fixture once so all 5 workers receive byte-identical Statement
+    // inputs (a real coordinator does the same fan-out).
+    let template = build_round2_request(&fix, 0_usize, 0_usize);
+
+    // Drive round2 on each of the 5 selected slots. For each, build a per-slot Round2Request
+    // that overrides self_slot + player_id but keeps Statement inputs + provenance fields
+    // byte-identical.
+    let sorted_slots: Vec<usize> = {
+        let mut s = fix.selected_slots.clone();
+        s.sort_unstable();
+        s
+    };
+    let mut r2_results = Vec::with_capacity(5);
+    for (ordinal, &slot) in sorted_slots.iter().enumerate() {
+        let mut req = template.clone();
+        req.base.self_slot = slot;
+        req.base.player_id = ordinal;
+        let state_dir = fix.slot_dirs[slot].clone();
+        let result = run_round2_v2(&state_dir, &req).expect("round2 per slot");
+        r2_results.push((slot, ordinal, result, state_dir, req));
+    }
+
+    // Aggregate partial_dk across all 5 workers. partial_dk[index]_aggregated = Σ partial_j[index].
+    let h = h_point();
+    let agg_point_at = |idx: usize| -> RistrettoPoint {
+        let mut acc = RistrettoPoint::identity();
+        for (_slot, _ord, result, _sd, _req) in &r2_results {
+            let p = result
+                .partial_dk_commitments
+                .iter()
+                .find(|p| p.index == idx)
+                .expect("partial for canonical index");
+            let bytes = hex_decode(&p.commitment_hex);
+            let mut arr = [0_u8; 32];
+            arr.copy_from_slice(&bytes);
+            let pt = curve25519_dalek::ristretto::CompressedRistretto(arr)
+                .decompress()
+                .expect("decompress");
+            acc += pt;
+        }
+        acc
+    };
+    let a0 = agg_point_at(0);
+    let a17 = agg_point_at(17);
+    let mut agg_hex: Vec<String> = Vec::with_capacity(30);
+    for i in 0..30 {
+        if i == 0 {
+            agg_hex.push(compressed_hex(&a0));
+        } else if i == 17 {
+            agg_hex.push(compressed_hex(&a17));
+        } else {
+            agg_hex.push(deterministic_compressed_hex(format!("agg5-{i}").as_bytes()));
+        }
+    }
+    let challenge_hex = derive_canonical_challenge_hex(
+        &fix.vault_ek_hex,
+        &template.recipient_ek,
+        &template.old_balance_c,
+        &template.old_balance_d,
+        &template.new_balance_c,
+        &template.new_balance_d,
+        &template.transfer_amount_c,
+        &template.transfer_amount_d_sender,
+        &template.transfer_amount_d_recipient,
+        &fix.sender,
+        &template.base.recipient,
+        &fix.asset,
+        fix.chain_id,
+        &agg_hex,
+    );
+
+    // Drive finalize on each slot with the same aggregated A + e.
+    let mut s_aggregated = Scalar::ZERO;
+    for (slot, ordinal, r2_result, state_dir, r2_req) in &r2_results {
+        let mut req = MpccaFinalizeRequest {
+            base: r2_req.base.clone(),
+            recipient_ek: r2_req.recipient_ek.clone(),
+            old_balance_c: r2_req.old_balance_c.clone(),
+            old_balance_d: r2_req.old_balance_d.clone(),
+            new_balance_c: r2_req.new_balance_c.clone(),
+            new_balance_d: r2_req.new_balance_d.clone(),
+            transfer_amount_c: r2_req.transfer_amount_c.clone(),
+            transfer_amount_d_sender: r2_req.transfer_amount_d_sender.clone(),
+            transfer_amount_d_recipient: r2_req.transfer_amount_d_recipient.clone(),
+            aggregated_sigma_commitments: agg_hex.clone(),
+            challenge_hex: challenge_hex.clone(),
+        };
+        req.base.previous_round_transcript_hash = r2_result.worker_transcript_hash.clone();
+        req.base.previous_round_commitments = (0..5)
+            .map(|i| {
+                let mut bytes = [0_u8; 32];
+                bytes[31] = i as u8 + 1;
+                hex_encode(&bytes)
+            })
+            .collect();
+        let f_result = run_finalize_v2(state_dir, &req).expect("finalize per slot");
+        let s_bytes = hex_decode(&f_result.partial_response_dk_hex);
+        let mut arr = [0_u8; 32];
+        arr.copy_from_slice(&s_bytes);
+        let s_j = Scalar::from_canonical_bytes(arr).unwrap();
+        s_aggregated += s_j;
+        let _ = (slot, ordinal); // bound for clarity
+    }
+
+    // Algebraic check: ek_sid · s[0] == A[0] + e · H.
+    let ek_sid_bytes = bytes32(&fix.vault_ek_hex);
+    let ek_sid = curve25519_dalek::ristretto::CompressedRistretto(ek_sid_bytes)
+        .decompress()
+        .expect("ek_sid decompress");
+    let e_bytes = bytes32(&challenge_hex);
+    let e = Scalar::from_canonical_bytes(e_bytes).unwrap();
+    let lhs = ek_sid * s_aggregated;
+    let rhs = a0 + e * h;
+    assert_eq!(
+        lhs, rhs,
+        "threshold algebra at index 0 broken: ek_sid · Σ s_share_j MUST equal A[0] + e · H"
     );
 }

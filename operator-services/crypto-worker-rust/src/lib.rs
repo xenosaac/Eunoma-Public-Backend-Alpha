@@ -7134,9 +7134,11 @@ pub mod mpcca_withdraw_v2 {
         lagrange_coefficients_at_zero, verify_registration_proof,
     };
     use crate::transfer_sigma_reference::{
-        build_statement,
-        threshold::{derive_dk_base_points, DkBasePoint},
-        Statement, TransferStatementInputs,
+        bcs_fiat_shamir_inputs, bcs_serialize_transfer_session, build_statement,
+        sigma_fiat_shamir_seed,
+        threshold::{derive_dk_base_points, DkBasePoint, COMMITMENT_LEN, WITNESS_LEN},
+        DomainSeparator, Statement, TransferStatementInputs, APTOS_FRAMEWORK_ADDRESS, PROTOCOL_ID,
+        TYPE_NAME,
     };
     use crate::vault_state_v2::{load_vault_state_v2, VaultStateFile};
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
@@ -7193,6 +7195,9 @@ pub mod mpcca_withdraw_v2 {
         "mpcca_withdraw_v2_round2_partial_sigma_pending_milestone4";
     pub(crate) const PROVE_NOT_IMPLEMENTED_PHASE: &str =
         "mpcca_withdraw_v2_prove_collaborative_bulletproof_pending_milestone4";
+    /// M4 commit 3 retired the finalize NotImplemented surface. Kept as a searchable registry
+    /// of the historical stub string.
+    #[allow(dead_code)]
     pub(crate) const FINALIZE_NOT_IMPLEMENTED_PHASE: &str =
         "mpcca_withdraw_v2_finalize_aggregate_pending_milestone4";
 
@@ -7323,7 +7328,49 @@ pub mod mpcca_withdraw_v2 {
     }
 
     pub type ProveRequest = ChainedRoundRequest;
-    pub type FinalizeRequest = ChainedRoundRequest;
+
+    /// Finalize (M4 commit 3) request. Wraps `ChainedRoundRequest` and adds:
+    /// 1. The Aptos CA TransferV1 Statement input fields (same canonical lengths as round2;
+    ///    coordinator MUST send the byte-identical values so the worker's round2 ↔ finalize
+    ///    Statement-input binding holds).
+    /// 2. The coordinator-aggregated 30-point sigma commitment vector `A_full`. Built by the
+    ///    coordinator from the user-supplied 29-entry commitment vector plus the worker
+    ///    partials at `BASE_DK_SET = {0, 17}` aggregated across the 5 selected slots.
+    /// 3. The coordinator-computed Fiat-Shamir challenge `e`. Worker re-derives `e` locally
+    ///    from `sigma_fiat_shamir_seed(BCS(domain, type_name, k=25, statement_x, statement_scalars, A_full))`
+    ///    and asserts byte-equality. This makes a malicious coordinator that lies about `e`
+    ///    fail closed at the worker.
+    ///
+    /// Wire shape: every base ChainedRoundRequest field at top level (via `serde(flatten)`),
+    /// then the Statement input fields, then `aggregatedSigmaCommitments` (30 × 32-byte hex),
+    /// then `challengeHex` (32-byte canonical Ed25519 scalar).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FinalizeRequest {
+        #[serde(flatten)]
+        pub base: ChainedRoundRequest,
+        /// Recipient encryption key (`ek_rid`). 32-byte compressed Ristretto hex.
+        pub recipient_ek: String,
+        /// Old balance Pedersen commitments. 8 × 32-byte hex.
+        pub old_balance_c: Vec<String>,
+        /// Old balance ElGamal D-component. 8 × 32-byte hex.
+        pub old_balance_d: Vec<String>,
+        /// New balance Pedersen commitments. 8 × 32-byte hex.
+        pub new_balance_c: Vec<String>,
+        /// New balance ElGamal D-component. 8 × 32-byte hex.
+        pub new_balance_d: Vec<String>,
+        /// Transfer-amount Pedersen commitments. 4 × 32-byte hex.
+        pub transfer_amount_c: Vec<String>,
+        /// Transfer-amount ElGamal D-component (sender). 4 × 32-byte hex.
+        pub transfer_amount_d_sender: Vec<String>,
+        /// Transfer-amount ElGamal D-component (recipient). 4 × 32-byte hex.
+        pub transfer_amount_d_recipient: Vec<String>,
+        /// Coordinator-aggregated 30-point sigma commitment vector `A_full`. Each entry is a
+        /// 32-byte compressed Ristretto hex.
+        pub aggregated_sigma_commitments: Vec<String>,
+        /// Coordinator-computed Fiat-Shamir challenge `e`. 32-byte canonical Ed25519 scalar hex.
+        pub challenge_hex: String,
+    }
 
     /// Output of the per-round milestone 3a stub. The crypto-specific fields (round_commitment,
     /// partial_response, etc.) are `None` because the crypto is not implemented yet — but
@@ -7392,6 +7439,68 @@ pub mod mpcca_withdraw_v2 {
         pub dk_base_indices_used: Vec<usize>,
     }
 
+    /// M4 Commit 3 — finalize result. The worker contributes ONLY the dk-component of the
+    /// sigma response vector `s`. Returned scalar is `s_share_j = α_share_j[0] + e · (λ_j · dk_share_j)`,
+    /// a single 32-byte canonical Ed25519 scalar hex. The coordinator aggregates the 5 selected
+    /// workers' shares via `s[0] = Σ_j s_share_j` and combines with the user-supplied
+    /// `s_user[1..25]` to assemble the full 25-vector sigma response.
+    ///
+    /// `dk_base_indices_used` mirrors round2's contract — re-derived from psi_transfer at
+    /// finalize as defense-in-depth (a Statement-input drift between round2 and finalize would
+    /// flip the recomputed BASE_DK_SET, surfacing as a `finalize_round2_state_dk_indices_mismatch`
+    /// before the response share is computed).
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FinalizeDkResult {
+        pub slot: usize,
+        pub player_id: usize,
+        pub session_state_path: String,
+        pub session_state_hash: String,
+        pub worker_transcript_hash: String,
+        pub observed_at_unix_ms: u128,
+        pub completed: bool, // always true under M4 commit 3
+        /// Single 32-byte canonical Ed25519 scalar hex: `s_share_j = α_share_j[0] + e · (λ_j · dk_share_j)`.
+        pub partial_response_dk_hex: String,
+        /// Canonical BASE_DK_SET indices re-derived at finalize via psi_transfer inspection.
+        pub dk_base_indices_used: Vec<usize>,
+    }
+
+    /// M4 Commit 3 — finalize binding pin. Written ATOMICALLY (via `write_atomic_no_clobber`
+    /// = POSIX `link(2)`) BEFORE the worker decrypts `α_share_j[0]`. Captures the
+    /// `(aggregated_commitments_hash, challenge_hex)` tuple that the FIRST finalize call
+    /// committed to for this (request_id, session_id, slot).
+    ///
+    /// Security contract — this is the load-bearing defense against the α-share replay
+    /// attack. A malicious coordinator that calls finalize twice with the SAME α-share but
+    /// DIFFERENT `(A, e)` would receive two responses `s1 = α + e1·w` and `s2 = α + e2·w`,
+    /// from which `w = (s2 - s1) · (e2 - e1)^-1` recovers the worker's Lagrange-weighted
+    /// dk-share `λ_j · dk_share_j`. Five such recoveries (across the quorum) reconstruct
+    /// `dk` itself. The pin makes the second call FAIL CLOSED before α is ever decrypted.
+    ///
+    /// Atomic-no-clobber semantics:
+    ///   - First call: link(2) succeeds, pin persisted.
+    ///   - Replay with byte-identical content: link(2) → EEXIST, file equality matches,
+    ///     `write_atomic_no_clobber` returns Ok → finalize re-runs deterministically.
+    ///   - Replay with different (A, e): link(2) → EEXIST, file equality fails,
+    ///     `write_atomic_no_clobber` returns
+    ///     `InvalidDkgState("mpcca_withdraw_v2_finalize_pin_already_exists_with_different_content")`
+    ///     → α is NEVER decrypted, secret material is NEVER touched.
+    ///
+    /// The pin file has NO timestamp: byte-equality across legitimate replays is required.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FinalizePinFile {
+        pub scheme: String,
+        pub slot: usize,
+        pub player_id: usize,
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub aggregated_commitments_hash: String,
+        pub challenge_hex: String,
+        pub worker_transcript_hash: String,
+    }
+
     /// File written by the worker after a successful M4 commit-1 round 2. Holds public
     /// partial dk-base commitments + an HPKE-encrypted-at-rest envelope sealing
     /// `α_share_j[0]` under the worker's own HPKE pubkey. M4 commit 3 (finalize) re-opens
@@ -7399,6 +7508,12 @@ pub mod mpcca_withdraw_v2 {
     ///
     /// Privacy contract: `α_share_j[0]` NEVER appears in plaintext on disk; only the
     /// HPKE seal lives here.
+    ///
+    /// `statement_inputs_hash` is the canonical sha256 hex of round2's Aptos CA TransferV1
+    /// Statement input fields (recipient_ek + 6 ciphertext vectors). M4 commit 3's finalize
+    /// handler cross-checks this against finalize's own statement_inputs_hash to catch a
+    /// coordinator that tampered with Statement inputs between rounds. Defaulted to empty
+    /// string for backwards-compat with pre-M4-c3 fixtures.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Round2StateFile {
@@ -7413,6 +7528,8 @@ pub mod mpcca_withdraw_v2 {
         pub worker_transcript_hash: String,
         pub encrypted_alpha_envelope: HpkeEnvelope,
         pub created_at_unix_ms: u128,
+        #[serde(default)]
+        pub statement_inputs_hash: String,
     }
 
     /// On-disk per-session-per-round state file. Holds only public binding metadata + a copy of
@@ -8053,22 +8170,46 @@ pub mod mpcca_withdraw_v2 {
     }
 
     fn normalise_round2_statement_inputs(req: &Round2Request) -> WorkerResult<Round2StatementInputs> {
-        let recipient_ek = normalize_hex(&req.recipient_ek, 32).map_err(|err| {
-            WorkerError::InvalidRequest(format!("round2 recipient_ek: {err:?}"))
-        })?;
-        let old_balance_c = normalise_round2_hex_vec(&req.old_balance_c, ROUND2_ELL, "old_balance_c")?;
-        let old_balance_d = normalise_round2_hex_vec(&req.old_balance_d, ROUND2_ELL, "old_balance_d")?;
-        let new_balance_c = normalise_round2_hex_vec(&req.new_balance_c, ROUND2_ELL, "new_balance_c")?;
-        let new_balance_d = normalise_round2_hex_vec(&req.new_balance_d, ROUND2_ELL, "new_balance_d")?;
-        let transfer_amount_c =
-            normalise_round2_hex_vec(&req.transfer_amount_c, ROUND2_N, "transfer_amount_c")?;
-        let transfer_amount_d_sender = normalise_round2_hex_vec(
+        normalise_round2_statement_inputs_from_parts(
+            &req.recipient_ek,
+            &req.old_balance_c,
+            &req.old_balance_d,
+            &req.new_balance_c,
+            &req.new_balance_d,
+            &req.transfer_amount_c,
             &req.transfer_amount_d_sender,
-            ROUND2_N,
-            "transfer_amount_d_sender",
-        )?;
-        let transfer_amount_d_recipient = normalise_round2_hex_vec(
             &req.transfer_amount_d_recipient,
+        )
+    }
+
+    /// M4 Commit 3 — share the Statement-inputs normalisation between Round2Request and
+    /// FinalizeRequest. Both rounds carry the same canonical Aptos CA TransferV1 Statement
+    /// input fields; if a malicious coordinator sends different Statement inputs at finalize
+    /// than at round2, the recomputed round2 worker_transcript_hash (built from finalize's
+    /// inputs) won't match the `previousRoundTranscriptHash` and the worker fails closed.
+    #[allow(clippy::too_many_arguments)]
+    fn normalise_round2_statement_inputs_from_parts(
+        recipient_ek: &str,
+        old_balance_c: &[String],
+        old_balance_d: &[String],
+        new_balance_c: &[String],
+        new_balance_d: &[String],
+        transfer_amount_c: &[String],
+        transfer_amount_d_sender: &[String],
+        transfer_amount_d_recipient: &[String],
+    ) -> WorkerResult<Round2StatementInputs> {
+        let recipient_ek = normalize_hex(recipient_ek, 32)
+            .map_err(|err| WorkerError::InvalidRequest(format!("round2 recipient_ek: {err:?}")))?;
+        let old_balance_c = normalise_round2_hex_vec(old_balance_c, ROUND2_ELL, "old_balance_c")?;
+        let old_balance_d = normalise_round2_hex_vec(old_balance_d, ROUND2_ELL, "old_balance_d")?;
+        let new_balance_c = normalise_round2_hex_vec(new_balance_c, ROUND2_ELL, "new_balance_c")?;
+        let new_balance_d = normalise_round2_hex_vec(new_balance_d, ROUND2_ELL, "new_balance_d")?;
+        let transfer_amount_c =
+            normalise_round2_hex_vec(transfer_amount_c, ROUND2_N, "transfer_amount_c")?;
+        let transfer_amount_d_sender =
+            normalise_round2_hex_vec(transfer_amount_d_sender, ROUND2_N, "transfer_amount_d_sender")?;
+        let transfer_amount_d_recipient = normalise_round2_hex_vec(
+            transfer_amount_d_recipient,
             ROUND2_N,
             "transfer_amount_d_recipient",
         )?;
@@ -8082,6 +8223,24 @@ pub mod mpcca_withdraw_v2 {
             transfer_amount_d_sender,
             transfer_amount_d_recipient,
         })
+    }
+
+    /// Normalise the Statement input fields carried by a FinalizeRequest. Calls
+    /// `normalise_round2_statement_inputs_from_parts` so the byte-shape rules are byte-identical
+    /// to round2 (and the canonical hash matches the round2 worker_transcript_hash binding).
+    fn normalise_finalize_statement_inputs(
+        req: &FinalizeRequest,
+    ) -> WorkerResult<Round2StatementInputs> {
+        normalise_round2_statement_inputs_from_parts(
+            &req.recipient_ek,
+            &req.old_balance_c,
+            &req.old_balance_d,
+            &req.new_balance_c,
+            &req.new_balance_d,
+            &req.transfer_amount_c,
+            &req.transfer_amount_d_sender,
+            &req.transfer_amount_d_recipient,
+        )
     }
 
     fn normalise_round2_hex_vec(
@@ -8146,6 +8305,140 @@ pub mod mpcca_withdraw_v2 {
         bytes.push(b':');
         bytes.extend_from_slice(statement_inputs_hash_hex.as_bytes());
         sha256_hex(&bytes)
+    }
+
+    /// Canonical sha256 hex over the 30-entry aggregated sigma commitment vector. Each entry
+    /// is the normalised 32-byte hex string; entries are joined by `|`. Byte-equal across
+    /// TS↔Rust so the coordinator's per-worker transcript hash cross-check holds.
+    fn aggregated_sigma_commitments_hash_hex(commitments_hex: &[String]) -> String {
+        let joined = commitments_hex.join("|");
+        sha256_hex(joined.as_bytes())
+    }
+
+    /// Finalize (M4 commit 3) worker_transcript_hash. Binds:
+    ///   - the chained-round hash under the FINALIZE domain
+    ///   - the Statement-inputs hash (same hash function as round2)
+    ///   - the aggregated 30-point commitment vector hash
+    ///   - the coordinator-supplied Fiat-Shamir challenge `e`
+    ///
+    /// Layout:
+    ///   sha256(chained_hash || ":" || statement_inputs_hash || ":" || aggregated_commitments_hash || ":" || challenge_hex)
+    fn finalize_v2_worker_transcript_hash(
+        chained_hash_hex: &str,
+        statement_inputs_hash_hex: &str,
+        aggregated_commitments_hash_hex: &str,
+        challenge_hex: &str,
+    ) -> String {
+        let mut bytes = Vec::with_capacity(
+            chained_hash_hex.len()
+                + 1
+                + statement_inputs_hash_hex.len()
+                + 1
+                + aggregated_commitments_hash_hex.len()
+                + 1
+                + challenge_hex.len(),
+        );
+        bytes.extend_from_slice(chained_hash_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(statement_inputs_hash_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(aggregated_commitments_hash_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(challenge_hex.as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    /// Test-friendly helper so TS↔Rust byte-parity tests can drive the finalize binding
+    /// hashing without exposing internal structs.
+    pub fn finalize_v2_worker_transcript_hash_hex_for_test(
+        chained_hash_hex: &str,
+        statement_inputs_hash_hex: &str,
+        aggregated_commitments_hash_hex: &str,
+        challenge_hex: &str,
+    ) -> String {
+        finalize_v2_worker_transcript_hash(
+            chained_hash_hex,
+            statement_inputs_hash_hex,
+            aggregated_commitments_hash_hex,
+            challenge_hex,
+        )
+    }
+
+    /// Build the Aptos CA TransferV1 sigma-protocol DomainSeparator from public binding
+    /// fields. The DomainSeparator's `session_id` is the BCS-serialised TransferSession
+    /// (sender || recipient || asset || ell || n || has_effective_auditor=false ||
+    /// num_volun_auditors=0). The constants `APTOS_FRAMEWORK_ADDRESS` and `PROTOCOL_ID`
+    /// come from `transfer_sigma_reference` and are locked to Aptos SDK 1.1.1.
+    fn build_finalize_domain_separator(
+        sender_address_hex: &str,
+        recipient_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+    ) -> WorkerResult<DomainSeparator> {
+        let sender = hex_to_bytes32(sender_address_hex)?;
+        let recipient = hex_to_bytes32(recipient_hex)?;
+        let asset = hex_to_bytes32(asset_type_hex)?;
+        let session = bcs_serialize_transfer_session(
+            &sender,
+            &recipient,
+            &asset,
+            ROUND2_ELL as u64,
+            ROUND2_N as u64,
+            false,
+            0,
+        );
+        Ok(DomainSeparator {
+            contract_address: APTOS_FRAMEWORK_ADDRESS,
+            chain_id,
+            protocol_id: PROTOCOL_ID.as_bytes().to_vec(),
+            session_id: session,
+        })
+    }
+
+    /// Validate + normalise the coordinator-supplied 30-point aggregated commitment vector.
+    /// Asserts: length == 30, every entry is a canonical 32-byte compressed Ristretto hex,
+    /// every entry decompresses successfully, no entry is the identity point (defense-in-depth
+    /// — psi_transfer outputs are never identity unless the witness is zero, which is
+    /// independently zero-rejected).
+    fn normalise_aggregated_sigma_commitments(items: &[String]) -> WorkerResult<Vec<String>> {
+        if items.len() != COMMITMENT_LEN {
+            return Err(WorkerError::InvalidRequest(format!(
+                "aggregated_sigma_commitments must have exactly {COMMITMENT_LEN} entries, got {}",
+                items.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(COMMITMENT_LEN);
+        for (i, hex) in items.iter().enumerate() {
+            let norm = normalize_hex(hex, 32).map_err(|err| {
+                WorkerError::InvalidRequest(format!(
+                    "aggregated_sigma_commitments[{i}]: {err:?}"
+                ))
+            })?;
+            let bytes = hex_to_bytes32(&norm)?;
+            let pt = CompressedRistretto(bytes).decompress().ok_or_else(|| {
+                WorkerError::InvalidRequest(format!(
+                    "aggregated_sigma_commitments[{i}] is not a valid compressed Ristretto point"
+                ))
+            })?;
+            if pt == RistrettoPoint::identity() {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "aggregated_sigma_commitments[{i}] is the identity element"
+                )));
+            }
+            out.push(norm);
+        }
+        Ok(out)
+    }
+
+    /// Decompress an already-normalised 30-entry compressed-hex commitment vector to
+    /// `[u8; 32]` entries for `bcs_fiat_shamir_inputs`.
+    fn decode_aggregated_commitments_bytes(
+        normalised: &[String],
+    ) -> WorkerResult<Vec<[u8; 32]>> {
+        normalised
+            .iter()
+            .map(|hex| hex_to_bytes32(hex))
+            .collect()
     }
 
     /// Build the public Statement for the Aptos CA TransferV1 sigma protocol from the normalised
@@ -8275,6 +8568,52 @@ pub mod mpcca_withdraw_v2 {
         }
         fs::rename(&tmp, &path).map_err(|err| WorkerError::Io(err.to_string()))?;
         Ok(())
+    }
+
+    /// Per-session file name for the M4 commit-3 finalize binding pin.
+    fn finalize_pin_file_name() -> &'static str {
+        "mpcca_withdraw_v2_finalize_pin.json"
+    }
+
+    /// Persist the finalize binding pin via atomic-no-clobber. The pin is written BEFORE
+    /// any secret material is loaded; if a second finalize call arrives with a different
+    /// `(aggregated_commitments_hash, challenge_hex)` for the same `(request_id, session_id,
+    /// slot)`, the no-clobber gate fails closed with
+    /// `mpcca_withdraw_v2_finalize_pin_already_exists_with_different_content` and α-share is
+    /// NEVER touched.
+    fn persist_finalize_pin(session_dir: &Path, pin: &FinalizePinFile) -> WorkerResult<()> {
+        let path = session_dir.join(finalize_pin_file_name());
+        let bytes = serde_json::to_vec_pretty(pin).map_err(|err| {
+            WorkerError::Crypto(format!("encode mpcca_withdraw_v2 finalize pin: {err}"))
+        })?;
+        crate::atomic_io::write_atomic_no_clobber(
+            &path,
+            &bytes,
+            "mpcca_withdraw_v2_finalize_pin",
+        )
+    }
+
+    /// Convenience read API for tests + replay-idempotency probes. Returns None if no
+    /// finalize pin file exists at the per-session path.
+    pub fn load_finalize_pin_file(
+        session_dir: &Path,
+    ) -> WorkerResult<Option<FinalizePinFile>> {
+        let path = session_dir.join(finalize_pin_file_name());
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(&path).map_err(|err| {
+            WorkerError::Crypto(format!("read finalize pin {}: {err}", path.display()))
+        })?;
+        let existing: FinalizePinFile = serde_json::from_slice(&raw).map_err(|err| {
+            WorkerError::Crypto(format!("parse finalize pin {}: {err}", path.display()))
+        })?;
+        if existing.scheme != "mpcca_withdraw_v2_finalize_pin" {
+            return Err(WorkerError::InvalidDkgState(
+                "mpcca_withdraw_v2_finalize_pin_unexpected_scheme_on_disk".to_string(),
+            ));
+        }
+        Ok(Some(existing))
     }
 
     /// Convenience read API for tests + M4 commit-3 finalize. Returns None if no round2
@@ -8799,6 +9138,9 @@ pub mod mpcca_withdraw_v2 {
             worker_transcript_hash: worker_transcript_hash.clone(),
             encrypted_alpha_envelope,
             created_at_unix_ms: now,
+            // M4 commit 3 binding: store the canonical Statement-inputs hash so finalize can
+            // cross-check round2 ↔ finalize Statement input drift directly.
+            statement_inputs_hash: statement_inputs_hash_hex.clone(),
         };
         fs::create_dir_all(&binding.session_dir)
             .map_err(|err| WorkerError::Io(err.to_string()))?;
@@ -8845,17 +9187,381 @@ pub mod mpcca_withdraw_v2 {
         )
     }
 
+    /// Finalize entrypoint (M4 Commit 3) — dk-component threshold response share.
+    ///
+    /// Worker contract:
+    ///   1. Run the shared chained-round public binding under FINALIZE domain (sigma re-verify,
+    ///      provenance gate, vault_sequence gate, observed-deposit ordering enforcement).
+    ///   2. Validate the Statement input fields (canonical lengths + 32-byte hex). These MUST
+    ///      be byte-identical to round2's Statement inputs; the cross-check is enforced
+    ///      indirectly via the recomputed round2 worker_transcript_hash equality with
+    ///      `previous_round_transcript_hash` AND directly via byte-comparison to the persisted
+    ///      Round2StateFile's `dk_base_indices_used` derived BASE_DK_SET at finalize.
+    ///   3. Validate the aggregated 30-point sigma commitment vector + the challenge hex.
+    ///   4. Re-derive the Fiat-Shamir challenge `e` locally via
+    ///      `sigma_fiat_shamir_seed(bcs_fiat_shamir_inputs(dst, TYPE_NAME, k=25, statement.x,
+    ///      statement.scalars, aggregated_commitments))`. Assert byte-equality with the
+    ///      coordinator-supplied `challenge_hex`. A malicious coordinator that lies about `e`
+    ///      fails closed here.
+    ///   5. Load `ca_dkg_share_v2.json` and `Round2StateFile` for the per-session state.
+    ///   6. Recompute Lagrange `λ_j` at x=0 over sorted selectedSlots (locally — do NOT trust
+    ///      the coordinator).
+    ///   7. HPKE-decrypt `α_share_j[0]` from the at-rest envelope under the worker's own HPKE
+    ///      private key with the round2 at-rest AAD. Reject non-canonical or zero α.
+    ///   8. Defense-in-depth: recompute round2 worker_transcript_hash from finalize's
+    ///      Statement inputs and assert it equals the request's `previous_round_transcript_hash`.
+    ///      A coordinator tampering with Statement inputs between rounds fails closed here.
+    ///   9. Compute `s_share_j = α_share_j[0] + e · (λ_j · dk_share_j)`. Zero-reject (goal.md
+    ///      decision #9; mathematically impossible for honest inputs but defense-in-depth).
+    ///  10. Zeroize `α_share_j[0]` and the `dk_share_j` stack copy after computing `s_share_j`.
+    ///      `s_share_j` itself is a PUBLIC output (the worker's threshold response share).
+    ///  11. Persist `mpcca_withdraw_v2_finalize.json` (RoundStateFile, completed=true) with the
+    ///      bound worker_transcript_hash.
+    ///  12. Return `FinalizeDkResult { partial_response_dk_hex, dk_base_indices_used, ... }`.
+    ///
+    /// Privacy contract: `α_share_j[0]` and `dk_share_j` never leave the worker process in
+    /// plaintext; the only output is `s_share_j` (a single 32-byte canonical Ed25519 scalar),
+    /// which is by-construction a PUBLIC sigma response share.
     pub fn run_finalize_v2(
         state_dir: &Path,
         req: &FinalizeRequest,
-    ) -> WorkerResult<StubRoundResult> {
-        run_chained_round(
-            state_dir,
-            req,
-            "finalize",
+    ) -> WorkerResult<FinalizeDkResult> {
+        // 1. Shared chained-round public binding. Returns a binding whose `chained_hash` is
+        //    computed under ROUND2_TRANSCRIPT_DOMAIN; we re-hash under FINALIZE_TRANSCRIPT_DOMAIN
+        //    below.
+        let binding = chained_round_public_binding(state_dir, &req.base)?;
+
+        // 2. Validate Statement input fields (lengths + 32-byte hex canonicalisation).
+        let stmt_inputs = normalise_finalize_statement_inputs(req)?;
+        let statement_inputs_hash = statement_inputs_hash_hex(&stmt_inputs);
+
+        // 3. Validate aggregated commitments shape (length 30, canonical compressed Ristretto,
+        //    non-identity) and the challenge hex (canonical Ed25519 scalar).
+        let aggregated_commitments_norm =
+            normalise_aggregated_sigma_commitments(&req.aggregated_sigma_commitments)?;
+        let aggregated_commitments_hash =
+            aggregated_sigma_commitments_hash_hex(&aggregated_commitments_norm);
+        let challenge_hex_norm = normalize_hex(&req.challenge_hex, 32).map_err(|err| {
+            WorkerError::InvalidRequest(format!("finalize challenge_hex: {err:?}"))
+        })?;
+        let coord_challenge = {
+            let bytes = hex_to_bytes32(&challenge_hex_norm)?;
+            let opt = Scalar::from_canonical_bytes(bytes);
+            if opt.is_none().into() {
+                return Err(WorkerError::InvalidRequest(
+                    "finalize challenge_hex is not a canonical Ed25519 scalar".to_string(),
+                ));
+            }
+            opt.unwrap()
+        };
+        if coord_challenge == Scalar::ZERO {
+            return Err(WorkerError::Crypto(
+                "finalize_challenge_zero_rejected".to_string(),
+            ));
+        }
+
+        // 4. Build the public Statement and re-derive `e` locally.
+        let statement = build_round2_statement(&stmt_inputs, &binding.normalised.vault_ek_hex)?;
+        let dst = build_finalize_domain_separator(
+            &binding.normalised.sender_address,
+            &binding.normalised.recipient,
+            &binding.normalised.asset_type,
+            req.base.chain_id,
+        )?;
+        let aggregated_commitments_bytes =
+            decode_aggregated_commitments_bytes(&aggregated_commitments_norm)?;
+        let bcs = bcs_fiat_shamir_inputs(
+            &dst,
+            TYPE_NAME,
+            WITNESS_LEN as u64,
+            &statement.compressed_points,
+            &statement.scalars,
+            &aggregated_commitments_bytes,
+        );
+        let (e_local, _beta) = sigma_fiat_shamir_seed(&bcs);
+        if e_local != coord_challenge {
+            return Err(WorkerError::Crypto(
+                "finalize_challenge_mismatch".to_string(),
+            ));
+        }
+
+        // 5. Programmatically derive BASE_DK_SET from the public Statement (must match round2's).
+        let dk_bases = derive_dk_base_points(&statement, ROUND2_ELL, ROUND2_N, false, 0)?;
+        if dk_bases.is_empty() {
+            return Err(WorkerError::Crypto(
+                "finalize_dk_base_set_empty".to_string(),
+            ));
+        }
+        let canonical_dk_indices: Vec<usize> = dk_bases.iter().map(|d| d.index).collect();
+
+        // 6. Recompute the chained hash under FINALIZE_TRANSCRIPT_DOMAIN, then the
+        //    finalize worker_transcript_hash that binds Statement inputs + aggregated A + e.
+        let previous_round_transcript_hash =
+            normalize_hex(&req.base.previous_round_transcript_hash, 32)?;
+        let mut previous_round_commitments = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for c in &req.base.previous_round_commitments {
+            previous_round_commitments.push(normalize_hex(c, 32)?);
+        }
+        let chained_hash_finalize = chained_round_worker_hash(
             FINALIZE_TRANSCRIPT_DOMAIN,
-            FINALIZE_NOT_IMPLEMENTED_PHASE,
-        )
+            &req.base.session_id,
+            &req.base.request_id,
+            &req.base.dkg_epoch,
+            &binding.normalised.vault_ek_transcript_hash,
+            &binding.normalised.registration_transcript_hash,
+            &binding.normalised.vault_state_init_transcript_hash,
+            &binding.normalised.observed_deposit_transcript_hashes,
+            &binding.normalised.roster_hash,
+            &binding.normalised.sorted,
+            req.base.self_slot,
+            req.base.player_id,
+            &binding.normalised.vault_ek_hex,
+            &binding.normalised.sender_address,
+            &binding.normalised.asset_type,
+            req.base.chain_id,
+            &binding.normalised.root,
+            &binding.normalised.nullifier_hash,
+            &binding.normalised.recipient,
+            &binding.normalised.recipient_hash,
+            &binding.normalised.amount_tag,
+            req.base.vault_sequence,
+            req.base.expiry_secs,
+            &binding.normalised.request_hash,
+            req.base.deposit_count,
+            &previous_round_transcript_hash,
+            &previous_round_commitments,
+        );
+        let worker_transcript_hash = finalize_v2_worker_transcript_hash(
+            &chained_hash_finalize,
+            &statement_inputs_hash,
+            &aggregated_commitments_hash,
+            &challenge_hex_norm,
+        );
+
+        // 7. Load the Round2StateFile and validate provenance + previous_round_transcript_hash.
+        //    Run all non-secret cross-checks BEFORE touching dk_share / α_share so we
+        //    fail closed early.
+        let round2_state =
+            load_round2_dk_state_file(&binding.session_dir)?.ok_or_else(|| {
+                WorkerError::InvalidDkgState(
+                    "finalize_missing_round2_dk_state".to_string(),
+                )
+            })?;
+        if round2_state.dkg_epoch != req.base.dkg_epoch
+            || round2_state.request_id != req.base.request_id
+            || round2_state.session_id != req.base.session_id
+            || round2_state.slot != req.base.self_slot
+            || round2_state.player_id != req.base.player_id
+        {
+            return Err(WorkerError::InvalidDkgState(
+                "finalize_round2_state_provenance_mismatch".to_string(),
+            ));
+        }
+        // Defense-in-depth: the persisted round2 worker_transcript_hash MUST equal the
+        // coordinator-supplied previous_round_transcript_hash. This catches:
+        //   (a) coordinator forwarded a stale or fabricated previousRoundTranscriptHash
+        //   (b) Statement-input drift between round2 and finalize (round2 stored its
+        //       Statement-bound transcript hash; finalize's previous_round_transcript_hash
+        //       MUST match that stored value)
+        if round2_state.worker_transcript_hash != previous_round_transcript_hash {
+            return Err(WorkerError::InvalidDkgState(
+                "finalize_round2_state_transcript_hash_mismatch".to_string(),
+            ));
+        }
+        // BASE_DK_SET cross-check: round2's persisted indices must match this finalize's
+        // re-derived canonical set. A psi-shape regression between rounds is impossible by
+        // construction (psi is pure function of Statement points), but the check defends
+        // against future refactors that decouple the derivation.
+        if round2_state.dk_base_indices_used != canonical_dk_indices {
+            return Err(WorkerError::InvalidDkgState(
+                "finalize_round2_state_dk_indices_mismatch".to_string(),
+            ));
+        }
+        // Defense-in-depth round2 ↔ finalize Statement-input binding: round2 persisted the
+        // canonical `statement_inputs_hash` it bound; finalize must use byte-identical
+        // Statement inputs. A coordinator that tampered with Statement inputs between rounds
+        // surfaces here as `finalize_round2_state_statement_inputs_hash_mismatch`. This is
+        // distinct from (and tighter than) the Fiat-Shamir challenge-mismatch guard, because
+        // it catches the tampering BEFORE any α_share decryption.
+        //
+        // Backwards-compat: if `statement_inputs_hash` is empty (pre-M4-c3 round2 fixture),
+        // skip this check — the Fiat-Shamir guard above remains the load-bearing defense.
+        if !round2_state.statement_inputs_hash.is_empty()
+            && round2_state.statement_inputs_hash != statement_inputs_hash
+        {
+            return Err(WorkerError::InvalidDkgState(
+                "finalize_round2_state_statement_inputs_hash_mismatch".to_string(),
+            ));
+        }
+
+        // 8. SECURITY GATE — atomically pin (aggregated_commitments_hash, challenge_hex)
+        //    BEFORE any secret material is loaded.
+        //
+        //    Codex M4-c3 P1 #13 (α-share replay attack): without this gate, a malicious
+        //    coordinator could call finalize twice with the SAME α-share (already at-rest
+        //    from round2) but DIFFERENT (A, e):
+        //      s1 = α + e1 · w
+        //      s2 = α + e2 · w
+        //      w  = (s2 − s1) · (e2 − e1)^-1     (where w = λ_j · dk_share_j)
+        //    Five such recoveries across the quorum reconstruct `dk`, breaking the
+        //    no-centralized-dk invariant. The pin makes the second call fail CLOSED at the
+        //    no-clobber gate BEFORE α is ever decrypted.
+        //
+        //    `write_atomic_no_clobber` semantics (POSIX link(2)):
+        //      - first call: link succeeds, pin persisted at the canonical path
+        //      - replay with byte-identical content: link → EEXIST, file equality matches,
+        //        returns Ok → finalize re-runs deterministically (replay-idempotent)
+        //      - replay with different content (= different A or e): link → EEXIST, file
+        //        equality fails → InvalidDkgState(
+        //        "mpcca_withdraw_v2_finalize_pin_already_exists_with_different_content")
+        fs::create_dir_all(&binding.session_dir)
+            .map_err(|err| WorkerError::Io(err.to_string()))?;
+        let pin = FinalizePinFile {
+            scheme: "mpcca_withdraw_v2_finalize_pin".to_string(),
+            slot: req.base.self_slot,
+            player_id: req.base.player_id,
+            dkg_epoch: req.base.dkg_epoch.clone(),
+            request_id: req.base.request_id.clone(),
+            session_id: req.base.session_id.clone(),
+            aggregated_commitments_hash: aggregated_commitments_hash.clone(),
+            challenge_hex: challenge_hex_norm.clone(),
+            worker_transcript_hash: worker_transcript_hash.clone(),
+        };
+        persist_finalize_pin(&binding.session_dir, &pin)?;
+
+        // 9. Load `ca_dkg_share_v2.json` and validate (slot, dkg_epoch) match the request.
+        let share = load_ca_dkg_v2_share(state_dir)?;
+        if share.slot != req.base.self_slot {
+            return Err(WorkerError::InvalidDkgState(format!(
+                "ca_dkg_share_v2 slot {} does not match self_slot {}",
+                share.slot, req.base.self_slot
+            )));
+        }
+        if share.dkg_epoch != req.base.dkg_epoch {
+            return Err(WorkerError::InvalidDkgState(format!(
+                "ca_dkg_share_v2 dkg_epoch {} does not match request {}",
+                share.dkg_epoch, req.base.dkg_epoch
+            )));
+        }
+        let mut dk_share_scalar = scalar_from_hex_local(&share.dk_share).map_err(|_| {
+            WorkerError::Crypto("finalize_dk_share_non_canonical".to_string())
+        })?;
+        if dk_share_scalar == Scalar::ZERO {
+            dk_share_scalar.zeroize();
+            return Err(WorkerError::Crypto(
+                "finalize_dk_share_zero_rejected".to_string(),
+            ));
+        }
+
+        // 10. Recompute Lagrange λ_j at x=0 over sorted selectedSlots — locally, do not
+        //     trust the coordinator.
+        let lambdas = lagrange_coefficients_at_zero(&binding.normalised.sorted)?;
+        let lambda_j = lambdas[req.base.player_id];
+        if lambda_j == Scalar::ZERO {
+            dk_share_scalar.zeroize();
+            return Err(WorkerError::Crypto(
+                "finalize_lagrange_coefficient_zero".to_string(),
+            ));
+        }
+
+        // 11. HPKE-decrypt `α_share_j[0]` from the at-rest envelope. The AAD MUST match the
+        //     round2 at-rest AAD byte-identically; the worker's own private key is the only
+        //     key that can open this envelope.
+        let keypair = match load_hpke_keypair_for_slot(state_dir, req.base.self_slot) {
+            Ok(k) => k,
+            Err(err) => {
+                dk_share_scalar.zeroize();
+                return Err(err);
+            }
+        };
+        let aad =
+            round2_at_rest_aad(&req.base.session_id, &req.base.request_id, req.base.self_slot);
+        let mut alpha_plaintext = match hpke_aead::open(
+            &keypair.private_key,
+            HPKE_INFO_ROUND2_AT_REST,
+            &aad,
+            &round2_state.encrypted_alpha_envelope,
+        ) {
+            Ok(pt) => pt,
+            Err(_) => {
+                dk_share_scalar.zeroize();
+                return Err(WorkerError::Crypto(
+                    "finalize_alpha_envelope_open_failed".to_string(),
+                ));
+            }
+        };
+        if alpha_plaintext.len() != 32 {
+            alpha_plaintext.zeroize();
+            dk_share_scalar.zeroize();
+            return Err(WorkerError::Crypto(
+                "finalize_alpha_envelope_wrong_plaintext_length".to_string(),
+            ));
+        }
+        let mut alpha_bytes = [0_u8; 32];
+        alpha_bytes.copy_from_slice(&alpha_plaintext);
+        alpha_plaintext.zeroize();
+        let alpha_opt = Scalar::from_canonical_bytes(alpha_bytes);
+        alpha_bytes.zeroize();
+        if alpha_opt.is_none().into() {
+            dk_share_scalar.zeroize();
+            return Err(WorkerError::Crypto(
+                "finalize_alpha_share_non_canonical".to_string(),
+            ));
+        }
+        let mut alpha_share = alpha_opt.unwrap();
+        if alpha_share == Scalar::ZERO {
+            alpha_share.zeroize();
+            dk_share_scalar.zeroize();
+            return Err(WorkerError::Crypto(
+                "finalize_alpha_share_zero_rejected".to_string(),
+            ));
+        }
+
+        // 12. Compute `s_share_j = α_share_j[0] + e · (λ_j · dk_share_j)`. Zero-reject as
+        //     defense-in-depth (mathematically impossible for honest inputs).
+        let weighted_dk = lambda_j * dk_share_scalar;
+        let s_share = alpha_share + coord_challenge * weighted_dk;
+
+        // Zeroize secrets. `s_share` is a public output (threshold response share).
+        alpha_share.zeroize();
+        dk_share_scalar.zeroize();
+
+        if s_share == Scalar::ZERO {
+            return Err(WorkerError::Crypto(
+                "finalize_zero_response_share_rejected".to_string(),
+            ));
+        }
+
+        let partial_response_dk_hex = hex_encode(s_share.to_bytes().as_slice());
+
+        // 13. Persist the finalize RoundStateFile (M3a-shape compat) — completed=true.
+        let session_state_path = persist_round_completed(
+            &binding.session_dir,
+            "finalize",
+            req.base.self_slot,
+            req.base.player_id,
+            &req.base.dkg_epoch,
+            &req.base.request_id,
+            &req.base.session_id,
+            &binding.normalised.vault_ek_hex,
+            req.base.vault_sequence,
+            req.base.deposit_count,
+            &worker_transcript_hash,
+            &binding.normalised.observed_deposit_transcript_hashes,
+        )?;
+        let session_state_hash = file_sha256_hex(&session_state_path)?;
+
+        Ok(FinalizeDkResult {
+            slot: req.base.self_slot,
+            player_id: req.base.player_id,
+            session_state_path: session_state_path.display().to_string(),
+            session_state_hash,
+            worker_transcript_hash,
+            observed_at_unix_ms: now_millis_local(),
+            completed: true,
+            partial_response_dk_hex,
+            dk_base_indices_used: canonical_dk_indices,
+        })
     }
 
     /// Normalised + validated public binding fields produced by the common-prefix validator.
