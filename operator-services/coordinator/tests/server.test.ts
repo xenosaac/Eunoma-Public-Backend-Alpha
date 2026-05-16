@@ -11,7 +11,7 @@ import {
   rosterHash,
 } from "@eunoma/deop-protocol";
 import { buildCoordinatorServer, forwardSessionShareToRoster } from "../src/index.js";
-import { configFromEnv } from "../src/config.js";
+import { buildDefaultRelayerSubmitter, configFromEnv } from "../src/config.js";
 
 const h32 = (byte: string) => byte.repeat(64);
 
@@ -88,6 +88,92 @@ describe("coordinator", () => {
         DEOPERATOR_ROSTER_JSON: JSON.stringify(r),
       }),
     ).toThrow(/ca_dkg_v2/);
+  });
+
+  // Codex M5b P2 #2: env-driven config sources all submit-route inputs so a production
+  // start.ts can wire stateRoot / relayerUrl / chainNodeUrl without any per-call config.
+  it("configFromEnv_sources_M5b_submit_route_inputs", () => {
+    const r = roster();
+    const cfg = configFromEnv({
+      DEOPERATOR_ROSTER_JSON: JSON.stringify(r),
+      EUNOMA_STATE_ROOT: "/var/eunoma/state",
+      RELAYER_URL: "https://relayer.invalid:4300",
+      RELAYER_BEARER_TOKEN: "test-relayer-bearer-token-do-not-use",
+      APTOS_NODE_URL: "https://node.invalid:8080",
+      APTOS_CHAIN_CONFIRMATION_TIMEOUT_MS: "45000",
+    });
+    expect(cfg.stateRoot).toBe("/var/eunoma/state");
+    expect(cfg.relayerUrl).toBe("https://relayer.invalid:4300");
+    expect(cfg.relayerBearerToken).toBe("test-relayer-bearer-token-do-not-use");
+    expect(cfg.chainNodeUrl).toBe("https://node.invalid:8080");
+    expect(cfg.chainConfirmationTimeoutMs).toBe(45000);
+  });
+
+  it("configFromEnv_rejects_non_decimal_chain_confirmation_timeout", () => {
+    const r = roster();
+    expect(() =>
+      configFromEnv({
+        DEOPERATOR_ROSTER_JSON: JSON.stringify(r),
+        APTOS_CHAIN_CONFIRMATION_TIMEOUT_MS: "abc",
+      }),
+    ).toThrow(/APTOS_CHAIN_CONFIRMATION_TIMEOUT_MS/);
+  });
+
+  // Codex M5b P2 #2: the default relayer submitter factory wires a fetch-backed
+  // submitter that POSTs to <relayerUrl>/v2/relayer/submit/withdraw with Bearer auth.
+  // Tests bypass this by injecting `relayerSubmitter` directly into buildCoordinatorServer;
+  // here we just verify the factory's wire shape.
+  it("buildDefaultRelayerSubmitter_returns_undefined_when_relayer_url_unset", () => {
+    const r = roster();
+    const cfg = configFromEnv({ DEOPERATOR_ROSTER_JSON: JSON.stringify(r) });
+    const submitter = buildDefaultRelayerSubmitter(cfg);
+    expect(submitter).toBeUndefined();
+  });
+
+  it("buildDefaultRelayerSubmitter_posts_to_relayer_with_bearer_auth", async () => {
+    const r = roster();
+    const cfg = configFromEnv({
+      DEOPERATOR_ROSTER_JSON: JSON.stringify(r),
+      RELAYER_URL: "https://relayer.invalid:4300",
+      RELAYER_BEARER_TOKEN: "abc123",
+    });
+    let observedUrl: string | undefined;
+    let observedAuth: string | undefined;
+    let observedBody: unknown;
+    const fakeFetch: typeof fetch = async (url, init) => {
+      observedUrl = String(url);
+      observedAuth = (init?.headers as Record<string, string>)?.authorization;
+      observedBody = JSON.parse(String(init?.body ?? "null"));
+      return new Response(
+        JSON.stringify({ accepted: true, txHash: "0xfeed", simulated: true }),
+        { status: 202, headers: { "content-type": "application/json" } },
+      );
+    };
+    const submitter = buildDefaultRelayerSubmitter(cfg, fakeFetch);
+    expect(submitter).toBeDefined();
+    const result = await submitter!({ root: "0xab" });
+    expect(result).toEqual({ accepted: true, txHash: "0xfeed", simulated: true });
+    expect(observedUrl).toBe("https://relayer.invalid:4300/v2/relayer/submit/withdraw");
+    expect(observedAuth).toBe("Bearer abc123");
+    expect(observedBody).toEqual({ root: "0xab" });
+  });
+
+  it("buildDefaultRelayerSubmitter_throws_on_relayer_5xx", async () => {
+    const r = roster();
+    const cfg = configFromEnv({
+      DEOPERATOR_ROSTER_JSON: JSON.stringify(r),
+      RELAYER_URL: "https://relayer.invalid:4300",
+      RELAYER_BEARER_TOKEN: "abc123",
+    });
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ error: "submit_failed", message: "boom" }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    const submitter = buildDefaultRelayerSubmitter(cfg, fakeFetch);
+    await expect(submitter!({ root: "0xab" })).rejects.toThrow(
+      /relayer responded 502 \(submit_failed\): boom/,
+    );
   });
 
   it("rejects plaintext witness fields in proxy", async () => {
