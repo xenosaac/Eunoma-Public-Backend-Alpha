@@ -1167,6 +1167,127 @@ export async function mpccaWithdrawFinalizeDeriveChallenge(input: {
   return bytesToHex(eBytes);
 }
 
+/**
+ * M5 prep — build the Aptos CA TransferV1 `ConfidentialTransferRawPayloadV2` from M4's
+ * MPCCA-finalize artifact + Statement inputs + base identity. This payload becomes the
+ * BCS-encoded input to `keccak256` for `caPayloadHash`, which is the canonical hash the
+ * Move-side verifier asserts via `hash_confidential_transfer_payload_v2`.
+ *
+ * Mapping (CA TransferV1, ell=8, n=4, no auditor):
+ *   assetType            ← request.assetType (chain-side coin/token address)
+ *   to                   ← request.recipient (chain-side recipient address)
+ *   newBalanceP          ← statementInputs.newBalanceC (8 entries; Pedersen commitments)
+ *   newBalanceR          ← statementInputs.newBalanceD (8 entries; ElGamal D-component)
+ *   newBalanceREffAud    ← []                          (no effective auditor in alpha)
+ *   amountP              ← statementInputs.transferAmountC (4 entries)
+ *   amountRSender        ← statementInputs.transferAmountDSender (4 entries)
+ *   amountRRecip         ← statementInputs.transferAmountDRecipient (4 entries)
+ *   amountREffAud        ← []
+ *   ekVolunAuds          ← []
+ *   amountRVolunAuds     ← []
+ *   zkrpNewBalance       ← mpccaWithdrawFinalizeArtifact.bulletproofZkrpNewBalanceHex
+ *   zkrpAmount           ← mpccaWithdrawFinalizeArtifact.bulletproofZkrpAmountHex
+ *   sigmaProtoComm       ← mpccaWithdrawFinalizeArtifact.aggregatedSigmaCommitmentsHex (30)
+ *   sigmaProtoResp       ← mpccaWithdrawFinalizeArtifact.sigmaResponseHex (25)
+ *   memo                 ← "" (empty in alpha; M5+ may bind out-of-band memo bytes)
+ *
+ * Byte-parity contract: pass the returned payload to `caPayloadHashRawV2` from `./bcs.js`
+ * to compute the canonical keccak256 over the BCS encoding. The result MUST byte-equal
+ * what the Move verifier produces from the same inputs (asserted by the
+ * `caPayloadHashRawV2_matches_move_bcs_byte_layout` test).
+ *
+ * Inputs:
+ *   - `mpccaArtifact`: the `mpccaWithdrawFinalizeArtifact` block persisted in
+ *     `__finalize.json` by M4-c4 (M5 reads this from disk via `loadMpccaFinalizeTranscript`).
+ *   - `statementInputs`: the round2 Statement input fields (recipient_ek + 6 ciphertext
+ *     vectors). These travel with the round2 artifact; M5 will also persist them in
+ *     `__finalize.json` (or M5 callers will read them from `__round2.json`).
+ *   - `recipientAddressHex`, `assetTypeHex`: chain-side identity from the base request.
+ */
+export function buildCaPayloadFromFinalizeArtifact(input: {
+  recipientAddressHex: HexString;
+  assetTypeHex: HexString;
+  statementInputs: MpccaWithdrawRound2StatementInputFields;
+  mpccaArtifact: {
+    aggregatedSigmaCommitmentsHex: HexString[];
+    sigmaResponseHex: HexString[];
+    bulletproofZkrpAmountHex: HexString;
+    bulletproofZkrpNewBalanceHex: HexString;
+  };
+  memoHex?: HexString;
+}): {
+  assetType: HexString;
+  to: HexString;
+  newBalanceP: HexString[];
+  newBalanceR: HexString[];
+  newBalanceREffAud: HexString[];
+  amountP: HexString[];
+  amountRSender: HexString[];
+  amountRRecip: HexString[];
+  amountREffAud: HexString[];
+  ekVolunAuds: HexString[];
+  amountRVolunAuds: HexString[][];
+  zkrpNewBalance: HexString;
+  zkrpAmount: HexString;
+  sigmaProtoComm: HexString[];
+  sigmaProtoResp: HexString[];
+  memo: HexString;
+} {
+  if (input.statementInputs.newBalanceC.length !== ROUND2_ELL) {
+    throw new Error(
+      `buildCaPayloadFromFinalizeArtifact: newBalanceC must have ${ROUND2_ELL} entries; got ${input.statementInputs.newBalanceC.length}`,
+    );
+  }
+  if (input.statementInputs.newBalanceD.length !== ROUND2_ELL) {
+    throw new Error(
+      `buildCaPayloadFromFinalizeArtifact: newBalanceD must have ${ROUND2_ELL} entries; got ${input.statementInputs.newBalanceD.length}`,
+    );
+  }
+  if (input.statementInputs.transferAmountC.length !== ROUND2_N) {
+    throw new Error(
+      `buildCaPayloadFromFinalizeArtifact: transferAmountC must have ${ROUND2_N} entries; got ${input.statementInputs.transferAmountC.length}`,
+    );
+  }
+  if (input.statementInputs.transferAmountDSender.length !== ROUND2_N) {
+    throw new Error(
+      `buildCaPayloadFromFinalizeArtifact: transferAmountDSender must have ${ROUND2_N} entries; got ${input.statementInputs.transferAmountDSender.length}`,
+    );
+  }
+  if (input.statementInputs.transferAmountDRecipient.length !== ROUND2_N) {
+    throw new Error(
+      `buildCaPayloadFromFinalizeArtifact: transferAmountDRecipient must have ${ROUND2_N} entries; got ${input.statementInputs.transferAmountDRecipient.length}`,
+    );
+  }
+  if (input.mpccaArtifact.aggregatedSigmaCommitmentsHex.length !== 30) {
+    throw new Error(
+      `buildCaPayloadFromFinalizeArtifact: aggregatedSigmaCommitmentsHex must have 30 entries; got ${input.mpccaArtifact.aggregatedSigmaCommitmentsHex.length}`,
+    );
+  }
+  if (input.mpccaArtifact.sigmaResponseHex.length !== 25) {
+    throw new Error(
+      `buildCaPayloadFromFinalizeArtifact: sigmaResponseHex must have 25 entries; got ${input.mpccaArtifact.sigmaResponseHex.length}`,
+    );
+  }
+  return {
+    assetType: normalizeHex(input.assetTypeHex),
+    to: normalizeHex(input.recipientAddressHex),
+    newBalanceP: input.statementInputs.newBalanceC.map((h) => normalizeHex(h)),
+    newBalanceR: input.statementInputs.newBalanceD.map((h) => normalizeHex(h)),
+    newBalanceREffAud: [],
+    amountP: input.statementInputs.transferAmountC.map((h) => normalizeHex(h)),
+    amountRSender: input.statementInputs.transferAmountDSender.map((h) => normalizeHex(h)),
+    amountRRecip: input.statementInputs.transferAmountDRecipient.map((h) => normalizeHex(h)),
+    amountREffAud: [],
+    ekVolunAuds: [],
+    amountRVolunAuds: [],
+    zkrpNewBalance: normalizeHex(input.mpccaArtifact.bulletproofZkrpNewBalanceHex),
+    zkrpAmount: normalizeHex(input.mpccaArtifact.bulletproofZkrpAmountHex),
+    sigmaProtoComm: input.mpccaArtifact.aggregatedSigmaCommitmentsHex.map((h) => normalizeHex(h)),
+    sigmaProtoResp: input.mpccaArtifact.sigmaResponseHex.map((h) => normalizeHex(h)),
+    memo: input.memoHex ? normalizeHex(input.memoHex) : "",
+  };
+}
+
 export function mpccaWithdrawFinalizeAggregateHash(input: {
   statementInputs: MpccaWithdrawRound2StatementInputFields;
   aggregatedSigmaCommitmentsHex: HexString[];

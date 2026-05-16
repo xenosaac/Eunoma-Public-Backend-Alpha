@@ -3,6 +3,7 @@ import type { HexString } from "@eunoma/shared";
 import type { HpkeEnvelope } from "../src/types.js";
 import {
   assembleMpccaWithdrawTranscript,
+  buildCaPayloadFromFinalizeArtifact,
   canonicalJsonStringify,
   DK_BASE_INDICES_CANONICAL,
   EUNOMA_M1_AMOUNT_INGRESS_V1,
@@ -818,6 +819,107 @@ describe("mpcca_withdraw_v2 finalize hashes (M4 commit 3 + 4)", () => {
       dkBaseIndicesUsed: [0, 17],
     };
     expect(() => parseMpccaWithdrawFinalizeDkResult(body)).toThrow(MpccaWithdrawV2Error);
+  });
+});
+
+describe("buildCaPayloadFromFinalizeArtifact (M5 prep — CA payload assembly)", () => {
+  function makeMpccaArtifact() {
+    return {
+      aggregatedSigmaCommitmentsHex: Array.from(
+        { length: 30 },
+        (_, i) => `${(0x60 + i).toString(16).padStart(2, "0")}`.repeat(32),
+      ),
+      sigmaResponseHex: Array.from(
+        { length: 25 },
+        (_, i) => `${(0x80 + i).toString(16).padStart(2, "0")}`.repeat(32),
+      ),
+      bulletproofZkrpAmountHex: "ab".repeat(96),
+      bulletproofZkrpNewBalanceHex: "cd".repeat(160),
+    };
+  }
+
+  it("maps M4 finalize artifact + Statement → 27-field CA payload with correct field provenance", () => {
+    const stmt = VALID_STATEMENT_INPUTS;
+    const artifact = makeMpccaArtifact();
+    const payload = buildCaPayloadFromFinalizeArtifact({
+      recipientAddressHex: "11".repeat(32),
+      assetTypeHex: "22".repeat(32),
+      statementInputs: stmt,
+      mpccaArtifact: artifact,
+    });
+    // 7 chunked-ciphertext fields drawn from Statement
+    expect(payload.newBalanceP).toEqual(stmt.newBalanceC.map((h) => h.toLowerCase()));
+    expect(payload.newBalanceR).toEqual(stmt.newBalanceD.map((h) => h.toLowerCase()));
+    expect(payload.amountP).toEqual(stmt.transferAmountC.map((h) => h.toLowerCase()));
+    expect(payload.amountRSender).toEqual(stmt.transferAmountDSender.map((h) => h.toLowerCase()));
+    expect(payload.amountRRecip).toEqual(
+      stmt.transferAmountDRecipient.map((h) => h.toLowerCase()),
+    );
+    // Auditor fields are empty in alpha
+    expect(payload.newBalanceREffAud).toEqual([]);
+    expect(payload.amountREffAud).toEqual([]);
+    expect(payload.ekVolunAuds).toEqual([]);
+    expect(payload.amountRVolunAuds).toEqual([]);
+    // Bulletproof + sigma fields drawn from MPCCA finalize artifact
+    expect(payload.zkrpAmount).toBe(artifact.bulletproofZkrpAmountHex);
+    expect(payload.zkrpNewBalance).toBe(artifact.bulletproofZkrpNewBalanceHex);
+    expect(payload.sigmaProtoComm).toEqual(
+      artifact.aggregatedSigmaCommitmentsHex.map((h) => h.toLowerCase()),
+    );
+    expect(payload.sigmaProtoResp).toEqual(
+      artifact.sigmaResponseHex.map((h) => h.toLowerCase()),
+    );
+    // memo defaults to empty
+    expect(payload.memo).toBe("");
+  });
+
+  it("rejects under/over-count Statement entries", () => {
+    const artifact = makeMpccaArtifact();
+    const stmt = { ...VALID_STATEMENT_INPUTS, newBalanceC: VALID_STATEMENT_INPUTS.newBalanceC.slice(1) };
+    expect(() =>
+      buildCaPayloadFromFinalizeArtifact({
+        recipientAddressHex: "11".repeat(32),
+        assetTypeHex: "22".repeat(32),
+        statementInputs: stmt,
+        mpccaArtifact: artifact,
+      }),
+    ).toThrow(/newBalanceC must have 8/);
+  });
+
+  it("rejects wrong aggregated commitments or response length", () => {
+    expect(() =>
+      buildCaPayloadFromFinalizeArtifact({
+        recipientAddressHex: "11".repeat(32),
+        assetTypeHex: "22".repeat(32),
+        statementInputs: VALID_STATEMENT_INPUTS,
+        mpccaArtifact: {
+          ...makeMpccaArtifact(),
+          aggregatedSigmaCommitmentsHex: Array.from({ length: 29 }, () => HEX32_A),
+        },
+      }),
+    ).toThrow(/aggregatedSigmaCommitmentsHex must have 30/);
+    expect(() =>
+      buildCaPayloadFromFinalizeArtifact({
+        recipientAddressHex: "11".repeat(32),
+        assetTypeHex: "22".repeat(32),
+        statementInputs: VALID_STATEMENT_INPUTS,
+        mpccaArtifact: {
+          ...makeMpccaArtifact(),
+          sigmaResponseHex: Array.from({ length: 24 }, () => HEX32_A),
+        },
+      }),
+    ).toThrow(/sigmaResponseHex must have 25/);
+  });
+
+  it("custom memo is preserved (normalised)", () => {
+    const payload = buildCaPayloadFromFinalizeArtifact({
+      recipientAddressHex: "11".repeat(32),
+      assetTypeHex: "22".repeat(32),
+      statementInputs: VALID_STATEMENT_INPUTS,
+      mpccaArtifact: makeMpccaArtifact(),
+      memoHex: "deadbeef",
+    });
+    expect(payload.memo).toBe("deadbeef");
   });
 });
 
