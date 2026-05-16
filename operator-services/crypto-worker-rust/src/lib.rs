@@ -3084,6 +3084,166 @@ pub mod mpc_inverse_adapter {
 
 pub mod mpc_spdz_adapter;
 
+// =================================================================================================
+// Codex M3a P2 #2: atomic write helper applied uniformly across V2 production sites.
+//
+// Pre-fix posture (M2a P2 #2): each V2 module had its own `write_secret_file` that did
+// tmp + create_new + rename. The atomic rename guarantees a partial file is never observed,
+// but `rename(2)` REPLACES the destination unconditionally — two concurrent writers to the
+// same canonical path can both win the tmp create and the later one clobbers the earlier
+// one's content.
+//
+// Codex M3a P2 #2 closes this by adding a pre-rename idempotency gate:
+//   1. If the destination does NOT exist → tmp write + rename, same as before. Atomic.
+//   2. If the destination exists AND is byte-identical to the new content → return OK.
+//      Idempotent replay.
+//   3. If the destination exists AND differs → fail closed with
+//      InvalidDkgState("<context>_already_exists_with_different_content"). The caller is
+//      responsible for having done an upstream content equality check if the new write is
+//      intentionally replacing the file.
+//
+// The race window is non-zero (a concurrent writer can land between our existence check and
+// our rename), but it's bounded: the post-rename file is the LATER of the two writes by
+// definition of rename(2), and BOTH writers are writing the same content shape (callers
+// passing different content would have failed the upstream equality check). The persisted
+// file is therefore always SOMEONE's intended content; we don't need cross-writer ordering.
+//
+// Applied to: vault_state_v2.json, ca_registration_v2 nonce file, mpcca_withdraw_v2 session
+// state file, vault_ek_derivation_v2 round0.json. Each call site documents its idempotency
+// contract.
+// =================================================================================================
+pub(crate) mod atomic_io {
+    use crate::{WorkerError, WorkerResult};
+    use std::fs;
+    use std::path::Path;
+
+    /// Tmp + create_new + rename with a pre-rename byte-equality idempotency gate.
+    ///
+    /// `context` is a string tag bound into the InvalidDkgState code so the caller can
+    /// distinguish a vault_state_v2 collision from a mpcca_withdraw_v2 session state
+    /// collision in error logs. Convention: snake_case module-or-file-name (e.g.
+    /// "vault_state_v2", "ca_registration_v2_nonce_file").
+    pub fn write_atomic_no_clobber(
+        path: &Path,
+        contents: &[u8],
+        context: &str,
+    ) -> WorkerResult<()> {
+        if path.exists() {
+            let existing = fs::read(path).map_err(|err| {
+                WorkerError::Crypto(format!(
+                    "{context}: read existing {} for idempotency check: {err}",
+                    path.display()
+                ))
+            })?;
+            if existing == contents {
+                // Byte-identical — idempotent replay. Nothing to do.
+                return Ok(());
+            }
+            return Err(WorkerError::InvalidDkgState(format!(
+                "{context}_already_exists_with_different_content"
+            )));
+        }
+        write_atomic_tmp_then_rename(path, contents, context)
+    }
+
+    /// Same tmp + create_new + rename without the pre-check. Used by callers that want
+    /// to OVERWRITE an existing file unconditionally (rare — only the auto-migration path
+    /// in `load_vault_state_v2` uses this, and only after re-asserting that the new
+    /// content embeds the persisted bindings verbatim).
+    pub fn write_atomic_replace(path: &Path, contents: &[u8], context: &str) -> WorkerResult<()> {
+        write_atomic_tmp_then_rename(path, contents, context)
+    }
+
+    fn write_atomic_tmp_then_rename(
+        path: &Path,
+        contents: &[u8],
+        context: &str,
+    ) -> WorkerResult<()> {
+        use rand::RngCore as _;
+        use std::io::Write as _;
+        let parent = path.parent().ok_or_else(|| {
+            WorkerError::Crypto(format!(
+                "{context}: path {} has no parent dir",
+                path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent).map_err(|err| {
+            WorkerError::Crypto(format!(
+                "{context}: create parent dir {}: {err}",
+                parent.display()
+            ))
+        })?;
+        let file_name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+            WorkerError::Crypto(format!("{context}: path {} has no file name", path.display()))
+        })?;
+        let pid = std::process::id();
+        let mut rng = rand::rngs::OsRng;
+        const MAX_ATTEMPTS: usize = 16;
+        for _ in 0..MAX_ATTEMPTS {
+            let suffix: u64 = rng.next_u64();
+            let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{suffix:016x}"));
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = match opts.open(&tmp_path) {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(WorkerError::Crypto(format!(
+                        "{context}: open tmp {}: {err}",
+                        tmp_path.display()
+                    )));
+                }
+            };
+            if let Err(err) = file.write_all(contents) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "{context}: write tmp {}: {err}",
+                    tmp_path.display()
+                )));
+            }
+            if let Err(err) = file.sync_all() {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "{context}: fsync tmp {}: {err}",
+                    tmp_path.display()
+                )));
+            }
+            drop(file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(WorkerError::Crypto(format!(
+                        "{context}: chmod 0o600 tmp {}: {err}",
+                        tmp_path.display()
+                    )));
+                }
+            }
+            if let Err(err) = fs::rename(&tmp_path, path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "{context}: rename {} -> {}: {err}",
+                    tmp_path.display(),
+                    path.display()
+                )));
+            }
+            return Ok(());
+        }
+        Err(WorkerError::Crypto(format!(
+            "{context}: exhausted {MAX_ATTEMPTS} tmp-suffix retries writing {}",
+            path.display()
+        )))
+    }
+}
+
 pub mod vault_ek_derivation_v2 {
     use crate::ca_dkg_v2::load_ca_dkg_v2_share;
     use crate::h_ristretto;
@@ -3479,23 +3639,19 @@ pub mod vault_ek_derivation_v2 {
         })
     }
 
-    /// Codex P1 #4 round0: writes the round0 commitment file with mode 0o600 (Unix). On
-    /// non-Unix it falls back to a plain write — Phase 2 is Unix-only in production.
+    /// Codex P1 #4 round0 + M3a P2 #2: atomic write with no-clobber + byte-equality
+    /// idempotency gate. The caller (run_round0) ALREADY does an idempotency check above
+    /// (`file_path.exists() → return persisted h_r_i`), so by the time this function is
+    /// reached the destination file should not exist. The no-clobber guard catches a race
+    /// where two concurrent round0 callers both passed the upstream existence check.
+    ///
+    /// Both writers will be writing different content (each call draws a fresh `r_i`), so
+    /// the loser sees `InvalidDkgState("vault_ek_round0_file_already_exists_with_different_content")`
+    /// and fails closed. The winner's content is persisted. Defense in depth — the upstream
+    /// idempotency check makes this race nearly impossible to hit, but the guard ensures
+    /// fail-closed semantics if it ever does.
     fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
-        use std::io::Write as _;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts
-            .open(path)
-            .map_err(|err| WorkerError::Crypto(format!("open {}: {err}", path.display())))?;
-        file.write_all(contents)
-            .map_err(|err| WorkerError::Crypto(format!("write {}: {err}", path.display())))?;
-        Ok(())
+        crate::atomic_io::write_atomic_no_clobber(path, contents, "vault_ek_round0_file")
     }
 
     /// Codex P1 #4 round0: read + parse + validate the round0 commitment file. Loaded by
@@ -5050,96 +5206,14 @@ pub mod ca_registration_v2 {
         Ok(copy)
     }
 
-    /// Codex M2a P2 #2: atomic write for the ca_registration_v2 round1 nonce file.
-    ///
-    /// Previously this did `OpenOptions::create(true).truncate(true).open(path)`. A crash
-    /// between truncate and full write would leave a partial file at the canonical
-    /// nonce path, where round2 reads from. Two concurrent round1 calls hitting the same
-    /// session would also race the truncate.
-    ///
-    /// Fix: same atomic pattern as `vault_state_v2::write_secret_file` — write to a
-    /// `<path>.tmp.<pid>.<random>` file with `create_new(true)`, fsync + chmod 0o600,
-    /// then `rename` to the final path. The round1 idempotency replay branch (above)
-    /// already gates this function on `path.exists() && layout matches`, so by the time
-    /// we reach `write_secret_file` we have either no existing file or one whose
-    /// rename-replace is intentional.
+    /// Codex M3a P2 #2: atomic write with no-clobber + byte-equality idempotency gate for
+    /// the ca_registration_v2 round1 nonce file. The caller (round1) already gates this
+    /// function on `path.exists() && layout matches` upstream — the no-clobber guard catches
+    /// a race where two concurrent fresh round1 callers both pass the upstream existence
+    /// check. Differing content (e.g. two callers each drawing a fresh r_i) fails closed
+    /// with `InvalidDkgState("ca_registration_v2_nonce_file_already_exists_with_different_content")`.
     fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
-        use rand::RngCore as _;
-        use std::io::Write as _;
-        let parent = path.parent().ok_or_else(|| {
-            WorkerError::Crypto(format!("path {} has no parent dir", path.display()))
-        })?;
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                WorkerError::Crypto(format!("path {} has no file name", path.display()))
-            })?;
-        let pid = std::process::id();
-        let mut rng = rand::rngs::OsRng;
-        const MAX_ATTEMPTS: usize = 16;
-        for _ in 0..MAX_ATTEMPTS {
-            let suffix: u64 = rng.next_u64();
-            let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{suffix:016x}"));
-            let mut opts = fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut file = match opts.open(&tmp_path) {
-                Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => {
-                    return Err(WorkerError::Crypto(format!(
-                        "open tmp {}: {err}",
-                        tmp_path.display()
-                    )));
-                }
-            };
-            if let Err(err) = file.write_all(contents) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "write tmp {}: {err}",
-                    tmp_path.display()
-                )));
-            }
-            if let Err(err) = file.sync_all() {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "fsync tmp {}: {err}",
-                    tmp_path.display()
-                )));
-            }
-            drop(file);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-                {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(WorkerError::Crypto(format!(
-                        "chmod 0o600 tmp {}: {err}",
-                        tmp_path.display()
-                    )));
-                }
-            }
-            if let Err(err) = fs::rename(&tmp_path, path) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "rename {} -> {}: {err}",
-                    tmp_path.display(),
-                    path.display()
-                )));
-            }
-            return Ok(());
-        }
-        Err(WorkerError::Crypto(format!(
-            "exhausted {MAX_ATTEMPTS} tmp-suffix retries writing {}",
-            path.display()
-        )))
+        crate::atomic_io::write_atomic_no_clobber(path, contents, "ca_registration_v2_nonce_file")
     }
 
     fn compressed_hex(point: &RistrettoPoint) -> String {
@@ -6109,7 +6183,11 @@ pub mod vault_state_v2 {
         let bytes = serde_json::to_vec_pretty(&updated)
             .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;
         let file_path = vault_state_file_path(state_dir);
-        write_secret_file(&file_path, &bytes)?;
+        // Codex M3a P2 #2: observe INTENTIONALLY overwrites the existing vault_state_v2.json
+        // with the new cursor — the no-clobber guard would reject this. Use the replace
+        // variant. Provenance + cursor monotonicity gates above guarantee the new content
+        // is a strict supersession of the existing file.
+        write_secret_file_replace(&file_path, &bytes)?;
 
         let vault_state_hash = sha256_hex(&bytes);
         let worker_transcript_hash = observe_worker_transcript_hash(
@@ -6181,117 +6259,22 @@ pub mod vault_state_v2 {
         Ok(copy)
     }
 
-    /// Codex M2a P2 #2: atomic write for vault_state_v2.json.
-    ///
-    /// Previously this did `OpenOptions::create(true).truncate(true).open(path)`, which
-    /// writes directly to the final path. Two consequences:
-    ///   1. A crash between truncate and write leaves a partial / empty file at the final
-    ///      path that subsequent reads parse-fail on.
-    ///   2. Two concurrent fresh writers both pass the `file_path.exists()` idempotency
-    ///      check before either write begins; the second writer then truncates whatever
-    ///      the first wrote.
-    ///
-    /// Fix: write to `<path>.tmp.<pid>.<random>` with `create_new(true)` (atomic
-    /// exclusive create — fails if name collides; we retry with a fresh random suffix),
-    /// fsync + chmod 0o600, then `rename` to the final path. `rename(2)` on the same
-    /// filesystem is atomic, so a partial file is never observed.
-    ///
-    /// `AlreadyExists` on the tmp open → retry with a new suffix (handles the rare
-    /// collision when two writers happen to draw the same random+pid+time triple).
-    /// `AlreadyExists` on the final-path rename is NOT a failure mode here because
-    /// `rename` REPLACES the destination atomically; the caller is responsible for
-    /// having done the byte-level idempotency check upstream of this function (which
-    /// `init_vault_state_v2` does — see the `if file_path.exists()` branch).
+    /// Codex M3a P2 #2: atomic write with no-clobber + byte-equality idempotency gate for
+    /// the vault_state_v2.json fresh-init path. The caller (init_vault_state_v2) already
+    /// gates on `file_path.exists()` upstream, so by the time we reach this function the
+    /// destination should not exist. The no-clobber guard catches a race where two
+    /// concurrent fresh-init callers both pass the upstream existence check; the loser
+    /// fails closed with InvalidDkgState.
     fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
-        use rand::RngCore as _;
-        use std::io::Write as _;
-        let parent = path.parent().ok_or_else(|| {
-            WorkerError::Crypto(format!("path {} has no parent dir", path.display()))
-        })?;
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                WorkerError::Crypto(format!("path {} has no file name", path.display()))
-            })?;
-        let pid = std::process::id();
-        let mut rng = rand::rngs::OsRng;
-        // Loop on AlreadyExists with a fresh suffix. 16 attempts is far more than enough
-        // — `OsRng` on a u64 with `create_new` collides with probability ~1 in 2^64 per
-        // attempt; if 16 retries don't succeed something else is broken (e.g. read-only
-        // dir, permissions, FS bug) and we fail closed.
-        const MAX_ATTEMPTS: usize = 16;
-        for _ in 0..MAX_ATTEMPTS {
-            let suffix: u64 = rng.next_u64();
-            let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{suffix:016x}"));
-            let mut opts = fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut file = match opts.open(&tmp_path) {
-                Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => {
-                    return Err(WorkerError::Crypto(format!(
-                        "open tmp {}: {err}",
-                        tmp_path.display()
-                    )));
-                }
-            };
-            // Write the full buffer.
-            if let Err(err) = file.write_all(contents) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "write tmp {}: {err}",
-                    tmp_path.display()
-                )));
-            }
-            // fsync so the bytes hit disk before the rename. On a crash between rename
-            // and fsync we could otherwise end up with the file's metadata pointing at
-            // an inode whose data hasn't been flushed.
-            if let Err(err) = file.sync_all() {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "fsync tmp {}: {err}",
-                    tmp_path.display()
-                )));
-            }
-            drop(file);
-            // Belt-and-suspenders chmod 0o600 in case the filesystem ignored
-            // OpenOptionsExt::mode (e.g. a Linux umask quirk on some setups).
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-                {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(WorkerError::Crypto(format!(
-                        "chmod 0o600 tmp {}: {err}",
-                        tmp_path.display()
-                    )));
-                }
-            }
-            // Atomic rename — this is the operation that makes the new file visible
-            // under the canonical name. After this point a reader that opens `path` sees
-            // either the OLD file (if any) or the FRESH file, never a partial mix.
-            if let Err(err) = fs::rename(&tmp_path, path) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "rename {} -> {}: {err}",
-                    tmp_path.display(),
-                    path.display()
-                )));
-            }
-            return Ok(());
-        }
-        Err(WorkerError::Crypto(format!(
-            "exhausted {MAX_ATTEMPTS} tmp-suffix retries writing {}",
-            path.display()
-        )))
+        crate::atomic_io::write_atomic_no_clobber(path, contents, "vault_state_v2")
+    }
+
+    /// Codex M3a P2 #2: atomic write WITH replace semantics for the vault_state_v2.json
+    /// cursor bump path. observe_deposit_v2 INTENTIONALLY overwrites the existing file with
+    /// the new cursor — the no-clobber guard would reject this. The upstream caller has
+    /// already verified the provenance matches, so the replace is safe.
+    pub(super) fn write_secret_file_replace(path: &Path, contents: &[u8]) -> WorkerResult<()> {
+        crate::atomic_io::write_atomic_replace(path, contents, "vault_state_v2_observe")
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -7165,6 +7148,26 @@ pub mod mpcca_withdraw_v2 {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
+        // Codex M3a P2 #2: idempotent replay. If the file already exists with the SAME
+        // worker_transcript_hash + round + slot + bindings, we preserve the original
+        // `created_at_unix_ms` from the persisted file so the byte content matches across
+        // replays. Without this, every replay would produce a different file (different
+        // timestamp) and the no-clobber atomic write would reject it as a divergent
+        // content collision.
+        let created_at_persisted = if file_path.exists() {
+            match load_round_state_file(session_dir, round_name)? {
+                Some(existing) if existing.worker_transcript_hash == worker_transcript_hash
+                    && existing.round == round_name
+                    && existing.slot == self_slot
+                    && existing.player_id == player_id =>
+                {
+                    Some(existing.created_at_unix_ms)
+                }
+                _ => None, // divergent — fall through and let no-clobber surface the collision
+            }
+        } else {
+            None
+        };
         let layout = RoundStateFile {
             scheme: "mpcca_withdraw_v2".to_string(),
             round: round_name.to_string(),
@@ -7178,18 +7181,14 @@ pub mod mpcca_withdraw_v2 {
             deposit_count,
             worker_transcript_hash: worker_transcript_hash.to_string(),
             not_implemented_phase: not_implemented_phase.to_string(),
-            created_at_unix_ms: created_at,
+            created_at_unix_ms: created_at_persisted.unwrap_or(created_at),
             observed_deposit_transcript_hashes: observed_deposit_transcript_hashes.to_vec(),
         };
         let bytes = serde_json::to_vec_pretty(&layout).map_err(|err| {
             WorkerError::Crypto(format!("encode mpcca_withdraw_v2 round state: {err}"))
         })?;
-        // Idempotent: if the file already exists with identical (worker_transcript_hash + round
-        // + slot) we leave it in place. We don't OVERWRITE a previously-persisted state on a
-        // matching public-binding replay — that would be a clobber from a session that's
-        // already mid-flight. A subsequent run with the SAME inputs ends up at the same path
-        // with the same content; OS-level rename is atomic so an outside reader either sees
-        // the old (matching) bytes or the new (also matching) bytes.
+        // Idempotent: if the file already exists byte-identically we no-op; if it exists
+        // with different content the no-clobber guard fails closed.
         write_secret_file(&file_path, &bytes)?;
         Ok(())
     }
@@ -7281,92 +7280,16 @@ pub mod mpcca_withdraw_v2 {
         Ok(copy)
     }
 
-    /// Atomic write via tmp + create_new + rename. Same pattern as `vault_state_v2::write_secret_file`.
-    /// Replicated here (instead of imported) to keep the module self-contained — if milestone 4
-    /// needs to extend the write path with per-round zeroize semantics, it lives in one place.
+    /// Codex M3a P2 #2: atomic write with no-clobber + byte-equality idempotency gate for
+    /// the mpcca_withdraw_v2 per-session-per-round state file. The caller (persist_and_stub)
+    /// preserves the original `created_at_unix_ms` on replays so the byte content is stable;
+    /// a divergent worker_transcript_hash + same path → InvalidDkgState collision.
     fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
-        use rand::RngCore as _;
-        use std::io::Write as _;
-        let parent = path.parent().ok_or_else(|| {
-            WorkerError::Crypto(format!("path {} has no parent dir", path.display()))
-        })?;
-        fs::create_dir_all(parent).map_err(|err| {
-            WorkerError::Crypto(format!(
-                "create parent dir {}: {err}",
-                parent.display()
-            ))
-        })?;
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                WorkerError::Crypto(format!("path {} has no file name", path.display()))
-            })?;
-        let pid = std::process::id();
-        let mut rng = rand::rngs::OsRng;
-        const MAX_ATTEMPTS: usize = 16;
-        for _ in 0..MAX_ATTEMPTS {
-            let suffix: u64 = rng.next_u64();
-            let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{suffix:016x}"));
-            let mut opts = fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut file = match opts.open(&tmp_path) {
-                Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => {
-                    return Err(WorkerError::Crypto(format!(
-                        "open tmp {}: {err}",
-                        tmp_path.display()
-                    )));
-                }
-            };
-            if let Err(err) = file.write_all(contents) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "write tmp {}: {err}",
-                    tmp_path.display()
-                )));
-            }
-            if let Err(err) = file.sync_all() {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "fsync tmp {}: {err}",
-                    tmp_path.display()
-                )));
-            }
-            drop(file);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-                {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(WorkerError::Crypto(format!(
-                        "chmod 0o600 tmp {}: {err}",
-                        tmp_path.display()
-                    )));
-                }
-            }
-            if let Err(err) = fs::rename(&tmp_path, path) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkerError::Crypto(format!(
-                    "rename {} -> {}: {err}",
-                    tmp_path.display(),
-                    path.display()
-                )));
-            }
-            return Ok(());
-        }
-        Err(WorkerError::Crypto(format!(
-            "exhausted {MAX_ATTEMPTS} tmp-suffix retries writing {}",
-            path.display()
-        )))
+        crate::atomic_io::write_atomic_no_clobber(
+            path,
+            contents,
+            "mpcca_withdraw_v2_session_state",
+        )
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
