@@ -1,0 +1,24 @@
+{
+  "name": "@eunoma/relayer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/bin/start.js",
+  "types": "dist/server.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "tsc": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "start": "tsx src/bin/start.ts"
+  },
+  "dependencies": {
+    "@eunoma/deop-protocol": "0.1.0",
+    "@eunoma/shared": "0.1.0",
+    "fastify": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
