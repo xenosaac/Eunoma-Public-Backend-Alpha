@@ -44,6 +44,25 @@ import type { HexString } from "./hex.js";
  */
 const APTOS_REST_API_VERSION = "/" + "v" + "1";
 
+/**
+ * Codex M5b P1 #1: structured error raised when the assembler detects a no-auditor
+ * invariant violation. The submit route surfaces `err.code` over the wire so callers
+ * can branch deterministically (mirrors `WithdrawV2CallArgsError` at the relayer parser).
+ *
+ * Defense-in-depth: the parser at `@eunoma/deop-protocol::parseWithdrawV2CallArgs` ALSO
+ * enforces this gate at the HTTP boundary. The assembler enforces it BEFORE the relayer is
+ * ever called so an in-process or mocked submitter cannot receive auditor payloads either.
+ */
+export class WithdrawSubmitAssemblyError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "WithdrawSubmitAssemblyError";
+  }
+}
+
 // =================================================================================================
 // FinalizeTranscript — the on-disk artifact M4e will write.
 //
@@ -345,6 +364,22 @@ export function assembleWithdrawV2CallArgs(
     throw new Error(
       "assembleWithdrawV2CallArgs: finalize transcript missing both notImplementedPhase and " +
         "withdrawV2CallArgsFields — exactly one must be present",
+    );
+  }
+  // Codex M5b P1 #1: enforce the M5a/M5b no-auditor invariant HERE — BEFORE the
+  // assembled args ever reach the relayer. The relayer parser also enforces this
+  // (defense-in-depth) but a mocked/in-process submitter trusting the coordinator type
+  // could otherwise receive auditor payloads. Fail closed at the assembler so no
+  // codepath can bypass.
+  if (
+    (Array.isArray(fields.newBalanceREffAud) && fields.newBalanceREffAud.length !== 0) ||
+    (Array.isArray(fields.amountREffAud) && fields.amountREffAud.length !== 0) ||
+    (Array.isArray(fields.ekVolunAuds) && fields.ekVolunAuds.length !== 0) ||
+    (Array.isArray(fields.amountRVolunAuds) && fields.amountRVolunAuds.length !== 0)
+  ) {
+    throw new WithdrawSubmitAssemblyError(
+      "auditor_branch_not_supported_in_milestone_5b",
+      "Eunoma is no-auditor today; auditor fields must be empty arrays. Milestone 4d / future hardening will introduce auditor support.",
     );
   }
   // Defensive shape validation. Mirrors @eunoma/deop-protocol::parseWithdrawV2CallArgs but

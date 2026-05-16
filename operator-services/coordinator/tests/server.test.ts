@@ -4337,6 +4337,7 @@ describe("coordinator", () => {
       stateRoot: string,
       dkgEpoch: string,
       requestId: string,
+      fieldOverrides: Record<string, unknown> = {},
     ): Promise<string> {
       const { mkdir, writeFile } = await import("node:fs/promises");
       const { join } = await import("node:path");
@@ -4379,6 +4380,7 @@ describe("coordinator", () => {
         sigmaProtoComm: Array.from({ length: 30 }, (_, i) => hex32(0xb0 + i)),
         sigmaProtoResp: Array.from({ length: 25 }, (_, i) => hex32(0xc0 + i)),
         memo: "",
+        ...fieldOverrides,
       };
       await writeFile(
         path,
@@ -4618,6 +4620,45 @@ describe("coordinator", () => {
       });
       expect(res.statusCode).toBe(400);
       expect(res.json().error).toBe("invalid_request");
+    });
+
+    // KILLER (Codex M5b P1 #1): the assembler enforces the M5a/M5b no-auditor invariant
+    // BEFORE the relayer is ever called. The relayer parser also enforces this at the HTTP
+    // boundary (defense in depth), but a mocked/in-process submitter trusting the
+    // coordinator type previously could receive auditor payloads. We assert each of the
+    // four auditor vectors independently to catch single-field regressions.
+    it("submit_route_rejects_nonempty_auditor_fields_at_assembler", async () => {
+      const oneHash = "ff".repeat(32);
+      const cases: Array<[string, Record<string, unknown>]> = [
+        ["newBalanceREffAud", { newBalanceREffAud: [oneHash] }],
+        ["amountREffAud", { amountREffAud: [oneHash] }],
+        ["ekVolunAuds", { ekVolunAuds: [oneHash] }],
+        ["amountRVolunAuds", { amountRVolunAuds: [[oneHash]] }],
+      ];
+      for (const [label, overrides] of cases) {
+        const stateRoot = await makeStateRoot(`eunoma-mpcca-submit-auditor-${label}-`);
+        await writeFinalizeTranscriptComplete(stateRoot, "1", `req-${label}`, overrides);
+        let submitterInvoked = false;
+        const { server } = buildCoordinatorServer({
+          caDkgV2Roster: dkgRoster(),
+          stateRoot,
+          relayerSubmitter: async () => {
+            submitterInvoked = true;
+            return { accepted: true, txHash: "0x" + "ab".repeat(32), simulated: true };
+          },
+        });
+        const res = await server.inject({
+          method: "POST",
+          url: "/v2/withdraw/mpcca/submit",
+          payload: { dkgEpoch: "1", requestId: `req-${label}` },
+        });
+        expect(res.statusCode, label).toBe(400);
+        const body = res.json();
+        expect(body.error, label).toBe("auditor_branch_not_supported_in_milestone_5b");
+        expect(body.message, label).toMatch(/Eunoma is no-auditor today/);
+        // CRITICAL: the relayer must NEVER have been invoked.
+        expect(submitterInvoked, label).toBe(false);
+      }
     });
   });
 });

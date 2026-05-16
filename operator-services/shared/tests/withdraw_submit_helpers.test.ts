@@ -8,6 +8,7 @@ import {
   loadMpccaFinalizeTranscript,
   mpccaFinalizeTranscriptPath,
   waitForTx,
+  WithdrawSubmitAssemblyError,
   type FinalizeTranscript,
   type FinalizeWithdrawV2CallArgsFields,
 } from "../src/index.js";
@@ -219,6 +220,41 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
         requestId: "req-empty",
       }),
     ).toThrowError(/exactly one must be present/);
+  });
+
+  // KILLER (Codex M5b P1 #1): the assembler MUST enforce the M5a/M5b no-auditor invariant
+  // before the relayer is ever called. Exercises each of the four auditor vectors
+  // independently so a single-field regression fails the test.
+  it("assembler_rejects_nonempty_auditor_fields_with_stable_code", () => {
+    const cases: Array<[string, Partial<FinalizeWithdrawV2CallArgsFields>]> = [
+      ["newBalanceREffAud", { newBalanceREffAud: ["ff".repeat(32)] }],
+      ["amountREffAud", { amountREffAud: ["ff".repeat(32)] }],
+      ["ekVolunAuds", { ekVolunAuds: ["ff".repeat(32)] }],
+      ["amountRVolunAuds", { amountRVolunAuds: [["ff".repeat(32)]] }],
+    ];
+    for (const [label, overrides] of cases) {
+      const fields: FinalizeWithdrawV2CallArgsFields = {
+        ...validCallArgsFields(),
+        ...overrides,
+      };
+      try {
+        assembleWithdrawV2CallArgs({
+          scheme: "mpcca_withdraw_v2_finalize",
+          dkgEpoch: "1",
+          requestId: "req-auditor",
+          withdrawV2CallArgsFields: fields,
+        });
+        throw new Error(`expected rejection for ${label}`);
+      } catch (err) {
+        expect(err, label).toBeInstanceOf(WithdrawSubmitAssemblyError);
+        expect((err as WithdrawSubmitAssemblyError).code, label).toBe(
+          "auditor_branch_not_supported_in_milestone_5b",
+        );
+        expect((err as WithdrawSubmitAssemblyError).message, label).toMatch(
+          /Eunoma is no-auditor today/,
+        );
+      }
+    }
   });
 
   it("rejects a finalize transcript with mis-shaped root", () => {

@@ -71,6 +71,7 @@ import {
   loadMpccaFinalizeTranscript,
   mpccaFinalizeTranscriptPath,
   waitForTx,
+  WithdrawSubmitAssemblyError,
   type WithdrawV2CallArgsShape,
 } from "@eunoma/shared";
 import { assertNoForbiddenPlaintextFields } from "@eunoma/deop-protocol";
@@ -3651,6 +3652,17 @@ export function buildCoordinatorServer(
         try {
           assembleResult = assembleWithdrawV2CallArgs(finalize);
         } catch (err) {
+          // Codex M5b P1 #1: structural no-auditor violation surfaces as 400 with the
+          // stable code, mirroring the relayer parser's wire shape so callers can
+          // branch deterministically.
+          if (err instanceof WithdrawSubmitAssemblyError) {
+            return reply.code(400).send({
+              error: err.code,
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              message: err.message,
+            });
+          }
           return reply.code(500).send({
             error: "withdraw_v2_call_args_assembly_failed",
             requestId: parsed.requestId,
