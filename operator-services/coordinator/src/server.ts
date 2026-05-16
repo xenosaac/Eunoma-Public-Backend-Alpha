@@ -64,7 +64,7 @@ import {
   type VaultEkContribution,
   type VaultStateV2InitContribution,
 } from "@eunoma/deop-protocol";
-import { sha256, bytesToHex } from "@eunoma/shared";
+import { aggregateRistrettoCommitments, sha256, bytesToHex } from "@eunoma/shared";
 import { HttpError, requireBearer } from "@eunoma/shared";
 import {
   assembleWithdrawV2CallArgs,
@@ -3105,6 +3105,26 @@ export function buildCoordinatorServer(
       // Pre-compute the ingress envelopes hash so every transcript-hash recompute uses the
       // exact same bytes the workers will fold into their per-slot worker_transcript_hash.
       const computedIngressEnvelopesHash = ingressEnvelopesHash(ingressEnvelopes);
+
+      // Coordinator-side defense-in-depth: assert Σ perShareCommitments == amountCommitment
+      // BEFORE fan-out, so a malicious user can't drift the aggregate from what the workers
+      // will commit to. The per-share Pedersen verify in each worker catches mismatches
+      // between (a_j, b_j) and perShareCommitments[j]; THIS check catches a user that submits
+      // a misleading amountCommitment relative to the actually-distributed shares.
+      try {
+        const aggregateSum = await aggregateRistrettoCommitments(perShareCommitments);
+        if (aggregateSum.toLowerCase() !== amountCommitment.replace(/^0x/i, "").toLowerCase()) {
+          return reply.code(400).send({
+            error: "ingress_aggregate_commitment_mismatch",
+            message: `Σ perShareCommitments does not equal amountCommitment (aggregateSum=${aggregateSum}, claimed=${amountCommitment})`,
+          });
+        }
+      } catch (err) {
+        return reply.code(400).send({
+          error: "ingress_invalid_commitment_shape",
+          message: err instanceof Error ? err.message : "unknown",
+        });
+      }
 
       // 3. Sanitise caller-supplied requestId BEFORE acquiring any lock or touching the FS.
       requestId =

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { RistrettoPoint } from "@aptos-labs/confidential-asset";
 import type {
   CaDkgV2Roster,
   DeoperatorRoster,
@@ -3536,6 +3537,33 @@ describe("coordinator", () => {
     };
   }
 
+  // Pre-compute a valid (amountCommitment, perShareCommitments[5]) tuple where
+  // Σ perShareCommitments == amountCommitment, using RistrettoPoint scalar-mul over
+  // BASE with distinct scalars. The shape is Pedersen-coherent enough to satisfy
+  // the coordinator's aggregate-sum invariant; the workers never see the underlying
+  // shares in these stub tests, so the per-share Pedersen verify isn't exercised here.
+  function buildValidIngressCommitments(): {
+    amountCommitment: string;
+    perShareCommitments: string[];
+  } {
+    const points = [1, 2, 3, 4, 5].map((seed) => {
+      // Use scalar from a fixed seed; arithmetic stays inside curve25519-dalek.
+      const scalarBytes = new Uint8Array(32);
+      scalarBytes[0] = seed;
+      return RistrettoPoint.BASE.multiply(BigInt(seed) + 7n);
+    });
+    const sum = points.reduce((acc, p) => acc.add(p));
+    const toHex = (bytes: Uint8Array) =>
+      Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    return {
+      amountCommitment: toHex(sum.toRawBytes()),
+      perShareCommitments: points.map((p) => toHex(p.toRawBytes())),
+    };
+  }
+  const VALID_COMMITMENTS = buildValidIngressCommitments();
+
   function mpccaWithdrawValidPayload(
     overrides: Record<string, unknown> = {},
   ): Record<string, unknown> {
@@ -3562,17 +3590,11 @@ describe("coordinator", () => {
       expirySecs: 1_700_000_000,
       requestHash: h32("6"),
       depositCount: 1,
-      // Milestone 1: amount ingress fields. The test stubs the per-share commitment check
-      // at the worker level (no real Pedersen verify here); coordinator-side defense-in-depth
-      // aggregate-sum check is deferred to the Commit 5 implementation.
-      amountCommitment: "ac".repeat(32),
-      perShareCommitments: [
-        "11".repeat(32),
-        "22".repeat(32),
-        "33".repeat(32),
-        "44".repeat(32),
-        "55".repeat(32),
-      ],
+      // Milestone 1: amount ingress fields. Use Pedersen-coherent commitments so the
+      // coordinator's aggregate-sum invariant accepts them; worker-side decrypt + verify is
+      // stubbed in stubMpccaRound1Forwarder, so we don't need real HPKE envelopes here.
+      amountCommitment: VALID_COMMITMENTS.amountCommitment,
+      perShareCommitments: VALID_COMMITMENTS.perShareCommitments,
       ingressEnvelopes: [
         mockIngressEnvelope(0x11),
         mockIngressEnvelope(0x22),
@@ -3892,14 +3914,8 @@ describe("coordinator", () => {
       requestHash: h32("6"),
       depositCount: 0,
       // M1 ingress fields.
-      amountCommitment: "ac".repeat(32),
-      perShareCommitments: [
-        "11".repeat(32),
-        "22".repeat(32),
-        "33".repeat(32),
-        "44".repeat(32),
-        "55".repeat(32),
-      ],
+      amountCommitment: VALID_COMMITMENTS.amountCommitment,
+      perShareCommitments: VALID_COMMITMENTS.perShareCommitments,
       ingressEnvelopes: [
         mockIngressEnvelope(0x11),
         mockIngressEnvelope(0x22),
@@ -4230,6 +4246,46 @@ describe("coordinator", () => {
     await firstPromise;
   });
 
+  it("mpcca_withdraw_round1 M1 aggregate-commitment invariant: rejects Σ != amountCommitment", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const payload = mpccaWithdrawValidPayload();
+    // Flip amountCommitment to a different valid Ristretto point (e.g., BASE * 99) so the
+    // aggregate-sum check fires. Use VALID_COMMITMENTS.perShareCommitments unchanged so each
+    // per-share commitment is still a valid Ristretto point — the invariant violation is the
+    // ONLY problem.
+    const altPoint = RistrettoPoint.BASE.multiply(99n);
+    (payload as Record<string, unknown>).amountCommitment = Array.from(altPoint.toRawBytes())
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-agg-mismatch", ...payload },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("ingress_aggregate_commitment_mismatch");
+  });
+
+  it("mpcca_withdraw_round1 M1: rejects non-canonical Ristretto perShareCommitment", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const payload = mpccaWithdrawValidPayload();
+    (payload as Record<string, unknown>).perShareCommitments = [
+      ...VALID_COMMITMENTS.perShareCommitments.slice(0, 4),
+      // ff*32 is not a valid Ristretto compression (decompress will fail).
+      "ff".repeat(32),
+    ];
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-noncanon-commit", ...payload },
+    });
+    expect(res.statusCode).toBe(400);
+    // The aggregate check decodes each commitment and rejects bad encodings before summing.
+    expect(res.json().error).toBe("ingress_invalid_commitment_shape");
+  });
+
   it("mpcca_withdraw_round1 rejects forbidden plaintext fields", async () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({ caDkgV2Roster });
@@ -4326,14 +4382,8 @@ describe("coordinator", () => {
         requestHash: h32("6"),
         depositCount: 1,
         // M1 ingress fields.
-        amountCommitment: "ac".repeat(32),
-        perShareCommitments: [
-          "11".repeat(32),
-          "22".repeat(32),
-          "33".repeat(32),
-          "44".repeat(32),
-          "55".repeat(32),
-        ],
+        amountCommitment: VALID_COMMITMENTS.amountCommitment,
+        perShareCommitments: VALID_COMMITMENTS.perShareCommitments,
         ingressEnvelopes: [
           mockIngressEnvelope(0x11),
           mockIngressEnvelope(0x22),
@@ -4425,14 +4475,8 @@ describe("coordinator", () => {
         requestHash: h32("6"),
         depositCount: 1, // > 0, but no observe transcript exists for it
         // M1 ingress fields.
-        amountCommitment: "ac".repeat(32),
-        perShareCommitments: [
-          "11".repeat(32),
-          "22".repeat(32),
-          "33".repeat(32),
-          "44".repeat(32),
-          "55".repeat(32),
-        ],
+        amountCommitment: VALID_COMMITMENTS.amountCommitment,
+        perShareCommitments: VALID_COMMITMENTS.perShareCommitments,
         ingressEnvelopes: [
           mockIngressEnvelope(0x11),
           mockIngressEnvelope(0x22),
