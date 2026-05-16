@@ -27,6 +27,7 @@
     "local:vault-state:init": "node scripts/local_vault_state_init.mjs",
     "local:vault-state:observe-deposit": "node scripts/local_deposit_observer.mjs",
     "local:mpcca:withdraw:round1": "node scripts/local_mpcca_withdraw_round1.mjs",
+    "local:mpcca:withdraw:submit": "node scripts/local_mpcca_withdraw_submit.mjs",
     "local:relayer:dryrun": "node scripts/local_relayer_submit_dryrun.mjs",
     "local:online-frost-dkg-smoke": "node scripts/local_frost_dkg_v2.mjs",
     "local:frost-rotation-apply": "node scripts/local_frost_rotation_apply.mjs",
