@@ -35,9 +35,10 @@ use eunoma_crypto_worker::{
     mpcca_withdraw_v2::{
         load_ingress_state_file, load_round2_dk_state_file, load_round_state_file,
         m1_ingress_aad_for_test, mpcca_withdraw_session_dir, round1_worker_transcript_hash,
-        run_finalize_v2, run_prove_v2, run_round1_v2, run_round2_v2,
-        seal_ingress_envelope_for_test, ChainedRoundRequest as MpccaChainedRoundRequest,
-        Round1Request as MpccaRound1Request, Round2Request as MpccaRound2Request,
+        round2_statement_inputs_hash_hex_for_test, run_finalize_v2, run_prove_v2, run_round1_v2,
+        run_round2_v2, seal_ingress_envelope_for_test,
+        ChainedRoundRequest as MpccaChainedRoundRequest, Round1Request as MpccaRound1Request,
+        Round2Request as MpccaRound2Request,
     },
     registration_verifier::{
         aggregate_registration_commitment, lagrange_coefficients_at_zero,
@@ -2081,5 +2082,53 @@ fn m4_round2_under_count_transfer_amount_c_rejected() {
             WorkerError::InvalidRequest(ref s) if s.contains("transfer_amount_c")
         ),
         "expected InvalidRequest for transfer_amount_c length mismatch, got {err:?}"
+    );
+}
+
+// =============================================================================================
+// M4 Commit 2 — Rust↔TS byte-parity for round2 statement_inputs_hash.
+//
+// The TS test `round2 statement_inputs hash matches the canonical Rust output (TS↔Rust byte
+// parity)` asserts the same hex against `mpccaWithdrawRound2StatementInputsHash` over the
+// SAME fixture. If either side drifts, BOTH tests fail in lockstep. This is the load-bearing
+// wedge that prevents the coordinator's worker_transcript_hash cross-check from breaking
+// silently between TS and Rust implementations.
+//
+// Fixture: 4-hex-char `(group||idx)` slots repeated 16× → 64 chars per entry. Counts
+// match the canonical Aptos CA TransferV1 shape (ell=8, n=4).
+// =============================================================================================
+#[test]
+fn mpcca_withdraw_v2_round2_statement_inputs_hash_byte_parity_with_ts_fixture() {
+    fn gen_hex(group: &str, i: usize) -> String {
+        let idx = format!("{i:02x}");
+        let cell = format!("{group}{idx}");
+        cell.repeat(16)
+    }
+    fn group(prefix: &str, count: usize) -> Vec<String> {
+        (0..count).map(|i| gen_hex(prefix, i)).collect()
+    }
+    let recipient_ek = "a1".repeat(32);
+    let old_balance_c = group("b0", 8);
+    let old_balance_d = group("c0", 8);
+    let new_balance_c = group("d0", 8);
+    let new_balance_d = group("e0", 8);
+    let transfer_amount_c = group("f0", 4);
+    let transfer_amount_d_sender = group("12", 4);
+    let transfer_amount_d_recipient = group("23", 4);
+
+    let hash = round2_statement_inputs_hash_hex_for_test(
+        &recipient_ek,
+        &old_balance_c,
+        &old_balance_d,
+        &new_balance_c,
+        &new_balance_d,
+        &transfer_amount_c,
+        &transfer_amount_d_sender,
+        &transfer_amount_d_recipient,
+    )
+    .expect("statement inputs hash byte-parity fixture");
+    assert_eq!(
+        hash, "ffa00e43e67bf54fb188596887ce58bcf3e0223d7a7a9e9f9576cde8ef25ef8d",
+        "statement_inputs_hash byte-parity with TS fixture broken — TS test must assert the same hex"
     );
 }

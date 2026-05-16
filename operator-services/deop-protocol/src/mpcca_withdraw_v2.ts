@@ -59,6 +59,42 @@ export const EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_FI
 export const EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1 = "EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1";
 
 /**
+ * M4 Commit 2: deterministic domain for the coordinator-side round2 aggregate hash that
+ * binds (Statement input fields ‖ sorted worker dk-base partial commitments ‖ sorted worker
+ * transcript hashes). Persisted into `__round2.json` and consumed by prove/finalize as the
+ * `previousRoundTranscriptHash` chain seed.
+ */
+export const EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1 =
+  "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1";
+
+/**
+ * Canonical Aptos CA TransferV1 Statement vector lengths. `ROUND2_ELL` (= 8) is the
+ * new-balance chunk count, `ROUND2_N` (= 4) is the transfer-amount chunk count. Mirrors
+ * the Rust constants of the same names in `crypto-worker-rust::mpcca_withdraw_v2`.
+ */
+export const ROUND2_ELL = 8;
+export const ROUND2_N = 4;
+
+/**
+ * M4 Commit 2 — coordinator-inbound user-supplied proof artifact lengths. Documented here
+ * because the wire shape REQUIRES exactly these counts; under-quorum or over-quorum fail
+ * closed at the boundary.
+ *
+ * - `USER_SIGMA_COMMITMENTS_LEN = 29`: 30-point CA TransferV1 commitment vector minus the
+ *   single pure-dk position (index 0 in the canonical psi_transfer output). The position-17
+ *   slot is shared — the user contributes its non-dk component here and the workers add
+ *   the dk-component at aggregation time.
+ * - `USER_SIGMA_RESPONSE_SHARES_LEN = 24`: 25-element response vector minus the dk slot
+ *   (index 0). User-supplied response shares for witness[1..25].
+ * - `DK_BASE_INDICES_CANONICAL = [0, 17]`: programmatic BASE_DK_SET output for Aptos CA
+ *   TransferV1 (ell=8, n=4, no auditor). Validated by `derive_dk_base_points` in the
+ *   Rust worker at every round2 call; the coordinator cross-checks the returned indices.
+ */
+export const USER_SIGMA_COMMITMENTS_LEN = 29;
+export const USER_SIGMA_RESPONSE_SHARES_LEN = 24;
+export const DK_BASE_INDICES_CANONICAL: readonly number[] = Object.freeze([0, 17]);
+
+/**
  * HPKE AAD domain for the M1 amount-ingress envelope. Locked. Any change must bump the V1
  * suffix and is a wire-protocol break.
  *
@@ -108,7 +144,15 @@ export type MpccaWithdrawV2ErrorCode =
   | "INGRESS_ENVELOPE_COUNT_MISMATCH"
   | "INGRESS_AGGREGATE_COMMITMENT_MISMATCH"
   | "INGRESS_INVALID_COMMITMENT_SHAPE"
-  | "INGRESS_INVALID_ENVELOPE_SHAPE";
+  | "INGRESS_INVALID_ENVELOPE_SHAPE"
+  // M4 commit 2: round2 orchestration + Statement / user-proof shape validation.
+  | "INVALID_STATEMENT_INPUT_SHAPE"
+  | "INVALID_USER_SIGMA_SHAPE"
+  | "INVALID_BULLETPROOF_BYTES"
+  | "INVALID_PER_CHUNK_COMMITMENT_SHAPE"
+  | "DK_BASE_INDICES_DIVERGENCE"
+  | "DUPLICATE_DK_INDEX"
+  | "INVALID_ROUND2_PARTIAL_SHAPE";
 
 export class MpccaWithdrawV2Error extends Error {
   constructor(
@@ -213,9 +257,116 @@ export interface MpccaWithdrawRound1IngressFields {
 
 export type MpccaWithdrawRound1Request = MpccaWithdrawBaseRequest &
   MpccaWithdrawRound1IngressFields;
-export type MpccaWithdrawRound2Request = MpccaWithdrawChainedRequest;
+
+/**
+ * M4 Commit 1 — public Aptos CA TransferV1 Statement input fields. Carried by every Round 2
+ * worker request so the worker can (a) reconstruct the public `Statement` and (b) derive
+ * `BASE_DK_SET` via `psi_transfer` inspection. Vector lengths are pinned at compile time
+ * (`ROUND2_ELL` = 8, `ROUND2_N` = 4) per the canonical no-auditor TransferV1 shape.
+ *
+ * Privacy contract: every field is a public chain ciphertext / public encryption key. The
+ * plaintext chunk values + scalar blinds NEVER appear here.
+ */
+export interface MpccaWithdrawRound2StatementInputFields {
+  /** Recipient encryption key (`ek_rid`). 32-byte compressed Ristretto hex. */
+  recipientEk: HexString;
+  /** Old balance Pedersen commitments `C[i] = G·old_a[i] + H·old_r[i]`. 8 entries. */
+  oldBalanceC: HexString[];
+  /** Old balance ElGamal D-component `D[i] = ek_sid · old_r[i]`. 8 entries. */
+  oldBalanceD: HexString[];
+  /** New balance Pedersen commitments. 8 entries. */
+  newBalanceC: HexString[];
+  /** New balance ElGamal D-component. 8 entries. */
+  newBalanceD: HexString[];
+  /** Transfer-amount Pedersen commitments. 4 entries. */
+  transferAmountC: HexString[];
+  /** Transfer-amount ElGamal D-component (sender). 4 entries. */
+  transferAmountDSender: HexString[];
+  /** Transfer-amount ElGamal D-component (recipient). 4 entries. */
+  transferAmountDRecipient: HexString[];
+}
+
+/**
+ * M4 Commit 1 — Round 2 worker request. Extends the chained-round envelope with the public
+ * CA TransferV1 Statement input fields. Byte-shape mirrors the Rust `Round2Request` struct
+ * (which uses `#[serde(flatten)]` to splice `ChainedRoundRequest` into the JSON top level).
+ */
+export type MpccaWithdrawRound2Request = MpccaWithdrawChainedRequest &
+  MpccaWithdrawRound2StatementInputFields;
+
 export type MpccaWithdrawProveRequest = MpccaWithdrawChainedRequest;
 export type MpccaWithdrawFinalizeRequest = MpccaWithdrawChainedRequest;
+
+/**
+ * M4 Commit 2 — user-supplied proof artifacts carried by the coordinator-inbound round2
+ * orchestrate request body. These artifacts are forwarded ONLY to the coordinator (NOT to
+ * any worker) and are persisted echoed-back in the `__round2.json` artifact for prove /
+ * finalize to consume. Workers never see Bulletproof bytes or user sigma commitments — the
+ * coordinator is the sole party that aggregates the user's contribution with the worker
+ * dk-base partials.
+ *
+ * Privacy contract: every entry is public crypto output (commitment / response scalar /
+ * Bulletproof byte string). The plaintext chunk values + amount NEVER appear here.
+ */
+export interface MpccaWithdrawRound2OrchestrateProofFields {
+  /**
+   * User's pre-computed sigma commitment vector (the 30-point Aptos CA TransferV1
+   * commitment vector minus the single pure-dk position). 29 × 32-byte hex.
+   *
+   * At aggregation time the coordinator inlines the worker dk-base partials into the
+   * positions named by `dkBaseIndicesUsed` to assemble the full 30-point vector A.
+   */
+  userSigmaCommitmentsHex: HexString[];
+  /**
+   * User's pre-computed sigma response scalars for witness slots `[1..25)` (the 25-element
+   * response vector minus the dk slot at index 0). 24 × 32-byte hex.
+   */
+  userSigmaResponseSharesHex: HexString[];
+  /** User-generated Bulletproof bytes proving the transfer amount is in range. Hex. */
+  bulletproofZkrpAmountHex: HexString;
+  /** User-generated Bulletproof bytes proving the new balance is in range. Hex. */
+  bulletproofZkrpNewBalanceHex: HexString;
+  /** Per-chunk Pedersen commitments to transfer-amount chunks. 4 × 32-byte hex. */
+  perChunkCommitmentsAmountHex: HexString[];
+  /** Per-chunk Pedersen commitments to new-balance chunks. 8 × 32-byte hex. */
+  perChunkCommitmentsNewBalanceHex: HexString[];
+}
+
+/**
+ * M4 Commit 2 — coordinator-inbound /v2/withdraw/mpcca/round2 request body. Combines the
+ * Milestone 3a base identity envelope, the Round2 Statement inputs, and the user-supplied
+ * proof artifacts. The coordinator reconstructs `previousRoundTranscriptHash` +
+ * `previousRoundCommitments` from the persisted `__round1.json` artifact — callers do NOT
+ * supply them here (the round1 transcript IS the source of truth).
+ */
+export interface MpccaWithdrawRound2OrchestrateRequest
+  extends MpccaWithdrawBaseRequest,
+    MpccaWithdrawRound2StatementInputFields,
+    MpccaWithdrawRound2OrchestrateProofFields {}
+
+/**
+ * M4 Commit 1 — single worker dk-base partial commitment. `commitmentHex` = `α_share_j[0]·base`
+ * where `base` is the public point at canonical BASE_DK_SET position `index`.
+ */
+export interface MpccaWithdrawRound2DkPartial {
+  index: number;
+  commitmentHex: HexString;
+}
+
+/**
+ * M4 Commit 1 — Round 2 worker response shape. The worker contributes ONLY the dk-component
+ * of the sigma commitment vector A. Returned points cover exactly the BASE_DK_SET indices
+ * (= `[0, 17]` for Aptos CA TransferV1 ell=8/n=4/no-auditor).
+ *
+ * Replaces the M3a stub-mode `MpccaWithdrawRound2Response` (which lives on as
+ * `MpccaWithdrawRound2StubResponse` for backwards-compat with any in-flight chained-round
+ * stub callers).
+ */
+export interface MpccaWithdrawRound2DkResult extends MpccaWithdrawBasePublicOutputs {
+  completed: true;
+  partialDkCommitments: MpccaWithdrawRound2DkPartial[];
+  dkBaseIndicesUsed: number[];
+}
 
 // =================================================================================================
 // Per-round Response shapes. Each round returns a per-slot "contribution" (commitment, partial
@@ -546,6 +697,55 @@ function chainedRoundHash(
   return bytesToHex(sha256(concat(parts)));
 }
 
+/**
+ * M4 Commit 1 — canonical sha256-hex of the normalised round2 Statement input fields. Byte
+ * identical to Rust `statement_inputs_hash_hex` so the coordinator's worker_transcript_hash
+ * cross-check holds across the language boundary.
+ *
+ * Layout (utf8 bytes, then sha256):
+ *   recipient_ek_hex
+ *   || ":" || old_balance_c[0]|...|old_balance_c[7]
+ *   || ":" || old_balance_d[0]|...|old_balance_d[7]
+ *   || ":" || new_balance_c[0]|...|new_balance_c[7]
+ *   || ":" || new_balance_d[0]|...|new_balance_d[7]
+ *   || ":" || transfer_amount_c[0]|...|transfer_amount_c[3]
+ *   || ":" || transfer_amount_d_sender[0]|...|transfer_amount_d_sender[3]
+ *   || ":" || transfer_amount_d_recipient[0]|...|transfer_amount_d_recipient[3]
+ *
+ * Every hex MUST already be normalised (32-byte lowercase, no `0x`). Caller validates lengths.
+ */
+export function mpccaWithdrawRound2StatementInputsHash(
+  inputs: MpccaWithdrawRound2StatementInputFields,
+): HexString {
+  const enc = new TextEncoder();
+  const parts: Uint8Array[] = [enc.encode(normalizeHex(inputs.recipientEk))];
+  const groups: HexString[][] = [
+    inputs.oldBalanceC,
+    inputs.oldBalanceD,
+    inputs.newBalanceC,
+    inputs.newBalanceD,
+    inputs.transferAmountC,
+    inputs.transferAmountDSender,
+    inputs.transferAmountDRecipient,
+  ];
+  for (const group of groups) {
+    parts.push(enc.encode(":"));
+    parts.push(enc.encode(group.map(normalizeHex).join("|")));
+  }
+  return bytesToHex(sha256(concat(parts)));
+}
+
+/**
+ * M4 Commit 1 — round2 worker_transcript_hash. Byte-identical with Rust
+ * `round2_v2_worker_transcript_hash(chained_hash_hex, statement_inputs_hash_hex)`.
+ *
+ *   chained_hash = sha256(round2 base + previous-round chain)  [domain V2]
+ *   statement_inputs_hash = sha256(7 Statement input groups)
+ *   worker_transcript_hash = sha256(chained_hash || ":" || statement_inputs_hash)
+ *
+ * A tampered Statement input flips the per-slot hash → the coordinator's
+ * worker-transcript-agreement check rejects.
+ */
 export function mpccaWithdrawRound2WorkerTranscriptHash(args: {
   sessionId: string;
   requestId: string;
@@ -573,8 +773,66 @@ export function mpccaWithdrawRound2WorkerTranscriptHash(args: {
   depositCount: number;
   previousRoundTranscriptHash: string;
   previousRoundCommitments: string[];
+  statementInputs: MpccaWithdrawRound2StatementInputFields;
 }): HexString {
-  return chainedRoundHash(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V2, args);
+  const { statementInputs, ...chainedArgs } = args;
+  const chainedHash = chainedRoundHash(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V2, chainedArgs);
+  const statementInputsHash = mpccaWithdrawRound2StatementInputsHash(statementInputs);
+  const enc = new TextEncoder();
+  const combined = concat([
+    enc.encode(chainedHash),
+    enc.encode(":"),
+    enc.encode(statementInputsHash),
+  ]);
+  return bytesToHex(sha256(combined));
+}
+
+/**
+ * M4 Commit 2 — deterministic coordinator-side round2 aggregate hash. Persisted into
+ * `__round2.json` and consumed by prove/finalize as the `previousRoundTranscriptHash`
+ * chain seed. Binds:
+ *
+ *   - The full Statement input set (via `mpccaWithdrawRound2StatementInputsHash`).
+ *   - Per-slot worker dk-base partials in (slot ASC, dkIndex ASC) order.
+ *   - Per-slot worker_transcript_hash values in slot ASC order.
+ *   - The agreed dkBaseIndicesUsed canonical set.
+ *
+ * Anyone can recompute this hash from the persisted artifact; it is the public deterministic
+ * fingerprint of the round2 step. NOT to be confused with the Fiat-Shamir sigma challenge
+ * `e` (which is computed in M4 commit 4 once the full A vector is assembled).
+ */
+export function mpccaWithdrawRound2AggregateHash(input: {
+  statementInputs: MpccaWithdrawRound2StatementInputFields;
+  dkBaseIndicesUsed: number[];
+  perSlotContributions: Array<{
+    slot: number;
+    workerTranscriptHash: HexString;
+    partialDkCommitments: MpccaWithdrawRound2DkPartial[];
+  }>;
+}): HexString {
+  const enc = new TextEncoder();
+  const parts: Uint8Array[] = [
+    enc.encode(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1),
+    enc.encode(":"),
+    enc.encode(mpccaWithdrawRound2StatementInputsHash(input.statementInputs)),
+    enc.encode(":"),
+    enc.encode([...input.dkBaseIndicesUsed].sort((a, b) => a - b).join(",")),
+  ];
+  const sortedContribs = [...input.perSlotContributions].sort((a, b) => a.slot - b.slot);
+  for (const c of sortedContribs) {
+    parts.push(enc.encode(":"));
+    parts.push(enc.encode(c.slot.toString()));
+    parts.push(enc.encode("|"));
+    parts.push(enc.encode(normalizeHex(c.workerTranscriptHash)));
+    parts.push(enc.encode("|"));
+    const sortedPartials = [...c.partialDkCommitments].sort((a, b) => a.index - b.index);
+    parts.push(
+      enc.encode(
+        sortedPartials.map((p) => `${p.index}=${normalizeHex(p.commitmentHex)}`).join(","),
+      ),
+    );
+  }
+  return bytesToHex(sha256(concat(parts)));
 }
 
 export function mpccaWithdrawProveWorkerTranscriptHash(args: {
@@ -1395,10 +1653,189 @@ export function parseMpccaWithdrawRound1Request(
   };
 }
 
+/**
+ * M4 Commit 1 — validate the 7 Statement input fields with their canonical
+ * `ROUND2_ELL=8` / `ROUND2_N=4` lengths and 32-byte hex per entry.
+ */
+function requireRound2StatementInputs(
+  obj: Record<string, unknown>,
+): MpccaWithdrawRound2StatementInputFields {
+  const requireHexVec = (key: string, expected: number): HexString[] => {
+    const v = obj[key];
+    if (!Array.isArray(v) || v.length !== expected) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_STATEMENT_INPUT_SHAPE",
+        `${key} must be an array of exactly ${expected} entries (got ${
+          Array.isArray(v) ? v.length : typeof v
+        })`,
+      );
+    }
+    const out: HexString[] = [];
+    for (let i = 0; i < v.length; i += 1) {
+      const entry = v[i];
+      if (typeof entry !== "string" || entry.length === 0) {
+        throw new MpccaWithdrawV2Error(
+          "INVALID_STATEMENT_INPUT_SHAPE",
+          `${key}[${i}] must be a non-empty hex string`,
+        );
+      }
+      const norm = normalizeHex(entry);
+      if (hexToBytes(norm).length !== 32) {
+        throw new MpccaWithdrawV2Error(
+          "INVALID_STATEMENT_INPUT_SHAPE",
+          `${key}[${i}] must be 32-byte hex (compressed Ristretto)`,
+        );
+      }
+      out.push(norm);
+    }
+    return out;
+  };
+  return {
+    recipientEk: requireHex(obj, "recipientEk", 32),
+    oldBalanceC: requireHexVec("oldBalanceC", ROUND2_ELL),
+    oldBalanceD: requireHexVec("oldBalanceD", ROUND2_ELL),
+    newBalanceC: requireHexVec("newBalanceC", ROUND2_ELL),
+    newBalanceD: requireHexVec("newBalanceD", ROUND2_ELL),
+    transferAmountC: requireHexVec("transferAmountC", ROUND2_N),
+    transferAmountDSender: requireHexVec("transferAmountDSender", ROUND2_N),
+    transferAmountDRecipient: requireHexVec("transferAmountDRecipient", ROUND2_N),
+  };
+}
+
+/**
+ * M4 Commit 1 — round2 worker request. Chained-round envelope + 7 Statement input fields.
+ * Used by the worker-side handler at `POST /worker/v2/mpcca/withdraw/round2`. Forbidden
+ * plaintext fields are guarded by `parseBaseRequest`.
+ */
 export function parseMpccaWithdrawRound2Request(
   body: unknown,
 ): MpccaWithdrawRound2Request {
-  return parseChainedRequest(body);
+  const chained = parseChainedRequest(body);
+  const obj = objectBody(body);
+  return { ...chained, ...requireRound2StatementInputs(obj) };
+}
+
+/**
+ * M4 Commit 2 — coordinator-inbound orchestrate request for `POST /v2/withdraw/mpcca/round2`.
+ *
+ * Wire shape: base identity (the Milestone 3a base envelope minus the previous-round chain
+ * fields, which the coordinator lifts from the persisted `__round1.json` artifact), the 7
+ * Statement input fields, and the user-supplied proof artifacts. Forbidden plaintext fields
+ * are guarded by `parseBaseRequest`.
+ *
+ * Coordinator builds the per-worker `Round2Request` (chained binding + Statement) by joining
+ * this body with the round1 transcript's `transcriptHash` and per-slot ingressTranscriptHash.
+ */
+export function parseMpccaWithdrawRound2OrchestrateRequest(
+  body: unknown,
+): MpccaWithdrawRound2OrchestrateRequest {
+  const base = parseBaseRequest(body);
+  const obj = objectBody(body);
+  const stmt = requireRound2StatementInputs(obj);
+  const userSigmaCommitmentsHex = requireFixedLengthHexVec(
+    obj,
+    "userSigmaCommitmentsHex",
+    USER_SIGMA_COMMITMENTS_LEN,
+    32,
+    "INVALID_USER_SIGMA_SHAPE",
+  );
+  const userSigmaResponseSharesHex = requireFixedLengthHexVec(
+    obj,
+    "userSigmaResponseSharesHex",
+    USER_SIGMA_RESPONSE_SHARES_LEN,
+    32,
+    "INVALID_USER_SIGMA_SHAPE",
+  );
+  const bulletproofZkrpAmountHex = requireNonEmptyHex(
+    obj,
+    "bulletproofZkrpAmountHex",
+    "INVALID_BULLETPROOF_BYTES",
+  );
+  const bulletproofZkrpNewBalanceHex = requireNonEmptyHex(
+    obj,
+    "bulletproofZkrpNewBalanceHex",
+    "INVALID_BULLETPROOF_BYTES",
+  );
+  const perChunkCommitmentsAmountHex = requireFixedLengthHexVec(
+    obj,
+    "perChunkCommitmentsAmountHex",
+    ROUND2_N,
+    32,
+    "INVALID_PER_CHUNK_COMMITMENT_SHAPE",
+  );
+  const perChunkCommitmentsNewBalanceHex = requireFixedLengthHexVec(
+    obj,
+    "perChunkCommitmentsNewBalanceHex",
+    ROUND2_ELL,
+    32,
+    "INVALID_PER_CHUNK_COMMITMENT_SHAPE",
+  );
+  return {
+    ...base,
+    ...stmt,
+    userSigmaCommitmentsHex,
+    userSigmaResponseSharesHex,
+    bulletproofZkrpAmountHex,
+    bulletproofZkrpNewBalanceHex,
+    perChunkCommitmentsAmountHex,
+    perChunkCommitmentsNewBalanceHex,
+  };
+}
+
+function requireFixedLengthHexVec(
+  obj: Record<string, unknown>,
+  key: string,
+  expected: number,
+  bytesPerEntry: number,
+  errorCode: MpccaWithdrawV2ErrorCode,
+): HexString[] {
+  const v = obj[key];
+  if (!Array.isArray(v) || v.length !== expected) {
+    throw new MpccaWithdrawV2Error(
+      errorCode,
+      `${key} must be an array of exactly ${expected} entries (got ${
+        Array.isArray(v) ? v.length : typeof v
+      })`,
+    );
+  }
+  const out: HexString[] = [];
+  for (let i = 0; i < v.length; i += 1) {
+    const entry = v[i];
+    if (typeof entry !== "string" || entry.length === 0) {
+      throw new MpccaWithdrawV2Error(
+        errorCode,
+        `${key}[${i}] must be a non-empty hex string`,
+      );
+    }
+    const norm = normalizeHex(entry);
+    if (hexToBytes(norm).length !== bytesPerEntry) {
+      throw new MpccaWithdrawV2Error(
+        errorCode,
+        `${key}[${i}] must be ${bytesPerEntry}-byte hex`,
+      );
+    }
+    out.push(norm);
+  }
+  return out;
+}
+
+function requireNonEmptyHex(
+  obj: Record<string, unknown>,
+  key: string,
+  errorCode: MpccaWithdrawV2ErrorCode,
+): HexString {
+  const v = obj[key];
+  if (typeof v !== "string" || v.length === 0) {
+    throw new MpccaWithdrawV2Error(errorCode, `${key} must be a non-empty hex string`);
+  }
+  const norm = normalizeHex(v);
+  if (hexToBytes(norm).length === 0) {
+    throw new MpccaWithdrawV2Error(
+      errorCode,
+      `${key} must decode to at least one byte`,
+    );
+  }
+  return norm;
 }
 
 export function parseMpccaWithdrawProveRequest(
@@ -1490,6 +1927,139 @@ export function parseMpccaWithdrawRound2Response(
   const base = parseBaseStubResponse(body);
   const obj = objectBody(body);
   return { ...base, partialResponse: maybeHex(obj, "partialResponse") };
+}
+
+/**
+ * M4 Commit 1 — parse the worker's `Round2DkResult` HTTP reply. The Rust worker emits this
+ * shape under `#[serde(rename_all = "camelCase")]`. Validates:
+ *   - `completed === true` (M4 commit 1 path; stub-mode rounds are gone for round2).
+ *   - `partialDkCommitments` is a non-empty array of `{ index, commitmentHex }`, no duplicate
+ *     indices, each `commitmentHex` is canonical 32-byte hex.
+ *   - `dkBaseIndicesUsed` equals `partialDkCommitments.map(p => p.index)` after sort, and is
+ *     a subset of `DK_BASE_INDICES_CANONICAL` (= `[0, 17]`).
+ *
+ * Caller-side: the coordinator additionally cross-checks
+ * `dkBaseIndicesUsed === DK_BASE_INDICES_CANONICAL` across ALL 5 workers (any divergence
+ * surfaces `DK_BASE_INDICES_DIVERGENCE`).
+ */
+export function parseMpccaWithdrawRound2DkResult(
+  body: unknown,
+): MpccaWithdrawRound2DkResult {
+  const pub = parsePublicOutputs(body);
+  const obj = objectBody(body);
+  const completed = obj.completed;
+  if (completed !== true) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_ROUND2_PARTIAL_SHAPE",
+      "M4 commit 1 round2 response must have completed: true",
+    );
+  }
+  const rawPartials = obj.partialDkCommitments;
+  if (!Array.isArray(rawPartials) || rawPartials.length === 0) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_ROUND2_PARTIAL_SHAPE",
+      "partialDkCommitments must be a non-empty array",
+    );
+  }
+  const partialDkCommitments: MpccaWithdrawRound2DkPartial[] = [];
+  const seenIndices = new Set<number>();
+  for (let i = 0; i < rawPartials.length; i += 1) {
+    const entry = rawPartials[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        `partialDkCommitments[${i}] must be an object`,
+      );
+    }
+    const e = entry as Record<string, unknown>;
+    const index = e.index;
+    if (
+      !Number.isInteger(index) ||
+      (index as number) < 0 ||
+      (index as number) > 1024
+    ) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        `partialDkCommitments[${i}].index must be a small non-negative integer`,
+      );
+    }
+    if (seenIndices.has(index as number)) {
+      throw new MpccaWithdrawV2Error(
+        "DUPLICATE_DK_INDEX",
+        `partialDkCommitments duplicate index ${index}`,
+      );
+    }
+    seenIndices.add(index as number);
+    const commitmentHex = e.commitmentHex;
+    if (typeof commitmentHex !== "string" || commitmentHex.length === 0) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        `partialDkCommitments[${i}].commitmentHex must be a non-empty hex string`,
+      );
+    }
+    const norm = normalizeHex(commitmentHex);
+    if (hexToBytes(norm).length !== 32) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        `partialDkCommitments[${i}].commitmentHex must be 32-byte hex`,
+      );
+    }
+    partialDkCommitments.push({ index: index as number, commitmentHex: norm });
+  }
+  const rawIndices = obj.dkBaseIndicesUsed;
+  if (!Array.isArray(rawIndices)) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_ROUND2_PARTIAL_SHAPE",
+      "dkBaseIndicesUsed must be an array",
+    );
+  }
+  const dkBaseIndicesUsed: number[] = [];
+  for (let i = 0; i < rawIndices.length; i += 1) {
+    const idx = rawIndices[i];
+    if (!Number.isInteger(idx) || (idx as number) < 0 || (idx as number) > 1024) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        `dkBaseIndicesUsed[${i}] must be a small non-negative integer`,
+      );
+    }
+    dkBaseIndicesUsed.push(idx as number);
+  }
+  // dkBaseIndicesUsed must mirror partialDkCommitments[*].index (any order).
+  const partialIndicesSorted = partialDkCommitments
+    .map((p) => p.index)
+    .sort((a, b) => a - b);
+  const dkIndicesSorted = [...dkBaseIndicesUsed].sort((a, b) => a - b);
+  if (partialIndicesSorted.length !== dkIndicesSorted.length) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_ROUND2_PARTIAL_SHAPE",
+      "dkBaseIndicesUsed length must equal partialDkCommitments length",
+    );
+  }
+  for (let i = 0; i < partialIndicesSorted.length; i += 1) {
+    if (partialIndicesSorted[i] !== dkIndicesSorted[i]) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        "dkBaseIndicesUsed entries must match partialDkCommitments indices",
+      );
+    }
+  }
+  // Defense in depth: the canonical BASE_DK_SET for Aptos CA TransferV1 is `[0, 17]`. Reject
+  // any out-of-set indices at the boundary. The coordinator additionally enforces all 5
+  // workers return the SAME set via DK_BASE_INDICES_DIVERGENCE.
+  for (const idx of dkBaseIndicesUsed) {
+    if (!DK_BASE_INDICES_CANONICAL.includes(idx)) {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_ROUND2_PARTIAL_SHAPE",
+        `dkBaseIndicesUsed entry ${idx} not in canonical BASE_DK_SET ${DK_BASE_INDICES_CANONICAL.join(",")}`,
+      );
+    }
+  }
+  return {
+    ...pub,
+    completed: true,
+    partialDkCommitments,
+    dkBaseIndicesUsed,
+  };
 }
 
 export function parseMpccaWithdrawProveResponse(

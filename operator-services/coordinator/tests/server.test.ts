@@ -4492,6 +4492,652 @@ describe("coordinator", () => {
   });
 
   // ---------------------------------------------------------------------------------------------
+  // M4 Commit 2 — POST /v2/withdraw/mpcca/round2 orchestrator.
+  //
+  // Builds on the round1 __round1.json artifact: the round2 route lifts the chained-round
+  // binding from round1 and fans out per-worker Round2Request bodies (chained envelope +
+  // 7 Statement input fields). User-supplied proof artifacts (Bulletproof bytes, per-chunk
+  // commitments, user sigma α-points + response shares) are coordinator-only and never
+  // forwarded to workers.
+  // ---------------------------------------------------------------------------------------------
+  describe("MPCCA withdraw V2 round2 — M4 commit 2 orchestrator", () => {
+    /** Generate a deterministic 32-byte hex per call (label+index pattern). */
+    function genHex32(group: string, i: number): string {
+      const idx = i.toString(16).padStart(2, "0");
+      return (group + idx).repeat(16);
+    }
+    function buildStatementInputs() {
+      return {
+        recipientEk: "a1".repeat(32),
+        oldBalanceC: Array.from({ length: 8 }, (_, i) => genHex32("b0", i)),
+        oldBalanceD: Array.from({ length: 8 }, (_, i) => genHex32("c0", i)),
+        newBalanceC: Array.from({ length: 8 }, (_, i) => genHex32("d0", i)),
+        newBalanceD: Array.from({ length: 8 }, (_, i) => genHex32("e0", i)),
+        transferAmountC: Array.from({ length: 4 }, (_, i) => genHex32("f0", i)),
+        transferAmountDSender: Array.from({ length: 4 }, (_, i) => genHex32("12", i)),
+        transferAmountDRecipient: Array.from({ length: 4 }, (_, i) => genHex32("23", i)),
+      };
+    }
+    function buildRound2OrchestrateBody(
+      overrides: Record<string, unknown> = {},
+    ): Record<string, unknown> {
+      const stmt = buildStatementInputs();
+      return {
+        dkgEpoch: "1",
+        requestId: "mpcca-wdr-r2",
+        sessionId: "mpcca-wdr-r2",
+        vaultEkTranscriptHash: h32("7"),
+        registrationTranscriptHash: h32("8"),
+        vaultStateInitTranscriptHash: h32("9"),
+        observedDepositTranscriptHashes: [h32("0")],
+        rosterHash: h32("aa"),
+        selectedSlots: [0, 1, 2, 3, 4],
+        selfSlot: 0,
+        playerId: 0,
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        root: h32("1"),
+        nullifierHash: h32("2"),
+        recipient: h32("3"),
+        recipientHash: h32("4"),
+        amountTag: h32("5"),
+        vaultSequence: 0,
+        expirySecs: 1_700_000_000,
+        requestHash: h32("6"),
+        depositCount: 1,
+        ...stmt,
+        userSigmaCommitmentsHex: Array.from({ length: 29 }, (_, i) => genHex32("34", i)),
+        userSigmaResponseSharesHex: Array.from({ length: 24 }, (_, i) => genHex32("45", i)),
+        bulletproofZkrpAmountHex: "ab".repeat(96),
+        bulletproofZkrpNewBalanceHex: "cd".repeat(160),
+        perChunkCommitmentsAmountHex: Array.from({ length: 4 }, (_, i) => genHex32("56", i)),
+        perChunkCommitmentsNewBalanceHex: Array.from({ length: 8 }, (_, i) => genHex32("67", i)),
+        ...overrides,
+      };
+    }
+    async function stageRound1Artifact(
+      stateRoot: string,
+      body: Record<string, unknown>,
+      rosterHashHex: string,
+      perSlotIngress: Map<number, string>,
+    ): Promise<string> {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+      await mkdir(dir, { recursive: true });
+      const path = join(
+        dir,
+        `${body.dkgEpoch}__${body.requestId}__round1.json`,
+      );
+      const sortedSlots = (body.selectedSlots as number[]).slice().sort((a, b) => a - b);
+      const perSlotContributions = sortedSlots.map((slot) => ({
+        slot,
+        sessionStateHash: h32(String((slot + 1) % 9)),
+        workerTranscriptHash: perSlotIngress.get(slot)!,
+        completed: true,
+        ingressTranscriptHash: perSlotIngress.get(slot)!,
+      }));
+      const artifact = {
+        scheme: "mpcca_withdraw_v2_round1_ingress",
+        dkgEpoch: body.dkgEpoch,
+        requestId: body.requestId,
+        vaultEkTranscriptHash: body.vaultEkTranscriptHash,
+        registrationTranscriptHash: body.registrationTranscriptHash,
+        vaultStateInitTranscriptHash: body.vaultStateInitTranscriptHash,
+        observedDepositTranscriptHashes: body.observedDepositTranscriptHashes,
+        rosterHash: rosterHashHex,
+        selectedSlots: sortedSlots,
+        vaultEk: body.vaultEk,
+        senderAddress: body.senderAddress,
+        assetType: body.assetType,
+        chainId: body.chainId,
+        root: body.root,
+        nullifierHash: body.nullifierHash,
+        recipient: body.recipient,
+        recipientHash: body.recipientHash,
+        amountTag: body.amountTag,
+        vaultSequence: body.vaultSequence,
+        expirySecs: body.expirySecs,
+        requestHash: body.requestHash,
+        depositCount: body.depositCount,
+        perSlotContributions,
+        transcriptHash: h32("ab"),
+        createdAtUnixMs: 1_700_000_000_000,
+      };
+      await writeFile(path, JSON.stringify(artifact), { mode: 0o600 });
+      return path;
+    }
+    async function makeStateRoot(prefix: string): Promise<string> {
+      const { mkdtemp } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const os = await import("node:os");
+      return mkdtemp(join(os.tmpdir(), prefix));
+    }
+
+    type ParsedRound2Body = {
+      dkgEpoch: string;
+      requestId: string;
+      sessionId: string;
+      vaultEkTranscriptHash: string;
+      registrationTranscriptHash: string;
+      vaultStateInitTranscriptHash: string;
+      observedDepositTranscriptHashes: string[];
+      rosterHash: string;
+      selectedSlots: number[];
+      selfSlot: number;
+      playerId: number;
+      vaultEk: string;
+      senderAddress: string;
+      assetType: string;
+      chainId: number;
+      root: string;
+      nullifierHash: string;
+      recipient: string;
+      recipientHash: string;
+      amountTag: string;
+      vaultSequence: number;
+      expirySecs: number;
+      requestHash: string;
+      depositCount: number;
+      previousRoundTranscriptHash: string;
+      previousRoundCommitments: string[];
+      recipientEk: string;
+      oldBalanceC: string[];
+      oldBalanceD: string[];
+      newBalanceC: string[];
+      newBalanceD: string[];
+      transferAmountC: string[];
+      transferAmountDSender: string[];
+      transferAmountDRecipient: string[];
+    };
+
+    function stubMpccaRound2Forwarder(opts: {
+      tamperWorkerHash?: (slot: number) => boolean;
+      tamperDkIndices?: (slot: number) => number[] | undefined;
+      onCall?: (slot: number, signal?: AbortSignal) => Promise<void>;
+      neverResolve?: (slot: number) => boolean;
+    }) {
+      return async (
+        path: string,
+        body: unknown,
+        _roster: unknown,
+        slot: number,
+        signal?: AbortSignal,
+      ) => {
+        if (opts.onCall) await opts.onCall(slot, signal);
+        if (opts.neverResolve && opts.neverResolve(slot)) {
+          // Wait until aborted, then throw.
+          await new Promise<void>((_, reject) => {
+            if (signal?.aborted) reject(new Error("aborted"));
+            signal?.addEventListener(
+              "abort",
+              () => reject(new Error("aborted")),
+              { once: true },
+            );
+          });
+        }
+        if (path !== "/worker/v2/mpcca/withdraw/round2") {
+          return {
+            slot,
+            ok: false,
+            statusCode: 500,
+            body: { error: "unexpected_path", path },
+          };
+        }
+        const b = body as ParsedRound2Body;
+        const playerId = b.selectedSlots.indexOf(slot);
+        const canonicalHash = (await import("@eunoma/deop-protocol"))
+          .mpccaWithdrawRound2WorkerTranscriptHash({
+            sessionId: b.sessionId,
+            requestId: b.requestId,
+            dkgEpoch: b.dkgEpoch,
+            vaultEkTranscriptHash: b.vaultEkTranscriptHash,
+            registrationTranscriptHash: b.registrationTranscriptHash,
+            vaultStateInitTranscriptHash: b.vaultStateInitTranscriptHash,
+            observedDepositTranscriptHashes: b.observedDepositTranscriptHashes,
+            rosterHash: b.rosterHash,
+            sortedSelectedSlots: b.selectedSlots,
+            selfSlot: slot,
+            playerId,
+            vaultEk: b.vaultEk,
+            senderAddress: b.senderAddress,
+            assetType: b.assetType,
+            chainId: b.chainId,
+            root: b.root,
+            nullifierHash: b.nullifierHash,
+            recipient: b.recipient,
+            recipientHash: b.recipientHash,
+            amountTag: b.amountTag,
+            vaultSequence: b.vaultSequence,
+            expirySecs: b.expirySecs,
+            requestHash: b.requestHash,
+            depositCount: b.depositCount,
+            previousRoundTranscriptHash: b.previousRoundTranscriptHash,
+            previousRoundCommitments: b.previousRoundCommitments,
+            statementInputs: {
+              recipientEk: b.recipientEk,
+              oldBalanceC: b.oldBalanceC,
+              oldBalanceD: b.oldBalanceD,
+              newBalanceC: b.newBalanceC,
+              newBalanceD: b.newBalanceD,
+              transferAmountC: b.transferAmountC,
+              transferAmountDSender: b.transferAmountDSender,
+              transferAmountDRecipient: b.transferAmountDRecipient,
+            },
+          });
+        const workerTranscriptHash =
+          opts.tamperWorkerHash && opts.tamperWorkerHash(slot)
+            ? h32(String((slot + 5) % 9))
+            : canonicalHash;
+        const dkBaseIndicesUsed =
+          (opts.tamperDkIndices && opts.tamperDkIndices(slot)) ?? [0, 17];
+        const partialDkCommitments = dkBaseIndicesUsed.map((index) => ({
+          index,
+          commitmentHex: h32(String((index + slot + 3) % 9)),
+        }));
+        return {
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {
+            slot,
+            playerId,
+            sessionStatePath: `/tmp/slot-${slot}/mpc-sessions/req__sess/mpcca_withdraw_v2_round2.json`,
+            sessionStateHash: h32(String((slot + 2) % 9)),
+            workerTranscriptHash,
+            observedAtUnixMs: 1_700_000_000_000 + slot,
+            completed: true,
+            partialDkCommitments,
+            dkBaseIndicesUsed,
+          },
+        };
+      };
+    }
+
+    it("round2_happy_path_concurrent_fan_out_persists_aggregate_hash", async () => {
+      const { mkdir } = await import("node:fs/promises");
+      const { readFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-happy-");
+      await mkdir(join(stateRoot, "coordinator", "mpcca_withdraw"), {
+        recursive: true,
+      });
+
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({ rosterHash: rosterHashHex });
+      const perSlotIngress = new Map<number, string>([
+        [0, h32("a0")],
+        [1, h32("a1")],
+        [2, h32("a2")],
+        [3, h32("a3")],
+        [4, h32("a4")],
+      ]);
+      await stageRound1Artifact(stateRoot, body, rosterHashHex, perSlotIngress);
+
+      // KILLER: concurrent fan-out — all 5 workers in flight at once before any completes.
+      let inFlight = 0;
+      let peak = 0;
+      let releaseBarrier: () => void = () => {};
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({
+          onCall: async () => {
+            inFlight += 1;
+            peak = Math.max(peak, inFlight);
+            if (inFlight === 5) queueMicrotask(() => releaseBarrier());
+            await barrier;
+            inFlight -= 1;
+          },
+        }),
+      });
+
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(200);
+      const respBody = res.json();
+      expect(respBody.accepted).toBe(false);
+      expect(respBody.round).toBe("round2");
+      expect(respBody.completed).toBe(true);
+      expect(respBody.requestId).toBe("mpcca-wdr-r2");
+      expect(respBody.dkBaseIndicesUsed).toEqual([0, 17]);
+      expect(respBody.perSlotContributions).toHaveLength(5);
+      expect(peak).toBe(5);
+      expect(respBody.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+
+      // Persisted __round2.json sanity.
+      const round2Path = join(
+        stateRoot,
+        "coordinator",
+        "mpcca_withdraw",
+        "1__mpcca-wdr-r2__round2.json",
+      );
+      const raw = await readFile(round2Path, "utf8");
+      const persisted = JSON.parse(raw);
+      expect(persisted.scheme).toBe("mpcca_withdraw_v2_round2_dk");
+      expect(persisted.transcriptHash).toBe(respBody.transcriptHash);
+      expect(persisted.dkBaseIndicesUsed).toEqual([0, 17]);
+      expect(persisted.perSlotContributions).toHaveLength(5);
+      expect(persisted.userProofArtifacts.bulletproofZkrpAmountHex).toBe(
+        body.bulletproofZkrpAmountHex,
+      );
+      expect(persisted.statementInputsHashHex).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it("round2_rejects_when_round1_transcript_missing", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-no-round1-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({ rosterHash: rosterHashHex });
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({}),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("round1_transcript_not_found");
+    });
+
+    it("round2_rejects_when_round1_identity_mismatch_vaultEk", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-mismatch-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({ rosterHash: rosterHashHex });
+      const perSlotIngress = new Map<number, string>(
+        [0, 1, 2, 3, 4].map((s) => [s, h32(String(s))]),
+      );
+      // Stage round1 with DIFFERENT vaultEk than round2 request.
+      const staleBody = { ...body, vaultEk: h32("ff") };
+      await stageRound1Artifact(stateRoot, staleBody, rosterHashHex, perSlotIngress);
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({}),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("round1_transcript_identity_mismatch");
+      expect(res.json().field).toBe("vaultEk");
+    });
+
+    it("round2_rejects_when_worker_timeout_fires", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-timeout-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({ rosterHash: rosterHashHex });
+      const perSlotIngress = new Map<number, string>(
+        [0, 1, 2, 3, 4].map((s) => [s, h32(String(s))]),
+      );
+      await stageRound1Artifact(stateRoot, body, rosterHashHex, perSlotIngress);
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        mpccaWithdrawRound2WorkerTimeoutMs: 50,
+        singleNodeForwarder: stubMpccaRound2Forwarder({
+          // Slot 2 never resolves → AbortController fires after 50ms.
+          neverResolve: (slot) => slot === 2,
+        }),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(502);
+      expect(res.json().error).toBe("round2_worker_timeout");
+      expect(res.json().slot).toBe(2);
+      expect(res.json().timeoutMs).toBe(50);
+    });
+
+    it("round2_rejects_when_worker_transcript_hash_diverges", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-hash-bad-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({ rosterHash: rosterHashHex });
+      const perSlotIngress = new Map<number, string>(
+        [0, 1, 2, 3, 4].map((s) => [s, h32(String(s))]),
+      );
+      await stageRound1Artifact(stateRoot, body, rosterHashHex, perSlotIngress);
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({
+          tamperWorkerHash: (slot) => slot === 3,
+        }),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(502);
+      expect(res.json().error).toBe("round2_worker_transcript_hash_mismatch");
+      expect(res.json().slot).toBe(3);
+    });
+
+    it("round2_rejects_when_dk_base_indices_diverge_across_workers", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-divergence-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({ rosterHash: rosterHashHex });
+      const perSlotIngress = new Map<number, string>(
+        [0, 1, 2, 3, 4].map((s) => [s, h32(String(s))]),
+      );
+      await stageRound1Artifact(stateRoot, body, rosterHashHex, perSlotIngress);
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({
+          // Slot 0 returns canonical [0,17] (first worker → sets canonical baseline).
+          // Slot 1 returns [0] only → invalid wrt canonical AND will be rejected by
+          // parseMpccaWithdrawRound2DkResult before divergence check fires.
+          tamperDkIndices: (slot) => (slot === 1 ? [0] : [0, 17]),
+        }),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(502);
+      // Could be either `round2_returned_invalid` (parse rejected [0] alone — canonical set is [0,17])
+      // or `dk_base_indices_divergence` (canonical anchored from slot 0, slot 1 differs).
+      // The parser-level check fires earlier (per-worker), so we expect round2_returned_invalid.
+      // But the rejection at minimum surfaces a 502 with a structured error code.
+      const errBody = res.json();
+      expect(errBody.error).toMatch(/(round2_returned_invalid|dk_base_indices_divergence)/);
+      expect(errBody.slot).toBe(1);
+    });
+
+    it("round2_rejects_forbidden_plaintext_field_amount", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-forbidden-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({
+        rosterHash: rosterHashHex,
+        amount: "1000",
+      });
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({}),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("forbidden_plaintext_field");
+      expect(res.json().field).toBe("amount");
+    });
+
+    it("round2_rejects_forbidden_plaintext_field_dkShare", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-dkshare-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({
+        rosterHash: rosterHashHex,
+        dkShare: "deadbeef",
+      });
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({}),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("forbidden_plaintext_field");
+    });
+
+    it("round2_rejects_empty_bulletproof_bytes", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-emptybp-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({
+        rosterHash: rosterHashHex,
+        bulletproofZkrpAmountHex: "",
+      });
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({}),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("INVALID_BULLETPROOF_BYTES");
+    });
+
+    it("round2_rejects_when_state_root_not_configured", async () => {
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({ rosterHash: rosterHashHex });
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        // No stateRoot configured.
+        singleNodeForwarder: stubMpccaRound2Forwarder({}),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("state_root_not_configured");
+    });
+
+    it("round2_rejects_stale_dkg_epoch", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-stale-epoch-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({
+        rosterHash: rosterHashHex,
+        dkgEpoch: "999",
+      });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({}),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("stale_dkg_epoch");
+    });
+
+    it("round2_returns_409_when_withdraw_lock_busy", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-round2-lockbusy-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildRound2OrchestrateBody({ rosterHash: rosterHashHex });
+      const perSlotIngress = new Map<number, string>(
+        [0, 1, 2, 3, 4].map((s) => [s, h32(String(s))]),
+      );
+      await stageRound1Artifact(stateRoot, body, rosterHashHex, perSlotIngress);
+
+      let releaseBarrier: () => void = () => {};
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubMpccaRound2Forwarder({
+          onCall: async () => {
+            await barrier;
+          },
+        }),
+      });
+      // Stage round1 artifact for the second request id too, so both reach lock acquisition.
+      await stageRound1Artifact(
+        stateRoot,
+        { ...body, requestId: "mpcca-wdr-r2-second" },
+        rosterHashHex,
+        perSlotIngress,
+      );
+      // First call holds the lock by parking on the barrier.
+      const firstCall = server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: body,
+      });
+      // Wait long enough for the first request to acquire the lock + start fan-out.
+      await new Promise((r) => setTimeout(r, 200));
+      // Second call (different requestId so they don't collide on the __round2.json path)
+      // hits the same lock and gets 409.
+      const secondCall = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/round2",
+        payload: { ...body, requestId: "mpcca-wdr-r2-second" },
+      });
+      releaseBarrier();
+      await firstCall;
+      expect(secondCall.statusCode).toBe(409);
+      expect(secondCall.json().error).toBe("vault_mpcca_withdraw_in_flight");
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------------
   // Milestone 5 sub-milestone 5b — POST /v2/withdraw/mpcca/submit orchestrator.
   //
   // M5b is plumbing-only: the finalize transcript is still the M3a NotImplemented stub today,

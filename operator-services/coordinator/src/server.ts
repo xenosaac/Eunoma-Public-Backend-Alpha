@@ -18,6 +18,10 @@ import {
   ingressEnvelopesHash,
   lagrangeCoefficientsAtZero,
   mpccaWithdrawRound1WorkerTranscriptHash,
+  mpccaWithdrawRound2AggregateHash,
+  mpccaWithdrawRound2StatementInputsHash,
+  mpccaWithdrawRound2WorkerTranscriptHash,
+  DK_BASE_INDICES_CANONICAL,
   parseCaRegistrationAggregateRequest,
   parseCaRegistrationAggregateResult,
   parseCaRegistrationChallengeRequest,
@@ -35,6 +39,8 @@ import {
   parseMpccaRoundRequest,
   parseMpccaRoundResult,
   parseMpccaWithdrawRound1Response,
+  parseMpccaWithdrawRound2DkResult,
+  parseMpccaWithdrawRound2OrchestrateRequest,
   parseMpccaWithdrawSubmitRequest,
   parseObserveDepositResponse,
   parseSessionShareEnvelope,
@@ -59,6 +65,10 @@ import {
   type FrostRound1Broadcast,
   type FrostRound2Envelope,
   type MpccaWithdrawRound1Contribution,
+  type MpccaWithdrawRound2DkPartial,
+  type MpccaWithdrawRound2DkResult,
+  type MpccaWithdrawRound2OrchestrateRequest,
+  type MpccaWithdrawRound2StatementInputFields,
   type ObserveDepositContribution,
   type SessionShareEnvelope,
   type VaultEkContribution,
@@ -141,6 +151,13 @@ export type SingleNodeForwarder = (
   body: unknown,
   roster: RoutableRoster,
   slot: number,
+  /**
+   * M4 Commit 2 — optional `AbortSignal` to bound the per-worker request. The default
+   * `forwardToRosterNode` passes the signal to `fetch`; injected test forwarders may
+   * ignore the signal (existing call sites don't pass one, so backwards compatibility
+   * is preserved).
+   */
+  signal?: AbortSignal,
 ) => Promise<ProxyForwardResult>;
 
 export interface RoutableRoster {
@@ -192,6 +209,12 @@ export interface CoordinatorServerOptions {
    * Milestone 5b: timeout for waitForTx polling (default 30s).
    */
   chainConfirmationTimeoutMs?: number;
+  /**
+   * M4 Commit 2 — per-worker `AbortController` timeout for the round2 fan-out. Default 30s.
+   * When the timeout fires, the underlying `fetch` is aborted and the coordinator surfaces
+   * a `round2_worker_timeout` 502 for the slow slot.
+   */
+  mpccaWithdrawRound2WorkerTimeoutMs?: number;
 }
 
 export function buildCoordinatorServer(
@@ -3672,6 +3695,578 @@ export function buildCoordinatorServer(
   });
 
   // =================================================================================================
+  // M4 Commit 2 — MPCCA withdraw V2 round2 fan-out orchestrator.
+  //
+  // POST /v2/withdraw/mpcca/round2 takes the user's Aptos CA TransferV1 Statement input fields +
+  // pre-computed user-side sigma artifacts + Bulletproof bytes, lifts the public chained-round
+  // binding from the persisted `__round1.json` artifact, and fans out the per-worker Round2Request
+  // (chained envelope + Statement inputs only — user sigma artifacts NEVER cross the worker
+  // boundary). Workers contribute the dk-component partial commitments at canonical BASE_DK_SET
+  // positions `[0, 17]` (programmatically derived by each worker, never trusted from the wire).
+  //
+  // Privacy contract: workers see only the Statement inputs (public chain ciphertexts +
+  // recipient_ek). The user's Bulletproof bytes / per-chunk commitments / sigma α-points /
+  // response shares stay coordinator-side and are persisted echoed into `__round2.json` for
+  // commit 4 (finalize) to consume.
+  //
+  // Wire shape:
+  //   1. Forbidden-plaintext-field guard on the raw body.
+  //   2. `parseMpccaWithdrawRound2OrchestrateRequest` — strict shape validation.
+  //   3. `isSafeId(requestId)` before any FS path construction.
+  //   4. Load `__round1.json` for `(dkgEpoch, requestId)` from the persisted M1 ingress
+  //      artifact. Verify every identity field matches the round2 body. 400
+  //      `round1_transcript_not_found` if absent; 400 `round1_transcript_identity_mismatch`
+  //      if any field drifts.
+  //   5. Acquire `vaultMpccaWithdrawInFlight` (re-used from M3a; ensures only one withdraw
+  //      session at a time). 409 `vault_mpcca_withdraw_in_flight` on contention.
+  //   6. Build per-worker `Round2Request` body: chained-round envelope (with
+  //      `previousRoundTranscriptHash` = round1.transcriptHash and
+  //      `previousRoundCommitments[i]` = round1.perSlotContributions[i].ingressTranscriptHash)
+  //      plus the 7 Statement input fields. Critically, user-supplied proof artifacts
+  //      (Bulletproof bytes, user sigma commitments, etc.) are NOT forwarded — they stay
+  //      coordinator-side.
+  //   7. `Promise.all` fan-out with per-worker `AbortController` timeout (default 30s, configurable
+  //      via `mpccaWithdrawRound2WorkerTimeoutMs`). A worker timeout surfaces 502
+  //      `round2_worker_timeout` for that slot.
+  //   8. Collect 5 `Round2DkResult` artifacts. Validate:
+  //      a. Every slot in `sortedSelectedSlots` returned a body (under-quorum / duplicate /
+  //         unknown slot all surface 502).
+  //      b. Each worker's `workerTranscriptHash` byte-equals the coordinator's recompute
+  //         via `mpccaWithdrawRound2WorkerTranscriptHash` (binds round1 chain + Statement).
+  //      c. Every worker's `dkBaseIndicesUsed` equals the canonical `[0, 17]`. Cross-worker
+  //         divergence surfaces 502 `dk_base_indices_divergence`.
+  //   9. Compute deterministic `round2AggregateHash` via `mpccaWithdrawRound2AggregateHash`.
+  //  10. Persist `__round2.json` at
+  //      `<stateRoot>/coordinator/mpcca_withdraw/<dkgEpoch>__<requestId>__round2.json` (atomic
+  //      0o600). The persisted shape includes the user's proof artifacts so commit 4 (finalize)
+  //      can read them without re-asking the user.
+  //  11. Return 200 with deterministic `transcriptHash` (= `round2AggregateHash`),
+  //      `previousRoundTranscriptHash` (= round1.transcriptHash), per-slot dk partials.
+  // =================================================================================================
+  const mpccaWithdrawRound2WorkerTimeoutMs =
+    opts.mpccaWithdrawRound2WorkerTimeoutMs ?? 30_000;
+  server.post("/v2/withdraw/mpcca/round2", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      // 1+2. Forbidden-plaintext-field guard + parse.
+      let parsed: MpccaWithdrawRound2OrchestrateRequest;
+      try {
+        parsed = parseMpccaWithdrawRound2OrchestrateRequest(raw);
+      } catch (err) {
+        if (err instanceof ForbiddenPlaintextFieldError) {
+          return reply
+            .code(400)
+            .send({ error: "forbidden_plaintext_field", field: err.path });
+        }
+        if (err instanceof MpccaWithdrawV2Error) {
+          return reply.code(400).send({ error: err.code, message: err.message });
+        }
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: err instanceof Error ? err.message : "unknown",
+        });
+      }
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+      if (parsed.rosterHash !== dkgRosterHash) {
+        return reply.code(400).send({
+          error: "stale_roster_hash",
+          requestId: parsed.requestId,
+          message: `rosterHash mismatch (request=${parsed.rosterHash}, roster=${dkgRosterHash})`,
+        });
+      }
+      if (parsed.dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          requestId: parsed.requestId,
+          message: `dkgEpoch mismatch (request=${parsed.dkgEpoch}, roster=${dkgRoster.dkgEpoch})`,
+        });
+      }
+      // 3. Sanitize requestId BEFORE any FS path construction.
+      requestId = parsed.requestId;
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds it into FS paths",
+        });
+      }
+      const sortedSelectedSlots = [...parsed.selectedSlots].sort((a, b) => a - b);
+
+      // 4. Load __round1.json artifact. We need stateRoot to find it; if not configured
+      // and this is an inline test scenario, we can fall back to caller-supplied
+      // previousRoundTranscriptHash + previousRoundCommitments — but the production wire
+      // expects stateRoot to be set and the round1 artifact to be on disk.
+      if (!opts.stateRoot) {
+        return reply.code(400).send({
+          error: "state_root_not_configured",
+          requestId,
+          message:
+            "MPCCA withdraw round2 requires stateRoot to be configured so the round1 transcript " +
+            "can be read from disk. Configure EUNOMA_STATE_ROOT or run via /v2/withdraw/mpcca/start " +
+            "with stateRoot before round2.",
+        });
+      }
+      const round1ArtifactPath = join(
+        opts.stateRoot,
+        "coordinator",
+        "mpcca_withdraw",
+        `${parsed.dkgEpoch}__${requestId}__round1.json`,
+      );
+      let round1Artifact: Record<string, unknown>;
+      try {
+        const raw1 = await readFile(round1ArtifactPath, "utf8");
+        round1Artifact = JSON.parse(raw1) as Record<string, unknown>;
+      } catch (err) {
+        return reply.code(400).send({
+          error: "round1_transcript_not_found",
+          requestId,
+          path: round1ArtifactPath,
+          message:
+            err instanceof Error ? err.message : "unable to read round1 artifact",
+        });
+      }
+      const round1IdentityMismatch = compareRound2IdentityWithRound1(
+        parsed,
+        round1Artifact,
+        sortedSelectedSlots,
+      );
+      if (round1IdentityMismatch) {
+        return reply.code(400).send({
+          error: "round1_transcript_identity_mismatch",
+          requestId,
+          field: round1IdentityMismatch.field,
+          round1Value: round1IdentityMismatch.round1Value,
+          requestValue: round1IdentityMismatch.requestValue,
+        });
+      }
+      const round1TranscriptHash = (round1Artifact.transcriptHash as string).replace(
+        /^0x/i,
+        "",
+      );
+      const round1PerSlot = round1Artifact.perSlotContributions as Array<{
+        slot: number;
+        ingressTranscriptHash: string;
+      }>;
+      // previousRoundCommitments[i] = ingressTranscriptHash of slot sortedSelectedSlots[i].
+      const previousRoundCommitments: string[] = [];
+      for (const slot of sortedSelectedSlots) {
+        const entry = round1PerSlot.find((c) => c.slot === slot);
+        if (!entry) {
+          return reply.code(400).send({
+            error: "round1_transcript_identity_mismatch",
+            requestId,
+            field: "perSlotContributions",
+            message: `round1 artifact missing slot ${slot}`,
+          });
+        }
+        previousRoundCommitments.push(
+          entry.ingressTranscriptHash.replace(/^0x/i, ""),
+        );
+      }
+
+      // 5. Acquire MPCCA withdraw lock.
+      const lock = await acquireVaultMpccaWithdrawLock();
+      if (lock === "busy") {
+        return reply.code(409).send({
+          error: "vault_mpcca_withdraw_in_flight",
+          requestId,
+          message:
+            "another MPCCA withdraw session is in progress; retry shortly",
+        });
+      }
+
+      try {
+        const statementInputs: MpccaWithdrawRound2StatementInputFields = {
+          recipientEk: parsed.recipientEk,
+          oldBalanceC: parsed.oldBalanceC,
+          oldBalanceD: parsed.oldBalanceD,
+          newBalanceC: parsed.newBalanceC,
+          newBalanceD: parsed.newBalanceD,
+          transferAmountC: parsed.transferAmountC,
+          transferAmountDSender: parsed.transferAmountDSender,
+          transferAmountDRecipient: parsed.transferAmountDRecipient,
+        };
+        // 6. Build per-worker round2 request bodies.
+        const sessionId = parsed.sessionId;
+        const round2Bodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
+          dkgEpoch: parsed.dkgEpoch,
+          requestId: requestId!,
+          sessionId,
+          vaultEkTranscriptHash: parsed.vaultEkTranscriptHash,
+          registrationTranscriptHash: parsed.registrationTranscriptHash,
+          vaultStateInitTranscriptHash: parsed.vaultStateInitTranscriptHash,
+          observedDepositTranscriptHashes: parsed.observedDepositTranscriptHashes,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selfSlot: slot,
+          playerId: ordinalIndex,
+          vaultEk: parsed.vaultEk,
+          senderAddress: parsed.senderAddress,
+          assetType: parsed.assetType,
+          chainId: parsed.chainId,
+          root: parsed.root,
+          nullifierHash: parsed.nullifierHash,
+          recipient: parsed.recipient,
+          recipientHash: parsed.recipientHash,
+          amountTag: parsed.amountTag,
+          vaultSequence: parsed.vaultSequence,
+          expirySecs: parsed.expirySecs,
+          requestHash: parsed.requestHash,
+          depositCount: parsed.depositCount,
+          previousRoundTranscriptHash: round1TranscriptHash,
+          previousRoundCommitments,
+          // Statement input fields — workers consume these to reconstruct the public
+          // Aptos CA TransferV1 Statement and derive BASE_DK_SET via psi_transfer.
+          recipientEk: statementInputs.recipientEk,
+          oldBalanceC: statementInputs.oldBalanceC,
+          oldBalanceD: statementInputs.oldBalanceD,
+          newBalanceC: statementInputs.newBalanceC,
+          newBalanceD: statementInputs.newBalanceD,
+          transferAmountC: statementInputs.transferAmountC,
+          transferAmountDSender: statementInputs.transferAmountDSender,
+          transferAmountDRecipient: statementInputs.transferAmountDRecipient,
+        }));
+
+        // 7. Concurrent fan-out with AbortController timeouts.
+        const fanoutPromises = sortedSelectedSlots.map((slot, ordinalIndex) => {
+          const controller = new AbortController();
+          const timer = setTimeout(
+            () => controller.abort(),
+            mpccaWithdrawRound2WorkerTimeoutMs,
+          );
+          return singleNodeForwarder(
+            "/worker/v2/mpcca/withdraw/round2",
+            round2Bodies[ordinalIndex],
+            dkgRoster,
+            slot,
+            controller.signal,
+          )
+            .then(
+              (value) => ({
+                kind: "value" as const,
+                slot,
+                value,
+                aborted: controller.signal.aborted,
+              }),
+              (reason) => ({
+                kind: "rejected" as const,
+                slot,
+                reason,
+                aborted: controller.signal.aborted,
+              }),
+            )
+            .finally(() => clearTimeout(timer));
+        });
+        const forwarded = await Promise.all(fanoutPromises);
+
+        // 8. Parse + cross-check.
+        const responsesBySlot = new Map<number, MpccaWithdrawRound2DkResult>();
+        const seenSlots = new Set<number>();
+        let canonicalDkIndices: number[] | null = null;
+        for (const res of forwarded) {
+          if (seenSlots.has(res.slot)) {
+            return reply.code(502).send({
+              error: "round2_duplicate_slot",
+              slot: res.slot,
+              requestId,
+            });
+          }
+          seenSlots.add(res.slot);
+          if (res.kind === "rejected") {
+            // AbortController triggered → worker_timeout 502. Else generic forward_rejected.
+            if (res.aborted) {
+              return reply.code(502).send({
+                error: "round2_worker_timeout",
+                slot: res.slot,
+                requestId,
+                timeoutMs: mpccaWithdrawRound2WorkerTimeoutMs,
+              });
+            }
+            return reply.code(502).send({
+              error: "round2_forward_rejected",
+              slot: res.slot,
+              requestId,
+              reason: res.reason instanceof Error ? res.reason.message : String(res.reason),
+            });
+          }
+          if (res.aborted) {
+            // Some forwarders may resolve with an error result instead of throwing on abort.
+            return reply.code(502).send({
+              error: "round2_worker_timeout",
+              slot: res.slot,
+              requestId,
+              timeoutMs: mpccaWithdrawRound2WorkerTimeoutMs,
+            });
+          }
+          if (res.value.statusCode !== 200) {
+            return reply.code(502).send({
+              error: "round2_unexpected_status",
+              slot: res.slot,
+              requestId,
+              statusCode: res.value.statusCode,
+              body: res.value.body,
+            });
+          }
+          if (!res.value.body) {
+            return reply.code(502).send({
+              error: "round2_empty_body",
+              slot: res.slot,
+              requestId,
+            });
+          }
+          let dkResult: MpccaWithdrawRound2DkResult;
+          try {
+            dkResult = parseMpccaWithdrawRound2DkResult(res.value.body);
+          } catch (err) {
+            return reply.code(502).send({
+              error: "round2_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: err instanceof Error ? err.message : "unknown",
+            });
+          }
+          if (dkResult.slot !== res.slot) {
+            return reply.code(502).send({
+              error: "round2_slot_drift",
+              slot: res.slot,
+              requestId,
+              returnedSlot: dkResult.slot,
+            });
+          }
+          if (dkResult.playerId !== sortedSelectedSlots.indexOf(res.slot)) {
+            return reply.code(502).send({
+              error: "round2_player_id_drift",
+              slot: res.slot,
+              requestId,
+              returnedPlayerId: dkResult.playerId,
+            });
+          }
+          // Coordinator recomputes the round2 worker_transcript_hash from public inputs
+          // (chained binding + Statement input fields). Cross-check binds the worker to
+          // the canonical body.
+          const expectedHash = mpccaWithdrawRound2WorkerTranscriptHash({
+            sessionId,
+            requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            vaultEkTranscriptHash: parsed.vaultEkTranscriptHash,
+            registrationTranscriptHash: parsed.registrationTranscriptHash,
+            vaultStateInitTranscriptHash: parsed.vaultStateInitTranscriptHash,
+            observedDepositTranscriptHashes: parsed.observedDepositTranscriptHashes,
+            rosterHash: dkgRosterHash,
+            sortedSelectedSlots,
+            selfSlot: res.slot,
+            playerId: sortedSelectedSlots.indexOf(res.slot),
+            vaultEk: parsed.vaultEk,
+            senderAddress: parsed.senderAddress,
+            assetType: parsed.assetType,
+            chainId: parsed.chainId,
+            root: parsed.root,
+            nullifierHash: parsed.nullifierHash,
+            recipient: parsed.recipient,
+            recipientHash: parsed.recipientHash,
+            amountTag: parsed.amountTag,
+            vaultSequence: parsed.vaultSequence,
+            expirySecs: parsed.expirySecs,
+            requestHash: parsed.requestHash,
+            depositCount: parsed.depositCount,
+            previousRoundTranscriptHash: round1TranscriptHash,
+            previousRoundCommitments,
+            statementInputs,
+          });
+          if (dkResult.workerTranscriptHash !== expectedHash) {
+            return reply.code(502).send({
+              error: "round2_worker_transcript_hash_mismatch",
+              slot: res.slot,
+              requestId,
+              expected: expectedHash,
+              actual: dkResult.workerTranscriptHash,
+            });
+          }
+          // Cross-worker dk_base_indices_used agreement: all 5 workers must report the
+          // SAME canonical set (= `[0, 17]` for Aptos CA TransferV1). A divergence means
+          // one worker mis-derived BASE_DK_SET — abort the round.
+          const sortedDkIndices = [...dkResult.dkBaseIndicesUsed].sort((a, b) => a - b);
+          if (canonicalDkIndices === null) {
+            canonicalDkIndices = sortedDkIndices;
+          } else if (
+            canonicalDkIndices.length !== sortedDkIndices.length ||
+            canonicalDkIndices.some((v, i) => v !== sortedDkIndices[i])
+          ) {
+            return reply.code(502).send({
+              error: "dk_base_indices_divergence",
+              slot: res.slot,
+              requestId,
+              expected: canonicalDkIndices,
+              actual: sortedDkIndices,
+            });
+          }
+          responsesBySlot.set(res.slot, dkResult);
+        }
+        // Quorum check: every selected slot must have responded.
+        if (responsesBySlot.size !== DEOPERATOR_THRESHOLD) {
+          return reply.code(502).send({
+            error: "round2_under_quorum",
+            requestId,
+            received: responsesBySlot.size,
+            expected: DEOPERATOR_THRESHOLD,
+          });
+        }
+        // Verify canonical BASE_DK_SET. Defense-in-depth — each parse already restricts
+        // entries to `DK_BASE_INDICES_CANONICAL`, but a future refactor that broadens the
+        // canonical set must still fail closed if the runtime indices drift.
+        const expectedCanonical = [...DK_BASE_INDICES_CANONICAL].sort((a, b) => a - b);
+        if (
+          !canonicalDkIndices ||
+          canonicalDkIndices.length !== expectedCanonical.length ||
+          canonicalDkIndices.some((v, i) => v !== expectedCanonical[i])
+        ) {
+          return reply.code(502).send({
+            error: "dk_base_indices_unexpected",
+            requestId,
+            expected: expectedCanonical,
+            actual: canonicalDkIndices ?? [],
+          });
+        }
+
+        // 9. Compute deterministic round2 aggregate hash.
+        const perSlotContributionsOrdered = sortedSelectedSlots.map((slot) => {
+          const r = responsesBySlot.get(slot)!;
+          return {
+            slot,
+            playerId: r.playerId,
+            sessionStateHash: r.sessionStateHash,
+            workerTranscriptHash: r.workerTranscriptHash,
+            partialDkCommitments: r.partialDkCommitments,
+            dkBaseIndicesUsed: r.dkBaseIndicesUsed,
+          };
+        });
+        const round2AggregateHash = mpccaWithdrawRound2AggregateHash({
+          statementInputs,
+          dkBaseIndicesUsed: canonicalDkIndices,
+          perSlotContributions: perSlotContributionsOrdered,
+        });
+        const statementInputsHashHex =
+          mpccaWithdrawRound2StatementInputsHash(statementInputs);
+
+        // 10. Persist __round2.json with public-only artifacts. User-supplied proof
+        // artifacts (Bulletproof bytes + per-chunk commitments + user sigma commitments
+        // + user sigma response shares) are echoed-back so commit 4 (finalize) can
+        // consume them without re-asking the user. All entries are public crypto outputs
+        // — no plaintext witness component appears here.
+        const round2ArtifactWithoutHash = {
+          scheme: "mpcca_withdraw_v2_round2_dk" as const,
+          dkgEpoch: parsed.dkgEpoch,
+          requestId,
+          sessionId,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          vaultEkTranscriptHash: parsed.vaultEkTranscriptHash,
+          registrationTranscriptHash: parsed.registrationTranscriptHash,
+          vaultStateInitTranscriptHash: parsed.vaultStateInitTranscriptHash,
+          observedDepositTranscriptHashes: parsed.observedDepositTranscriptHashes,
+          vaultEk: parsed.vaultEk,
+          senderAddress: parsed.senderAddress,
+          assetType: parsed.assetType,
+          chainId: parsed.chainId,
+          root: parsed.root,
+          nullifierHash: parsed.nullifierHash,
+          recipient: parsed.recipient,
+          recipientHash: parsed.recipientHash,
+          amountTag: parsed.amountTag,
+          vaultSequence: parsed.vaultSequence,
+          expirySecs: parsed.expirySecs,
+          requestHash: parsed.requestHash,
+          depositCount: parsed.depositCount,
+          previousRoundTranscriptHash: round1TranscriptHash,
+          previousRoundCommitments,
+          statementInputs,
+          statementInputsHashHex,
+          dkBaseIndicesUsed: canonicalDkIndices,
+          perSlotContributions: perSlotContributionsOrdered,
+          // User-supplied proof artifacts (echo-back). Commit 4 (finalize coord) consumes them.
+          userProofArtifacts: {
+            userSigmaCommitmentsHex: parsed.userSigmaCommitmentsHex,
+            userSigmaResponseSharesHex: parsed.userSigmaResponseSharesHex,
+            bulletproofZkrpAmountHex: parsed.bulletproofZkrpAmountHex,
+            bulletproofZkrpNewBalanceHex: parsed.bulletproofZkrpNewBalanceHex,
+            perChunkCommitmentsAmountHex: parsed.perChunkCommitmentsAmountHex,
+            perChunkCommitmentsNewBalanceHex: parsed.perChunkCommitmentsNewBalanceHex,
+          },
+          round1TranscriptHash,
+          round1TranscriptPath: round1ArtifactPath,
+          createdAtUnixMs: Date.now(),
+        };
+        const round2TranscriptArtifact = {
+          ...round2ArtifactWithoutHash,
+          transcriptHash: round2AggregateHash,
+        };
+        const round2TranscriptPath = join(
+          opts.stateRoot,
+          "coordinator",
+          "mpcca_withdraw",
+          `${parsed.dkgEpoch}__${requestId}__round2.json`,
+        );
+        await writeTranscriptArtifactAtomic(
+          round2TranscriptPath,
+          round2TranscriptArtifact,
+        );
+        for (const slot of sortedSelectedSlots) {
+          const r = responsesBySlot.get(slot)!;
+          await store.recordPartialArtifact({
+            requestId,
+            sessionId,
+            rosterHash: dkgRosterHash,
+            slot,
+            artifactKind: "mpcca-withdraw-v2-round2-dk",
+            artifactHash: r.sessionStateHash,
+            transcriptHash: r.workerTranscriptHash,
+          });
+        }
+
+        // 11. Return 200 with deterministic round2 transcriptHash + per-slot dk partials.
+        return reply.code(200).send({
+          accepted: false,
+          requestId,
+          dkgEpoch: parsed.dkgEpoch,
+          round: "round2",
+          completed: true,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          dkBaseIndicesUsed: canonicalDkIndices,
+          perSlotContributions: perSlotContributionsOrdered,
+          previousRoundTranscriptHash: round1TranscriptHash,
+          statementInputsHashHex,
+          transcriptHash: round2AggregateHash,
+          transcriptPath: round2TranscriptPath,
+          message:
+            "M4 commit 2 round2 dk-component fan-out complete; commit 3 (finalize worker) " +
+            "consumes the per-slot α-share via at-rest envelopes, commit 4 (finalize coord) " +
+            "aggregates s[0] + assembles WithdrawV2CallArgs.",
+        });
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      if (requestId) await store.markAborted(requestId);
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof MpccaWithdrawV2Error) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // =================================================================================================
   // Milestone 5 sub-milestone 5b — MPCCA withdraw V2 chain-submit orchestrator.
   //
   // POST /v2/withdraw/mpcca/submit reads the finalize transcript that M4e will write at
@@ -4675,7 +5270,7 @@ export function forwardSessionShareToRoster(
 export function forwardToRosterNode(
   bearerTokens: Record<string, string> = {},
 ): SingleNodeForwarder {
-  return async (path, body, roster, slot) => {
+  return async (path, body, roster, slot, signal) => {
     const node = roster.nodes.find((item) => item.slot === slot);
     if (!node) return { slot, ok: false, error: "unknown_slot" };
     try {
@@ -4686,6 +5281,7 @@ export function forwardToRosterNode(
         method: "POST",
         headers,
         body: JSON.stringify(body),
+        signal,
       });
       let responseBody: unknown;
       try {
@@ -5063,6 +5659,128 @@ async function findCaRegistrationV2Provenance(
  * + Milestone 1 here — the init orchestrator already did, and an attacker would need to
  * fabricate a matching init transcript (gated by the init lock + atomic write).
  */
+/**
+ * M4 Commit 2 — compare the round2 orchestrate body's identity fields against the persisted
+ * `__round1.json` artifact. Catches a caller that supplies a wrong vault_ek / sender / asset
+ * / selectedSlots etc., that would otherwise sneak past the worker (the chained-round binding
+ * uses the round1 transcript hash, which already differs if any of these drift — but giving
+ * a specific 400 here surfaces the mismatch sooner with operator-actionable detail).
+ *
+ * Returns `undefined` on no mismatch; otherwise a structured `{field, round1Value, requestValue}`
+ * describing the first divergence (left-to-right field order).
+ */
+function compareRound2IdentityWithRound1(
+  request: MpccaWithdrawRound2OrchestrateRequest,
+  round1: Record<string, unknown>,
+  sortedSelectedSlots: number[],
+):
+  | { field: string; round1Value: unknown; requestValue: unknown }
+  | undefined {
+  const lowerHex = (v: unknown): string => {
+    if (typeof v !== "string") return "";
+    return v.replace(/^0x/i, "").toLowerCase();
+  };
+  const checks: Array<[string, unknown, unknown]> = [
+    ["dkgEpoch", round1.dkgEpoch, request.dkgEpoch],
+    ["rosterHash", lowerHex(round1.rosterHash), lowerHex(request.rosterHash)],
+    [
+      "vaultEkTranscriptHash",
+      lowerHex(round1.vaultEkTranscriptHash),
+      lowerHex(request.vaultEkTranscriptHash),
+    ],
+    [
+      "registrationTranscriptHash",
+      lowerHex(round1.registrationTranscriptHash),
+      lowerHex(request.registrationTranscriptHash),
+    ],
+    [
+      "vaultStateInitTranscriptHash",
+      lowerHex(round1.vaultStateInitTranscriptHash),
+      lowerHex(request.vaultStateInitTranscriptHash),
+    ],
+    ["vaultEk", lowerHex(round1.vaultEk), lowerHex(request.vaultEk)],
+    [
+      "senderAddress",
+      lowerHex(round1.senderAddress),
+      lowerHex(request.senderAddress),
+    ],
+    ["assetType", lowerHex(round1.assetType), lowerHex(request.assetType)],
+    ["chainId", round1.chainId, request.chainId],
+    ["root", lowerHex(round1.root), lowerHex(request.root)],
+    [
+      "nullifierHash",
+      lowerHex(round1.nullifierHash),
+      lowerHex(request.nullifierHash),
+    ],
+    ["recipient", lowerHex(round1.recipient), lowerHex(request.recipient)],
+    [
+      "recipientHash",
+      lowerHex(round1.recipientHash),
+      lowerHex(request.recipientHash),
+    ],
+    ["amountTag", lowerHex(round1.amountTag), lowerHex(request.amountTag)],
+    ["vaultSequence", round1.vaultSequence, request.vaultSequence],
+    ["expirySecs", round1.expirySecs, request.expirySecs],
+    ["requestHash", lowerHex(round1.requestHash), lowerHex(request.requestHash)],
+    ["depositCount", round1.depositCount, request.depositCount],
+  ];
+  for (const [field, a, b] of checks) {
+    if (a !== b) return { field, round1Value: a, requestValue: b };
+  }
+  // selectedSlots must match (sorted).
+  const round1Slots = Array.isArray(round1.selectedSlots)
+    ? (round1.selectedSlots as number[])
+    : [];
+  if (
+    round1Slots.length !== sortedSelectedSlots.length ||
+    round1Slots.some((v, i) => v !== sortedSelectedSlots[i])
+  ) {
+    return {
+      field: "selectedSlots",
+      round1Value: round1Slots,
+      requestValue: sortedSelectedSlots,
+    };
+  }
+  // observedDepositTranscriptHashes must match (length + entries).
+  const r1Observed = Array.isArray(round1.observedDepositTranscriptHashes)
+    ? (round1.observedDepositTranscriptHashes as string[])
+    : [];
+  if (r1Observed.length !== request.observedDepositTranscriptHashes.length) {
+    return {
+      field: "observedDepositTranscriptHashes.length",
+      round1Value: r1Observed.length,
+      requestValue: request.observedDepositTranscriptHashes.length,
+    };
+  }
+  for (let i = 0; i < r1Observed.length; i += 1) {
+    if (lowerHex(r1Observed[i]) !== lowerHex(request.observedDepositTranscriptHashes[i])) {
+      return {
+        field: `observedDepositTranscriptHashes[${i}]`,
+        round1Value: r1Observed[i],
+        requestValue: request.observedDepositTranscriptHashes[i],
+      };
+    }
+  }
+  // The round1 artifact MUST carry transcriptHash + perSlotContributions[5] with
+  // ingressTranscriptHash. We don't compare contents here — the caller (round2 route)
+  // reads them via direct field access.
+  if (typeof round1.transcriptHash !== "string") {
+    return {
+      field: "transcriptHash",
+      round1Value: round1.transcriptHash,
+      requestValue: "<derived from round1>",
+    };
+  }
+  if (!Array.isArray(round1.perSlotContributions)) {
+    return {
+      field: "perSlotContributions",
+      round1Value: round1.perSlotContributions,
+      requestValue: "<expected array>",
+    };
+  }
+  return undefined;
+}
+
 async function findVaultStateV2InitProvenance(
   stateRoot: string,
   expected: {

@@ -3,12 +3,14 @@ import type { HpkeEnvelope } from "../src/types.js";
 import {
   assembleMpccaWithdrawTranscript,
   canonicalJsonStringify,
+  DK_BASE_INDICES_CANONICAL,
   EUNOMA_M1_AMOUNT_INGRESS_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2,
+  EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1,
   EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V2,
   ingressEnvelopesHash,
   m1IngressAad,
@@ -17,6 +19,8 @@ import {
   mpccaWithdrawFinalizeWorkerTranscriptHash,
   mpccaWithdrawProveWorkerTranscriptHash,
   mpccaWithdrawRound1WorkerTranscriptHash,
+  mpccaWithdrawRound2AggregateHash,
+  mpccaWithdrawRound2StatementInputsHash,
   mpccaWithdrawRound2WorkerTranscriptHash,
   parseMpccaWithdrawFinalizeRequest,
   parseMpccaWithdrawFinalizeResponse,
@@ -24,9 +28,16 @@ import {
   parseMpccaWithdrawProveResponse,
   parseMpccaWithdrawRound1Request,
   parseMpccaWithdrawRound1Response,
+  parseMpccaWithdrawRound2DkResult,
+  parseMpccaWithdrawRound2OrchestrateRequest,
   parseMpccaWithdrawRound2Request,
   parseMpccaWithdrawRound2Response,
   perShareCommitmentsHash,
+  ROUND2_ELL,
+  ROUND2_N,
+  USER_SIGMA_COMMITMENTS_LEN,
+  USER_SIGMA_RESPONSE_SHARES_LEN,
+  type MpccaWithdrawRound2StatementInputFields,
 } from "../src/mpcca_withdraw_v2.js";
 
 const HEX32_A = "aa".repeat(32);
@@ -119,6 +130,87 @@ function validChainedBody(): Record<string, unknown> {
     ...body,
     previousRoundTranscriptHash: HEX32_0,
     previousRoundCommitments: [HEX32_A, HEX32_B, HEX32_C, HEX32_D, HEX32_E],
+  };
+}
+
+/**
+ * M4 Commit 1+2 — fixed Statement inputs for byte-parity tests with Rust. Each entry uses
+ * a deterministic distinct hex pattern so a single-field swap visibly changes the hash.
+ * Lengths match the canonical Aptos CA TransferV1 shape (ell=8, n=4). Every hex string
+ * is exactly 64 chars = 32 bytes.
+ */
+function genHex32(group: string, i: number): string {
+  // 4 hex chars per "slot": group(2) + idx(2). Repeated 16 times → 64 chars = 32 bytes.
+  const idx = i.toString(16).padStart(2, "0");
+  return (group + idx).repeat(16);
+}
+const VALID_STATEMENT_INPUTS: MpccaWithdrawRound2StatementInputFields = {
+  recipientEk: "a1".repeat(32),
+  oldBalanceC: Array.from({ length: ROUND2_ELL }, (_, i) => genHex32("b0", i)),
+  oldBalanceD: Array.from({ length: ROUND2_ELL }, (_, i) => genHex32("c0", i)),
+  newBalanceC: Array.from({ length: ROUND2_ELL }, (_, i) => genHex32("d0", i)),
+  newBalanceD: Array.from({ length: ROUND2_ELL }, (_, i) => genHex32("e0", i)),
+  transferAmountC: Array.from({ length: ROUND2_N }, (_, i) => genHex32("f0", i)),
+  transferAmountDSender: Array.from({ length: ROUND2_N }, (_, i) =>
+    genHex32("12", i),
+  ),
+  transferAmountDRecipient: Array.from({ length: ROUND2_N }, (_, i) =>
+    genHex32("23", i),
+  ),
+};
+
+function validChainedRound2Body(): Record<string, unknown> {
+  return { ...validChainedBody(), ...VALID_STATEMENT_INPUTS };
+}
+
+const VALID_USER_SIGMA_COMMITMENTS = Array.from(
+  { length: USER_SIGMA_COMMITMENTS_LEN },
+  (_, i) => genHex32("34", i),
+);
+const VALID_USER_SIGMA_RESPONSE_SHARES = Array.from(
+  { length: USER_SIGMA_RESPONSE_SHARES_LEN },
+  (_, i) => genHex32("45", i),
+);
+const VALID_PER_CHUNK_COMMITMENTS_AMOUNT = Array.from(
+  { length: ROUND2_N },
+  (_, i) => genHex32("56", i),
+);
+const VALID_PER_CHUNK_COMMITMENTS_NEW_BALANCE = Array.from(
+  { length: ROUND2_ELL },
+  (_, i) => genHex32("67", i),
+);
+
+function validRound2OrchestrateBody(): Record<string, unknown> {
+  const base = validRound1Body();
+  delete (base as Record<string, unknown>).amountCommitment;
+  delete (base as Record<string, unknown>).perShareCommitments;
+  delete (base as Record<string, unknown>).ingressEnvelopes;
+  return {
+    ...base,
+    ...VALID_STATEMENT_INPUTS,
+    userSigmaCommitmentsHex: VALID_USER_SIGMA_COMMITMENTS,
+    userSigmaResponseSharesHex: VALID_USER_SIGMA_RESPONSE_SHARES,
+    bulletproofZkrpAmountHex: "ab".repeat(96),
+    bulletproofZkrpNewBalanceHex: "cd".repeat(160),
+    perChunkCommitmentsAmountHex: VALID_PER_CHUNK_COMMITMENTS_AMOUNT,
+    perChunkCommitmentsNewBalanceHex: VALID_PER_CHUNK_COMMITMENTS_NEW_BALANCE,
+  };
+}
+
+function validRound2DkResultBody(slot = 2): Record<string, unknown> {
+  return {
+    slot,
+    playerId: slot,
+    sessionStatePath: `/tmp/state/mpc-sessions/wdr/mpcca_withdraw_v2_round2.json`,
+    sessionStateHash: HEX32_A,
+    workerTranscriptHash: HEX32_B,
+    observedAtUnixMs: 1_700_000_000_000,
+    completed: true,
+    partialDkCommitments: [
+      { index: 0, commitmentHex: HEX32_1 },
+      { index: 17, commitmentHex: HEX32_2 },
+    ],
+    dkBaseIndicesUsed: [0, 17],
   };
 }
 
@@ -255,7 +347,7 @@ describe("mpcca_withdraw_v2 round1 worker transcript hash (M1 V2 with ingress bi
 });
 
 describe("mpcca_withdraw_v2 chained rounds (round2/prove/finalize)", () => {
-  const base = {
+  const chainedBase = {
     sessionId: "sess-x",
     requestId: "req-x",
     dkgEpoch: "1",
@@ -283,34 +375,208 @@ describe("mpcca_withdraw_v2 chained rounds (round2/prove/finalize)", () => {
     previousRoundTranscriptHash: HEX32_0,
     previousRoundCommitments: [HEX32_A, HEX32_B, HEX32_C, HEX32_D, HEX32_E],
   };
+  const round2Base = { ...chainedBase, statementInputs: VALID_STATEMENT_INPUTS };
 
   it("each chained round returns distinct hashes for the same body", () => {
-    const r2 = mpccaWithdrawRound2WorkerTranscriptHash(base);
-    const pr = mpccaWithdrawProveWorkerTranscriptHash(base);
-    const fin = mpccaWithdrawFinalizeWorkerTranscriptHash(base);
+    const r2 = mpccaWithdrawRound2WorkerTranscriptHash(round2Base);
+    const pr = mpccaWithdrawProveWorkerTranscriptHash(chainedBase);
+    const fin = mpccaWithdrawFinalizeWorkerTranscriptHash(chainedBase);
     expect(new Set([r2, pr, fin]).size).toBe(3);
     expect(r2).toMatch(/^[0-9a-f]{64}$/);
     expect(pr).toMatch(/^[0-9a-f]{64}$/);
     expect(fin).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("chained hash changes when previousRoundTranscriptHash flips", () => {
-    const baseHash = mpccaWithdrawRound2WorkerTranscriptHash(base);
+  it("round2 chained hash changes when previousRoundTranscriptHash flips", () => {
+    const baseHash = mpccaWithdrawRound2WorkerTranscriptHash(round2Base);
     expect(
       mpccaWithdrawRound2WorkerTranscriptHash({
-        ...base,
+        ...round2Base,
         previousRoundTranscriptHash: HEX32_F,
       }),
     ).not.toBe(baseHash);
   });
 
   it("chained hash changes when ANY previousRoundCommitments entry flips", () => {
-    const baseHash = mpccaWithdrawProveWorkerTranscriptHash(base);
+    const baseHash = mpccaWithdrawProveWorkerTranscriptHash(chainedBase);
     const mutated = {
-      ...base,
+      ...chainedBase,
       previousRoundCommitments: [HEX32_A, HEX32_B, HEX32_F, HEX32_D, HEX32_E],
     };
     expect(mpccaWithdrawProveWorkerTranscriptHash(mutated)).not.toBe(baseHash);
+  });
+
+  // M4 Commit 1+2 — round2 worker_transcript_hash now binds Statement input fields.
+  // A single flip in ANY Statement field MUST change the round2 hash. This is the
+  // load-bearing wedge that prevents a coordinator from forwarding tampered Statement
+  // inputs without all 5 workers diverging at the transcript-hash cross-check.
+  it("round2 hash binds the Statement input set (single-field flips)", () => {
+    const baseHash = mpccaWithdrawRound2WorkerTranscriptHash(round2Base);
+    const flipped: Array<MpccaWithdrawRound2StatementInputFields> = [
+      { ...VALID_STATEMENT_INPUTS, recipientEk: HEX32_F },
+      {
+        ...VALID_STATEMENT_INPUTS,
+        oldBalanceC: [
+          HEX32_F,
+          ...VALID_STATEMENT_INPUTS.oldBalanceC.slice(1),
+        ],
+      },
+      {
+        ...VALID_STATEMENT_INPUTS,
+        newBalanceD: [
+          ...VALID_STATEMENT_INPUTS.newBalanceD.slice(0, 4),
+          HEX32_F,
+          ...VALID_STATEMENT_INPUTS.newBalanceD.slice(5),
+        ],
+      },
+      {
+        ...VALID_STATEMENT_INPUTS,
+        transferAmountC: [
+          HEX32_F,
+          ...VALID_STATEMENT_INPUTS.transferAmountC.slice(1),
+        ],
+      },
+      {
+        ...VALID_STATEMENT_INPUTS,
+        transferAmountDRecipient: [
+          ...VALID_STATEMENT_INPUTS.transferAmountDRecipient.slice(0, 3),
+          HEX32_F,
+        ],
+      },
+    ];
+    for (const stmt of flipped) {
+      expect(
+        mpccaWithdrawRound2WorkerTranscriptHash({
+          ...round2Base,
+          statementInputs: stmt,
+        }),
+      ).not.toBe(baseHash);
+    }
+  });
+
+  it("round2 hash is byte-stable for identical Statement inputs", () => {
+    const a = mpccaWithdrawRound2WorkerTranscriptHash(round2Base);
+    const b = mpccaWithdrawRound2WorkerTranscriptHash({
+      ...round2Base,
+      statementInputs: { ...VALID_STATEMENT_INPUTS },
+    });
+    expect(a).toBe(b);
+  });
+
+  it("round2 statement_inputs hash is byte-stable + length 64", () => {
+    const h = mpccaWithdrawRound2StatementInputsHash(VALID_STATEMENT_INPUTS);
+    expect(h).toMatch(/^[0-9a-f]{64}$/);
+    expect(h).toBe(mpccaWithdrawRound2StatementInputsHash(VALID_STATEMENT_INPUTS));
+  });
+
+  /**
+   * M4 Commit 2 — TS↔Rust byte-parity. The Rust test
+   * `mpcca_withdraw_v2_round2_statement_inputs_hash_byte_parity_with_ts_fixture` asserts
+   * the same hex. If either side drifts, BOTH tests fail in lockstep; we then know the
+   * round2 worker_transcript_hash byte-parity is broken and the coordinator's worker-
+   * hash cross-check would reject every legitimate worker reply.
+   */
+  it("round2 statement_inputs hash matches the canonical Rust output (TS↔Rust byte parity)", () => {
+    expect(mpccaWithdrawRound2StatementInputsHash(VALID_STATEMENT_INPUTS)).toBe(
+      "ffa00e43e67bf54fb188596887ce58bcf3e0223d7a7a9e9f9576cde8ef25ef8d",
+    );
+  });
+
+  it("round2 statement_inputs hash flips on any single field change", () => {
+    const base = mpccaWithdrawRound2StatementInputsHash(VALID_STATEMENT_INPUTS);
+    expect(
+      mpccaWithdrawRound2StatementInputsHash({
+        ...VALID_STATEMENT_INPUTS,
+        recipientEk: HEX32_F,
+      }),
+    ).not.toBe(base);
+    expect(
+      mpccaWithdrawRound2StatementInputsHash({
+        ...VALID_STATEMENT_INPUTS,
+        transferAmountDSender: [
+          HEX32_F,
+          ...VALID_STATEMENT_INPUTS.transferAmountDSender.slice(1),
+        ],
+      }),
+    ).not.toBe(base);
+  });
+});
+
+describe("mpcca_withdraw_v2 round2 aggregate hash (M4 commit 2)", () => {
+  const baseInput = {
+    statementInputs: VALID_STATEMENT_INPUTS,
+    dkBaseIndicesUsed: [...DK_BASE_INDICES_CANONICAL],
+    perSlotContributions: [0, 1, 2, 3, 4].map((slot) => ({
+      slot,
+      workerTranscriptHash: HEX32_A,
+      partialDkCommitments: [
+        { index: 0, commitmentHex: HEX32_1 },
+        { index: 17, commitmentHex: HEX32_2 },
+      ],
+    })),
+  };
+
+  it("aggregate hash is byte-stable + 64 hex chars", () => {
+    const a = mpccaWithdrawRound2AggregateHash(baseInput);
+    const b = mpccaWithdrawRound2AggregateHash({
+      ...baseInput,
+      perSlotContributions: [...baseInput.perSlotContributions].reverse(),
+    });
+    expect(a).toMatch(/^[0-9a-f]{64}$/);
+    // Order-independence on the contribution list: sort is internal.
+    expect(a).toBe(b);
+  });
+
+  it("aggregate hash flips on Statement input change", () => {
+    const base = mpccaWithdrawRound2AggregateHash(baseInput);
+    expect(
+      mpccaWithdrawRound2AggregateHash({
+        ...baseInput,
+        statementInputs: { ...VALID_STATEMENT_INPUTS, recipientEk: HEX32_F },
+      }),
+    ).not.toBe(base);
+  });
+
+  it("aggregate hash flips when ANY per-slot worker_transcript_hash flips", () => {
+    const base = mpccaWithdrawRound2AggregateHash(baseInput);
+    const mutated = {
+      ...baseInput,
+      perSlotContributions: baseInput.perSlotContributions.map((c, i) =>
+        i === 2 ? { ...c, workerTranscriptHash: HEX32_F } : c,
+      ),
+    };
+    expect(mpccaWithdrawRound2AggregateHash(mutated)).not.toBe(base);
+  });
+
+  it("aggregate hash flips when ANY partial dk commitment flips", () => {
+    const base = mpccaWithdrawRound2AggregateHash(baseInput);
+    const mutated = {
+      ...baseInput,
+      perSlotContributions: baseInput.perSlotContributions.map((c, i) =>
+        i === 1
+          ? {
+              ...c,
+              partialDkCommitments: [
+                { index: 0, commitmentHex: HEX32_F },
+                { index: 17, commitmentHex: HEX32_2 },
+              ],
+            }
+          : c,
+      ),
+    };
+    expect(mpccaWithdrawRound2AggregateHash(mutated)).not.toBe(base);
+  });
+
+  it("aggregate hash uses its own domain (not round2 or final)", () => {
+    expect(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1).toBe(
+      "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1",
+    );
+    expect(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1).not.toBe(
+      EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V2,
+    );
+    expect(EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_AGGREGATE_V1).not.toBe(
+      EUNOMA_MPCCA_WITHDRAW_V2_FINAL_V1,
+    );
   });
 });
 
@@ -509,24 +775,264 @@ describe("mpcca_withdraw_v2 parsers", () => {
     expect(() => parseMpccaWithdrawRound1Request(body)).toThrow(MpccaWithdrawV2Error);
   });
 
-  it("parseMpccaWithdrawRound2Request accepts a chained body", () => {
-    const parsed = parseMpccaWithdrawRound2Request(validChainedBody());
+  it("parseMpccaWithdrawRound2Request accepts a chained body with Statement inputs", () => {
+    const parsed = parseMpccaWithdrawRound2Request(validChainedRound2Body());
     expect(parsed.previousRoundTranscriptHash).toBe(HEX32_0);
     expect(parsed.previousRoundCommitments).toHaveLength(5);
+    expect(parsed.recipientEk).toBe(VALID_STATEMENT_INPUTS.recipientEk);
+    expect(parsed.oldBalanceC).toHaveLength(ROUND2_ELL);
+    expect(parsed.transferAmountC).toHaveLength(ROUND2_N);
   });
 
   it("parseMpccaWithdrawRound2Request rejects missing previousRoundTranscriptHash", () => {
-    const body = { ...validChainedBody() };
+    const body = { ...validChainedRound2Body() };
     delete (body as Record<string, unknown>).previousRoundTranscriptHash;
     expect(() => parseMpccaWithdrawRound2Request(body)).toThrow(MpccaWithdrawV2Error);
   });
 
   it("parseMpccaWithdrawRound2Request rejects under-quorum previousRoundCommitments", () => {
     const body = {
-      ...validChainedBody(),
+      ...validChainedRound2Body(),
       previousRoundCommitments: [HEX32_A, HEX32_B, HEX32_C, HEX32_D],
     };
     expect(() => parseMpccaWithdrawRound2Request(body)).toThrow(MpccaWithdrawV2Error);
+  });
+
+  it("parseMpccaWithdrawRound2Request rejects missing recipientEk", () => {
+    const body = { ...validChainedRound2Body() };
+    delete (body as Record<string, unknown>).recipientEk;
+    expect(() => parseMpccaWithdrawRound2Request(body)).toThrow(/recipientEk/);
+  });
+
+  it("parseMpccaWithdrawRound2Request rejects under-length oldBalanceC", () => {
+    const body = {
+      ...validChainedRound2Body(),
+      oldBalanceC: VALID_STATEMENT_INPUTS.oldBalanceC.slice(0, 7),
+    };
+    expect(() => parseMpccaWithdrawRound2Request(body)).toThrow(/oldBalanceC/);
+  });
+
+  it("parseMpccaWithdrawRound2Request rejects over-length transferAmountC", () => {
+    const body = {
+      ...validChainedRound2Body(),
+      transferAmountC: [
+        ...VALID_STATEMENT_INPUTS.transferAmountC,
+        VALID_STATEMENT_INPUTS.transferAmountC[0],
+      ],
+    };
+    expect(() => parseMpccaWithdrawRound2Request(body)).toThrow(/transferAmountC/);
+  });
+
+  it("parseMpccaWithdrawRound2Request rejects non-32-byte recipientEk", () => {
+    const body = { ...validChainedRound2Body(), recipientEk: "aa".repeat(33) };
+    expect(() => parseMpccaWithdrawRound2Request(body)).toThrow(/recipientEk/);
+  });
+
+  it("parseMpccaWithdrawRound2Request fires forbidden guard on amount field", () => {
+    const body = { ...validChainedRound2Body(), amount: "100" };
+    expect(() => parseMpccaWithdrawRound2Request(body)).toThrow(/forbidden plaintext field/);
+  });
+
+  // =================================================================================================
+  // M4 Commit 2 — orchestrate request parser
+  // =================================================================================================
+  it("parseMpccaWithdrawRound2OrchestrateRequest accepts a complete body", () => {
+    const parsed = parseMpccaWithdrawRound2OrchestrateRequest(validRound2OrchestrateBody());
+    expect(parsed.userSigmaCommitmentsHex).toHaveLength(USER_SIGMA_COMMITMENTS_LEN);
+    expect(parsed.userSigmaResponseSharesHex).toHaveLength(USER_SIGMA_RESPONSE_SHARES_LEN);
+    expect(parsed.perChunkCommitmentsAmountHex).toHaveLength(ROUND2_N);
+    expect(parsed.perChunkCommitmentsNewBalanceHex).toHaveLength(ROUND2_ELL);
+    expect(parsed.recipientEk).toBe(VALID_STATEMENT_INPUTS.recipientEk);
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest rejects userSigmaCommitmentsHex.length=28", () => {
+    const body = {
+      ...validRound2OrchestrateBody(),
+      userSigmaCommitmentsHex: VALID_USER_SIGMA_COMMITMENTS.slice(0, 28),
+    };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /userSigmaCommitmentsHex/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest rejects userSigmaResponseSharesHex.length=23", () => {
+    const body = {
+      ...validRound2OrchestrateBody(),
+      userSigmaResponseSharesHex: VALID_USER_SIGMA_RESPONSE_SHARES.slice(0, 23),
+    };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /userSigmaResponseSharesHex/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest rejects empty bulletproof bytes", () => {
+    const body = { ...validRound2OrchestrateBody(), bulletproofZkrpAmountHex: "" };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /bulletproofZkrpAmountHex/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest rejects wrong perChunkCommitmentsAmount length", () => {
+    const body = {
+      ...validRound2OrchestrateBody(),
+      perChunkCommitmentsAmountHex: VALID_PER_CHUNK_COMMITMENTS_AMOUNT.slice(0, 3),
+    };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /perChunkCommitmentsAmountHex/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest rejects wrong perChunkCommitmentsNewBalance length", () => {
+    const body = {
+      ...validRound2OrchestrateBody(),
+      perChunkCommitmentsNewBalanceHex: VALID_PER_CHUNK_COMMITMENTS_NEW_BALANCE.slice(0, 6),
+    };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /perChunkCommitmentsNewBalanceHex/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest fires forbidden guard on amount", () => {
+    const body = { ...validRound2OrchestrateBody(), amount: "100" };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /forbidden plaintext field/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest fires forbidden guard on blind", () => {
+    const body = { ...validRound2OrchestrateBody(), blind: "1234" };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /forbidden plaintext field/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest fires forbidden guard on dkShare", () => {
+    const body = { ...validRound2OrchestrateBody(), dkShare: "abc" };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /forbidden plaintext field/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest fires forbidden guard on nested secret", () => {
+    const body = {
+      ...validRound2OrchestrateBody(),
+      metadata: { nested: { secret: "leak" } },
+    };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(
+      /forbidden plaintext field/,
+    );
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest rejects non-32-byte perChunk entry", () => {
+    const bad = [...VALID_PER_CHUNK_COMMITMENTS_AMOUNT];
+    bad[1] = "ab".repeat(31);
+    const body = { ...validRound2OrchestrateBody(), perChunkCommitmentsAmountHex: bad };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).toThrow(/32-byte hex/);
+  });
+
+  it("parseMpccaWithdrawRound2OrchestrateRequest body must NOT carry previousRoundTranscriptHash", () => {
+    // The coordinator lifts these from __round1.json; if a caller smuggles them in, they
+    // are simply ignored by the orchestrate parser (parseBaseRequest doesn't extract them).
+    // This isn't a security risk but is documented behavior.
+    const body = {
+      ...validRound2OrchestrateBody(),
+      previousRoundTranscriptHash: HEX32_F,
+      previousRoundCommitments: Array(5).fill(HEX32_F),
+    };
+    expect(() => parseMpccaWithdrawRound2OrchestrateRequest(body)).not.toThrow();
+  });
+
+  // =================================================================================================
+  // M4 Commit 1 — Round2DkResult parser
+  // =================================================================================================
+  it("parseMpccaWithdrawRound2DkResult accepts the canonical body", () => {
+    const r = parseMpccaWithdrawRound2DkResult(validRound2DkResultBody());
+    expect(r.completed).toBe(true);
+    expect(r.partialDkCommitments).toHaveLength(2);
+    expect(r.dkBaseIndicesUsed).toEqual([0, 17]);
+  });
+
+  it("parseMpccaWithdrawRound2DkResult rejects completed=false", () => {
+    expect(() =>
+      parseMpccaWithdrawRound2DkResult({
+        ...validRound2DkResultBody(),
+        completed: false,
+      }),
+    ).toThrow(/completed: true/);
+  });
+
+  it("parseMpccaWithdrawRound2DkResult rejects empty partialDkCommitments", () => {
+    expect(() =>
+      parseMpccaWithdrawRound2DkResult({
+        ...validRound2DkResultBody(),
+        partialDkCommitments: [],
+      }),
+    ).toThrow(/non-empty array/);
+  });
+
+  it("parseMpccaWithdrawRound2DkResult rejects duplicate index", () => {
+    expect(() =>
+      parseMpccaWithdrawRound2DkResult({
+        ...validRound2DkResultBody(),
+        partialDkCommitments: [
+          { index: 0, commitmentHex: HEX32_1 },
+          { index: 0, commitmentHex: HEX32_2 },
+        ],
+        dkBaseIndicesUsed: [0, 0],
+      }),
+    ).toThrow(/duplicate/);
+  });
+
+  it("parseMpccaWithdrawRound2DkResult rejects out-of-set index", () => {
+    expect(() =>
+      parseMpccaWithdrawRound2DkResult({
+        ...validRound2DkResultBody(),
+        partialDkCommitments: [
+          { index: 0, commitmentHex: HEX32_1 },
+          { index: 5, commitmentHex: HEX32_2 },
+        ],
+        dkBaseIndicesUsed: [0, 5],
+      }),
+    ).toThrow(/canonical BASE_DK_SET/);
+  });
+
+  it("parseMpccaWithdrawRound2DkResult rejects non-32-byte commitmentHex", () => {
+    expect(() =>
+      parseMpccaWithdrawRound2DkResult({
+        ...validRound2DkResultBody(),
+        partialDkCommitments: [
+          { index: 0, commitmentHex: "ab".repeat(31) },
+          { index: 17, commitmentHex: HEX32_2 },
+        ],
+      }),
+    ).toThrow(/32-byte hex/);
+  });
+
+  it("parseMpccaWithdrawRound2DkResult rejects mismatched dkBaseIndicesUsed length", () => {
+    expect(() =>
+      parseMpccaWithdrawRound2DkResult({
+        ...validRound2DkResultBody(),
+        dkBaseIndicesUsed: [0],
+      }),
+    ).toThrow(/length must equal/);
+  });
+
+  it("parseMpccaWithdrawRound2DkResult rejects mismatched dkBaseIndicesUsed entries", () => {
+    expect(() =>
+      parseMpccaWithdrawRound2DkResult({
+        ...validRound2DkResultBody(),
+        dkBaseIndicesUsed: [0, 3],
+      }),
+    ).toThrow(/(must match|canonical BASE_DK_SET)/);
+  });
+
+  it("parseMpccaWithdrawRound2DkResult fires forbidden-field guard on amount", () => {
+    expect(() =>
+      parseMpccaWithdrawRound2DkResult({
+        ...validRound2DkResultBody(),
+        amount: 42,
+      }),
+    ).toThrow(/forbidden plaintext field/);
   });
 
   it("parseMpccaWithdrawProveRequest accepts a chained body", () => {
