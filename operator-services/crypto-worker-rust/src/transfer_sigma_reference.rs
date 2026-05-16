@@ -760,3 +760,153 @@ fn bigint_be_gt(a: &[u8; 32], b: &[u8; 32]) -> bool {
 pub fn prng_next_scalar_list(prng: &mut CounterPrng, count: usize) -> Vec<Scalar> {
     (0..count).map(|_| prng_next_scalar(prng)).collect()
 }
+
+// =============================================================================
+// Milestone 4c — threshold Σ-protocol response-share primitives
+// =============================================================================
+//
+// PURPOSE
+// -------
+// The Aptos CA `TransferV1` Σ-protocol response is linear in the witness:
+//   s = α + e · w
+// where `w ∈ Z_q^25` is the (dk, new_a[8], new_r[8], v[4], r[4]) witness and
+// `α ∈ Z_q^25` is the prover's nonce vector.
+//
+// If both vectors are additively shared across `P` parties —
+//   w = Σ_j w_share_j      α = Σ_j α_share_j
+// — then by linearity of `psi` (the homomorphism producing the 30 commitment
+// points, see `sigmaProtocolTransfer.ts:311-398` / `psi_transfer` above) and of
+// the response equation:
+//   A     = psi(α) = psi(Σ_j α_share_j) = Σ_j psi(α_share_j)        = Σ_j A_share_j
+//   s     = α + e · w = Σ_j (α_share_j + e · w_share_j)             = Σ_j s_share_j
+//
+// PSI LINEARITY CHECK (file:line refs in `psi_transfer` above):
+//   * Output 0:        ek_sid * dk                              — linear in dk
+//   * Outputs 1..ell+1: G*new_a[i] + H*new_r[i]                 — linear in (new_a[i], new_r[i])
+//   * Outputs ell+1..2ell+1: ek_sid * new_r[i]                  — linear in new_r[i]
+//   * Output 2ell+1 (balance):
+//       Σ_i (b_pow_ell[i] * stmt.old_R[i]) * dk                 — linear in dk
+//     + Σ_i (b_pow_ell[i] * G)             * new_a[i]           — linear in new_a[i]
+//     + Σ_j (b_pow_n[j]   * G)             * v[j]               — linear in v[j]
+//     The scalar `b_pow_ell[i]` is a fixed public power of 2^16, not a witness
+//     element, so each term is a single scalar-times-fixed-base. NO α-α
+//     products. The balance equation is a linear functional of the witness.
+//   * Outputs 2ell+2..2ell+2+n:    G*v[j] + H*r[j]              — linear in (v[j], r[j])
+//   * Outputs 2ell+2+n..2ell+2+2n: ek_sid * r[j]                — linear in r[j]
+//   * Outputs 2ell+2+2n..30:       ek_rid * r[j]                — linear in r[j]
+//
+// Every output is a Z-linear combination of witness components against bases
+// fixed by the public statement. So `psi(α1 + α2) = psi(α1) + psi(α2)`. QED.
+//
+// E.1-INDEPENDENCE
+// ----------------
+// These primitives are pure scalar/group arithmetic. They make NO statement
+// about how shares are produced, distributed, or where the public challenge
+// `e` comes from at the protocol level — the wire plumbing (Phase E.1) is
+// out of scope for this commit. Production callers MUST drive the
+// Fiat-Shamir challenge over the aggregated commitment `A = Σ A_share_j`,
+// not per share.
+pub mod threshold {
+    use super::*;
+
+    /// Aptos CA `TransferV1` witness/alpha length for ell=8, n=4 (no auditor):
+    /// `1 + 2*ell + 2*n = 25`. The threshold API is fixed to this shape.
+    pub const WITNESS_LEN: usize = 25;
+
+    /// Aptos CA `TransferV1` Σ-protocol commitment vector length: 30 points.
+    pub const COMMITMENT_LEN: usize = 30;
+
+    /// Per-party partial commitment `A_share = psi(α_share)`.
+    ///
+    /// The 30 group points are uncompressed `RistrettoPoint`s so aggregation
+    /// stays in the curve group (compressing only at the end avoids
+    /// decompression round-trips during summation).
+    ///
+    /// Linearity contract: `psi(Σ α_share_j) = Σ psi(α_share_j)` — verified
+    /// inline in the module comment above.
+    pub fn compute_threshold_sigma_partial_commitment(
+        alpha_share: &[Scalar; WITNESS_LEN],
+        statement: &Statement,
+        ell: usize,
+        n: usize,
+        has_effective_auditor: bool,
+        num_voluntary_auditors: usize,
+    ) -> WorkerResult<[RistrettoPoint; COMMITMENT_LEN]> {
+        if 1 + 2 * ell + 2 * n != WITNESS_LEN {
+            return Err(WorkerError::InvalidRequest(format!(
+                "threshold sigma is fixed to ell=8, n=4 (1 + 2*ell + 2*n = 25); got ell={ell}, n={n}"
+            )));
+        }
+        let pts = psi_transfer(
+            statement,
+            alpha_share,
+            ell,
+            n,
+            has_effective_auditor,
+            num_voluntary_auditors,
+        )?;
+        if pts.len() != COMMITMENT_LEN {
+            return Err(WorkerError::InvalidRequest(format!(
+                "psi_transfer returned {} points; expected {COMMITMENT_LEN}",
+                pts.len()
+            )));
+        }
+        let mut out = [RistrettoPoint::identity(); COMMITMENT_LEN];
+        out.copy_from_slice(&pts);
+        Ok(out)
+    }
+
+    /// Aggregate per-party partial commitments by per-index point addition.
+    ///
+    /// No challenge is needed — the operation is pure additive aggregation,
+    /// which by `psi`'s linearity gives `A = psi(Σ α_share_j)`. The Fiat-Shamir
+    /// challenge `e` is computed by the caller on the aggregated `A`, after
+    /// this function returns.
+    pub fn aggregate_threshold_sigma_commitments(
+        commitments: &[[RistrettoPoint; COMMITMENT_LEN]],
+    ) -> [RistrettoPoint; COMMITMENT_LEN] {
+        let mut acc = [RistrettoPoint::identity(); COMMITMENT_LEN];
+        for share in commitments {
+            for i in 0..COMMITMENT_LEN {
+                acc[i] += share[i];
+            }
+        }
+        acc
+    }
+
+    /// Per-party response share: `s_share[i] = α_share[i] + e · w_share[i]`.
+    ///
+    /// Pure scalar arithmetic — no group ops, no I/O. Mirrors the single-party
+    /// response equation in `prove_transfer_single_party` (line 568-572) on
+    /// per-party shares.
+    pub fn compute_threshold_sigma_response_share(
+        alpha_share: &[Scalar; WITNESS_LEN],
+        witness_share: &[Scalar; WITNESS_LEN],
+        challenge: &Scalar,
+    ) -> [Scalar; WITNESS_LEN] {
+        let mut out = [Scalar::ZERO; WITNESS_LEN];
+        for i in 0..WITNESS_LEN {
+            out[i] = alpha_share[i] + challenge * witness_share[i];
+        }
+        out
+    }
+
+    /// Aggregate per-party response shares by per-index scalar addition.
+    ///
+    /// By linearity:
+    ///   Σ_j s_share_j = Σ_j (α_share_j + e · w_share_j)
+    ///                 = (Σ_j α_share_j) + e · (Σ_j w_share_j)
+    ///                 = α + e · w
+    ///                 = s
+    pub fn aggregate_threshold_sigma_responses(
+        responses: &[[Scalar; WITNESS_LEN]],
+    ) -> [Scalar; WITNESS_LEN] {
+        let mut acc = [Scalar::ZERO; WITNESS_LEN];
+        for share in responses {
+            for i in 0..WITNESS_LEN {
+                acc[i] += share[i];
+            }
+        }
+        acc
+    }
+}

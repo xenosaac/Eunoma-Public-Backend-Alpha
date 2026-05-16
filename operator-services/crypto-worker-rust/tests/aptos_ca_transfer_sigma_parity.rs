@@ -11,9 +11,15 @@ use std::{fs, path::PathBuf};
 
 use curve25519_dalek::scalar::Scalar;
 use eunoma_crypto_worker::transfer_sigma_reference::{
-    bcs_serialize_transfer_session, build_statement, prng_next_scalar_list,
-    prove_transfer_single_party, verify_transfer_single_party, CounterPrng, DomainSeparator,
-    SigmaProtocolProof, TransferStatementInputs, APTOS_FRAMEWORK_ADDRESS, PROTOCOL_ID,
+    bcs_fiat_shamir_inputs, bcs_serialize_transfer_session, build_statement,
+    prng_next_scalar_list, prove_transfer_single_party, sigma_fiat_shamir_seed,
+    threshold::{
+        aggregate_threshold_sigma_commitments, aggregate_threshold_sigma_responses,
+        compute_threshold_sigma_partial_commitment, compute_threshold_sigma_response_share,
+        COMMITMENT_LEN, WITNESS_LEN,
+    },
+    verify_transfer_single_party, CounterPrng, DomainSeparator, SigmaProtocolProof,
+    TransferStatementInputs, APTOS_FRAMEWORK_ADDRESS, PROTOCOL_ID, TYPE_NAME,
 };
 use serde::Deserialize;
 
@@ -495,4 +501,279 @@ fn auditor_branches_unsupported() {
     let err = prove_transfer_single_party(&witness, &statement, &alpha, &dst, ell, n, false, 1)
         .expect_err("numVolun=1 must be rejected");
     assert!(format!("{err:?}").contains("auditor"));
+}
+
+// =============================================================================
+// Milestone 4c — threshold Σ-protocol primitive byte-parity tests
+//
+// These exercise the load-bearing invariant of the threshold construction:
+// additive sharing of (witness, alpha) across 5 parties + per-party
+// commitment/response computation + aggregation MUST byte-match the
+// single-party M4a fixture. The challenge `e` is computed by single-party
+// Fiat-Shamir on the *aggregated* commitment vector (which equals the M4a A).
+// =============================================================================
+
+const NUM_PARTIES: usize = 5;
+
+/// Deterministic test scalar from a label. Same construction as the
+/// twisted_elgamal threshold tests, but with a distinct domain to avoid
+/// label collisions across the two test files.
+fn det_scalar(label: &[u8]) -> Scalar {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    h.update(b"EUNOMA_M4C_TRANSFER_SIGMA_TEST_DET_SCALAR_V1");
+    h.update((label.len() as u64).to_le_bytes());
+    h.update(label);
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&h.finalize());
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+/// Convert a 25-element scalar slice to a `[Scalar; 25]` array for the
+/// threshold API.
+fn to_25(v: &[Scalar]) -> [Scalar; WITNESS_LEN] {
+    let mut out = [Scalar::ZERO; WITNESS_LEN];
+    assert_eq!(v.len(), WITNESS_LEN, "expected 25-scalar vector");
+    out.copy_from_slice(v);
+    out
+}
+
+/// Split a 25-scalar vector into 5 additive shares, each a `[Scalar; 25]`,
+/// whose per-index sum equals the input. Four pseudorandom shares plus a
+/// balancing fifth share. Deterministic per `domain_label`.
+fn split_vector_into_five_additive_shares(
+    v: &[Scalar; WITNESS_LEN],
+    domain_label: &[u8],
+) -> [[Scalar; WITNESS_LEN]; NUM_PARTIES] {
+    let mut shares = [[Scalar::ZERO; WITNESS_LEN]; NUM_PARTIES];
+    for i in 0..WITNESS_LEN {
+        let mut sum_pseudorandom = Scalar::ZERO;
+        for j in 0..(NUM_PARTIES - 1) {
+            let label = format!("party/{j}/index/{i}").into_bytes();
+            let s = det_scalar(&[domain_label, b"/", label.as_slice()].concat());
+            shares[j][i] = s;
+            sum_pseudorandom += s;
+        }
+        // Balancing share so Σ shares[j][i] == v[i].
+        shares[NUM_PARTIES - 1][i] = v[i] - sum_pseudorandom;
+    }
+    shares
+}
+
+/// Common test setup: load fixture, build statement + DST + witness + alpha.
+fn build_threshold_test_context() -> (
+    Fixture,
+    eunoma_crypto_worker::transfer_sigma_reference::Statement,
+    DomainSeparator,
+    [Scalar; WITNESS_LEN],
+    [Scalar; WITNESS_LEN],
+) {
+    let fix = load_fixture();
+    let ell = fix.params.ell;
+    let n = fix.params.n;
+
+    let inputs = TransferStatementInputs {
+        sender_ek: hex_32(&fix.statement.sender_ek),
+        recipient_ek: hex_32(&fix.statement.recipient_ek),
+        old_balance_c: compress_list(&fix.ciphertexts.old_balance_c),
+        old_balance_d: compress_list(&fix.ciphertexts.old_balance_d),
+        new_balance_c: compress_list(&fix.ciphertexts.new_balance_c),
+        new_balance_d: compress_list(&fix.ciphertexts.new_balance_d),
+        transfer_amount_c: compress_list(&fix.ciphertexts.amount_c),
+        transfer_amount_d_sender: compress_list(&fix.ciphertexts.amount_d_sender),
+        transfer_amount_d_recipient: compress_list(&fix.ciphertexts.amount_d_recipient),
+    };
+    let statement = build_statement(&inputs).expect("build statement");
+    let dst = build_dst(&fix.statement, ell, n);
+    let witness_vec = build_witness(&fix);
+    let alpha_vec = replay_alpha_via_prng(&fix, witness_vec.len());
+    let witness = to_25(&witness_vec);
+    let alpha = to_25(&alpha_vec);
+    (fix, statement, dst, witness, alpha)
+}
+
+/// Run the threshold-prove pipeline end-to-end given pre-computed shares.
+///
+/// Returns `(aggregated_commitment_bytes_30, aggregated_response_bytes_25,
+/// challenge_e)`.
+fn run_threshold_pipeline(
+    statement: &eunoma_crypto_worker::transfer_sigma_reference::Statement,
+    dst: &DomainSeparator,
+    alpha_shares: &[[Scalar; WITNESS_LEN]; NUM_PARTIES],
+    witness_shares: &[[Scalar; WITNESS_LEN]; NUM_PARTIES],
+    ell: usize,
+    n: usize,
+) -> (Vec<[u8; 32]>, Vec<[u8; 32]>, Scalar) {
+    // Round 1: each party computes A_share_j = psi(α_share_j).
+    let mut commitments = Vec::with_capacity(NUM_PARTIES);
+    for j in 0..NUM_PARTIES {
+        let a_share =
+            compute_threshold_sigma_partial_commitment(&alpha_shares[j], statement, ell, n, false, 0)
+                .expect("compute partial commitment");
+        commitments.push(a_share);
+    }
+
+    // Aggregate to get A = Σ A_share.
+    let a_agg = aggregate_threshold_sigma_commitments(&commitments);
+    let a_compressed: Vec<[u8; 32]> = a_agg.iter().map(|p| p.compress().to_bytes()).collect();
+    assert_eq!(a_compressed.len(), COMMITMENT_LEN);
+
+    // Round 2: compute Fiat-Shamir challenge `e` from the AGGREGATED A.
+    let bcs = bcs_fiat_shamir_inputs(
+        dst,
+        TYPE_NAME,
+        WITNESS_LEN as u64,
+        &statement.compressed_points,
+        &statement.scalars,
+        &a_compressed,
+    );
+    let (e, _beta) = sigma_fiat_shamir_seed(&bcs);
+
+    // Round 3: each party computes s_share_j = α_share_j + e · w_share_j.
+    let mut responses = Vec::with_capacity(NUM_PARTIES);
+    for j in 0..NUM_PARTIES {
+        let s_share = compute_threshold_sigma_response_share(
+            &alpha_shares[j],
+            &witness_shares[j],
+            &e,
+        );
+        responses.push(s_share);
+    }
+
+    // Aggregate to get s = Σ s_share.
+    let s_agg = aggregate_threshold_sigma_responses(&responses);
+    let s_bytes: Vec<[u8; 32]> = s_agg.iter().map(|s| s.to_bytes()).collect();
+    assert_eq!(s_bytes.len(), WITNESS_LEN);
+
+    (a_compressed, s_bytes, e)
+}
+
+#[test]
+fn threshold_sigma_byte_parity_with_m4a_fixture_response() {
+    let (fix, statement, dst, witness, alpha) = build_threshold_test_context();
+    let ell = fix.params.ell;
+    let n = fix.params.n;
+
+    // Split α and w into 5 additive shares each. Distinct domain labels so
+    // the α-split and w-split shares are independent (no accidental coupling).
+    let alpha_shares =
+        split_vector_into_five_additive_shares(&alpha, b"M4C_TRANSFER_SIGMA_ALPHA_SPLIT_V1");
+    let witness_shares =
+        split_vector_into_five_additive_shares(&witness, b"M4C_TRANSFER_SIGMA_WITNESS_SPLIT_V1");
+
+    // Sanity: shares actually sum to α and w (catch a wrong split before
+    // attributing a byte mismatch to the threshold math).
+    for i in 0..WITNESS_LEN {
+        let sum_alpha: Scalar = (0..NUM_PARTIES).map(|j| alpha_shares[j][i]).sum();
+        let sum_w: Scalar = (0..NUM_PARTIES).map(|j| witness_shares[j][i]).sum();
+        assert_eq!(sum_alpha, alpha[i], "alpha share split[{i}] sum mismatch");
+        assert_eq!(sum_w, witness[i], "witness share split[{i}] sum mismatch");
+    }
+
+    let (a_compressed, s_bytes, _e) =
+        run_threshold_pipeline(&statement, &dst, &alpha_shares, &witness_shares, ell, n);
+
+    // LOAD-BEARING BYTE PARITY: 30 commitments + 25 responses must byte-match
+    // the M4a fixture.
+    assert_eq!(a_compressed.len(), 30);
+    assert_eq!(s_bytes.len(), 25);
+    for (i, expected_hex) in fix.sigma_proof.commitment.iter().enumerate() {
+        let expected = hex_32(expected_hex);
+        assert_eq!(
+            hex_encode(&a_compressed[i]),
+            hex_encode(&expected),
+            "threshold sigma commitment[{i}] disagrees with M4a fixture ({SDK_FILE_REF}:282)"
+        );
+    }
+    for (i, expected_hex) in fix.sigma_proof.response.iter().enumerate() {
+        let expected = hex_32(expected_hex);
+        assert_eq!(
+            hex_encode(&s_bytes[i]),
+            hex_encode(&expected),
+            "threshold sigma response[{i}] disagrees with M4a fixture ({SDK_FILE_REF}:283)"
+        );
+    }
+}
+
+#[test]
+fn threshold_sigma_zero_shares_collapse_to_single_party() {
+    let (fix, statement, dst, witness, alpha) = build_threshold_test_context();
+    let ell = fix.params.ell;
+    let n = fix.params.n;
+
+    // Special case: parties 0..4 contribute zero shares; party 4 holds full
+    // witness + alpha. By linearity, the aggregate must equal the single-party
+    // output (and thus byte-match the fixture).
+    let mut alpha_shares = [[Scalar::ZERO; WITNESS_LEN]; NUM_PARTIES];
+    let mut witness_shares = [[Scalar::ZERO; WITNESS_LEN]; NUM_PARTIES];
+    alpha_shares[NUM_PARTIES - 1] = alpha;
+    witness_shares[NUM_PARTIES - 1] = witness;
+
+    let (a_compressed, s_bytes, _e) =
+        run_threshold_pipeline(&statement, &dst, &alpha_shares, &witness_shares, ell, n);
+
+    for (i, expected_hex) in fix.sigma_proof.commitment.iter().enumerate() {
+        let expected = hex_32(expected_hex);
+        assert_eq!(
+            hex_encode(&a_compressed[i]),
+            hex_encode(&expected),
+            "zero-shares commitment[{i}] must collapse to single-party fixture"
+        );
+    }
+    for (i, expected_hex) in fix.sigma_proof.response.iter().enumerate() {
+        let expected = hex_32(expected_hex);
+        assert_eq!(
+            hex_encode(&s_bytes[i]),
+            hex_encode(&expected),
+            "zero-shares response[{i}] must collapse to single-party fixture"
+        );
+    }
+}
+
+#[test]
+fn threshold_sigma_arbitrary_share_decomposition_byte_parity() {
+    let (fix, statement, dst, witness, alpha) = build_threshold_test_context();
+    let ell = fix.params.ell;
+    let n = fix.params.n;
+
+    // A DIFFERENT random additive split (distinct domain labels) — the
+    // byte-parity invariant should be agnostic to the share decomposition.
+    let alpha_shares = split_vector_into_five_additive_shares(
+        &alpha,
+        b"M4C_TRANSFER_SIGMA_ARBITRARY_ALPHA_SPLIT_V1",
+    );
+    let witness_shares = split_vector_into_five_additive_shares(
+        &witness,
+        b"M4C_TRANSFER_SIGMA_ARBITRARY_WITNESS_SPLIT_V1",
+    );
+
+    // Verify the shares are different from the first test's splits (sanity:
+    // distinct decomposition → exercises the same invariant from a different
+    // starting point).
+    let other_alpha_shares =
+        split_vector_into_five_additive_shares(&alpha, b"M4C_TRANSFER_SIGMA_ALPHA_SPLIT_V1");
+    assert_ne!(
+        alpha_shares[0][0], other_alpha_shares[0][0],
+        "two distinct domain labels must give distinct first-party first-index alpha shares"
+    );
+
+    let (a_compressed, s_bytes, _e) =
+        run_threshold_pipeline(&statement, &dst, &alpha_shares, &witness_shares, ell, n);
+
+    for (i, expected_hex) in fix.sigma_proof.commitment.iter().enumerate() {
+        let expected = hex_32(expected_hex);
+        assert_eq!(
+            hex_encode(&a_compressed[i]),
+            hex_encode(&expected),
+            "arbitrary-split commitment[{i}] disagrees with M4a fixture"
+        );
+    }
+    for (i, expected_hex) in fix.sigma_proof.response.iter().enumerate() {
+        let expected = hex_32(expected_hex);
+        assert_eq!(
+            hex_encode(&s_bytes[i]),
+            hex_encode(&expected),
+            "arbitrary-split response[{i}] disagrees with M4a fixture"
+        );
+    }
 }
