@@ -856,15 +856,22 @@ fn vault_state_init_partial_finalize_recoverable() {
     };
 
     // PHASE 1: init all 5 selected workers. Capture original per-slot init responses + the
-    // ORIGINAL `per_slot_contribs` + `final_hash_v1` — these are what the coordinator
-    // computes BEFORE the partition. We retain them only to assert byte-equality with the
-    // post-replay values; we DO NOT pass them into PHASE 4.
+    // ORIGINAL `per_slot_contribs_v1` + `final_hash_v1` — these are what the coordinator
+    // computes BEFORE the partition. We retain them as the canonical-value reference: the
+    // post-replay PHASE 3 contributions MUST be byte-identical to these, and the post-replay
+    // `final_hash_v2` MUST byte-equal `final_hash_v1` without any normalisation.
+    //
+    // Capture the raw init results too so PHASE 3 can byte-compare them as serde_json::Value
+    // dictionaries (catching any field drift, including `initialized` and `createdAtUnixMs`
+    // — though the latter is NOT in the contribution tuple).
+    let mut init_responses_v1: Vec<eunoma_crypto_worker::vault_state_v2::InitResult> = Vec::with_capacity(5);
     let mut per_slot_contribs_v1: Vec<FinalizeContribution> = Vec::with_capacity(5);
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
         let req = make_init_req(slot, ordinal);
         let result = init_vault_state_v2(&fix.slot_dirs[slot], &req).expect("init");
         assert!(result.initialized, "slot {slot}: first init must report initialized=true");
         per_slot_contribs_v1.push(make_contrib(slot, &result));
+        init_responses_v1.push(result);
     }
     let mut sorted_contribs_v1 = per_slot_contribs_v1.clone();
     sorted_contribs_v1.sort_by_key(|c| c.slot);
@@ -931,115 +938,139 @@ fn vault_state_init_partial_finalize_recoverable() {
     // PHASE 3 (KILLER REPLAY): COORDINATOR RETRY. Re-run init on all 5 workers — the same
     // call the production coordinator makes in /v2/vault_state/init/start as the FIRST step
     // of its retry flow. Capture the REPLAYED init responses (NOT phase 1's values) and
-    // build `per_slot_contribs_v2` from them. This is the critical change from the pre-v4
-    // false-positive test: we use the actual replay responses, including each replay's
-    // returned `vault_state_hash`.
+    // build `per_slot_contribs_v2` from them DIRECTLY — NO normalisation. This is the
+    // critical change from the pre-v5 test: we use the actual replay responses and the
+    // coordinator binds `r.initialized` directly into the contribution (see server.ts:2050).
     //
-    // If `vault_state_hash` is NOT canonical (pre-v4: sha256 of on-disk bytes), the replay
-    // returns DIFFERENT `vault_state_hash` values for finalized vs not-finalized slots and
-    // PHASE 4's finalize retry fails on slots 0/1/2 with
-    // `vault_state_v2_finalize_already_pinned_with_different_value`.
+    // The load-bearing assertion: `final_hash_v2 == final_hash_v1` byte-for-byte WITHOUT
+    // any test-side normalisation of `initialized` or anything else. Pre-v5, the worker
+    // returned `initialized=false` on replay, the contribution differed, and the
+    // recomputed final hash diverged. v5 returns `initialized=true` on replay → byte-
+    // identical contribution → byte-identical final hash → partial-finalize recovery works.
+    //
+    // If `vault_state_hash` were NOT canonical (pre-v4: sha256 of on-disk bytes), the replay
+    // would return DIFFERENT `vault_state_hash` values for finalized vs not-finalized slots
+    // and the same load-bearing assertion would surface that bug. So this single equality
+    // check tests both the v4 canonical-hash fix AND the v5 initialized-monotonicity fix.
+    let mut init_responses_v2: Vec<eunoma_crypto_worker::vault_state_v2::InitResult> = Vec::with_capacity(5);
     let mut per_slot_contribs_v2: Vec<FinalizeContribution> = Vec::with_capacity(5);
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
         let req = make_init_req(slot, ordinal);
         let replay = init_vault_state_v2(&fix.slot_dirs[slot], &req).expect("init replay");
         assert!(
-            !replay.initialized,
-            "slot {slot}: init replay MUST be idempotent (initialized=false)"
+            replay.initialized,
+            "slot {slot}: Codex M3a P1 v5 — `initialized` is now monotonic (once true, \
+             stays true). Init replay on an existing vault MUST return initialized=true \
+             — the file IS initialized. Pre-v5 returned false here, breaking partial-finalize \
+             recovery."
         );
         per_slot_contribs_v2.push(make_contrib(slot, &replay));
+        init_responses_v2.push(replay);
     }
     let mut sorted_contribs_v2 = per_slot_contribs_v2.clone();
     sorted_contribs_v2.sort_by_key(|c| c.slot);
     let final_hash_v2 = compute_final_hash(&sorted_contribs_v2);
 
-    // Cross-checks against PHASE 1's captured values. THIS is the canonical-vault-state-hash
-    // invariant: every per-slot vault_state_hash + worker_transcript_hash must be byte-equal
-    // across the replay boundary, regardless of finalize state. If this fails on any slot,
-    // the canonical hash subset is wrong (something mutable leaked in).
+    // Cross-checks: every contribution field is byte-stable across the replay boundary,
+    // regardless of finalize state. If ANY of these fails, a mutable field leaked into the
+    // contribution tuple bound into the final_transcript_hash.
     for (i, c) in per_slot_contribs_v2.iter().enumerate() {
         assert_eq!(
             c.worker_transcript_hash.to_lowercase(),
             per_slot_contribs_v1[i].worker_transcript_hash.to_lowercase(),
-            "slot {}: replayed worker_transcript_hash MUST equal original (frozen)",
+            "slot {}: replayed worker_transcript_hash MUST equal original (frozen at init)",
             c.slot,
         );
         assert_eq!(
             c.vault_state_hash.to_lowercase(),
             per_slot_contribs_v1[i].vault_state_hash.to_lowercase(),
-            "slot {}: replayed vault_state_hash MUST equal original. This is THE \
-             partial-finalize-recovery invariant — pre-v4, finalized slots returned the \
-             sha256 of the post-finalize file (with init_transcript_hash=Some), and \
-             unfinalized slots returned the sha256 of the pre-finalize file (with \
-             init_transcript_hash=None). The two values differed and made the recovery \
-             impossible. v4 hashes only the immutable field subset.",
+            "slot {}: replayed vault_state_hash MUST equal original (v4 canonical-subset \
+             hash — immutable across the init/finalize/observe lifecycle).",
             c.slot,
         );
         assert_eq!(
-            c.vault_sequence,
-            per_slot_contribs_v1[i].vault_sequence,
-            "slot {}: vault_sequence stable across replay",
+            c.vault_sequence, per_slot_contribs_v1[i].vault_sequence,
+            "slot {}: vault_sequence stable across replay (no withdraw in this test)",
             c.slot,
         );
         assert_eq!(
-            c.deposit_count_observed,
-            per_slot_contribs_v1[i].deposit_count_observed,
+            c.deposit_count_observed, per_slot_contribs_v1[i].deposit_count_observed,
             "slot {}: deposit_count_observed stable across replay (no observe in this test)",
             c.slot,
         );
-        // The replay reports initialized=false (idempotent), which differs from the
-        // original initialized=true. The coordinator binds whatever was returned, so the
-        // contributions naturally differ in this field — but the FINAL_V1 transcript
-        // hash MUST still match because `initialized` participates symmetrically across
-        // all 5 slots. Both v1 and v2 contribs are derived from the same boolean
-        // disposition for each slot (`initialized=true` for all in v1; `initialized=false`
-        // for all in v2 — which would make final_hash_v1 != final_hash_v2 if we ever
-        // included `initialized` in the canonical state hash and treated the per-slot
-        // contribution differently). We assert hash equality below, so any leakage of
-        // mutable state into the canonical hash will surface as a final_hash mismatch.
+        assert_eq!(
+            c.initialized, per_slot_contribs_v1[i].initialized,
+            "slot {}: Codex M3a P1 v5 — `initialized` is now monotonic. Replay MUST return \
+             the same value as the first init (both true). Pre-v5 returned false here, \
+             breaking partial-finalize recovery.",
+            c.slot,
+        );
     }
-    // Note: `final_hash_v2 != final_hash_v1` is EXPECTED here because every contribution's
-    // `initialized` flipped from true → false across the replay boundary. That's a
-    // coordinator-side concern: the production coordinator computes `final_hash` once,
-    // persists it into the init transcript artifact, and re-uses that artifact on retry —
-    // it does NOT recompute from replayed contribs. So we use `final_hash_v1` as the
-    // canonical value to finalize against in PHASE 4. The `final_hash_v2` value is computed
-    // for a separate sub-assertion below.
-    let final_hash = final_hash_v1.clone();
 
-    // Sub-assertion: build a "coordinator-rebuilt" contribs set in which every per-slot
-    // `initialized` is normalised to the ORIGINAL true (since the coordinator's persisted
-    // artifact stamps `initialized=true` from the first init across all retries). Compute
-    // a third final_hash from that and assert byte-equality with `final_hash_v1`. This is
-    // what a coordinator that genuinely uses the replay responses (but preserves the
-    // original `initialized` flag) computes — and it MUST match the original. The whole
-    // point of the canonical vault_state_hash is to make THIS recompute stable.
-    let coordinator_rebuilt: Vec<FinalizeContribution> = per_slot_contribs_v2
-        .iter()
-        .map(|c| FinalizeContribution {
-            initialized: true,
-            ..c.clone()
-        })
-        .collect();
-    let mut coordinator_rebuilt_sorted = coordinator_rebuilt.clone();
-    coordinator_rebuilt_sorted.sort_by_key(|c| c.slot);
-    let final_hash_coordinator_rebuild = compute_final_hash(&coordinator_rebuilt_sorted);
+    // THE LOAD-BEARING ASSERTION (Codex M3a P1 v5 KILLER). NO normalisation. NO test-side
+    // workarounds. The coordinator's `final_transcript_hash`, recomputed from the replayed
+    // init responses BYTE-FOR-BYTE, MUST equal the original `final_transcript_hash`. This
+    // is what makes partial-finalize recovery work: a coordinator that re-runs init →
+    // re-computes the final hash → re-fans-out finalize gets the SAME canonical hash on
+    // both rounds, so already-finalized workers accept the retry idempotently.
+    //
+    // If this fails: SOME field in `perSlotContributions` is mutable across init replay,
+    // and partial-finalize recovery is broken. Audit every InitResponse field that flows
+    // into the contribution tuple at server.ts:2041 — the bug is one of them.
     assert_eq!(
-        final_hash_coordinator_rebuild.to_lowercase(),
+        final_hash_v2.to_lowercase(),
         final_hash_v1.to_lowercase(),
-        "coordinator-rebuilt final hash from REPLAYED init responses (normalised \
-         `initialized=true` to match the first init) MUST equal the original final hash. \
-         If this fails, the canonical vault_state_hash is NOT stable across init/finalize \
-         and partial-finalize recovery is broken — every retry will compute a different \
-         final hash and already-finalized workers will reject it."
+        "Codex M3a P1 v5 KILLER: `final_transcript_hash` recomputed from REPLAYED init \
+         responses MUST byte-equal the original WITHOUT any test-side normalisation. If this \
+         fails, a mutable field leaked into perSlotContributions and partial-finalize \
+         recovery is broken — the coordinator's retry computes a different final hash and \
+         already-finalized workers reject it as \
+         vault_state_v2_finalize_already_pinned_with_different_value."
     );
 
+    // Belt-and-braces: assert init response equality as serde_json::Value. This catches
+    // ANY field drift between the first init and the replay — including fields that aren't
+    // currently bound into the contribution but might be added later, AND including the
+    // one field that legitimately differs (`createdAtUnixMs` is per-call). We exclude
+    // `createdAtUnixMs` from this comparison BUT explicitly assert it remains OUT of
+    // perSlotContributions (covered by the byte-equality above).
+    for (i, _) in init_responses_v1.iter().enumerate() {
+        let v1 = &init_responses_v1[i];
+        let v2 = &init_responses_v2[i];
+        assert_eq!(v1.slot, v2.slot, "slot drift");
+        assert_eq!(v1.player_id, v2.player_id, "player_id drift");
+        assert_eq!(v1.vault_state_path, v2.vault_state_path, "vault_state_path drift");
+        assert_eq!(v1.vault_state_hash, v2.vault_state_hash, "vault_state_hash drift");
+        assert_eq!(
+            v1.worker_transcript_hash, v2.worker_transcript_hash,
+            "worker_transcript_hash drift"
+        );
+        assert_eq!(v1.vault_sequence, v2.vault_sequence, "vault_sequence drift");
+        assert_eq!(
+            v1.deposit_count_observed, v2.deposit_count_observed,
+            "deposit_count_observed drift"
+        );
+        assert_eq!(
+            v1.initialized, v2.initialized,
+            "initialized drift — Codex M3a P1 v5 makes this a vault-level monotonic flag"
+        );
+        assert_eq!(
+            v1.created_at_unix_ms, v2.created_at_unix_ms,
+            "created_at_unix_ms MUST equal the original (the worker reads it back from disk \
+             on idempotent replay — NOT recomputed). It's also NOT a contribution field, so \
+             even if it did drift it wouldn't break recovery; but byte-equality here is a \
+             defense-in-depth signal."
+        );
+    }
+
+    let final_hash = final_hash_v1.clone();
+
     // PHASE 4: COORDINATOR FINALIZE RETRY. The coordinator fans out finalize to all 5 slots
-    // with `(final_transcript_hash = final_hash_v1, per_slot_contributions = coordinator_rebuilt)`
-    // — the canonical body it built from the REPLAYED init responses (this test path) +
-    // the `initialized=true` normalisation a real coordinator's persisted artifact carries.
-    // Slots 0, 1, 2 must accept idempotently (finalized=false). Slots 3, 4 must finalize
-    // for the first time (finalized=true). ALL 5 must accept — this is the killer assertion.
+    // with `(final_transcript_hash = final_hash_v1, per_slot_contributions = per_slot_contribs_v2)`
+    // — the canonical body it built DIRECTLY from the REPLAYED init responses (this test
+    // path), with NO normalisation. Slots 0, 1, 2 must accept idempotently (finalized=false).
+    // Slots 3, 4 must finalize for the first time (finalized=true). ALL 5 must accept — this
+    // is the killer assertion that the v5 fix actually closes the recovery story.
     let make_finalize_req_v2 = |slot: usize, ordinal: usize| FinalizeRequest {
         dkg_epoch: DKG_EPOCH.to_string(),
         request_id: "partial-finalize-req".to_string(),
@@ -1058,7 +1089,7 @@ fn vault_state_init_partial_finalize_recoverable() {
         aggregate_commitment: fix.aggregate_commitment.clone(),
         aggregate_response: fix.aggregate_response.clone(),
         challenge: fix.challenge.clone(),
-        per_slot_contributions: coordinator_rebuilt.clone(),
+        per_slot_contributions: per_slot_contribs_v2.clone(),
         final_transcript_hash: final_hash.clone(),
     };
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
@@ -1133,20 +1164,124 @@ fn vault_state_init_partial_finalize_recoverable() {
         }
     }
 
-    // PHASE 6 (BELT AND BRACES): the silent `final_hash_v2` mismatch we mentioned above.
-    // The coordinator's PERSISTED artifact carries the original `initialized=true` per-slot.
-    // A naive coordinator that recomputed `final_hash` from PURELY replayed responses
-    // (without normalising `initialized`) would compute `final_hash_v2`, which differs from
-    // `final_hash_v1` because every replayed `initialized=false`. We assert this expected
-    // delta to make the test's intent visible — the canonical-vault-state-hash fix does NOT
-    // turn `final_hash_v2 == final_hash_v1`; what it DOES do is make
-    // `final_hash_coordinator_rebuild == final_hash_v1` (asserted above).
-    assert_ne!(
-        final_hash_v2.to_lowercase(),
-        final_hash_v1.to_lowercase(),
-        "raw-replay final hash differs from original ONLY because `initialized` flipped \
-         true→false (coordinator must preserve the original flag from its persisted artifact)"
+    // PHASE 6 (Codex M3a P1 v5 audit): we've already asserted `final_hash_v2 == final_hash_v1`
+    // up in PHASE 3 without any normalisation. That's the load-bearing fix. The remaining
+    // belt-and-braces assertion is that the per-slot contribution tuple ONLY contains fields
+    // that are stable across init replay. Audit (see also lib.rs ~5675, FinalizeContribution
+    // struct definition):
+    //   - slot                    : stable (the request input).
+    //   - vault_state_hash        : stable (v4 canonical hash of immutable subset).
+    //   - worker_transcript_hash  : stable (frozen at init; read back from disk on replay).
+    //   - vault_sequence          : stable on init replay (mutated only by withdraw, not here).
+    //   - deposit_count_observed  : stable on init replay (mutated only by observe-deposit).
+    //   - initialized             : stable (v5: monotonic vault-level flag, true on both first
+    //                               init and replay).
+    // No mutable field remains in the contribution tuple. This is the FINAL audit boundary
+    // for the partial-finalize recovery story.
+}
+
+// =============================================================================================
+// Codex M3a P1 v5 KILLER — init replay on an already-initialized vault returns
+// `initialized=true`.
+//
+// The micro-version of the partial-finalize recovery test, focused on the single load-bearing
+// v5 invariant: `initialized` is a monotonic VAULT-level flag — true on first init, true on
+// every subsequent replay. Pre-v5 this returned false on replay, which broke the partial-
+// finalize recovery because the coordinator binds `r.initialized` directly into the per-slot
+// contribution tuple bound into the final_transcript_hash. With every retry returning a
+// different boolean, the coordinator's recomputed final hash would diverge from the original
+// and already-finalized workers would reject the retry.
+//
+// This test also captures the response equality invariant: an init replay (excluding
+// `created_at_unix_ms`, which is per-call) MUST return the same response as the first init.
+// =============================================================================================
+#[test]
+fn init_replay_returns_initialized_true_for_already_initialized_vault() {
+    let fix = build_fixture("init-replay-initialized-true");
+    let slot = 0_usize;
+    let ordinal = 0_usize;
+
+    let init_req = VaultStateInitRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "v5-init-replay-req".to_string(),
+        session_id: "v5-init-replay-sess".to_string(),
+        ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+        vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+        registration_transcript_hash: fix.registration_transcript_hash.clone(),
+        roster_hash: fix.roster_hash.clone(),
+        selected_slots: fix.selected_slots.clone(),
+        self_slot: slot,
+        player_id: ordinal,
+        vault_ek: fix.vault_ek_hex.clone(),
+        sender_address: fix.sender.clone(),
+        asset_type: fix.asset.clone(),
+        chain_id: fix.chain_id,
+        aggregate_commitment: fix.aggregate_commitment.clone(),
+        aggregate_response: fix.aggregate_response.clone(),
+        challenge: fix.challenge.clone(),
+    };
+
+    // First init: materialises the file. Must return initialized=true.
+    let first = init_vault_state_v2(&fix.slot_dirs[slot], &init_req).expect("first init");
+    assert!(
+        first.initialized,
+        "first init must return initialized=true (the file was just created)"
     );
+
+    // Replay: file already exists. v5 invariant: STILL returns initialized=true.
+    let replay = init_vault_state_v2(&fix.slot_dirs[slot], &init_req).expect("init replay");
+    assert!(
+        replay.initialized,
+        "Codex M3a P1 v5 KILLER: `initialized` is a monotonic VAULT-level flag. Once the \
+         vault state file has been written, `initialized` stays true. Pre-v5 this returned \
+         `false` on replay, which broke partial-finalize recovery — the coordinator binds \
+         this value directly into perSlotContributions[i].initialized at server.ts:2050, \
+         and a flipped flag makes the recomputed final_transcript_hash diverge from the \
+         original."
+    );
+
+    // Every other field must be byte-equal across the replay boundary. We exclude
+    // `created_at_unix_ms` from the comparison philosophy (the worker reads it back from
+    // disk on replay, so it IS equal — but we still verify it explicitly). This catches
+    // any future field drift in the InitResponse / InitResult shape.
+    assert_eq!(first.slot, replay.slot, "slot drift");
+    assert_eq!(first.player_id, replay.player_id, "player_id drift");
+    assert_eq!(
+        first.vault_state_path, replay.vault_state_path,
+        "vault_state_path drift"
+    );
+    assert_eq!(
+        first.vault_state_hash, replay.vault_state_hash,
+        "vault_state_hash drift — v4 canonical hash MUST be stable across init replay"
+    );
+    assert_eq!(
+        first.worker_transcript_hash, replay.worker_transcript_hash,
+        "worker_transcript_hash drift — v3 frozen field MUST be stable across init replay"
+    );
+    assert_eq!(
+        first.vault_sequence, replay.vault_sequence,
+        "vault_sequence drift — must be read back from disk"
+    );
+    assert_eq!(
+        first.deposit_count_observed, replay.deposit_count_observed,
+        "deposit_count_observed drift — must be read back from disk"
+    );
+    assert_eq!(
+        first.created_at_unix_ms, replay.created_at_unix_ms,
+        "created_at_unix_ms drift — must be read back from disk on replay (NOT \
+         recomputed). Even if it did drift, it is NOT part of the contribution tuple — \
+         but byte-equality here is a defense-in-depth signal."
+    );
+    assert_eq!(
+        first.initialized, replay.initialized,
+        "initialized drift — v5 makes this a monotonic vault-level flag"
+    );
+
+    // Third replay (idempotency over many retries): same response.
+    let replay2 = init_vault_state_v2(&fix.slot_dirs[slot], &init_req).expect("init replay 2");
+    assert!(replay2.initialized);
+    assert_eq!(first.vault_state_hash, replay2.vault_state_hash);
+    assert_eq!(first.worker_transcript_hash, replay2.worker_transcript_hash);
 }
 
 // =============================================================================================
@@ -1299,7 +1434,11 @@ fn vault_state_init_replay_returns_frozen_worker_hash_after_finalize() {
     // PHASE 4 KILLER: init replay — MUST return the FROZEN per-slot hash, NOT the final hash.
     // Pre-v3 this returned final_hash, breaking the coordinator's per-slot recomputation gate.
     let replay = init_vault_state_v2(&fix.slot_dirs[slot], &init_req).expect("init replay");
-    assert!(!replay.initialized, "init replay MUST be idempotent");
+    // Codex M3a P1 v5: `initialized` is now monotonic — true on first init AND on replay.
+    assert!(
+        replay.initialized,
+        "v5: init replay on an already-initialized vault MUST return initialized=true"
+    );
     assert_eq!(
         replay.worker_transcript_hash.to_lowercase(),
         frozen_per_slot_hash.to_lowercase(),

@@ -8,7 +8,11 @@
 // selected workers and asserts:
 //   1. Each worker writes a `state_dir/vault_state_v2.json` file at mode 0o600.
 //   2. The file pins all required bindings (Phase 2, Milestone 1, dkg_epoch, sender, etc.).
-//   3. A re-call with identical inputs is idempotent (initialized=false; same file bytes).
+//   3. A re-call with identical inputs is idempotent. Codex M3a P1 v5: `initialized` is
+//      a monotonic vault-level flag — replay STILL returns initialized=true (the file
+//      IS initialized). Pre-v5 returned false on replay; that broke partial-finalize
+//      recovery because the coordinator binds the per-call flag into the contribution
+//      tuple bound into final_transcript_hash.
 //   4. A re-call with ANY mutated binding is rejected
 //      `vault_state_v2_already_initialized_with_different_inputs`.
 //   5. The worker_transcript_hash is reproducible by the TS reconstructor (we test the Rust
@@ -442,12 +446,20 @@ fn vault_state_v2_init_five_workers_idempotent() {
         first_results.push(result);
     }
 
-    // Second pass: identical inputs → idempotent replay. initialized=false, same hash.
+    // Second pass: identical inputs → idempotent replay. Codex M3a P1 v5: `initialized` is
+    // a monotonic vault-level flag (once true, stays true) — the replay STILL reports
+    // initialized=true. Same hash. Same response, byte-for-byte (modulo created_at_unix_ms,
+    // which is read back from disk).
     for (ordinal, &slot) in selected.iter().enumerate() {
         let req = build_init_request(&fix, slot, ordinal);
         let result = init_vault_state_v2(&fix.slot_dirs[slot], &req)
             .expect("init_vault_state_v2 idempotent replay");
-        assert!(!result.initialized, "slot {slot} should report initialized=false on replay");
+        assert!(
+            result.initialized,
+            "slot {slot}: Codex M3a P1 v5 — `initialized` is a monotonic vault-level flag. \
+             Replay on an existing vault MUST return initialized=true (the file IS \
+             initialized)."
+        );
         assert_eq!(result.vault_state_hash, first_results[ordinal].vault_state_hash);
         assert_eq!(
             result.worker_transcript_hash,
