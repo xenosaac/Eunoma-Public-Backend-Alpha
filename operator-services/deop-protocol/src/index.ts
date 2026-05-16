@@ -1,4 +1,5 @@
 export * from "./bcs.js";
+export * from "./ca_registration_v2.js";
 export * from "./constants.js";
 export * from "./forbidden.js";
 export * from "./local_cluster.js";

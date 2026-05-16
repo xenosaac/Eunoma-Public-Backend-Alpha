@@ -577,3 +577,131 @@ export type VaultEkDerivationCode =
   | "STALE_CA_DKG_TRANSCRIPT_HASH"
   | "STALE_ROSTER_HASH"
   | "INVALID_CONTRIBUTION_SHAPE";
+
+// =============================================================================================
+// Milestone 1: V2 threshold CA registration sigma over Phase 2-derived vault_ek.
+//
+// Wire shapes for `/worker/v2/derive/ca_registration/{round1,round2,verify}` and the
+// coordinator orchestrator `/v2/derive/ca_registration/start`. V1 routes
+// (`/worker/v2/ca/registration/*`) stay intact for V1 fixtures; these are the new V2
+// equivalents that read `ca_dkg_share_v2.json` and accept a request-supplied `vaultEk`.
+// =============================================================================================
+
+/**
+ * V2 round1 request: each selected worker generates a nonce `r_i`, commits
+ * `T_i = vaultEk * r_i`, persists `r_i` under
+ * `state_dir/mpc-sessions/<requestId>__<sessionId>/ca_registration_v2_nonce.json` (0o600),
+ * and returns `(commitmentHex, commitmentHash, nonceId, workerTranscriptHash)`. The
+ * coordinator collects 5 commitments concurrently, Lagrange-aggregates them, then Fiat-
+ * Shamir-derives the challenge over `(vaultEk, senderAddress, assetType, chainId,
+ * aggregateCommitment)`.
+ */
+export interface CaRegistrationV2Round1Request {
+  dkgEpoch: string;
+  requestId: string;
+  sessionId: string;
+  caDkgTranscriptHash: HexString;
+  rosterHash: HexString;
+  selectedSlots: number[];
+  selfSlot: number;
+  playerId: number;
+  /** Phase 2-derived public point `H * 1/dk`. Acts as the sigma generator. */
+  vaultEk: HexString;
+  senderAddress: HexString;
+  assetType: HexString;
+  chainId: number;
+}
+
+export interface CaRegistrationV2Round1Response {
+  slot: number;
+  commitmentHex: HexString;
+  commitmentHash: HexString;
+  nonceId: HexString;
+  workerTranscriptHash: HexString;
+}
+
+/**
+ * V2 round2 request: coordinator delivers the aggregate challenge back to each worker;
+ * worker reloads its `r_i` from the persisted nonce file, computes
+ * `response_i = r_i + challenge * dk_share_i (mod q)`, returns `responseHex +
+ * responseHash + workerTranscriptHash`. The nonce file is scrubbed + removed via RAII on
+ * every return path.
+ */
+export interface CaRegistrationV2Round2Request {
+  dkgEpoch: string;
+  requestId: string;
+  sessionId: string;
+  caDkgTranscriptHash: HexString;
+  rosterHash: HexString;
+  selectedSlots: number[];
+  selfSlot: number;
+  playerId: number;
+  nonceId: HexString;
+  /** Coordinator-computed aggregate challenge scalar. 32-byte hex. */
+  challenge: HexString;
+}
+
+export interface CaRegistrationV2Round2Response {
+  slot: number;
+  responseHex: HexString;
+  responseHash: HexString;
+  workerTranscriptHash: HexString;
+}
+
+export interface CaRegistrationV2VerifyRequest {
+  vaultEk: HexString;
+  senderAddress: HexString;
+  assetType: HexString;
+  chainId: number;
+  aggregateCommitment: HexString;
+  aggregateResponse: HexString;
+}
+
+export interface CaRegistrationV2VerifyResponse {
+  ok: boolean;
+}
+
+/**
+ * Per-slot partial artifact bundling everything a slot contributed to the V2 threshold
+ * sigma. Persisted in the coordinator transcript for audit.
+ */
+export interface CaRegistrationV2Contribution {
+  slot: number;
+  commitmentHex: HexString;
+  responseHex: HexString;
+  workerRound1TranscriptHash: HexString;
+  workerRound2TranscriptHash: HexString;
+}
+
+/**
+ * Coordinator-persisted transcript artifact for a V2 CA registration session. Same shape
+ * as the vault_ek transcript artifact — atomic write, 0o600.
+ */
+export interface CaRegistrationV2Transcript {
+  scheme: "ca_registration_v2";
+  dkgEpoch: string;
+  caDkgTranscriptHash: HexString;
+  rosterHash: HexString;
+  selectedSlots: number[];
+  verifierSlot: number;
+  vaultEk: HexString;
+  senderAddress: HexString;
+  assetType: HexString;
+  chainId: number;
+  aggregateCommitment: HexString;
+  aggregateResponse: HexString;
+  challenge: HexString;
+  perSlotContributions: CaRegistrationV2Contribution[];
+  transcriptHash: HexString;
+  createdAtUnixMs: number;
+}
+
+export type CaRegistrationV2Code =
+  | "UNDER_QUORUM"
+  | "DUPLICATE_SLOT"
+  | "UNKNOWN_SLOT"
+  | "STALE_DKG_EPOCH"
+  | "STALE_CA_DKG_TRANSCRIPT_HASH"
+  | "STALE_ROSTER_HASH"
+  | "INVALID_VAULT_EK"
+  | "INVALID_CONTRIBUTION_SHAPE";
