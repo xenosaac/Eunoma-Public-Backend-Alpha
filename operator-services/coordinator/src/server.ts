@@ -7,7 +7,9 @@ import {
   CaRegistrationV2Error,
   DEOPERATOR_COUNT,
   DEOPERATOR_THRESHOLD,
+  EUNOMA_MPCCA_WITHDRAW_SUBMIT_V1,
   ForbiddenPlaintextFieldError,
+  MpccaWithdrawSubmitError,
   MpccaWithdrawV2Error,
   caDkgV2RosterHash,
   caRegistrationV2Round1WorkerTranscriptHash,
@@ -32,6 +34,7 @@ import {
   parseMpccaRoundRequest,
   parseMpccaRoundResult,
   parseMpccaWithdrawRound1Response,
+  parseMpccaWithdrawSubmitRequest,
   parseObserveDepositResponse,
   parseSessionShareEnvelope,
   parseVaultEkContributions,
@@ -62,6 +65,14 @@ import {
 } from "@eunoma/deop-protocol";
 import { sha256, bytesToHex } from "@eunoma/shared";
 import { HttpError, requireBearer } from "@eunoma/shared";
+import {
+  assembleWithdrawV2CallArgs,
+  isNotImplementedPhasePassthrough,
+  loadMpccaFinalizeTranscript,
+  mpccaFinalizeTranscriptPath,
+  waitForTx,
+  type WithdrawV2CallArgsShape,
+} from "@eunoma/shared";
 import { assertNoForbiddenPlaintextFields } from "@eunoma/deop-protocol";
 import { mkdir, rename, writeFile, chmod, readdir, readFile, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -125,6 +136,21 @@ export interface RoutableRoster {
   nodes: Array<{ slot: number; endpoint: string }>;
 }
 
+/**
+ * Milestone 5b — injectable relayer submitter for POST /v2/withdraw/mpcca/submit.
+ *
+ * The coordinator's submit route does NOT speak HTTP to the relayer directly in tests; the
+ * test injects a `relayerSubmitter` that captures the assembled WithdrawV2CallArgs body and
+ * returns a deterministic result. In production, configFromEnv wires up a fetch-backed
+ * implementation pointing at RELAYER_URL with RELAYER_BEARER_TOKEN.
+ *
+ * The submitter returns the relayer's reply shape — `accepted`, `txHash`, `simulated`. Any
+ * thrown error (relayer 5xx, network failure) is surfaced by the route as 502.
+ */
+export type RelayerWithdrawSubmitter = (
+  args: WithdrawV2CallArgsShape,
+) => Promise<{ accepted: boolean; txHash: string; simulated: boolean }>;
+
 export interface CoordinatorServerOptions {
   roster?: DeoperatorRoster;
   caDkgV2Roster?: CaDkgV2Roster;
@@ -135,6 +161,26 @@ export interface CoordinatorServerOptions {
   forwarder?: SessionShareForwarder;
   singleNodeForwarder?: SingleNodeForwarder;
   stateRoot?: string;
+  /**
+   * Milestone 5b: optional relayer submitter for POST /v2/withdraw/mpcca/submit. If absent,
+   * the route returns 502 relayer_unreachable when invoked. Tests inject mocks.
+   */
+  relayerSubmitter?: RelayerWithdrawSubmitter;
+  /**
+   * Milestone 5b: Aptos fullnode URL for waitForTx polling. If absent, the route SKIPS chain
+   * confirmation (simulated submits) and returns `completed: true, simulated: true` directly
+   * after the relayer accepts.
+   */
+  chainNodeUrl?: string;
+  /**
+   * Milestone 5b: injectable fetch for waitForTx. Tests use this to feed deterministic
+   * chain-confirmation responses without standing up a real Aptos node.
+   */
+  chainFetch?: typeof fetch;
+  /**
+   * Milestone 5b: timeout for waitForTx polling (default 30s).
+   */
+  chainConfirmationTimeoutMs?: number;
 }
 
 export function buildCoordinatorServer(
@@ -327,6 +373,44 @@ export function buildCoordinatorServer(
     return {
       release: () => {
         vaultMpccaWithdrawInFlight = null;
+        resolveHeld();
+      },
+    };
+  }
+
+  // Milestone 5b: separate session lock for /v2/withdraw/mpcca/submit. We keep it distinct
+  // from the round1 lock because the two routes operate on different artifacts (round1 lock
+  // protects the 4-round state machine; submit lock protects the chain-submission pipeline +
+  // the persisted submit-transcript artifact). A submit concurrent with a withdraw start is
+  // SAFE — they're disjoint phases — but two concurrent submits for the same (dkgEpoch,
+  // requestId) would race on the persisted artifact path.
+  let vaultMpccaWithdrawSubmitInFlight: Promise<unknown> | null = null;
+  const vaultMpccaWithdrawSubmitLockAcquireTimeoutMs = 100;
+  async function acquireVaultMpccaWithdrawSubmitLock(): Promise<
+    { release: () => void } | "busy"
+  > {
+    const start = Date.now();
+    while (vaultMpccaWithdrawSubmitInFlight !== null) {
+      if (Date.now() - start > vaultMpccaWithdrawSubmitLockAcquireTimeoutMs) {
+        return "busy";
+      }
+      try {
+        await Promise.race([
+          vaultMpccaWithdrawSubmitInFlight,
+          new Promise((resolve) => setTimeout(resolve, 25)),
+        ]);
+      } catch {
+        // Holder failed; loop re-checks.
+      }
+    }
+    let resolveHeld: (value: void) => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      resolveHeld = resolve;
+    });
+    vaultMpccaWithdrawSubmitInFlight = held;
+    return {
+      release: () => {
+        vaultMpccaWithdrawSubmitInFlight = null;
         resolveHeld();
       },
     };
@@ -3464,6 +3548,282 @@ export function buildCoordinatorServer(
         return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
       }
       if (err instanceof MpccaWithdrawV2Error) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // =================================================================================================
+  // Milestone 5 sub-milestone 5b — MPCCA withdraw V2 chain-submit orchestrator.
+  //
+  // POST /v2/withdraw/mpcca/submit reads the finalize transcript that M4e will write at
+  //   <stateRoot>/coordinator/mpcca_withdraw/<dkgEpoch>__<requestId>__finalize.json,
+  // assembles the 27-field WithdrawV2CallArgs from it, hands them to the relayer, and polls for
+  // chain confirmation.
+  //
+  // 5b is PLUMBING-ONLY — the finalize transcript is still the M3a NotImplemented stub today, so
+  // every real-world call to this route surfaces 501 with `notImplementedPhase` set. The route is
+  // wired so that when M4d/M4e ship the actual finalize crypto + populate the on-disk artifact,
+  // NO new orchestration plumbing is needed.
+  //
+  // Wire shape:
+  //   1. Forbidden-plaintext-field guard FIRST on the raw body.
+  //   2. parseMpccaWithdrawSubmitRequest — { dkgEpoch, requestId, [relayerOverrides] }.
+  //   3. isSafeId(requestId) before any FS path construction.
+  //   4. Acquire vaultMpccaWithdrawSubmitInFlight lock. 409 mpcca_withdraw_submit_in_flight on
+  //      contention.
+  //   5. loadMpccaFinalizeTranscript(stateRoot, dkgEpoch, requestId). Null → 400
+  //      mpcca_finalize_transcript_not_found with an actionable message.
+  //   6. assembleWithdrawV2CallArgs(finalize). If returns { notImplementedPhase } → persist the
+  //      submit-transcript stub artifact + return 501 with the phase string.
+  //   7. Otherwise: invoke the injected relayerSubmitter with the assembled 27-field bundle.
+  //      Captures (txHash, simulated).
+  //   8. If chainNodeUrl is configured AND the result is not simulated, waitForTx until
+  //      confirmed or timeout. On timeout → 502 chain_confirmation_timeout.
+  //   9. Persist the submit-transcript artifact at
+  //      <stateRoot>/coordinator/mpcca_withdraw_submit/<dkgEpoch>__<requestId>.json.
+  //  10. Return 200 (real success), 202 (simulated success), or 501 (M3a stub).
+  // =================================================================================================
+  server.post("/v2/withdraw/mpcca/submit", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      // 1. Forbidden-plaintext-field guard FIRST.
+      assertNoForbiddenPlaintextFields(raw);
+      // 2. Parse + shape-validate.
+      const parsed = parseMpccaWithdrawSubmitRequest(raw);
+      // 3. isSafeId(requestId) before any FS path construction.
+      if (!isSafeId(parsed.requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds this into " +
+            "filesystem paths",
+        });
+      }
+      if (!opts.stateRoot) {
+        // Plumbing precondition: the submit route is stateRoot-only because the finalize
+        // transcript is the load-bearing source of truth. Without stateRoot there's nothing
+        // to read.
+        return reply.code(400).send({
+          error: "state_root_required",
+          message:
+            "POST /v2/withdraw/mpcca/submit requires stateRoot — the finalize transcript is " +
+            "loaded from disk; configure EUNOMA_STATE_ROOT or pass stateRoot to buildCoordinatorServer",
+        });
+      }
+      // 4. Acquire submit lock.
+      const lock = await acquireVaultMpccaWithdrawSubmitLock();
+      if (lock === "busy") {
+        return reply.code(409).send({
+          error: "mpcca_withdraw_submit_in_flight",
+          requestId: parsed.requestId,
+          message: "another MPCCA withdraw submit is in progress for this coordinator; retry shortly",
+        });
+      }
+      try {
+        // 5. Load the finalize transcript.
+        const finalize = await loadMpccaFinalizeTranscript(
+          opts.stateRoot,
+          parsed.dkgEpoch,
+          parsed.requestId,
+        );
+        if (!finalize) {
+          return reply.code(400).send({
+            error: "mpcca_finalize_transcript_not_found",
+            requestId: parsed.requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            expectedPath: mpccaFinalizeTranscriptPath(
+              opts.stateRoot,
+              parsed.dkgEpoch,
+              parsed.requestId,
+            ),
+            message:
+              "invoke /v2/withdraw/mpcca/start first; ensure all 4 rounds completed (currently " +
+              "rounds 2/prove/finalize return 501 — M4 will fill them in)",
+          });
+        }
+        // 6. Assemble. Either get the 27-field bundle or the NotImplemented passthrough.
+        let assembleResult: WithdrawV2CallArgsShape | { notImplementedPhase: string };
+        try {
+          assembleResult = assembleWithdrawV2CallArgs(finalize);
+        } catch (err) {
+          return reply.code(500).send({
+            error: "withdraw_v2_call_args_assembly_failed",
+            requestId: parsed.requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            message: err instanceof Error ? err.message : "unknown",
+          });
+        }
+
+        // Persistence helper. Used by all three outcome paths so the audit log captures both
+        // the stub case AND the real-submission case.
+        const submitTranscriptDir = join(
+          opts.stateRoot,
+          "coordinator",
+          "mpcca_withdraw_submit",
+        );
+        const submitTranscriptPath = join(
+          submitTranscriptDir,
+          `${parsed.dkgEpoch}__${parsed.requestId}.json`,
+        );
+        async function persistSubmitTranscript(payload: Record<string, unknown>): Promise<string> {
+          const artifactWithoutHash = {
+            scheme: "mpcca_withdraw_submit_v2" as const,
+            domain: EUNOMA_MPCCA_WITHDRAW_SUBMIT_V1,
+            dkgEpoch: parsed.dkgEpoch,
+            requestId: parsed.requestId,
+            finalizeTranscriptPath: mpccaFinalizeTranscriptPath(
+              opts.stateRoot!,
+              parsed.dkgEpoch,
+              parsed.requestId,
+            ),
+            finalizeTranscriptHash: finalize!.transcriptHash,
+            createdAtUnixMs: Date.now(),
+            ...payload,
+          };
+          const transcriptHash = bytesToHex(
+            sha256(new TextEncoder().encode(canonicalJsonStringify(artifactWithoutHash))),
+          );
+          await writeTranscriptArtifactAtomic(submitTranscriptPath, {
+            ...artifactWithoutHash,
+            transcriptHash,
+          });
+          return transcriptHash;
+        }
+
+        if (isNotImplementedPhasePassthrough(assembleResult)) {
+          // 6a. M3a/M4 stub passthrough — finalize transcript still carries a NotImplemented
+          // phase. Persist the stub submit-transcript so an auditor can see the attempt + the
+          // phase that blocked it.
+          const phase = assembleResult.notImplementedPhase;
+          const transcriptHash = await persistSubmitTranscript({
+            completed: false,
+            simulated: true,
+            notImplementedPhase: phase,
+          });
+          return reply.code(501).send({
+            accepted: false,
+            requestId: parsed.requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            simulated: true,
+            completed: false,
+            notImplementedPhase: phase,
+            transcriptHash,
+            transcriptPath: submitTranscriptPath,
+            message:
+              `MPCCA withdraw finalize transcript is still on the NotImplemented stub: ${phase}. ` +
+              "M4d/M4e will fill in the real finalize crypto. The submit route plumbing is in " +
+              "place; no new orchestration work is needed when M4 lands.",
+          });
+        }
+
+        // 7. Real assembly succeeded. Hand to the relayer.
+        if (!opts.relayerSubmitter) {
+          return reply.code(502).send({
+            error: "relayer_unreachable",
+            requestId: parsed.requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            message:
+              "coordinator has no relayer submitter configured; set RELAYER_URL + " +
+              "RELAYER_BEARER_TOKEN in the environment or inject `relayerSubmitter` for tests",
+          });
+        }
+        let relayerResult: Awaited<ReturnType<RelayerWithdrawSubmitter>>;
+        try {
+          relayerResult = await opts.relayerSubmitter(assembleResult);
+        } catch (err) {
+          return reply.code(502).send({
+            error: "relayer_returned_error",
+            requestId: parsed.requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            message: err instanceof Error ? err.message : "unknown",
+          });
+        }
+        // 8. Poll for chain confirmation. We poll only if (a) it's NOT a simulated submit
+        // (simulated submits never make it on-chain) AND (b) a chainNodeUrl is configured.
+        let confirmation: { confirmed: boolean; success?: boolean; vmStatus?: string } | null =
+          null;
+        if (!relayerResult.simulated && opts.chainNodeUrl) {
+          try {
+            confirmation = await waitForTx(opts.chainNodeUrl, relayerResult.txHash, {
+              timeoutMs: opts.chainConfirmationTimeoutMs,
+              fetchImpl: opts.chainFetch,
+            });
+          } catch (err) {
+            // waitForTx threw — either a 5xx from the chain node or unexpected transport
+            // failure. Surface as 502 chain_confirmation_timeout so the operator sees the
+            // exact failure mode.
+            const transcriptHash = await persistSubmitTranscript({
+              completed: false,
+              simulated: false,
+              txHash: relayerResult.txHash,
+              chainConfirmationError: err instanceof Error ? err.message : "unknown",
+            });
+            return reply.code(502).send({
+              error: "chain_confirmation_timeout",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              txHash: relayerResult.txHash,
+              transcriptHash,
+              transcriptPath: submitTranscriptPath,
+              message:
+                `chain confirmation polling failed: ${err instanceof Error ? err.message : "unknown"}`,
+            });
+          }
+          if (!confirmation.confirmed) {
+            const transcriptHash = await persistSubmitTranscript({
+              completed: false,
+              simulated: false,
+              txHash: relayerResult.txHash,
+              chainConfirmationError: "timeout",
+            });
+            return reply.code(502).send({
+              error: "chain_confirmation_timeout",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              txHash: relayerResult.txHash,
+              transcriptHash,
+              transcriptPath: submitTranscriptPath,
+              message: `tx ${relayerResult.txHash} did not confirm within ${opts.chainConfirmationTimeoutMs ?? 30_000}ms`,
+            });
+          }
+        }
+        // 9. Persist the success submit-transcript artifact.
+        const submitTranscriptHash = await persistSubmitTranscript({
+          completed: true,
+          simulated: relayerResult.simulated,
+          txHash: relayerResult.txHash,
+          ...(confirmation
+            ? {
+                chainSuccess: confirmation.success,
+                chainVmStatus: confirmation.vmStatus,
+              }
+            : {}),
+        });
+        // 10. Return — 200 for real-chain confirmation, 202 for simulated.
+        const statusCode = relayerResult.simulated ? 202 : 200;
+        return reply.code(statusCode).send({
+          accepted: relayerResult.accepted,
+          requestId: parsed.requestId,
+          dkgEpoch: parsed.dkgEpoch,
+          txHash: relayerResult.txHash,
+          simulated: relayerResult.simulated,
+          completed: true,
+          transcriptHash: submitTranscriptHash,
+          transcriptPath: submitTranscriptPath,
+        });
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof MpccaWithdrawSubmitError) {
         return reply.code(400).send({ error: err.code, message: err.message });
       }
       return reply.code(400).send({

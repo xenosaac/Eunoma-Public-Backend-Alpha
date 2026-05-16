@@ -4290,4 +4290,334 @@ describe("coordinator", () => {
     expect(res.json().error).toBe("vault_state_observed_provenance_unknown");
     expect(workerCalled).toBe(false);
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Milestone 5 sub-milestone 5b — POST /v2/withdraw/mpcca/submit orchestrator.
+  //
+  // M5b is plumbing-only: the finalize transcript is still the M3a NotImplemented stub today,
+  // so every real-world call to this route surfaces 501 with `notImplementedPhase` set. These
+  // tests exercise the orchestration WITHOUT touching crypto — the killer is
+  // `mpcca_submit_returns_501_when_finalize_is_m3a_stub` which proves the plumbing surfaces
+  // NotImplemented cleanly.
+  // ---------------------------------------------------------------------------------------------
+  describe("MPCCA withdraw V2 submit — M5b plumbing", () => {
+    async function makeStateRoot(prefix: string): Promise<string> {
+      const { mkdtemp } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const os = await import("node:os");
+      return mkdtemp(join(os.tmpdir(), prefix));
+    }
+
+    async function writeFinalizeTranscriptStub(
+      stateRoot: string,
+      dkgEpoch: string,
+      requestId: string,
+      notImplementedPhase: string,
+    ): Promise<string> {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+      await mkdir(dir, { recursive: true });
+      const path = join(dir, `${dkgEpoch}__${requestId}__finalize.json`);
+      await writeFile(
+        path,
+        JSON.stringify({
+          scheme: "mpcca_withdraw_v2_finalize",
+          dkgEpoch,
+          requestId,
+          notImplementedPhase,
+          transcriptHash: h32("e"),
+          createdAtUnixMs: 1_700_000_000_000,
+        }),
+      );
+      return path;
+    }
+
+    async function writeFinalizeTranscriptComplete(
+      stateRoot: string,
+      dkgEpoch: string,
+      requestId: string,
+    ): Promise<string> {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+      await mkdir(dir, { recursive: true });
+      const path = join(dir, `${dkgEpoch}__${requestId}__finalize.json`);
+      const hex32 = (seed: number) =>
+        Array.from({ length: 32 }, (_, i) =>
+          ((i + seed) & 0xff).toString(16).padStart(2, "0"),
+        ).join("");
+      const hexN = (n: number, seed: number) =>
+        Array.from({ length: n }, (_, i) =>
+          ((i + seed) & 0xff).toString(16).padStart(2, "0"),
+        ).join("");
+      const fields = {
+        root: hex32(0x10),
+        nullifierHash: hex32(0x11),
+        recipient: hex32(0x12),
+        recipientHash: hex32(0x13),
+        amountTag: hex32(0x14),
+        caPayloadHash: hex32(0x15),
+        requestHash: hex32(0x16),
+        vaultSequence: "42",
+        expirySecs: "1800000000",
+        withdrawProof: hexN(192, 0x20),
+        groupSignature: hexN(64, 0x30),
+        fallbackBitmap: 0,
+        fallbackSignatures: [],
+        newBalanceP: Array.from({ length: 8 }, (_, i) => hex32(0x40 + i)),
+        newBalanceR: Array.from({ length: 8 }, (_, i) => hex32(0x50 + i)),
+        newBalanceREffAud: [],
+        amountP: Array.from({ length: 4 }, (_, i) => hex32(0x60 + i)),
+        amountRSender: Array.from({ length: 4 }, (_, i) => hex32(0x70 + i)),
+        amountRRecip: Array.from({ length: 4 }, (_, i) => hex32(0x80 + i)),
+        amountREffAud: [],
+        ekVolunAuds: [],
+        amountRVolunAuds: [],
+        zkrpNewBalance: hexN(672, 0x90),
+        zkrpAmount: hexN(672, 0xa0),
+        sigmaProtoComm: Array.from({ length: 30 }, (_, i) => hex32(0xb0 + i)),
+        sigmaProtoResp: Array.from({ length: 25 }, (_, i) => hex32(0xc0 + i)),
+        memo: "",
+      };
+      await writeFile(
+        path,
+        JSON.stringify({
+          scheme: "mpcca_withdraw_v2_finalize",
+          dkgEpoch,
+          requestId,
+          withdrawV2CallArgsFields: fields,
+          transcriptHash: h32("e"),
+          createdAtUnixMs: 1_700_000_000_000,
+        }),
+      );
+      return path;
+    }
+
+    it("mpcca_submit_returns_400_when_finalize_transcript_missing", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-no-finalize-");
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-missing" },
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json();
+      expect(body.error).toBe("mpcca_finalize_transcript_not_found");
+      expect(body.expectedPath).toContain("1__withdraw-missing__finalize.json");
+      expect(body.message).toContain("M4 will fill them in");
+    });
+
+    // KILLER: M5b's load-bearing assertion. When the finalize transcript carries the M3a
+    // NotImplemented stub, the submit route surfaces 501 cleanly with the phase string
+    // verbatim, AND persists a stub submit-transcript so an auditor can see the attempt.
+    it("mpcca_submit_returns_501_when_finalize_is_m3a_stub", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-stub-");
+      await writeFinalizeTranscriptStub(
+        stateRoot,
+        "1",
+        "withdraw-stub",
+        "mpcca_withdraw_v2_finalize_aggregate_pending_milestone4",
+      );
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-stub" },
+      });
+      expect(res.statusCode).toBe(501);
+      const body = res.json();
+      expect(body.accepted).toBe(false);
+      expect(body.completed).toBe(false);
+      expect(body.simulated).toBe(true);
+      expect(body.notImplementedPhase).toBe(
+        "mpcca_withdraw_v2_finalize_aggregate_pending_milestone4",
+      );
+      expect(body.txHash).toBeUndefined();
+      // Stub submit-transcript persisted with a real digest.
+      expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(body.transcriptPath).toContain("mpcca_withdraw_submit");
+      expect(body.transcriptPath).toContain("1__withdraw-stub.json");
+      // Verify the file actually exists on disk + carries the same transcriptHash.
+      const { readFile } = await import("node:fs/promises");
+      const artifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
+      expect(artifact.transcriptHash).toBe(body.transcriptHash);
+      expect(artifact.notImplementedPhase).toBe(
+        "mpcca_withdraw_v2_finalize_aggregate_pending_milestone4",
+      );
+      expect(artifact.domain).toBe("EUNOMA_MPCCA_WITHDRAW_SUBMIT_V1");
+    });
+
+    it("mpcca_submit_calls_relayer_with_assembled_args", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-relayer-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-real");
+      let receivedArgs: Record<string, unknown> | undefined;
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async (args) => {
+          receivedArgs = args as unknown as Record<string, unknown>;
+          return { accepted: true, txHash: "0x" + "ab".repeat(32), simulated: true };
+        },
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-real" },
+      });
+      expect(res.statusCode).toBe(202); // simulated submit → 202
+      const body = res.json();
+      expect(body.accepted).toBe(true);
+      expect(body.completed).toBe(true);
+      expect(body.simulated).toBe(true);
+      expect(body.txHash).toBe("0x" + "ab".repeat(32));
+      expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(body.transcriptPath).toContain("mpcca_withdraw_submit");
+      // LOAD-BEARING: 27 fields handed to the relayer.
+      expect(receivedArgs).toBeDefined();
+      expect(Object.keys(receivedArgs!).length).toBe(27);
+      expect(receivedArgs!.root).toBeDefined();
+      expect(receivedArgs!.vaultSequence).toBe("42");
+      expect(receivedArgs!.memo).toBe("");
+    });
+
+    it("mpcca_submit_propagates_relayer_error", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-relayer-err-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-relayer-err");
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => {
+          throw new Error("relayer is down");
+        },
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-relayer-err" },
+      });
+      expect(res.statusCode).toBe(502);
+      const body = res.json();
+      expect(body.error).toBe("relayer_returned_error");
+      expect(body.message).toContain("relayer is down");
+    });
+
+    it("mpcca_submit_returns_502_relayer_unreachable_when_no_submitter_configured", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-no-submitter-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-no-submitter");
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        // no relayerSubmitter
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-no-submitter" },
+      });
+      expect(res.statusCode).toBe(502);
+      expect(res.json().error).toBe("relayer_unreachable");
+    });
+
+    it("mpcca_submit_returns_409_on_lock_contention", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-lock-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-lock-a");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-lock-b");
+      let releaseBarrier: () => void = () => {};
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => {
+          await barrier;
+          return { accepted: true, txHash: "0x" + "ab".repeat(32), simulated: true };
+        },
+      });
+      const first = server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-lock-a" },
+      });
+      // Give the first call enough time to acquire the lock and reach the relayer await.
+      await new Promise((r) => setTimeout(r, 20));
+      const secondRes = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-lock-b" },
+      });
+      expect(secondRes.statusCode).toBe(409);
+      expect(secondRes.json().error).toBe("mpcca_withdraw_submit_in_flight");
+      // Drain the first call so the lock releases cleanly.
+      releaseBarrier();
+      const firstRes = await first;
+      expect(firstRes.statusCode).toBe(202);
+    });
+
+    it("mpcca_submit_rejects_forbidden_plaintext_field", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-forbidden-");
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-x", amount: "1000" },
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json();
+      expect(body.error).toBe("forbidden_plaintext_field");
+      expect(body.field).toBe("amount");
+    });
+
+    it("mpcca_submit_rejects_unsafe_request_id_before_loading_finalize", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-unsafe-");
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "../../etc/passwd" },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("unsafe_request_id");
+    });
+
+    it("mpcca_submit_returns_400_state_root_required_without_stateRoot_config", async () => {
+      const { server } = buildCoordinatorServer({ caDkgV2Roster: dkgRoster() });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-x" },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("state_root_required");
+    });
+
+    it("mpcca_submit_returns_400_for_malformed_request_body", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-bad-body-");
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "abc", requestId: "withdraw-x" },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("invalid_request");
+    });
+  });
 });
