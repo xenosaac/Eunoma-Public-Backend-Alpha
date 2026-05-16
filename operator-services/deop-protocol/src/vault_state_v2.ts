@@ -528,6 +528,89 @@ export function parseVaultStateV2InitRequest(body: unknown): VaultStateV2InitReq
   };
 }
 
+// =================================================================================================
+// Codex M3a P1 (regression fix) — vault_state_v2 init FINALIZE round.
+//
+// Background: the original Milestone 2a init flow had each worker persist its OWN per-slot
+// worker_transcript_hash as `init_transcript_hash` in vault_state_v2.json, and the MPCCA
+// withdraw round bodies verified a caller-supplied vaultStateInitTranscriptHash against that
+// per-slot value. But the coordinator's /v2/withdraw/mpcca/start sends the FINAL aggregated
+// init transcript hash (the FINAL_V1 domain digest over all 5 contributions) — a single
+// canonical value distinct from any per-slot hash. The mismatch made every coordinator-
+// orchestrated MPCCA withdraw fail closed with vault_state_init_transcript_hash_mismatch.
+//
+// The fix: a second fan-out from /v2/vault_state/init AFTER it has collected all 5 per-slot
+// init contributions. The coordinator computes finalTranscriptHash via
+// assembleVaultStateV2InitTranscript and POSTs /worker/v2/vault_state/init/finalize to each
+// of the 5 selected slots with `(finalTranscriptHash, perSlotContributions)`. Each worker:
+//   1. Re-derives finalTranscriptHash locally from the supplied per-slot contributions +
+//      public inputs (byte-identical with vaultStateV2InitFinalTranscriptHash).
+//   2. Asserts the request's claimed value matches its local derivation (defense in depth
+//      against a coordinator-side bug).
+//   3. UPDATES its persisted vault_state_v2.json's `init_transcript_hash` to this canonical
+//      value.
+// Subsequent MPCCA withdraw rounds verify against this byte-stable value, matching what the
+// coordinator's request body will carry.
+// =================================================================================================
+
+export interface VaultStateV2InitFinalizeRequest {
+  dkgEpoch: string;
+  requestId: string;
+  sessionId: string;
+  caDkgTranscriptHash: HexString;
+  vaultEkTranscriptHash: HexString;
+  registrationTranscriptHash: HexString;
+  rosterHash: HexString;
+  selectedSlots: number[];
+  selfSlot: number;
+  playerId: number;
+  vaultEk: HexString;
+  senderAddress: HexString;
+  assetType: HexString;
+  chainId: number;
+  aggregateCommitment: HexString;
+  aggregateResponse: HexString;
+  challenge: HexString;
+  perSlotContributions: VaultStateV2InitContribution[];
+  finalTranscriptHash: HexString;
+}
+
+export interface VaultStateV2InitFinalizeResponse {
+  slot: number;
+  playerId: number;
+  vaultStatePath: string;
+  /** Sha256 of the post-finalize vault_state_v2.json byte buffer. */
+  vaultStateHash: HexString;
+  /** Pinned init_transcript_hash value — byte-equal to request.finalTranscriptHash. */
+  initTranscriptHash: HexString;
+  /** True when this call wrote a new pin; false on idempotent replay. */
+  finalized: boolean;
+}
+
+export function parseVaultStateV2InitFinalizeResponse(
+  body: unknown,
+): VaultStateV2InitFinalizeResponse {
+  assertNoForbiddenPlaintextFields(body);
+  const obj = objectBody(body);
+  return {
+    slot: requireInt(obj, "slot", 0, DEOPERATOR_COUNT - 1),
+    playerId: requireInt(obj, "playerId", 0, DEOPERATOR_THRESHOLD - 1),
+    vaultStatePath: requireString(obj, "vaultStatePath"),
+    vaultStateHash: requireHex(obj, "vaultStateHash", 32),
+    initTranscriptHash: requireHex(obj, "initTranscriptHash", 32),
+    finalized: (() => {
+      const v = obj.finalized;
+      if (typeof v !== "boolean") {
+        throw new VaultStateV2InitError(
+          "INVALID_CONTRIBUTION_SHAPE",
+          "finalized must be a boolean",
+        );
+      }
+      return v;
+    })(),
+  };
+}
+
 export function parseVaultStateV2InitResponse(body: unknown): VaultStateV2InitResponse {
   assertNoForbiddenPlaintextFields(body);
   const obj = objectBody(body);

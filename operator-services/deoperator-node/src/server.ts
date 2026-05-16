@@ -282,6 +282,7 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/derive/ca_registration/verify"
       | "/worker/v2/derive/ca_registration/aggregate"
       | "/worker/v2/vault_state/init"
+      | "/worker/v2/vault_state/init/finalize"
       | "/worker/v2/vault_state/observe_deposit"
       | "/worker/v2/mpcca/withdraw/round1"
       | "/worker/v2/mpcca/withdraw/round2"
@@ -466,6 +467,35 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/worker/v2/vault_state/init", req.body, reply);
+  });
+
+  // Codex M3a P1 (regression fix) — vault_state_v2 init finalize passthrough. The coordinator
+  // fans this round out AFTER the per-slot init responses are collected + assembled into a
+  // final init transcript. Each worker re-derives the same final hash, asserts byte-
+  // equality with the coordinator's claim, then UPDATES init_transcript_hash in its
+  // persisted vault_state_v2.json. Without this round, the MPCCA withdraw round1's
+  // vaultStateInitTranscriptHash (= the final hash) would never match a worker's persisted
+  // per-slot init hash and every legitimate withdraw would fail closed.
+  //
+  // Same passthrough posture as /init: forbidden-field guard runs first, rosterHash must
+  // match the configured CA DKG V2 roster, selfSlot must equal this node's slot. The body
+  // contains only public binding values + the (per-slot contributions, final hash) tuple;
+  // no secret material on the wire.
+  server.post("/worker/v2/vault_state/init/finalize", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/vault_state/init/finalize", req.body, reply);
   });
 
   // Milestone 2 sub-milestone 2b — vault_state_v2/observe_deposit passthrough. Mirrors the

@@ -2299,6 +2299,28 @@ describe("coordinator", () => {
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
       singleNodeForwarder: async (path, body, _roster, slot) => {
+        // Codex M3a P1: handle the second-round /init/finalize fan-out. The mock workers
+        // here apply the SAME semantics as the real Rust workers — they re-derive the
+        // final transcript hash from the supplied contributions and echo back
+        // `initTranscriptHash = finalTranscriptHash`. A real worker would also UPDATE
+        // its persisted vault_state_v2.json to pin this canonical value.
+        if (path === "/worker/v2/vault_state/init/finalize") {
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const finalTranscriptHash = (body as Record<string, unknown>).finalTranscriptHash as string;
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              playerId,
+              vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+              vaultStateHash: h32(String((slot + 5) % 9)),
+              initTranscriptHash: finalTranscriptHash,
+              finalized: true,
+            },
+          };
+        }
         if (path !== "/worker/v2/vault_state/init") {
           return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path", path } };
         }
@@ -2695,6 +2717,24 @@ describe("coordinator", () => {
       caDkgV2Roster,
       stateRoot,
       singleNodeForwarder: async (path, body, _roster, slot) => {
+        // Codex M3a P1: respond to the second-round finalize fan-out.
+        if (path === "/worker/v2/vault_state/init/finalize") {
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const finalTranscriptHash = (body as Record<string, unknown>).finalTranscriptHash as string;
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              playerId,
+              vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+              vaultStateHash: h32(String((slot + 5) % 9)),
+              initTranscriptHash: finalTranscriptHash,
+              finalized: true,
+            },
+          };
+        }
         if (path !== "/worker/v2/vault_state/init") {
           return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
         }

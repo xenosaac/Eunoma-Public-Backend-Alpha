@@ -35,6 +35,7 @@ import {
   parseObserveDepositResponse,
   parseSessionShareEnvelope,
   parseVaultEkContributions,
+  parseVaultStateV2InitFinalizeResponse,
   parseVaultStateV2InitResponse,
   rosterHash,
   scalarHexFromBigint,
@@ -2066,6 +2067,115 @@ export function buildCoordinatorServer(
           challenge,
           perSlotContributions,
         });
+        // ===================================================================================
+        // Codex M3a P1 (regression fix) — vault_state_v2 init finalize fan-out.
+        //
+        // The first fan-out collected per-slot init contributions. Each worker persisted
+        // its OWN per-slot worker_transcript_hash as init_transcript_hash. But the
+        // canonical value the MPCCA withdraw round1 binds against — and that the
+        // coordinator's request body carries — is the FINAL transcript hash
+        // (EUNOMA_VAULT_STATE_V2_FINAL_V1 domain over public inputs + sorted
+        // contributions), computed by assembleVaultStateV2InitTranscript above.
+        //
+        // We MUST now fan out a finalize round so every worker re-derives the same final
+        // hash, asserts byte-equality, and UPDATES its persisted init_transcript_hash to
+        // the canonical value. Without this round, every coordinator-orchestrated MPCCA
+        // withdraw will fail closed with vault_state_init_transcript_hash_mismatch even
+        // though all upstream provenance gates passed.
+        //
+        // The finalize round is fail-closed: if ANY of the 5 workers rejects the finalize
+        // call, we tear down with init_finalize_failed (502) and the init itself is treated
+        // as not-yet-canonical. The store.markComplete call only runs after the finalize
+        // round succeeds across all 5 workers.
+        const finalizeBodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
+          dkgEpoch,
+          requestId: requestId!,
+          sessionId,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selfSlot: slot,
+          playerId: ordinalIndex,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment,
+          aggregateResponse,
+          challenge,
+          perSlotContributions,
+          finalTranscriptHash: transcript.transcriptHash,
+        }));
+        const finalizeForwarded = await Promise.all(
+          sortedSelectedSlots.map((slot, ordinalIndex) =>
+            singleNodeForwarder(
+              "/worker/v2/vault_state/init/finalize",
+              finalizeBodies[ordinalIndex],
+              dkgRoster,
+              slot,
+            ).then(
+              (value) => ({ kind: "value" as const, slot, value }),
+              (reason) => ({ kind: "rejected" as const, slot, reason }),
+            ),
+          ),
+        );
+        for (const res of finalizeForwarded) {
+          if (res.kind === "rejected") {
+            return reply.code(502).send({
+              error: "init_finalize_forward_rejected",
+              slot: res.slot,
+              requestId,
+              reason:
+                res.reason instanceof Error ? res.reason.message : String(res.reason),
+            });
+          }
+          if (!res.value.ok || !res.value.body) {
+            return reply.code(502).send({
+              error: "init_finalize_forward_failed",
+              slot: res.slot,
+              statusCode: res.value.statusCode,
+              body: res.value.body,
+              requestId,
+            });
+          }
+          let parsedFinalize;
+          try {
+            parsedFinalize = parseVaultStateV2InitFinalizeResponse(res.value.body);
+          } catch (err) {
+            return reply.code(502).send({
+              error: "init_finalize_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: err instanceof Error ? err.message : "unknown",
+            });
+          }
+          // Defense in depth: worker's claimed `initTranscriptHash` MUST equal the
+          // coordinator's computed final hash. A divergence here means the worker either
+          // (a) didn't run the local re-derivation (impossible by worker code path), or
+          // (b) the deop-node tampered the response on its way back.
+          if (
+            parsedFinalize.initTranscriptHash.replace(/^0x/i, "").toLowerCase() !==
+            transcript.transcriptHash.replace(/^0x/i, "").toLowerCase()
+          ) {
+            return reply.code(502).send({
+              error: "init_finalize_hash_mismatch",
+              slot: res.slot,
+              requestId,
+              expected: transcript.transcriptHash,
+              actual: parsedFinalize.initTranscriptHash,
+            });
+          }
+          if (parsedFinalize.slot !== res.slot) {
+            return reply.code(502).send({
+              error: "init_finalize_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: `worker returned slot ${parsedFinalize.slot} for selfSlot ${res.slot}`,
+            });
+          }
+        }
         const transcriptArtifact = {
           ...transcript,
           selectionRationale,
