@@ -4708,6 +4708,109 @@ describe("coordinator", () => {
       expect(res.json().error).toBe("invalid_request");
     });
 
+    // Codex M5b P2 #3: when the finalize transcript carries an `attestationConfig`
+    // block, the submit artifact MUST mirror it verbatim — but the relayer MUST NOT
+    // receive these fields (only the 27-field WithdrawV2CallArgs).
+    it("submit_route_persists_attestationConfig_into_submit_artifact", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-attest-");
+      const { mkdir, writeFile, readFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+      await mkdir(dir, { recursive: true });
+      const hex32 = (seed: number) =>
+        Array.from({ length: 32 }, (_, i) =>
+          ((i + seed) & 0xff).toString(16).padStart(2, "0"),
+        ).join("");
+      const hexN = (n: number, seed: number) =>
+        Array.from({ length: n }, (_, i) =>
+          ((i + seed) & 0xff).toString(16).padStart(2, "0"),
+        ).join("");
+      const attestationConfig = {
+        chainId: 2,
+        bridge: hex32(0x01),
+        vault: hex32(0x02),
+        assetType: hex32(0x03),
+        operatorSetVersion: "1",
+        rosterHash: hex32(0x04),
+        frostGroupPubkey: hex32(0x05),
+        circuitVersionsHash: hex32(0x06),
+      };
+      const fields = {
+        root: hex32(0x10),
+        nullifierHash: hex32(0x11),
+        recipient: hex32(0x12),
+        recipientHash: hex32(0x13),
+        amountTag: hex32(0x14),
+        caPayloadHash: hex32(0x15),
+        requestHash: hex32(0x16),
+        vaultSequence: "42",
+        expirySecs: "1800000000",
+        withdrawProof: hexN(192, 0x20),
+        groupSignature: hexN(64, 0x30),
+        fallbackBitmap: 0,
+        fallbackSignatures: [],
+        newBalanceP: Array.from({ length: 8 }, (_, i) => hex32(0x40 + i)),
+        newBalanceR: Array.from({ length: 8 }, (_, i) => hex32(0x50 + i)),
+        newBalanceREffAud: [],
+        amountP: Array.from({ length: 4 }, (_, i) => hex32(0x60 + i)),
+        amountRSender: Array.from({ length: 4 }, (_, i) => hex32(0x70 + i)),
+        amountRRecip: Array.from({ length: 4 }, (_, i) => hex32(0x80 + i)),
+        amountREffAud: [],
+        ekVolunAuds: [],
+        amountRVolunAuds: [],
+        zkrpNewBalance: hexN(672, 0x90),
+        zkrpAmount: hexN(672, 0xa0),
+        sigmaProtoComm: Array.from({ length: 30 }, (_, i) => hex32(0xb0 + i)),
+        sigmaProtoResp: Array.from({ length: 25 }, (_, i) => hex32(0xc0 + i)),
+        memo: "",
+      };
+      await writeFile(
+        join(dir, "1__withdraw-attest__finalize.json"),
+        JSON.stringify({
+          scheme: "mpcca_withdraw_v2_finalize",
+          dkgEpoch: "1",
+          requestId: "withdraw-attest",
+          withdrawV2CallArgsFields: fields,
+          attestationConfig,
+          transcriptHash: h32("e"),
+        }),
+      );
+      let relayerArgs: Record<string, unknown> | undefined;
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async (args) => {
+          relayerArgs = args as unknown as Record<string, unknown>;
+          return { accepted: true, txHash: "0x" + "ab".repeat(32), simulated: true };
+        },
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-attest" },
+      });
+      expect(res.statusCode).toBe(202);
+      // Relayer must receive ONLY the 27 call-args fields; attestationConfig keys must
+      // NOT appear.
+      expect(relayerArgs).toBeDefined();
+      const relayerKeys = Object.keys(relayerArgs!);
+      expect(relayerKeys.length).toBe(27);
+      for (const k of [
+        "chainId",
+        "bridge",
+        "vault",
+        "operatorSetVersion",
+        "rosterHash",
+        "frostGroupPubkey",
+        "circuitVersionsHash",
+      ]) {
+        expect(relayerKeys, `relayer must not see ${k}`).not.toContain(k);
+      }
+      // But the submit artifact MUST carry it verbatim.
+      const artifact = JSON.parse(await readFile(res.json().transcriptPath, "utf8"));
+      expect(artifact.attestationConfig).toEqual(attestationConfig);
+    });
+
     // KILLER (Codex M5b P2 #1): a completed submit is idempotent against retries with
     // byte-identical inputs — the route returns the existing artifact verbatim WITHOUT
     // re-invoking the relayer.

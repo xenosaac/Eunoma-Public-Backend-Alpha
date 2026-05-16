@@ -95,9 +95,36 @@ export interface FinalizeTranscript {
    * field order documented in `@eunoma/deop-protocol::WITHDRAW_V2_CALL_ARGS_ORDER`).
    */
   withdrawV2CallArgsFields?: FinalizeWithdrawV2CallArgsFields;
+  /**
+   * Codex M5b P2 #3: attestation-config fields that scope the finalize transcript to the
+   * issuing operator set + roster + circuit versions. These are NOT part of WithdrawV2CallArgs
+   * (the Move entry function does not consume them); they live on the transcript so the
+   * submit artifact's audit trail captures the deployment context M4e used. Mirrors
+   * `@eunoma/deop-protocol::WithdrawAttestationV2Message` (the non-call-args fields).
+   *
+   * The submit route writes these into the persisted submit artifact verbatim but DOES
+   * NOT pass them to the relayer (the relayer signature only needs WithdrawV2CallArgs).
+   */
+  attestationConfig?: WithdrawFinalizeAttestationConfig;
   /** SHA-256 over the canonicalized transcript content (set by M4e's persistence step). */
   transcriptHash?: HexString;
   createdAtUnixMs?: number;
+}
+
+/**
+ * Codex M5b P2 #3: deployment-context fields the finalize transcript MAY carry to scope
+ * an audit trail. None of these enter WithdrawV2CallArgs; the submit route persists them
+ * into the submit artifact for auditor reconstruction.
+ */
+export interface WithdrawFinalizeAttestationConfig {
+  chainId: number;
+  bridge: HexString;
+  vault: HexString;
+  assetType: HexString;
+  operatorSetVersion: string;
+  rosterHash: HexString;
+  frostGroupPubkey: HexString;
+  circuitVersionsHash: HexString;
 }
 
 /**
@@ -329,6 +356,12 @@ function assertFinalizeTranscriptShape(value: unknown, path: string): FinalizeTr
       );
     }
   }
+  // Codex M5b P2 #3: optional attestationConfig block.
+  const attestationConfigRaw = obj.attestationConfig;
+  let attestationConfig: WithdrawFinalizeAttestationConfig | undefined;
+  if (attestationConfigRaw !== undefined && attestationConfigRaw !== null) {
+    attestationConfig = assertAttestationConfigShape(attestationConfigRaw, path);
+  }
   return {
     scheme: "mpcca_withdraw_v2_finalize",
     dkgEpoch: obj.dkgEpoch,
@@ -337,8 +370,57 @@ function assertFinalizeTranscriptShape(value: unknown, path: string): FinalizeTr
     ...(withdrawV2CallArgsFields !== undefined && withdrawV2CallArgsFields !== null
       ? { withdrawV2CallArgsFields: withdrawV2CallArgsFields as FinalizeWithdrawV2CallArgsFields }
       : {}),
+    ...(attestationConfig !== undefined ? { attestationConfig } : {}),
     ...(transcriptHash !== undefined ? { transcriptHash: transcriptHash as HexString } : {}),
     ...(typeof obj.createdAtUnixMs === "number" ? { createdAtUnixMs: obj.createdAtUnixMs } : {}),
+  };
+}
+
+function assertAttestationConfigShape(
+  value: unknown,
+  path: string,
+): WithdrawFinalizeAttestationConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(
+      `loadMpccaFinalizeTranscript: ${path}.attestationConfig must be an object when present`,
+    );
+  }
+  const obj = value as Record<string, unknown>;
+  const requireHex = (key: string): HexString => {
+    const v = obj[key];
+    if (typeof v !== "string" || v.length === 0) {
+      throw new Error(
+        `loadMpccaFinalizeTranscript: ${path}.attestationConfig.${key} must be a non-empty hex string`,
+      );
+    }
+    // Sanity check: parse as hex bytes.
+    hexToBytes(v);
+    return v as HexString;
+  };
+  const requireDecimalString = (key: string): string => {
+    const v = obj[key];
+    if (typeof v !== "string" || !/^(0|[1-9][0-9]*)$/.test(v)) {
+      throw new Error(
+        `loadMpccaFinalizeTranscript: ${path}.attestationConfig.${key} must be a decimal string`,
+      );
+    }
+    return v;
+  };
+  const chainId = obj.chainId;
+  if (!Number.isInteger(chainId) || (chainId as number) < 0) {
+    throw new Error(
+      `loadMpccaFinalizeTranscript: ${path}.attestationConfig.chainId must be a non-negative integer`,
+    );
+  }
+  return {
+    chainId: chainId as number,
+    bridge: requireHex("bridge"),
+    vault: requireHex("vault"),
+    assetType: requireHex("assetType"),
+    operatorSetVersion: requireDecimalString("operatorSetVersion"),
+    rosterHash: requireHex("rosterHash"),
+    frostGroupPubkey: requireHex("frostGroupPubkey"),
+    circuitVersionsHash: requireHex("circuitVersionsHash"),
   };
 }
 

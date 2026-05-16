@@ -86,6 +86,68 @@ describe("loadMpccaFinalizeTranscript — disk loader", () => {
     expect(result!.withdrawV2CallArgsFields).toBeUndefined();
   });
 
+  // Codex M5b P2 #3: the loader accepts an optional attestationConfig block that
+  // scopes the deployment context the finalize aggregator used. None of these fields
+  // enter WithdrawV2CallArgs; they ride into the submit artifact for the audit trail.
+  it("loads_finalize_transcript_with_attestationConfig", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "eunoma-finalize-attest-"));
+    const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "1__req-attest__finalize.json");
+    const attestationConfig = {
+      chainId: 2,
+      bridge: "ab".repeat(32),
+      vault: "cd".repeat(32),
+      assetType: "ef".repeat(32),
+      operatorSetVersion: "1",
+      rosterHash: "10".repeat(32),
+      frostGroupPubkey: "20".repeat(32),
+      circuitVersionsHash: "30".repeat(32),
+    };
+    await writeFile(
+      path,
+      JSON.stringify({
+        scheme: "mpcca_withdraw_v2_finalize",
+        dkgEpoch: "1",
+        requestId: "req-attest",
+        notImplementedPhase: "stub",
+        attestationConfig,
+      }),
+    );
+    const result = await loadMpccaFinalizeTranscript(stateRoot, "1", "req-attest");
+    expect(result).toBeDefined();
+    expect(result!.attestationConfig).toEqual(attestationConfig);
+  });
+
+  it("rejects_finalize_transcript_with_malformed_attestationConfig_chainId", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "eunoma-finalize-attest-bad-"));
+    const dir = join(stateRoot, "coordinator", "mpcca_withdraw");
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "1__req-bad-attest__finalize.json");
+    await writeFile(
+      path,
+      JSON.stringify({
+        scheme: "mpcca_withdraw_v2_finalize",
+        dkgEpoch: "1",
+        requestId: "req-bad-attest",
+        notImplementedPhase: "stub",
+        attestationConfig: {
+          chainId: "not-an-int",
+          bridge: "ab".repeat(32),
+          vault: "cd".repeat(32),
+          assetType: "ef".repeat(32),
+          operatorSetVersion: "1",
+          rosterHash: "10".repeat(32),
+          frostGroupPubkey: "20".repeat(32),
+          circuitVersionsHash: "30".repeat(32),
+        },
+      }),
+    );
+    await expect(
+      loadMpccaFinalizeTranscript(stateRoot, "1", "req-bad-attest"),
+    ).rejects.toThrowError(/attestationConfig\.chainId must be a non-negative integer/);
+  });
+
   it("loads a complete finalize transcript (withdrawV2CallArgsFields populated)", async () => {
     const stateRoot = await mkdtemp(join(tmpdir(), "eunoma-finalize-real-"));
     const dir = join(stateRoot, "coordinator", "mpcca_withdraw");

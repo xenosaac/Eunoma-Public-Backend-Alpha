@@ -3709,6 +3709,9 @@ export function buildCoordinatorServer(
           payload: Record<string, unknown>,
           opts2: { noClobber?: boolean } = {},
         ): Promise<string> {
+          // Codex M5b P2 #3: stamp the finalize transcript's attestationConfig into the
+          // submit artifact (audit trail). The relayer NEVER receives this — it only
+          // consumes the 27-field WithdrawV2CallArgs.
           const artifactWithoutHash = {
             scheme: "mpcca_withdraw_submit_v2" as const,
             domain: EUNOMA_MPCCA_WITHDRAW_SUBMIT_V1,
@@ -3720,6 +3723,9 @@ export function buildCoordinatorServer(
               parsed.requestId,
             ),
             finalizeTranscriptHash: finalize!.transcriptHash,
+            ...(finalize!.attestationConfig
+              ? { attestationConfig: finalize!.attestationConfig }
+              : {}),
             createdAtUnixMs: Date.now(),
             ...payload,
           };
