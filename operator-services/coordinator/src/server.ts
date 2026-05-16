@@ -58,6 +58,39 @@ import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
 
+/**
+ * Codex M2a P2 #3: safe-id sanitiser for caller-supplied identifiers that the coordinator
+ * embeds in filesystem paths.
+ *
+ * The Rust worker rejects unsafe ids before writing its own files (see
+ * `mpc_spdz_adapter::is_safe_id`), but the COORDINATOR should not depend on worker success
+ * for its own filesystem hygiene. A worker that returns matching public hashes can let a
+ * caller-controlled `requestId` containing path separators (e.g. `../../etc/passwd`) or
+ * null bytes influence where the coordinator writes its transcript artifact.
+ *
+ * Allowed: ASCII alphanumeric plus `.`, `_`, `-`. Length: 1..=128 bytes. Anything else —
+ * `/`, `\`, `..`, null bytes, control chars, non-ASCII — is rejected.
+ *
+ * Mirrors the worker's `is_safe_id` byte-for-byte, with a length cap added (the worker
+ * doesn't impose a length cap because its callers already cap the size of POSTed JSON,
+ * but the coordinator builds these names directly into paths and we want a hard ceiling
+ * to prevent `requestId = "a" * 1e9` blowing up the file system).
+ */
+const SAFE_ID_MAX_LEN = 128;
+export function isSafeId(s: string): boolean {
+  if (typeof s !== "string") return false;
+  if (s.length === 0 || s.length > SAFE_ID_MAX_LEN) return false;
+  for (let i = 0; i < s.length; i += 1) {
+    const code = s.charCodeAt(i);
+    const isDigit = code >= 0x30 && code <= 0x39;
+    const isLower = code >= 0x61 && code <= 0x7a;
+    const isUpper = code >= 0x41 && code <= 0x5a;
+    const isPunct = code === 0x2e || code === 0x5f || code === 0x2d; // . _ -
+    if (!(isDigit || isLower || isUpper || isPunct)) return false;
+  }
+  return true;
+}
+
 export interface ProxyForwardResult {
   slot: number;
   ok: boolean;
@@ -469,6 +502,17 @@ export function buildCoordinatorServer(
         typeof raw.requestId === "string" && raw.requestId.length > 0
           ? raw.requestId
           : `vault-ek-derive-${Date.now()}`;
+      // Codex M2a P2 #3: sanitise caller-supplied requestId BEFORE acquiring any lock,
+      // touching the provenance scan, or constructing any FS path. Reject with 400 so
+      // the caller knows the requestId was the problem (NOT a 500 / silent rejection).
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds this into " +
+            "filesystem paths",
+        });
+      }
       if (raw.selectedSlots !== undefined) {
         return reply.code(400).send({
           error: "selected_slots_not_overridable",
@@ -950,6 +994,16 @@ export function buildCoordinatorServer(
         typeof raw.requestId === "string" && raw.requestId.length > 0
           ? raw.requestId
           : `ca-registration-v2-${Date.now()}`;
+      // Codex M2a P2 #3: sanitise caller-supplied requestId BEFORE acquiring any lock,
+      // touching the provenance scan, or constructing any FS path.
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds this into " +
+            "filesystem paths",
+        });
+      }
 
       // Slot selection: either caller-supplied (validated against current roster) or
       // coordinator-chosen lowest 5. Both shapes feed the same downstream pipeline.
@@ -1569,6 +1623,16 @@ export function buildCoordinatorServer(
         typeof raw.requestId === "string" && raw.requestId.length > 0
           ? raw.requestId
           : `vault-state-v2-${Date.now()}`;
+      // Codex M2a P2 #3: sanitise caller-supplied requestId BEFORE acquiring any lock,
+      // touching the provenance scan, or constructing any FS path.
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds this into " +
+            "filesystem paths",
+        });
+      }
 
       // Slot selection: same shape as ca_registration_v2. Default to lowest-5; caller may
       // override for failover/recovery. Note that in production the Milestone 1 transcript

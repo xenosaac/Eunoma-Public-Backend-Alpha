@@ -2539,6 +2539,82 @@ describe("coordinator", () => {
     expect(res.json().error).toBe("stale_dkg_epoch");
   });
 
+  // Codex M2a P2 #3: requestId is embedded into transcript paths
+  // (<stateRoot>/coordinator/vault_state_v2/<dkgEpoch>__<requestId>.json). A caller-supplied
+  // requestId containing path separators ("../"), null bytes, or non-ASCII must be rejected
+  // 400 BEFORE the lock acquire / provenance scan / worker fan-out. This test exercises
+  // each unsafe shape against the three endpoints that take a caller-supplied requestId
+  // and write a transcript file.
+  //
+  // The empty-string case is intentionally NOT included here: the endpoints fall back to a
+  // server-generated default in that case (`vault-ek-derive-${Date.now()}` etc), which is
+  // safe by construction. The unsafe-id guard never sees the empty value.
+  it("rejects unsafe requestId before lock / provenance / fan-out across all 3 transcript-writing endpoints", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({ caDkgV2Roster });
+    const unsafeIds = [
+      "../../etc/passwd", // path traversal
+      "a/b", // path separator
+      "a\\b", // windows separator
+      "a\0b", // null byte
+      "a\nb", // newline
+      "a b", // space
+      "a:b", // colon (rejected even though it's a valid Unix path char)
+      "x".repeat(129), // over length cap
+    ];
+    for (const requestId of unsafeIds) {
+      // /v2/derive/vault_ek/start
+      const r1 = await server.inject({
+        method: "POST",
+        url: "/v2/derive/vault_ek/start",
+        payload: {
+          dkgEpoch: "1",
+          caDkgTranscriptHash: h32("a"),
+          requestId,
+        },
+      });
+      // /v2/derive/ca_registration/start
+      const r2 = await server.inject({
+        method: "POST",
+        url: "/v2/derive/ca_registration/start",
+        payload: {
+          dkgEpoch: "1",
+          caDkgTranscriptHash: h32("a"),
+          vaultEk: h32("d"),
+          senderAddress: h32("e"),
+          assetType: h32("f"),
+          chainId: 2,
+          requestId,
+        },
+      });
+      // /v2/vault_state/init
+      const r3 = await server.inject({
+        method: "POST",
+        url: "/v2/vault_state/init",
+        payload: {
+          dkgEpoch: "1",
+          caDkgTranscriptHash: h32("a"),
+          vaultEk: h32("d"),
+          senderAddress: h32("e"),
+          assetType: h32("f"),
+          chainId: 2,
+          vaultEkTranscriptHash: h32("b"),
+          registrationTranscriptHash: h32("c"),
+          aggregateCommitment: h32("1"),
+          aggregateResponse: h32("2"),
+          challenge: h32("3"),
+          requestId,
+        },
+      });
+      expect(r1.statusCode).toBe(400);
+      expect(r1.json().error).toBe("unsafe_request_id");
+      expect(r2.statusCode).toBe(400);
+      expect(r2.json().error).toBe("unsafe_request_id");
+      expect(r3.statusCode).toBe(400);
+      expect(r3.json().error).toBe("unsafe_request_id");
+    }
+  });
+
   it("vault_state_v2 init resolves provenance from persisted transcripts when stateRoot configured", async () => {
     const { vaultStateV2InitWorkerTranscriptHash } = await import("@eunoma/deop-protocol");
     const { mkdtemp, writeFile, mkdir, readFile } = await import("node:fs/promises");
