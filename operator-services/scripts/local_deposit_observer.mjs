@@ -199,8 +199,13 @@ const normalizedBridge = bridgeAddress.startsWith("0x")
 
 // Construct the events accessor URL if not supplied. The path format follows Aptos's module
 // event accessor: /v1/accounts/<module_address>/events/<event_struct_type>.
+//
+// Goal.md M3: prefer DepositConfirmedV2 (carries on-chain `deposit_count` + vault_addr +
+// asset_type natively) over the legacy DepositEventV2 (synthesized depositCount from
+// sequence_number). Operators can override via --events-url to fall back to DepositEventV2
+// if their chain doesn't have the M3 contract yet.
 if (!eventsUrl) {
-  const accessor = `${normalizedBridge}::eunoma_bridge::DepositEventV2`;
+  const accessor = `${normalizedBridge}::eunoma_bridge::DepositConfirmedV2`;
   // Construct manually because URL doesn't permit colons in pathnames cleanly without encoding.
   const base = aptosNodeUrl.replace(/\/+$/, "");
   eventsUrl = `${base}/v1/accounts/${normalizedBridge}/events/${encodeURIComponent(accessor)}`;
@@ -266,11 +271,28 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
     console.error(`malformed event at index ${i}: ${JSON.stringify(event)}`);
     process.exit(EXIT_GENERIC_FAILURE);
   }
-  const { commitment, amount_tag, ca_payload_hash, deposit_nonce } = event.data;
+  const {
+    commitment,
+    amount_tag,
+    ca_payload_hash,
+    deposit_nonce,
+    deposit_count: onChainDepositCount,
+    vault_addr: eventVaultAddr,
+    asset_type: eventAssetType,
+  } = event.data;
   // Each event field is a `vector<u8>` on-chain; Aptos serialises this as a 0x-prefixed hex
   // string in the JSON response. Strip the prefix to align with our 32-byte hex format.
   const stripHex = (h) =>
     typeof h === "string" && h.startsWith("0x") ? h.slice(2) : h;
+  // Goal.md M3 defense-in-depth: when reading DepositConfirmedV2 (default), cross-check
+  // event.asset_type matches the operator's expected asset_type. Mismatched asset → stale
+  // or cross-vault event, fail closed.
+  if (eventAssetType !== undefined && stripHex(eventAssetType).toLowerCase() !== stripHex(assetType).toLowerCase()) {
+    console.error(
+      `event ${event.sequence_number} asset_type=${eventAssetType} does not match operator expected ${assetType} — stale or cross-vault event, refusing to advance cursor`,
+    );
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
   for (const [name, value] of [
     ["commitment", commitment],
     ["amount_tag", amount_tag],
@@ -284,7 +306,17 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
   }
 
   const sequenceNumber = event.sequence_number;
-  const depositCount = (BigInt(sequenceNumber) + 1n).toString();
+  // Goal.md M3: prefer the on-chain DepositConfirmedV2.deposit_count when present (the
+  // chain-authoritative monotonic counter). Legacy DepositEventV2 fallback uses
+  // (sequence_number + 1) — but the goal.md M3 contract is "observer updates worker-local
+  // state shares only via the confirmed deposit_count emitted by the chain", so the
+  // operator should be reading DepositConfirmedV2 (default since this commit).
+  let depositCount;
+  if (onChainDepositCount !== undefined) {
+    depositCount = String(onChainDepositCount);
+  } else {
+    depositCount = (BigInt(sequenceNumber) + 1n).toString();
+  }
   if (BigInt(depositCount) > BigInt(Number.MAX_SAFE_INTEGER)) {
     console.error(
       `depositCount ${depositCount} exceeds Number.MAX_SAFE_INTEGER; coordinator expects a JSON number`,
