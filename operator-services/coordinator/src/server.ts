@@ -3187,7 +3187,12 @@ export function buildCoordinatorServer(
             };
           },
         );
-        const round1TranscriptArtifact = {
+        // Codex M3a P2 #3: build the artifact with a real `transcriptHash` digest. Pre-fix
+        // the field was set to the scheme literal `"mpcca_withdraw_v2_round1_partial"`, so
+        // recovery/audit clients could not pin the persisted artifact by the returned hash.
+        // We sha256(canonicalize(artifact-without-transcriptHash)) and embed the digest into
+        // the artifact, so a later reader can recompute the same hash and verify integrity.
+        const round1ArtifactWithoutHash = {
           scheme: "mpcca_withdraw_v2_round1_partial" as const,
           dkgEpoch,
           requestId,
@@ -3214,6 +3219,13 @@ export function buildCoordinatorServer(
           notImplementedPhase: phase,
           perSlotContributions,
           createdAtUnixMs: Date.now(),
+        };
+        const round1TranscriptHash = bytesToHex(
+          sha256(new TextEncoder().encode(canonicalJsonStringify(round1ArtifactWithoutHash))),
+        );
+        const round1TranscriptArtifact = {
+          ...round1ArtifactWithoutHash,
+          transcriptHash: round1TranscriptHash,
         };
         let transcriptPath: string | undefined;
         if (opts.stateRoot) {
@@ -3265,7 +3277,7 @@ export function buildCoordinatorServer(
           expirySecs,
           requestHash: withdrawHex.requestHash,
           perSlotContributions,
-          transcriptHash: round1TranscriptArtifact.scheme,
+          transcriptHash: round1TranscriptHash,
           transcriptPath,
           message:
             "milestone 3a stub: round1 public binding succeeded across all 5 workers; round2/" +
@@ -3941,6 +3953,42 @@ function resolveMpcPeerAddress(
     }
   }
   return `${host}:${portBase + slot}`;
+}
+
+/**
+ * Codex M3a P2 #3: deterministic JSON serializer that sorts object keys recursively. Used
+ * to compute integrity hashes over coordinator artifacts where a later reader must be able
+ * to recompute the EXACT same hash. Standard JSON.stringify preserves insertion order, which
+ * is fine when the artifact's keys are always emitted in the same order — but if a future
+ * refactor reorders the object literal, the hash would drift silently. Sorting keys gives
+ * a stable serialization tied only to the (key,value) set.
+ *
+ * Behaviour:
+ *   - Plain objects: keys sorted lexicographically (locale-independent UTF-16 order).
+ *   - Arrays: order preserved (semantic order is load-bearing — observed transcript order,
+ *     per-slot contributions, etc.).
+ *   - Primitives: passed through to JSON.stringify.
+ *   - `undefined` properties: dropped (matches JSON.stringify semantics).
+ *
+ * NOT a full JCS implementation; sufficient for the artifact shapes we hash here.
+ */
+function canonicalJsonStringify(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    return value.map((v) => canonicalize(v));
+  }
+  const obj = value as Record<string, unknown>;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj).sort()) {
+    const v = obj[key];
+    if (v === undefined) continue;
+    sorted[key] = canonicalize(v);
+  }
+  return sorted;
 }
 
 async function writeTranscriptArtifactAtomic(

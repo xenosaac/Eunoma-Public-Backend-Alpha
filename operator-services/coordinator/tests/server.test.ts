@@ -3573,6 +3573,9 @@ describe("coordinator", () => {
     expect(body.perSlotContributions).toHaveLength(5);
     // KILLER ASSERTION: concurrent fan-out — all 5 workers in flight simultaneously.
     expect(peak).toBe(5);
+    // Codex M3a P2 #3: transcriptHash is a real 32-byte hex digest, NOT the scheme literal.
+    expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.transcriptHash).not.toBe("mpcca_withdraw_v2_round1_partial");
 
     // Touch the imported helper to keep TS happy (the stub uses it directly).
     expect(mpccaWithdrawRound1WorkerTranscriptHash).toBeTypeOf("function");
