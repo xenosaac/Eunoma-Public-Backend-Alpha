@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   assembleVaultStateV2InitTranscript,
+  assembleVaultStateV2ObserveDepositTranscript,
+  parseObserveDepositRequest,
+  parseObserveDepositResponse,
   parseVaultStateV2InitRequest,
   parseVaultStateV2InitResponse,
   vaultStateV2InitFinalTranscriptHash,
   vaultStateV2InitWorkerTranscriptHash,
+  vaultStateV2ObserveFinalTranscriptHash,
+  vaultStateV2ObserveWorkerTranscriptHash,
   VaultStateV2InitError,
+  VaultStateV2ObserveDepositError,
 } from "../src/vault_state_v2.js";
 
 const HEX32_A = "aa".repeat(32);
@@ -291,5 +297,320 @@ describe("vault_state_v2 protocol", () => {
         // initialized missing
       }),
     ).toThrow(VaultStateV2InitError);
+  });
+});
+
+// =================================================================================================
+// Milestone 2 sub-milestone 2b — observe_deposit transcript types.
+// =================================================================================================
+function validObserveRequestBody(): Record<string, unknown> {
+  return {
+    dkgEpoch: "1",
+    requestId: "obs-1",
+    sessionId: "obs-1",
+    vaultEkTranscriptHash: HEX32_A,
+    registrationTranscriptHash: HEX32_B,
+    rosterHash: HEX32_C,
+    selectedSlots: [0, 1, 2, 3, 4],
+    selfSlot: 2,
+    playerId: 2,
+    vaultEk: HEX32_D,
+    senderAddress: HEX32_E,
+    assetType: HEX32_F,
+    chainId: 2,
+    depositCount: 1,
+    commitment: HEX32_1,
+    amountTag: HEX32_2,
+    caPayloadHash: HEX32_A,
+    depositNonce: HEX32_B,
+    sequenceNumber: "0",
+    txVersion: "1234567",
+    eventGuid: "0:0xdeadbeef",
+    previousDepositCountObserved: 0,
+    newDepositCountObserved: 1,
+  };
+}
+
+describe("vault_state_v2 observe_deposit protocol", () => {
+  it("observe worker transcript hash is byte-stable for identical inputs", () => {
+    const args = {
+      sessionId: "sess-x",
+      requestId: "req-x",
+      dkgEpoch: "1",
+      sortedSelectedSlots: [0, 1, 2, 3, 4],
+      selfSlot: 2,
+      playerId: 2,
+      vaultEkTranscriptHash: HEX32_A,
+      registrationTranscriptHash: HEX32_B,
+      vaultEk: HEX32_C,
+      senderAddress: HEX32_D,
+      assetType: HEX32_E,
+      chainId: 2,
+      depositCount: 3,
+      commitment: HEX32_F,
+      amountTag: HEX32_1,
+      caPayloadHash: HEX32_2,
+      depositNonce: HEX32_A,
+      sequenceNumber: "2",
+      txVersion: "9876543",
+      eventGuid: "0:0xfeed",
+      previousDepositCountObserved: 2,
+      newDepositCountObserved: 3,
+    };
+    const a = vaultStateV2ObserveWorkerTranscriptHash(args);
+    const b = vaultStateV2ObserveWorkerTranscriptHash(args);
+    expect(a).toBe(b);
+    expect(a).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("observe worker transcript hash changes when ANY binding changes", () => {
+    const base = {
+      sessionId: "sess-x",
+      requestId: "req-x",
+      dkgEpoch: "1",
+      sortedSelectedSlots: [0, 1, 2, 3, 4],
+      selfSlot: 2,
+      playerId: 2,
+      vaultEkTranscriptHash: HEX32_A,
+      registrationTranscriptHash: HEX32_B,
+      vaultEk: HEX32_C,
+      senderAddress: HEX32_D,
+      assetType: HEX32_E,
+      chainId: 2,
+      depositCount: 3,
+      commitment: HEX32_F,
+      amountTag: HEX32_1,
+      caPayloadHash: HEX32_2,
+      depositNonce: HEX32_A,
+      sequenceNumber: "2",
+      txVersion: "9876543",
+      eventGuid: "0:0xfeed",
+      previousDepositCountObserved: 2,
+      newDepositCountObserved: 3,
+    };
+    const baseHash = vaultStateV2ObserveWorkerTranscriptHash(base);
+    // KILLER: every field, when flipped, MUST move the hash.
+    const mutators: Array<(b: typeof base) => typeof base> = [
+      (b) => ({ ...b, sessionId: "sess-y" }),
+      (b) => ({ ...b, requestId: "req-y" }),
+      (b) => ({ ...b, dkgEpoch: "2" }),
+      (b) => ({ ...b, sortedSelectedSlots: [1, 2, 3, 4, 5] }),
+      (b) => ({ ...b, selfSlot: 3, playerId: 3 }),
+      (b) => ({ ...b, vaultEkTranscriptHash: HEX32_F }),
+      (b) => ({ ...b, registrationTranscriptHash: HEX32_F }),
+      (b) => ({ ...b, vaultEk: HEX32_F }),
+      (b) => ({ ...b, senderAddress: HEX32_F }),
+      (b) => ({ ...b, assetType: HEX32_F }),
+      (b) => ({ ...b, chainId: 3 }),
+      (b) => ({ ...b, depositCount: 4, newDepositCountObserved: 4 }),
+      (b) => ({ ...b, commitment: HEX32_1 }),
+      (b) => ({ ...b, amountTag: HEX32_F }),
+      (b) => ({ ...b, caPayloadHash: HEX32_F }),
+      (b) => ({ ...b, depositNonce: HEX32_F }),
+      (b) => ({ ...b, sequenceNumber: "3" }),
+      (b) => ({ ...b, txVersion: "0" }),
+      (b) => ({ ...b, eventGuid: "1:0xbeef" }),
+      (b) => ({ ...b, previousDepositCountObserved: 1 }),
+    ];
+    for (const mutate of mutators) {
+      const mutated = mutate(base);
+      const mutatedHash = vaultStateV2ObserveWorkerTranscriptHash(mutated);
+      expect(mutatedHash, JSON.stringify(mutated)).not.toBe(baseHash);
+    }
+  });
+
+  it("observe final transcript hash binds every per-slot contribution", () => {
+    const slots = [0, 1, 2, 3, 4];
+    const perSlotA = slots.map((slot) => ({
+      slot,
+      vaultStateHash: HEX32_A,
+      workerTranscriptHash: HEX32_B,
+      previousDepositCountObserved: 0,
+      depositCountObserved: 1,
+      vaultSequence: 0,
+    }));
+    const perSlotB = perSlotA.map((c) =>
+      c.slot === 2 ? { ...c, vaultStateHash: HEX32_F } : c,
+    );
+    const input = {
+      dkgEpoch: "1",
+      vaultEkTranscriptHash: HEX32_A,
+      registrationTranscriptHash: HEX32_B,
+      rosterHash: HEX32_C,
+      sortedSelectedSlots: slots,
+      vaultEk: HEX32_D,
+      senderAddress: HEX32_E,
+      assetType: HEX32_F,
+      chainId: 2,
+      depositCount: 1,
+      commitment: HEX32_1,
+      amountTag: HEX32_2,
+      caPayloadHash: HEX32_A,
+      depositNonce: HEX32_B,
+      sequenceNumber: "0",
+      txVersion: "1234567",
+      eventGuid: "0:0xdeadbeef",
+      previousDepositCountObserved: 0,
+      newDepositCountObserved: 1,
+    };
+    const a = vaultStateV2ObserveFinalTranscriptHash({
+      ...input,
+      perSlotContributions: perSlotA,
+    });
+    const b = vaultStateV2ObserveFinalTranscriptHash({
+      ...input,
+      perSlotContributions: perSlotB,
+    });
+    expect(a).not.toBe(b);
+  });
+
+  it("assembleVaultStateV2ObserveDepositTranscript happy path", () => {
+    const slots = [0, 1, 2, 3, 4];
+    const perSlot = slots.map((slot) => ({
+      slot,
+      vaultStateHash: HEX32_A,
+      workerTranscriptHash: HEX32_B,
+      previousDepositCountObserved: 0,
+      depositCountObserved: 1,
+      vaultSequence: 0,
+    }));
+    const t = assembleVaultStateV2ObserveDepositTranscript({
+      dkgEpoch: "1",
+      requestId: "obs-1",
+      vaultEkTranscriptHash: HEX32_A,
+      registrationTranscriptHash: HEX32_B,
+      rosterHash: HEX32_C,
+      selectedSlots: slots,
+      vaultEk: HEX32_D,
+      senderAddress: HEX32_E,
+      assetType: HEX32_F,
+      chainId: 2,
+      depositCount: 1,
+      commitment: HEX32_1,
+      amountTag: HEX32_2,
+      caPayloadHash: HEX32_A,
+      depositNonce: HEX32_B,
+      sequenceNumber: "0",
+      txVersion: "1234567",
+      eventGuid: "0:0xdeadbeef",
+      previousDepositCountObserved: 0,
+      newDepositCountObserved: 1,
+      perSlotContributions: perSlot,
+    });
+    expect(t.scheme).toBe("vault_state_v2_observe_deposit");
+    expect(t.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(t.perSlotContributions).toHaveLength(5);
+    expect(t.depositCount).toBe(1);
+  });
+
+  it("assembleVaultStateV2ObserveDepositTranscript rejects stale_deposit_count", () => {
+    const slots = [0, 1, 2, 3, 4];
+    const perSlot = slots.map((slot) => ({
+      slot,
+      vaultStateHash: HEX32_A,
+      workerTranscriptHash: HEX32_B,
+      previousDepositCountObserved: 5,
+      depositCountObserved: 5,
+      vaultSequence: 0,
+    }));
+    expect(() =>
+      assembleVaultStateV2ObserveDepositTranscript({
+        dkgEpoch: "1",
+        requestId: "obs-stale",
+        vaultEkTranscriptHash: HEX32_A,
+        registrationTranscriptHash: HEX32_B,
+        rosterHash: HEX32_C,
+        selectedSlots: slots,
+        vaultEk: HEX32_D,
+        senderAddress: HEX32_E,
+        assetType: HEX32_F,
+        chainId: 2,
+        depositCount: 5, // <= previousDepositCountObserved → stale
+        commitment: HEX32_1,
+        amountTag: HEX32_2,
+        caPayloadHash: HEX32_A,
+        depositNonce: HEX32_B,
+        sequenceNumber: "4",
+        txVersion: "100",
+        eventGuid: "0:0xfeed",
+        previousDepositCountObserved: 5,
+        newDepositCountObserved: 5,
+        perSlotContributions: perSlot,
+      }),
+    ).toThrow(VaultStateV2ObserveDepositError);
+  });
+
+  it("parseObserveDepositRequest accepts a valid wire body", () => {
+    const body = validObserveRequestBody();
+    const parsed = parseObserveDepositRequest(body);
+    expect(parsed.depositCount).toBe(1);
+    expect(parsed.sequenceNumber).toBe("0");
+    expect(parsed.selfSlot).toBe(2);
+    expect(parsed.eventGuid).toBe("0:0xdeadbeef");
+  });
+
+  it("parseObserveDepositRequest rejects under-quorum selectedSlots", () => {
+    const body = { ...validObserveRequestBody(), selectedSlots: [0, 1, 2] };
+    expect(() => parseObserveDepositRequest(body)).toThrow(VaultStateV2ObserveDepositError);
+  });
+
+  it("parseObserveDepositRequest rejects 33-byte commitment", () => {
+    const body = { ...validObserveRequestBody(), commitment: "aa".repeat(33) };
+    expect(() => parseObserveDepositRequest(body)).toThrow(VaultStateV2ObserveDepositError);
+  });
+
+  it("parseObserveDepositRequest rejects non-decimal sequenceNumber", () => {
+    const body = { ...validObserveRequestBody(), sequenceNumber: "0xabc" };
+    expect(() => parseObserveDepositRequest(body)).toThrow(VaultStateV2ObserveDepositError);
+  });
+
+  it("parseObserveDepositRequest fires forbidden-plaintext-field guard", () => {
+    const body = { ...validObserveRequestBody(), dkShare: "abc" };
+    expect(() => parseObserveDepositRequest(body)).toThrow(/forbidden plaintext field/);
+  });
+
+  it("parseObserveDepositRequest fires forbidden-plaintext-field guard on nullifier", () => {
+    const body = { ...validObserveRequestBody(), nullifier: "abc" };
+    expect(() => parseObserveDepositRequest(body)).toThrow(/forbidden plaintext field/);
+  });
+
+  it("parseObserveDepositRequest fires forbidden-plaintext-field guard on nested", () => {
+    const body = { ...validObserveRequestBody(), metadata: { secret: "leak" } };
+    expect(() => parseObserveDepositRequest(body)).toThrow(/forbidden plaintext field/);
+  });
+
+  it("parseObserveDepositResponse accepts a valid worker response", () => {
+    const r = parseObserveDepositResponse({
+      slot: 2,
+      playerId: 2,
+      vaultStatePath: "/var/state/slot-2/vault_state_v2.json",
+      vaultStateHash: HEX32_A,
+      workerTranscriptHash: HEX32_B,
+      previousDepositCountObserved: 0,
+      depositCountObserved: 1,
+      vaultSequence: 0,
+      observedAtUnixMs: 1700000000000,
+      observed: true,
+    });
+    expect(r.slot).toBe(2);
+    expect(r.depositCountObserved).toBe(1);
+    expect(r.observed).toBe(true);
+  });
+
+  it("parseObserveDepositResponse rejects observed=false", () => {
+    expect(() =>
+      parseObserveDepositResponse({
+        slot: 2,
+        playerId: 2,
+        vaultStatePath: "/p",
+        vaultStateHash: HEX32_A,
+        workerTranscriptHash: HEX32_B,
+        previousDepositCountObserved: 0,
+        depositCountObserved: 1,
+        vaultSequence: 0,
+        observedAtUnixMs: 1,
+        observed: false,
+      }),
+    ).toThrow(VaultStateV2ObserveDepositError);
   });
 });
