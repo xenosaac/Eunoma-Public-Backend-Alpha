@@ -99,11 +99,86 @@ requireEnv(
   "EUNOMA_TESTNET_DKG_EPOCH",
   "dkgEpoch (decimal string) this withdraw binds to.",
 );
-requireEnv(
-  "EUNOMA_TESTNET_WITHDRAW_PROOF",
-  "User-side Groth16 withdraw proof bytes (hex). The M6-b user-client generates this; " +
-    "this script does NOT generate it. As of current HEAD, M6-b is NOT IMPLEMENTED.",
-);
+// M6-b: prefer EUNOMA_TESTNET_WITHDRAW_PROOF (proof hex directly). If absent BUT
+// EUNOMA_TESTNET_WITHDRAW_WITNESS_JSON is set, auto-generate the proof via the M6-b
+// prover wrapper (local_generate_withdraw_proof.mjs).
+if (!env.EUNOMA_TESTNET_WITHDRAW_PROOF) {
+  if (env.EUNOMA_TESTNET_WITHDRAW_WITNESS_JSON) {
+    console.log("▶ M6-b: generating withdraw Groth16 proof from witness JSON");
+    const proveArgs = [
+      "scripts/local_generate_withdraw_proof.mjs",
+      "--witness-json",
+      env.EUNOMA_TESTNET_WITHDRAW_WITNESS_JSON,
+    ];
+    const prove = spawnSync("node", proveArgs, {
+      cwd: serviceRoot,
+      encoding: "utf8",
+    });
+    if (prove.status !== EXIT_SUCCESS) {
+      console.error(
+        JSON.stringify(
+          {
+            ok: false,
+            command: "testnet:e2e",
+            error: "m6b_prover_failed",
+            message:
+              "M6-b withdraw proof generation failed. Investigate witness inputs + circuit " +
+              "artifacts (circuits/generated/withdrawal_proof_*).",
+            stderr: prove.stderr,
+            exitCode: prove.status,
+          },
+          null,
+          2,
+        ),
+      );
+      process.exit(EXIT_M6B_NOT_IMPLEMENTED);
+    }
+    // Parse JSON output of the prover to extract proofHex.
+    let proverOutput;
+    try {
+      proverOutput = JSON.parse(prove.stdout);
+    } catch (parseErr) {
+      console.error(
+        JSON.stringify(
+          {
+            ok: false,
+            error: "m6b_prover_output_malformed",
+            message:
+              "M6-b prover stdout was not valid JSON; cannot extract proofHex. " +
+              (parseErr instanceof Error ? parseErr.message : String(parseErr)),
+            stdoutFirst200: prove.stdout.slice(0, 200),
+          },
+          null,
+          2,
+        ),
+      );
+      process.exit(EXIT_M6B_NOT_IMPLEMENTED);
+    }
+    env.EUNOMA_TESTNET_WITHDRAW_PROOF = proverOutput.proofHex;
+    if (!env.EUNOMA_TESTNET_WITHDRAW_PROOF || env.EUNOMA_TESTNET_WITHDRAW_PROOF.length === 0) {
+      console.error(
+        JSON.stringify(
+          {
+            ok: false,
+            error: "m6b_prover_empty_output",
+            message: "M6-b prover ran but produced empty proof hex",
+          },
+          null,
+          2,
+        ),
+      );
+      process.exit(EXIT_M6B_NOT_IMPLEMENTED);
+    }
+    console.log(`▶ M6-b: proof generated (${env.EUNOMA_TESTNET_WITHDRAW_PROOF.length} hex chars)`);
+  } else {
+    requireEnv(
+      "EUNOMA_TESTNET_WITHDRAW_PROOF",
+      "User-side Groth16 withdraw proof bytes (hex), OR set EUNOMA_TESTNET_WITHDRAW_WITNESS_JSON " +
+        "to a witness JSON file and this script will auto-generate the proof via M6-b " +
+        "(local_generate_withdraw_proof.mjs).",
+    );
+  }
+}
 
 if (errors.length > 0) {
   const m6bMissing = errors.find((e) => e.env === "EUNOMA_TESTNET_WITHDRAW_PROOF");
