@@ -5082,7 +5082,6 @@ export function buildCoordinatorServer(
             "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds it into FS paths",
         });
       }
-      const sortedSelectedSlots = [...parsed.selectedSlots].sort((a, b) => a - b);
 
       // 4. Read __round2.json + __finalize.json artifacts.
       if (!opts.stateRoot) {
@@ -5111,6 +5110,59 @@ export function buildCoordinatorServer(
           requestId,
           path: round2ArtifactPath,
           message: err instanceof Error ? err.message : "unable to read round2 artifact",
+        });
+      }
+      // Codex M5-c1 P1 #1 + #10: coordinator-selected quorum comes from the PERSISTED
+      // __round2.json artifact, NOT the user-supplied body. A caller that submitted a
+      // different selectedSlots set than the original round2 ceremony would have its
+      // quorum swapped out from under it. Identity fields (vaultEk, recipient, etc.) are
+      // cross-checked below via compareFinalizeIdentityWithRound2.
+      const round2SelectedSlots = round2Artifact.selectedSlots;
+      if (!Array.isArray(round2SelectedSlots) || round2SelectedSlots.length !== DEOPERATOR_THRESHOLD) {
+        return reply.code(400).send({
+          error: "round2_transcript_selected_slots_missing",
+          requestId,
+          message: `__round2.json must carry selectedSlots[${DEOPERATOR_THRESHOLD}]; got ${round2SelectedSlots ? (round2SelectedSlots as unknown[]).length : "<missing>"}`,
+        });
+      }
+      const sortedSelectedSlots = [...(round2SelectedSlots as number[])].sort((a, b) => a - b);
+      // Defense-in-depth: cross-check the user-supplied selectedSlots against the persisted
+      // value. A divergence means the caller is trying to swap quorum mid-flight; fail closed.
+      const callerSorted = [...parsed.selectedSlots].sort((a, b) => a - b);
+      if (
+        callerSorted.length !== sortedSelectedSlots.length ||
+        callerSorted.some((v, i) => v !== sortedSelectedSlots[i])
+      ) {
+        return reply.code(400).send({
+          error: "frost_attest_caller_quorum_mismatch",
+          requestId,
+          callerSelectedSlots: callerSorted,
+          round2SelectedSlots: sortedSelectedSlots,
+          message:
+            "caller-supplied selectedSlots differs from the persisted __round2.json quorum; " +
+            "coordinator only signs over the original round2 quorum",
+        });
+      }
+
+      // Codex M5-c1 P1 #10: cross-check ALL identity fields (vaultEk, recipient, asset_type,
+      // root, nullifierHash, ...) against the persisted __round2.json BEFORE driving FROST
+      // signing. A caller that hijacks a requestId but supplies different identity fields
+      // could induce workers to sign over a different message than the round2 ceremony bound.
+      // Re-uses the M4-c4 compareFinalizeIdentityWithRound2 helper which walks 18 identity
+      // fields + selectedSlots + observedDepositTranscriptHashes + statementInputs +
+      // userProofArtifacts.
+      const identityMismatch = compareFinalizeIdentityWithRound2(
+        parsed,
+        round2Artifact,
+        sortedSelectedSlots,
+      );
+      if (identityMismatch) {
+        return reply.code(400).send({
+          error: "round2_transcript_identity_mismatch",
+          requestId,
+          field: identityMismatch.field,
+          round2Value: identityMismatch.round2Value,
+          requestValue: identityMismatch.requestValue,
         });
       }
       const finalizeArtifactPath = join(
