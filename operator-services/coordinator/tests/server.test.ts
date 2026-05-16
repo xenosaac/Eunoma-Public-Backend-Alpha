@@ -4622,6 +4622,87 @@ describe("coordinator", () => {
       expect(res.json().error).toBe("invalid_request");
     });
 
+    // KILLER (Codex M5b P2 #1): a completed submit is idempotent against retries with
+    // byte-identical inputs — the route returns the existing artifact verbatim WITHOUT
+    // re-invoking the relayer.
+    it("submit_route_idempotent_on_completed_retry_with_identical_inputs", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-idempotent-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-idem");
+      let submitterCallCount = 0;
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => {
+          submitterCallCount += 1;
+          return { accepted: true, txHash: "0x" + "ab".repeat(32), simulated: true };
+        },
+      });
+      // First call — relayer is invoked and the artifact is persisted with completed=true.
+      const first = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-idem" },
+      });
+      expect(first.statusCode).toBe(202);
+      const firstBody = first.json();
+      expect(firstBody.completed).toBe(true);
+      expect(submitterCallCount).toBe(1);
+      // Second call — identical body. MUST return the same artifact verbatim WITHOUT
+      // re-invoking the relayer (no rebroadcast).
+      const second = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-idem" },
+      });
+      expect(second.statusCode).toBe(202);
+      const secondBody = second.json();
+      expect(secondBody.completed).toBe(true);
+      expect(secondBody.txHash).toBe(firstBody.txHash);
+      expect(secondBody.transcriptHash).toBe(firstBody.transcriptHash);
+      expect(secondBody.idempotentReplay).toBe(true);
+      expect(submitterCallCount).toBe(1); // CRITICAL: relayer NEVER re-invoked
+    });
+
+    // KILLER (Codex M5b P2 #1): a retry whose assembled inputs differ from the
+    // already-completed artifact MUST 409 — refuse to overwrite the audit record.
+    it("submit_route_409s_on_retry_with_different_inputs", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-409-diff-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-409");
+      let submitterCallCount = 0;
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => {
+          submitterCallCount += 1;
+          return { accepted: true, txHash: "0x" + "ab".repeat(32), simulated: true };
+        },
+      });
+      // First call — succeeds + persists.
+      const first = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-409" },
+      });
+      expect(first.statusCode).toBe(202);
+      expect(submitterCallCount).toBe(1);
+      // Mutate the finalize transcript on disk so the assembled args differ from what
+      // was previously committed. (In real operations the finalize transcript should
+      // never mutate post-completion; the gate exists to catch tampering.)
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-409", {
+        vaultSequence: "999", // different from the first run's "42"
+      });
+      const second = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-409" },
+      });
+      expect(second.statusCode).toBe(409);
+      expect(second.json().error).toBe(
+        "mpcca_withdraw_submit_already_completed_with_different_inputs",
+      );
+      expect(submitterCallCount).toBe(1); // CRITICAL: relayer NEVER re-invoked
+    });
+
     // KILLER (Codex M5b P1 #4): when the relayer returns simulated:false (real
     // submission), the route MUST require chainNodeUrl + poll for confirmation. Without
     // chainNodeUrl, the route previously returned 200 completed after only relayer

@@ -75,7 +75,16 @@ import {
   type WithdrawV2CallArgsShape,
 } from "@eunoma/shared";
 import { assertNoForbiddenPlaintextFields } from "@eunoma/deop-protocol";
-import { mkdir, rename, writeFile, chmod, readdir, readFile, unlink } from "node:fs/promises";
+import {
+  mkdir,
+  rename,
+  writeFile,
+  chmod,
+  readdir,
+  readFile,
+  unlink,
+  link,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
@@ -3696,7 +3705,10 @@ export function buildCoordinatorServer(
           submitTranscriptDir,
           `${parsed.dkgEpoch}__${parsed.requestId}.json`,
         );
-        async function persistSubmitTranscript(payload: Record<string, unknown>): Promise<string> {
+        async function persistSubmitTranscript(
+          payload: Record<string, unknown>,
+          opts2: { noClobber?: boolean } = {},
+        ): Promise<string> {
           const artifactWithoutHash = {
             scheme: "mpcca_withdraw_submit_v2" as const,
             domain: EUNOMA_MPCCA_WITHDRAW_SUBMIT_V1,
@@ -3714,11 +3726,68 @@ export function buildCoordinatorServer(
           const transcriptHash = bytesToHex(
             sha256(new TextEncoder().encode(canonicalJsonStringify(artifactWithoutHash))),
           );
-          await writeTranscriptArtifactAtomic(submitTranscriptPath, {
-            ...artifactWithoutHash,
-            transcriptHash,
-          });
+          await writeTranscriptArtifactAtomic(
+            submitTranscriptPath,
+            { ...artifactWithoutHash, transcriptHash },
+            { noClobber: opts2.noClobber === true },
+          );
           return transcriptHash;
+        }
+
+        // Codex M5b P2 #1: idempotent-retry pre-check. If a prior successful submit
+        // artifact already exists at this path AND its recorded submitInputHash matches
+        // what we'd hand the relayer today, return that artifact verbatim — no rebroadcast.
+        // If it exists with completed:true but the inputs differ, return 409 so the
+        // caller cannot silently replace a committed audit record. If it exists with
+        // completed:false (stub passthrough or any failure state), allow re-attempt.
+        //
+        // The hash is computed BEFORE the stub-passthrough branch so an existing
+        // completed-success artifact short-circuits even if the finalize transcript on
+        // disk has somehow regressed to a stub (defense-in-depth).
+        const submitInputHash = bytesToHex(
+          sha256(new TextEncoder().encode(canonicalJsonStringify(assembleResult))),
+        );
+        let existingSubmitArtifact: Record<string, unknown> | null = null;
+        try {
+          const raw = await readFile(submitTranscriptPath, "utf8");
+          existingSubmitArtifact = JSON.parse(raw) as Record<string, unknown>;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw err;
+          }
+        }
+        if (
+          existingSubmitArtifact &&
+          existingSubmitArtifact.completed === true
+        ) {
+          const recordedInputHash = existingSubmitArtifact.submitInputHash;
+          if (typeof recordedInputHash !== "string" || recordedInputHash !== submitInputHash) {
+            return reply.code(409).send({
+              error: "mpcca_withdraw_submit_already_completed_with_different_inputs",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              transcriptPath: submitTranscriptPath,
+              message:
+                "a prior submit for this (dkgEpoch, requestId) already completed with a " +
+                "DIFFERENT assembled WithdrawV2CallArgs; refusing to overwrite the audit " +
+                "record. Investigate before retrying.",
+            });
+          }
+          // Inputs are byte-identical — return the existing artifact verbatim. We do
+          // NOT re-invoke the relayer (no rebroadcast). Status code mirrors the
+          // original outcome: 202 for simulated, 200 for real-confirmed.
+          const wasSimulated = existingSubmitArtifact.simulated === true;
+          return reply.code(wasSimulated ? 202 : 200).send({
+            accepted: existingSubmitArtifact.accepted === true,
+            requestId: parsed.requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            txHash: existingSubmitArtifact.txHash,
+            simulated: wasSimulated,
+            completed: true,
+            transcriptHash: existingSubmitArtifact.transcriptHash,
+            transcriptPath: submitTranscriptPath,
+            idempotentReplay: true,
+          });
         }
 
         if (isNotImplementedPhasePassthrough(assembleResult)) {
@@ -3871,18 +3940,49 @@ export function buildCoordinatorServer(
             });
           }
         }
-        // 9. Persist the success submit-transcript artifact.
-        const submitTranscriptHash = await persistSubmitTranscript({
-          completed: true,
-          simulated: relayerResult.simulated,
-          txHash: relayerResult.txHash,
-          ...(confirmation
-            ? {
-                chainSuccess: confirmation.success,
-                chainVmStatus: confirmation.vmStatus,
-              }
-            : {}),
-        });
+        // 9. Persist the success submit-transcript artifact. Codex M5b P2 #1: stamp
+        // `submitInputHash` so subsequent retries can verify byte-identical inputs.
+        // Use noClobber: any prior completed artifact at this path should have already
+        // short-circuited the idempotent-retry pre-check; if it didn't (race or stale
+        // state on disk) we MUST fail closed rather than overwrite the audit record.
+        let submitTranscriptHash: string;
+        try {
+          submitTranscriptHash = await persistSubmitTranscript(
+            {
+              completed: true,
+              simulated: relayerResult.simulated,
+              accepted: relayerResult.accepted,
+              submitInputHash,
+              txHash: relayerResult.txHash,
+              ...(confirmation
+                ? {
+                    chainSuccess: confirmation.success,
+                    chainVmStatus: confirmation.vmStatus,
+                  }
+                : {}),
+            },
+            { noClobber: true },
+          );
+        } catch (persistErr) {
+          if (
+            persistErr instanceof Error &&
+            (persistErr as NodeJS.ErrnoException).code === "EEXIST"
+          ) {
+            // A completed artifact materialized between the idempotent-retry pre-check
+            // and now (race window). Fail closed rather than overwrite the audit record.
+            return reply.code(409).send({
+              error: "mpcca_withdraw_submit_already_completed_with_different_inputs",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              transcriptPath: submitTranscriptPath,
+              message:
+                "a completed submit artifact materialized concurrently; refusing to " +
+                "overwrite the audit record. Re-issue the submit request to read the " +
+                "existing artifact's outcome.",
+            });
+          }
+          throw persistErr;
+        }
         // 10. Return — 200 for real-chain confirmation, 202 for simulated.
         const statusCode = relayerResult.simulated ? 202 : 200;
         return reply.code(statusCode).send({
@@ -4605,6 +4705,7 @@ function canonicalize(value: unknown): unknown {
 async function writeTranscriptArtifactAtomic(
   path: string,
   value: unknown,
+  opts: { noClobber?: boolean } = {},
 ): Promise<void> {
   // Codex M2a P2 #2: write to <path>.tmp.<pid>.<random> with flag 'wx' (O_EXCL +
   // O_CREAT, fails if path exists), fsync via writeFile's flag chain isn't possible in
@@ -4613,6 +4714,12 @@ async function writeTranscriptArtifactAtomic(
   // a concurrent writer can't clobber an in-progress write.
   // Loop on AlreadyExists with a fresh random suffix. 16 attempts is far more than
   // enough — collisions on 8 random bytes + pid + ms are astronomically unlikely.
+  //
+  // Codex M5b P2 #1: opt-in noClobber mode. When `opts.noClobber === true`, we use
+  // `link()` (atomic, fails with EEXIST if target exists) + unlink the tmp source
+  // instead of `rename()` (which silently replaces). Caller surfaces EEXIST on the
+  // FINAL path as a semantic error (e.g. 409 already_completed_with_different_inputs);
+  // EEXIST on the TMP path remains an internal retry condition.
   const dir = dirname(path);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const body = `${JSON.stringify(value, null, 2)}\n`;
@@ -4623,25 +4730,33 @@ async function writeTranscriptArtifactAtomic(
     const tmp = `${path}.tmp.${process.pid}.${Date.now()}.${suffix}`;
     try {
       await writeFile(tmp, body, { mode: 0o600, flag: "wx" });
-      await chmod(tmp, 0o600);
-      try {
-        await rename(tmp, path);
-        return;
-      } catch (renameErr) {
-        // best-effort cleanup of the tmp we created
-        await unlink(tmp).catch(() => undefined);
-        throw renameErr;
-      }
     } catch (err) {
       if (
         err instanceof Error &&
         (err as NodeJS.ErrnoException).code === "EEXIST"
       ) {
-        // tmp suffix collided; retry
+        // tmp suffix collided; retry with a fresh suffix.
         lastErr = err;
         continue;
       }
       throw err;
+    }
+    try {
+      await chmod(tmp, 0o600);
+      if (opts.noClobber === true) {
+        // link() is atomic across the same filesystem; fails with EEXIST if `path`
+        // already exists. We then unlink the tmp source to leave only the final path.
+        await link(tmp, path);
+        await unlink(tmp).catch(() => undefined);
+      } else {
+        await rename(tmp, path);
+      }
+      return;
+    } catch (finalizeErr) {
+      // best-effort cleanup of the tmp we created (the rename or link may have
+      // failed; the tmp could still be sitting on disk).
+      await unlink(tmp).catch(() => undefined);
+      throw finalizeErr;
     }
   }
   throw new Error(
