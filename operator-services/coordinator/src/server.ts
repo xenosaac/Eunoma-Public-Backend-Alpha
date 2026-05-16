@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import {
   assembleCaRegistrationV2Transcript,
   assembleVaultEkTranscript,
+  assembleVaultStateV2InitTranscript,
   CaRegistrationV2Error,
   DEOPERATOR_COUNT,
   DEOPERATOR_THRESHOLD,
@@ -29,6 +30,7 @@ import {
   parseMpccaRoundResult,
   parseSessionShareEnvelope,
   parseVaultEkContributions,
+  parseVaultStateV2InitResponse,
   rosterHash,
   scalarHexFromBigint,
   UnderQuorumError,
@@ -36,6 +38,8 @@ import {
   validateFrostDkgV2Roster,
   validateRoster,
   VaultEkDerivationError,
+  VaultStateV2InitError,
+  vaultStateV2InitWorkerTranscriptHash,
   type CaDkgV2Roster,
   type CaRegistrationV2Contribution,
   type DeoperatorRoster,
@@ -44,6 +48,7 @@ import {
   type FrostRound2Envelope,
   type SessionShareEnvelope,
   type VaultEkContribution,
+  type VaultStateV2InitContribution,
 } from "@eunoma/deop-protocol";
 import { sha256, bytesToHex } from "@eunoma/shared";
 import { HttpError, requireBearer } from "@eunoma/shared";
@@ -167,6 +172,44 @@ export function buildCoordinatorServer(
     return {
       release: () => {
         caRegistrationV2InFlight = null;
+        resolveHeld();
+      },
+    };
+  }
+
+  // Milestone 2a: separate session lock for /v2/vault_state/init. We keep it distinct from the
+  // vault_ek and ca_registration locks: a fresh init under the same (vaultEk, registration)
+  // pair against a different roster subset is a coordinator state-mutation we want serialized,
+  // but it doesn't block in-flight derivations. The vault-state init writes to per-worker
+  // `state_dir/vault_state_v2.json`; two concurrent initialisations for the SAME vault would
+  // both write the same file, which is fine on the disk side (worker checks for byte-identical
+  // contents) but produces ambiguous coordinator transcripts unless one wins. Single-session-
+  // at-a-time semantics mirror the other V2 surfaces.
+  let vaultStateV2InitInFlight: Promise<unknown> | null = null;
+  const vaultStateV2InitLockAcquireTimeoutMs = 100;
+  async function acquireVaultStateV2InitLock(): Promise<{ release: () => void } | "busy"> {
+    const start = Date.now();
+    while (vaultStateV2InitInFlight !== null) {
+      if (Date.now() - start > vaultStateV2InitLockAcquireTimeoutMs) {
+        return "busy";
+      }
+      try {
+        await Promise.race([
+          vaultStateV2InitInFlight,
+          new Promise((resolve) => setTimeout(resolve, 25)),
+        ]);
+      } catch {
+        // Holder failed; loop re-checks.
+      }
+    }
+    let resolveHeld: (value: void) => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      resolveHeld = resolve;
+    });
+    vaultStateV2InitInFlight = held;
+    return {
+      release: () => {
+        vaultStateV2InitInFlight = null;
         resolveHeld();
       },
     };
@@ -1418,6 +1461,531 @@ export function buildCoordinatorServer(
     }
   });
 
+  // =============================================================================================
+  // Milestone 2 sub-milestone 2a: vault-state share initialization orchestrator.
+  //
+  // Flow:
+  //   1. Parse + validate request body (forbidden-field guard, decimal dkgEpoch, hex shape).
+  //   2. Look up Phase 2 transcript by (dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash). If
+  //      stateRoot is configured and no match → 400 vault_ek_provenance_unknown (mirrors the
+  //      Milestone 1 check; same operator runbook).
+  //   3. Look up Milestone 1 ca_registration_v2 transcript by (dkgEpoch, vaultEk, rosterHash,
+  //      caDkgTranscriptHash). If stateRoot is configured and no match → 400
+  //      ca_registration_provenance_unknown. Extract `aggregateCommitment`, `aggregateResponse`,
+  //      `challenge`, `transcriptHash` so the caller doesn't have to pass them (the coordinator
+  //      already produced them).
+  //   4. Acquire session lock (409 vault_state_v2_init_in_flight on contention).
+  //   5. Fan-out `/worker/v2/vault_state/init` to all 5 selectedSlots concurrently. Cross-check
+  //      each worker's `workerTranscriptHash` against the TS-side reconstruction.
+  //   6. Assemble + persist the transcript artifact at
+  //      `state_root/coordinator/vault_state_v2/<dkgEpoch>__<requestId>.json` (atomic 0o600).
+  //   7. Return { accepted, requestId, dkgEpoch, vaultEk, vaultEkTranscriptHash,
+  //      registrationTranscriptHash, perSlotContributions, transcriptHash, transcriptPath }.
+  //
+  // Failure modes:
+  //   - 400 forbidden_plaintext_field / under_quorum / duplicate_slot / unknown_slot
+  //   - 400 vault_ek_provenance_unknown / ca_registration_provenance_unknown
+  //   - 400 vault_ek_provenance_mismatch / ca_registration_provenance_mismatch
+  //   - 409 vault_state_v2_init_in_flight (lock contention)
+  //   - 502 init_forward_rejected / init_forward_failed / init_returned_invalid
+  //   - 502 worker_transcript_hash_mismatch
+  // =============================================================================================
+  server.post("/v2/vault_state/init", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+
+      const dkgEpoch =
+        typeof raw.dkgEpoch === "string" && raw.dkgEpoch.length > 0 ? raw.dkgEpoch : undefined;
+      if (!dkgEpoch || !/^[0-9]+$/.test(dkgEpoch)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "dkgEpoch must be a non-empty decimal string",
+        });
+      }
+      if (dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          message: `request.dkgEpoch ${dkgEpoch} does not match caDkgV2Roster.dkgEpoch ${dkgRoster.dkgEpoch}`,
+        });
+      }
+      const caDkgTranscriptHashInput = raw.caDkgTranscriptHash;
+      if (typeof caDkgTranscriptHashInput !== "string" || caDkgTranscriptHashInput.length === 0) {
+        return reply.code(400).send({
+          error: "no_ca_dkg_v2_record_for_dkg_epoch",
+          message:
+            "caDkgTranscriptHash is required; supply the value from the CA DKG V2 artifact",
+        });
+      }
+      const vaultEk = raw.vaultEk;
+      if (typeof vaultEk !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(vaultEk)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "vaultEk must be a 32-byte hex string (Phase 2-derived public point)",
+        });
+      }
+      const senderAddress = raw.senderAddress;
+      if (
+        typeof senderAddress !== "string" ||
+        !/^(0x)?[0-9a-fA-F]{64}$/.test(senderAddress)
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "senderAddress must be a 32-byte hex string",
+        });
+      }
+      const assetType = raw.assetType;
+      if (typeof assetType !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(assetType)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "assetType must be a 32-byte hex string",
+        });
+      }
+      const chainIdRaw = raw.chainId;
+      if (
+        !Number.isInteger(chainIdRaw) ||
+        (chainIdRaw as number) < 0 ||
+        (chainIdRaw as number) > 255
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "chainId must be a u8",
+        });
+      }
+      const chainId = chainIdRaw as number;
+
+      requestId =
+        typeof raw.requestId === "string" && raw.requestId.length > 0
+          ? raw.requestId
+          : `vault-state-v2-${Date.now()}`;
+
+      // Slot selection: same shape as ca_registration_v2. Default to lowest-5; caller may
+      // override for failover/recovery. Note that in production the Milestone 1 transcript
+      // already pins the selectedSlots that ran the sigma — if the operator wants the SAME
+      // 5-of-7 to hold per-worker state (best practice), they should pass that subset here.
+      // We don't enforce equality though: a vault can legitimately be served by a 5-of-7
+      // subset different from the one that ran the registration sigma, as long as the new
+      // subset's workers all hold valid ca_dkg_share_v2 entries.
+      let selectedSlots: number[];
+      let selectionRationale: "caller-supplied" | "coordinator-chosen";
+      if (raw.selectedSlots !== undefined) {
+        if (
+          !Array.isArray(raw.selectedSlots) ||
+          raw.selectedSlots.length !== DEOPERATOR_THRESHOLD
+        ) {
+          return reply.code(400).send({
+            error: "invalid_request",
+            message: `selectedSlots must have ${DEOPERATOR_THRESHOLD} entries`,
+          });
+        }
+        const seen = new Set<number>();
+        const arr: number[] = [];
+        for (const slot of raw.selectedSlots) {
+          if (
+            !Number.isInteger(slot) ||
+            (slot as number) < 0 ||
+            (slot as number) >= DEOPERATOR_COUNT
+          ) {
+            return reply.code(400).send({
+              error: "invalid_request",
+              message: `selectedSlots entry ${slot} out of range`,
+            });
+          }
+          if (seen.has(slot as number)) {
+            return reply.code(400).send({
+              error: "duplicate_slot",
+              message: `duplicate selectedSlots entry ${slot}`,
+            });
+          }
+          seen.add(slot as number);
+          arr.push(slot as number);
+        }
+        const rosterSlots = new Set(dkgRoster.nodes.map((node) => node.slot));
+        for (const slot of arr) {
+          if (!rosterSlots.has(slot)) {
+            return reply.code(400).send({
+              error: "unknown_slot",
+              message: `selectedSlots entry ${slot} is not in caDkgV2Roster`,
+            });
+          }
+        }
+        selectedSlots = arr;
+        selectionRationale = "caller-supplied";
+      } else {
+        selectedSlots = lowestEligibleSlots(dkgRoster, DEOPERATOR_THRESHOLD);
+        selectionRationale = "coordinator-chosen";
+      }
+      const sortedSelectedSlots = [...selectedSlots].sort((a, b) => a - b);
+      const sessionId = requestId;
+
+      // Provenance: cross-reference both Phase 2 (vault_ek) and Milestone 1 (registration)
+      // transcripts BEFORE acquiring the lock or fanning out. A bad request fails closed at
+      // ~2 disk reads.
+      const claimedVaultEkTranscriptHash =
+        typeof raw.vaultEkTranscriptHash === "string" && raw.vaultEkTranscriptHash.length > 0
+          ? raw.vaultEkTranscriptHash
+          : undefined;
+      let vaultEkTranscriptHash: string | undefined;
+      let vaultEkTranscriptPath: string | undefined;
+      if (opts.stateRoot) {
+        const provenance = await findVaultEkProvenance(opts.stateRoot, {
+          dkgEpoch,
+          vaultEk,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          rosterHash: dkgRosterHash,
+        });
+        if (!provenance) {
+          return reply.code(400).send({
+            error: "vault_ek_provenance_unknown",
+            requestId,
+            message:
+              "no persisted Phase 2 vault_ek_derivation transcript matches the supplied " +
+              "(dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash). Run /v2/derive/vault_ek/start " +
+              "first or supply a vaultEk that the coordinator produced.",
+          });
+        }
+        if (
+          claimedVaultEkTranscriptHash &&
+          claimedVaultEkTranscriptHash.replace(/^0x/i, "").toLowerCase() !==
+            provenance.vaultEkTranscriptHash.replace(/^0x/i, "").toLowerCase()
+        ) {
+          return reply.code(400).send({
+            error: "vault_ek_provenance_mismatch",
+            requestId,
+            message:
+              "vaultEkTranscriptHash supplied in the request does not match the persisted " +
+              "Phase 2 transcript that produced this vaultEk",
+            expected: provenance.vaultEkTranscriptHash,
+            received: claimedVaultEkTranscriptHash,
+          });
+        }
+        vaultEkTranscriptHash = provenance.vaultEkTranscriptHash;
+        vaultEkTranscriptPath = provenance.transcriptPath;
+      } else if (claimedVaultEkTranscriptHash) {
+        vaultEkTranscriptHash = claimedVaultEkTranscriptHash;
+      }
+
+      // Milestone 1 (CA registration) provenance. Same shape as Phase 2 — scan
+      // `<stateRoot>/coordinator/ca_registration_v2/` for a transcript whose
+      // (dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash, senderAddress, assetType,
+      // chainId) tuple matches. The matched transcript supplies the sigma tuple
+      // (aggregateCommitment, aggregateResponse, challenge) we forward to every worker.
+      const claimedRegistrationTranscriptHash =
+        typeof raw.registrationTranscriptHash === "string" &&
+        raw.registrationTranscriptHash.length > 0
+          ? raw.registrationTranscriptHash
+          : undefined;
+      let registrationTranscriptHash: string | undefined;
+      let registrationTranscriptPath: string | undefined;
+      let aggregateCommitment: string | undefined;
+      let aggregateResponse: string | undefined;
+      let challenge: string | undefined;
+      let registrationVerifierSlot: number | undefined;
+      if (opts.stateRoot) {
+        const provenance = await findCaRegistrationV2Provenance(opts.stateRoot, {
+          dkgEpoch,
+          vaultEk,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          rosterHash: dkgRosterHash,
+          senderAddress,
+          assetType,
+          chainId,
+        });
+        if (!provenance) {
+          return reply.code(400).send({
+            error: "ca_registration_provenance_unknown",
+            requestId,
+            message:
+              "no persisted Milestone 1 ca_registration_v2 transcript matches the supplied " +
+              "(dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash, senderAddress, assetType, chainId). " +
+              "Run /v2/derive/ca_registration/start first.",
+          });
+        }
+        if (
+          claimedRegistrationTranscriptHash &&
+          claimedRegistrationTranscriptHash.replace(/^0x/i, "").toLowerCase() !==
+            provenance.registrationTranscriptHash.replace(/^0x/i, "").toLowerCase()
+        ) {
+          return reply.code(400).send({
+            error: "ca_registration_provenance_mismatch",
+            requestId,
+            message:
+              "registrationTranscriptHash supplied in the request does not match the persisted " +
+              "Milestone 1 transcript",
+            expected: provenance.registrationTranscriptHash,
+            received: claimedRegistrationTranscriptHash,
+          });
+        }
+        registrationTranscriptHash = provenance.registrationTranscriptHash;
+        registrationTranscriptPath = provenance.transcriptPath;
+        aggregateCommitment = provenance.aggregateCommitment;
+        aggregateResponse = provenance.aggregateResponse;
+        challenge = provenance.challenge;
+        registrationVerifierSlot = provenance.verifierSlot;
+      } else {
+        // No stateRoot — caller MUST supply the sigma tuple inline. Same shape as Phase 2
+        // dev/test fallback.
+        if (
+          typeof raw.aggregateCommitment !== "string" ||
+          typeof raw.aggregateResponse !== "string" ||
+          typeof raw.challenge !== "string" ||
+          !claimedRegistrationTranscriptHash
+        ) {
+          return reply.code(400).send({
+            error: "invalid_request",
+            message:
+              "stateRoot is not configured; caller must supply aggregateCommitment, aggregateResponse, " +
+              "challenge, and registrationTranscriptHash inline",
+          });
+        }
+        aggregateCommitment = raw.aggregateCommitment;
+        aggregateResponse = raw.aggregateResponse;
+        challenge = raw.challenge;
+        registrationTranscriptHash = claimedRegistrationTranscriptHash;
+      }
+      if (!vaultEkTranscriptHash || !registrationTranscriptHash) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message:
+            "vaultEkTranscriptHash and registrationTranscriptHash are required (supply " +
+            "inline OR configure stateRoot to derive them from persisted transcripts)",
+        });
+      }
+      if (!aggregateCommitment || !aggregateResponse || !challenge) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message:
+            "aggregateCommitment, aggregateResponse, and challenge are required (supply " +
+            "inline OR configure stateRoot to derive them from the Milestone 1 transcript)",
+        });
+      }
+
+      const lock = await acquireVaultStateV2InitLock();
+      if (lock === "busy") {
+        return reply.code(409).send({
+          error: "vault_state_v2_init_in_flight",
+          requestId,
+          message: "another vault_state_v2 init session is in progress; retry shortly",
+        });
+      }
+
+      try {
+        // Fan out to all 5 selected slots concurrently. Each worker writes
+        // `state_dir/vault_state_v2.json` and returns
+        // (slot, playerId, vaultStatePath, vaultStateHash, workerTranscriptHash,
+        //  vaultSequence, depositCountObserved, createdAtUnixMs, initialized).
+        const initBodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
+          dkgEpoch,
+          requestId: requestId!,
+          sessionId,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selfSlot: slot,
+          playerId: ordinalIndex,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment,
+          aggregateResponse,
+          challenge,
+        }));
+        const forwarded = await Promise.all(
+          sortedSelectedSlots.map((slot, ordinalIndex) =>
+            singleNodeForwarder(
+              "/worker/v2/vault_state/init",
+              initBodies[ordinalIndex],
+              dkgRoster,
+              slot,
+            ).then(
+              (value) => ({ kind: "value" as const, slot, value }),
+              (reason) => ({ kind: "rejected" as const, slot, reason }),
+            ),
+          ),
+        );
+        const responsesBySlot = new Map<number, ReturnType<typeof parseVaultStateV2InitResponse>>();
+        for (const res of forwarded) {
+          if (res.kind === "rejected") {
+            return reply.code(502).send({
+              error: "init_forward_rejected",
+              slot: res.slot,
+              requestId,
+              reason:
+                res.reason instanceof Error ? res.reason.message : String(res.reason),
+            });
+          }
+          if (!res.value.ok || !res.value.body) {
+            return reply.code(502).send({
+              error: "init_forward_failed",
+              slot: res.slot,
+              statusCode: res.value.statusCode,
+              body: res.value.body,
+              requestId,
+            });
+          }
+          let parsed;
+          try {
+            parsed = parseVaultStateV2InitResponse(res.value.body);
+          } catch (err) {
+            return reply.code(502).send({
+              error: "init_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: err instanceof Error ? err.message : "unknown",
+            });
+          }
+          // Defense in depth: re-derive the worker transcript hash from public inputs and
+          // assert byte-equality with the worker's claim. Cuts off the "wrong slot replied"
+          // and "tampered transcript" paths even if a deop-node was tricked.
+          const expectedWorkerHash = vaultStateV2InitWorkerTranscriptHash({
+            sessionId,
+            requestId: requestId!,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashInput,
+            vaultEkTranscriptHash,
+            registrationTranscriptHash,
+            rosterHash: dkgRosterHash,
+            sortedSelectedSlots,
+            selfSlot: res.slot,
+            playerId: sortedSelectedSlots.indexOf(res.slot),
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            aggregateCommitment,
+            aggregateResponse,
+            challenge,
+            vaultSequence: parsed.vaultSequence,
+            depositCountObserved: parsed.depositCountObserved,
+          });
+          if (parsed.workerTranscriptHash !== expectedWorkerHash) {
+            return reply.code(502).send({
+              error: "worker_transcript_hash_mismatch",
+              slot: res.slot,
+              requestId,
+              expected: expectedWorkerHash,
+              actual: parsed.workerTranscriptHash,
+            });
+          }
+          if (parsed.slot !== res.slot) {
+            return reply.code(502).send({
+              error: "init_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: `worker returned slot ${parsed.slot} for selfSlot ${res.slot}`,
+            });
+          }
+          responsesBySlot.set(res.slot, parsed);
+        }
+
+        const perSlotContributions: VaultStateV2InitContribution[] = sortedSelectedSlots.map(
+          (slot) => {
+            const r = responsesBySlot.get(slot)!;
+            return {
+              slot,
+              vaultStateHash: r.vaultStateHash,
+              workerTranscriptHash: r.workerTranscriptHash,
+              vaultSequence: r.vaultSequence,
+              depositCountObserved: r.depositCountObserved,
+              initialized: r.initialized,
+            };
+          },
+        );
+        const transcript = assembleVaultStateV2InitTranscript({
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment,
+          aggregateResponse,
+          challenge,
+          perSlotContributions,
+        });
+        const transcriptArtifact = {
+          ...transcript,
+          selectionRationale,
+          requestId,
+          vaultEkTranscriptPath,
+          registrationTranscriptPath,
+          registrationVerifierSlot,
+          createdAtUnixMs: Date.now(),
+        };
+
+        let transcriptPath: string | undefined;
+        if (opts.stateRoot) {
+          const dir = join(opts.stateRoot, "coordinator", "vault_state_v2");
+          transcriptPath = join(dir, `${dkgEpoch}__${requestId}.json`);
+          await writeTranscriptArtifactAtomic(transcriptPath, transcriptArtifact);
+        }
+        // Persist per-slot rows in the coordinator's partial-artifact log. Same shape as
+        // ca_registration and vault_ek — auditors can query
+        // /v2/status/<requestId> after the call.
+        for (const slot of sortedSelectedSlots) {
+          const r = responsesBySlot.get(slot)!;
+          await store.recordPartialArtifact({
+            requestId,
+            sessionId,
+            rosterHash: dkgRosterHash,
+            slot,
+            artifactKind: "vault-state-v2-init",
+            artifactHash: r.vaultStateHash,
+            transcriptHash: r.workerTranscriptHash,
+          });
+        }
+        await store.markComplete(requestId);
+
+        return reply.code(200).send({
+          accepted: true,
+          requestId,
+          dkgEpoch,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selectionRationale,
+          vaultEk,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment,
+          aggregateResponse,
+          challenge,
+          perSlotContributions,
+          transcriptHash: transcript.transcriptHash,
+          transcriptPath,
+        });
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      if (requestId) await store.markAborted(requestId);
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof VaultStateV2InitError) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
   server.post("/v2/dkg/frost/v2/start", async (req, reply) => {
     try {
       const raw = (req.body ?? {}) as Record<string, unknown>;
@@ -2158,6 +2726,103 @@ async function findVaultEkProvenance(
     return {
       vaultEkTranscriptHash: artifact.finalTranscriptHash,
       transcriptPath,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Milestone 2a — verify Milestone 1 (CA registration sigma) provenance.
+ *
+ * Mirrors `findVaultEkProvenance`. Scans `<stateRoot>/coordinator/ca_registration_v2/` for an
+ * artifact whose (dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash, senderAddress, assetType,
+ * chainId) tuple matches the supplied tuple. Returns the persisted sigma tuple
+ * (aggregateCommitment, aggregateResponse, challenge) + the final transcriptHash so the
+ * coordinator can forward all five fields to each worker without trusting the caller's body.
+ *
+ * Bounds the attack surface to "burning the coordinator's transcript dir": since the coordinator
+ * itself produced those transcripts (each behind the ca_registration_v2 lock), an attacker
+ * cannot fabricate them without first running a successful Milestone 1 sigma.
+ */
+async function findCaRegistrationV2Provenance(
+  stateRoot: string,
+  expected: {
+    dkgEpoch: string;
+    vaultEk: string;
+    caDkgTranscriptHash: string;
+    rosterHash: string;
+    senderAddress: string;
+    assetType: string;
+    chainId: number;
+  },
+): Promise<
+  | {
+      registrationTranscriptHash: string;
+      transcriptPath: string;
+      aggregateCommitment: string;
+      aggregateResponse: string;
+      challenge: string;
+      verifierSlot: number | undefined;
+    }
+  | undefined
+> {
+  const dir = join(stateRoot, "coordinator", "ca_registration_v2");
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+  const lowerVaultEk = expected.vaultEk.replace(/^0x/i, "").toLowerCase();
+  const lowerCaDkg = expected.caDkgTranscriptHash.replace(/^0x/i, "").toLowerCase();
+  const lowerRoster = expected.rosterHash.replace(/^0x/i, "").toLowerCase();
+  const lowerSender = expected.senderAddress.replace(/^0x/i, "").toLowerCase();
+  const lowerAsset = expected.assetType.replace(/^0x/i, "").toLowerCase();
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const epochPrefix = `${expected.dkgEpoch}__`;
+    if (!entry.startsWith(epochPrefix)) continue;
+    const transcriptPath = join(dir, entry);
+    let raw: string;
+    try {
+      raw = await readFile(transcriptPath, "utf8");
+    } catch {
+      continue;
+    }
+    let artifact: Record<string, unknown>;
+    try {
+      artifact = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (artifact.scheme !== "ca_registration_v2") continue;
+    if (typeof artifact.dkgEpoch !== "string" || artifact.dkgEpoch !== expected.dkgEpoch) continue;
+    if (typeof artifact.vaultEk !== "string") continue;
+    if (typeof artifact.caDkgTranscriptHash !== "string") continue;
+    if (typeof artifact.rosterHash !== "string") continue;
+    if (typeof artifact.transcriptHash !== "string") continue;
+    if (typeof artifact.senderAddress !== "string") continue;
+    if (typeof artifact.assetType !== "string") continue;
+    if (typeof artifact.aggregateCommitment !== "string") continue;
+    if (typeof artifact.aggregateResponse !== "string") continue;
+    if (typeof artifact.challenge !== "string") continue;
+    if (typeof artifact.chainId !== "number") continue;
+    if (artifact.vaultEk.replace(/^0x/i, "").toLowerCase() !== lowerVaultEk) continue;
+    if (artifact.caDkgTranscriptHash.replace(/^0x/i, "").toLowerCase() !== lowerCaDkg) continue;
+    if (artifact.rosterHash.replace(/^0x/i, "").toLowerCase() !== lowerRoster) continue;
+    if (artifact.senderAddress.replace(/^0x/i, "").toLowerCase() !== lowerSender) continue;
+    if (artifact.assetType.replace(/^0x/i, "").toLowerCase() !== lowerAsset) continue;
+    if (artifact.chainId !== expected.chainId) continue;
+    const verifierSlot =
+      typeof artifact.verifierSlot === "number" ? artifact.verifierSlot : undefined;
+    return {
+      registrationTranscriptHash: artifact.transcriptHash,
+      transcriptPath,
+      aggregateCommitment: artifact.aggregateCommitment,
+      aggregateResponse: artifact.aggregateResponse,
+      challenge: artifact.challenge,
+      verifierSlot,
     };
   }
   return undefined;
