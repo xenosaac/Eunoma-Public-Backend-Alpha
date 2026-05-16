@@ -3771,6 +3771,31 @@ export function buildCoordinatorServer(
         }
         // 8. Poll for chain confirmation. We poll only if (a) it's NOT a simulated submit
         // (simulated submits never make it on-chain) AND (b) a chainNodeUrl is configured.
+        //
+        // Codex M5b P1 #4: for `simulated:false` (real submission), chainNodeUrl is
+        // REQUIRED. Without it the route would skip chain confirmation entirely and
+        // return 200 completed after relayer acceptance — fail closed instead so a
+        // misconfigured deploy cannot silently broadcast unconfirmed transactions.
+        if (!relayerResult.simulated && !opts.chainNodeUrl) {
+          const transcriptHash = await persistSubmitTranscript({
+            completed: false,
+            simulated: false,
+            txHash: relayerResult.txHash,
+            chainConfirmationError: "chain_node_url_required_for_real_submit",
+          });
+          return reply.code(502).send({
+            error: "chain_node_url_required_for_real_submit",
+            requestId: parsed.requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            txHash: relayerResult.txHash,
+            transcriptHash,
+            transcriptPath: submitTranscriptPath,
+            message:
+              "relayer returned simulated:false but coordinator has no chainNodeUrl " +
+              "configured; set APTOS_NODE_URL in the environment or inject `chainNodeUrl` " +
+              "into buildCoordinatorServer so the submit route can confirm chain execution",
+          });
+        }
         let confirmation: { confirmed: boolean; success?: boolean; vmStatus?: string } | null =
           null;
         if (!relayerResult.simulated && opts.chainNodeUrl) {

@@ -4622,6 +4622,43 @@ describe("coordinator", () => {
       expect(res.json().error).toBe("invalid_request");
     });
 
+    // KILLER (Codex M5b P1 #4): when the relayer returns simulated:false (real
+    // submission), the route MUST require chainNodeUrl + poll for confirmation. Without
+    // chainNodeUrl, the route previously returned 200 completed after only relayer
+    // acceptance — a misconfigured deploy could silently broadcast unconfirmed txs.
+    it("submit_route_502s_when_chain_node_url_absent_for_real_submit", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-no-node-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-no-node");
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => ({
+          accepted: true,
+          txHash: "0x" + "ab".repeat(32),
+          simulated: false, // REAL submission
+        }),
+        // chainNodeUrl: undefined  ← intentionally omitted
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-no-node" },
+      });
+      expect(res.statusCode).toBe(502);
+      const body = res.json();
+      expect(body.error).toBe("chain_node_url_required_for_real_submit");
+      expect(body.txHash).toBe("0x" + "ab".repeat(32));
+      expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(body.message).toContain("APTOS_NODE_URL");
+      // Persisted artifact reflects the failure-closed posture.
+      const { readFile } = await import("node:fs/promises");
+      const artifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
+      expect(artifact.completed).toBe(false);
+      expect(artifact.chainConfirmationError).toBe(
+        "chain_node_url_required_for_real_submit",
+      );
+    });
+
     // KILLER (Codex M5b P1 #3): a confirmed-but-failed chain execution surfaces as 502
     // chain_execution_failed with vmStatus, NOT a 200 success. The submit artifact must
     // also record completed: false so P2 #1 retry idempotency does not short-circuit on
