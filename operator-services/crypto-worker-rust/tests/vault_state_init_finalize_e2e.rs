@@ -65,8 +65,8 @@ use eunoma_crypto_worker::{
     },
     vault_state_v2::{
         final_transcript_hash, finalize_vault_state_v2, init_vault_state_v2,
-        load_vault_state_v2, FinalizeContribution, FinalizeRequest,
-        InitRequest as VaultStateInitRequest,
+        load_vault_state_v2, observe_deposit_v2, FinalizeContribution, FinalizeRequest,
+        InitRequest as VaultStateInitRequest, ObserveDepositRequest,
     },
     WorkerError,
 };
@@ -753,5 +753,586 @@ fn vault_state_init_finalize_rejects_tampered_self_contribution() {
                 if s == "vault_state_v2_finalize_self_contribution_mismatch"
         ),
         "tampered self contribution must surface InvalidDkgState(self_contribution_mismatch), got {err:?}"
+    );
+}
+// =============================================================================================
+// Codex M3a P1 v3 KILLER — partial-finalize recovery.
+//
+// Scenario: coordinator runs init → collects 5 per-slot worker_transcript_hashes → computes
+// final_transcript_hash → fans out finalize. Network partitions mid-fan-out: 3 of 5 workers
+// (slots 0, 1, 2) acknowledge before the partition; slots 3, 4 don't. The coordinator's
+// retry must converge by re-fanning-out finalize to all 5 slots — already-finalized workers
+// return OK idempotently, not-yet-finalized workers finalize for the first time.
+//
+// Pre-v3 the recovery was broken: finalized slots had `init_transcript_hash = final_hash`
+// on disk, and init replays returned that final hash as `worker_transcript_hash` instead of
+// the per-slot value. The coordinator's per-slot recomputation gate then surfaced
+// `worker_transcript_hash_mismatch` on every retry, with no normal recovery path.
+//
+// v3 fix: `worker_transcript_hash` (frozen at init) and `init_transcript_hash` (set by
+// finalize) are SEPARATE fields. Init replays return the frozen per-slot hash regardless
+// of finalize state, so a coordinator can ALWAYS recompute the canonical final hash and
+// re-finalize the partial slots.
+// =============================================================================================
+#[test]
+fn vault_state_init_partial_finalize_recoverable() {
+    let fix = build_fixture("partial-finalize");
+
+    // PHASE 1: init all 5 selected workers + capture per-slot contributions.
+    let mut per_slot_contribs: Vec<FinalizeContribution> = Vec::with_capacity(5);
+    for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
+        let req = VaultStateInitRequest {
+            dkg_epoch: DKG_EPOCH.to_string(),
+            request_id: "partial-finalize-req".to_string(),
+            session_id: "partial-finalize-sess".to_string(),
+            ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+            vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: fix.registration_transcript_hash.clone(),
+            roster_hash: fix.roster_hash.clone(),
+            selected_slots: fix.selected_slots.clone(),
+            self_slot: slot,
+            player_id: ordinal,
+            vault_ek: fix.vault_ek_hex.clone(),
+            sender_address: fix.sender.clone(),
+            asset_type: fix.asset.clone(),
+            chain_id: fix.chain_id,
+            aggregate_commitment: fix.aggregate_commitment.clone(),
+            aggregate_response: fix.aggregate_response.clone(),
+            challenge: fix.challenge.clone(),
+        };
+        let result = init_vault_state_v2(&fix.slot_dirs[slot], &req).expect("init");
+        per_slot_contribs.push(FinalizeContribution {
+            slot,
+            vault_state_hash: result.vault_state_hash,
+            worker_transcript_hash: result.worker_transcript_hash,
+            vault_sequence: 0,
+            deposit_count_observed: 0,
+            initialized: true,
+        });
+    }
+    let mut sorted_slots = fix.selected_slots.clone();
+    sorted_slots.sort_unstable();
+    let mut sorted_contribs = per_slot_contribs.clone();
+    sorted_contribs.sort_by_key(|c| c.slot);
+    let final_hash = final_transcript_hash(
+        DKG_EPOCH,
+        &fix.ca_transcript,
+        &fix.vault_ek_transcript_hash,
+        &fix.registration_transcript_hash,
+        &fix.roster_hash,
+        &sorted_slots,
+        &fix.vault_ek_hex,
+        &fix.sender,
+        &fix.asset,
+        fix.chain_id,
+        &fix.aggregate_commitment,
+        &fix.aggregate_response,
+        &fix.challenge,
+        &sorted_contribs,
+    );
+
+    let make_finalize_req = |slot: usize, ordinal: usize| FinalizeRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "partial-finalize-req".to_string(),
+        session_id: "partial-finalize-sess".to_string(),
+        ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+        vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+        registration_transcript_hash: fix.registration_transcript_hash.clone(),
+        roster_hash: fix.roster_hash.clone(),
+        selected_slots: fix.selected_slots.clone(),
+        self_slot: slot,
+        player_id: ordinal,
+        vault_ek: fix.vault_ek_hex.clone(),
+        sender_address: fix.sender.clone(),
+        asset_type: fix.asset.clone(),
+        chain_id: fix.chain_id,
+        aggregate_commitment: fix.aggregate_commitment.clone(),
+        aggregate_response: fix.aggregate_response.clone(),
+        challenge: fix.challenge.clone(),
+        per_slot_contributions: per_slot_contribs.clone(),
+        final_transcript_hash: final_hash.clone(),
+    };
+
+    // PHASE 2: SIMULATE the partial-finalize. Only slots 0, 1, 2 process the finalize body.
+    // Slots 3 and 4 never see this round (coordinator partition mid-fan-out).
+    for (ordinal, &slot) in fix.selected_slots.iter().enumerate().take(3) {
+        let res = finalize_vault_state_v2(&fix.slot_dirs[slot], &make_finalize_req(slot, ordinal))
+            .expect("finalize must succeed for slot 0,1,2");
+        assert!(res.finalized, "slot {slot}: first finalize must report finalized=true");
+        assert_eq!(res.init_transcript_hash.to_lowercase(), final_hash.to_lowercase());
+    }
+
+    // Sanity check: slots 0, 1, 2 have init_transcript_hash = final_hash; slots 3, 4 have None.
+    for &slot in &fix.selected_slots[..3] {
+        let persisted = load_vault_state_v2(&fix.slot_dirs[slot])
+            .expect("load")
+            .expect("file");
+        assert_eq!(
+            persisted.init_transcript_hash.as_deref().map(str::to_lowercase),
+            Some(final_hash.to_lowercase()),
+            "slot {slot}: finalized, init_transcript_hash MUST equal final_hash"
+        );
+        // Frozen per-slot hash unchanged.
+        let idx = fix.selected_slots.iter().position(|&s| s == slot).unwrap();
+        assert_eq!(
+            persisted.worker_transcript_hash.to_lowercase(),
+            per_slot_contribs[idx].worker_transcript_hash.to_lowercase(),
+            "slot {slot}: worker_transcript_hash MUST be the frozen per-slot value (never overwritten)"
+        );
+    }
+    for &slot in &fix.selected_slots[3..] {
+        let persisted = load_vault_state_v2(&fix.slot_dirs[slot])
+            .expect("load")
+            .expect("file");
+        assert_eq!(
+            persisted.init_transcript_hash, None,
+            "slot {slot}: NOT-finalized, init_transcript_hash MUST be None"
+        );
+    }
+
+    // PHASE 3: COORDINATOR REPLAY. Re-run init on all 5 workers. Expectation: every slot
+    // returns its FROZEN per-slot worker_transcript_hash — the EXACT same value returned at
+    // the first init. This is the load-bearing property the v2 fix broke: finalized slots
+    // pre-v3 would return final_hash as worker_transcript_hash, breaking the coordinator's
+    // per-slot recomputation gate.
+    for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
+        let req = VaultStateInitRequest {
+            dkg_epoch: DKG_EPOCH.to_string(),
+            request_id: "partial-finalize-req".to_string(),
+            session_id: "partial-finalize-sess".to_string(),
+            ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+            vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: fix.registration_transcript_hash.clone(),
+            roster_hash: fix.roster_hash.clone(),
+            selected_slots: fix.selected_slots.clone(),
+            self_slot: slot,
+            player_id: ordinal,
+            vault_ek: fix.vault_ek_hex.clone(),
+            sender_address: fix.sender.clone(),
+            asset_type: fix.asset.clone(),
+            chain_id: fix.chain_id,
+            aggregate_commitment: fix.aggregate_commitment.clone(),
+            aggregate_response: fix.aggregate_response.clone(),
+            challenge: fix.challenge.clone(),
+        };
+        let result = init_vault_state_v2(&fix.slot_dirs[slot], &req).expect("init replay");
+        assert!(!result.initialized, "slot {slot}: init replay MUST be idempotent (initialized=false)");
+        assert_eq!(
+            result.worker_transcript_hash.to_lowercase(),
+            per_slot_contribs[ordinal].worker_transcript_hash.to_lowercase(),
+            "slot {slot}: init replay MUST return the FROZEN per-slot worker_transcript_hash \
+             (regardless of finalize state) — this is the partial-finalize-recovery invariant"
+        );
+    }
+
+    // PHASE 4: RE-RUN FINALIZE on all 5 slots with the SAME body. Slots 0, 1, 2 already
+    // finalized → idempotent OK with finalized=false. Slots 3, 4 finalize for the first
+    // time with finalized=true. All 5 converge on the same canonical init_transcript_hash.
+    for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
+        let res = finalize_vault_state_v2(&fix.slot_dirs[slot], &make_finalize_req(slot, ordinal))
+            .expect("finalize retry MUST succeed on every slot");
+        let already_finalized = ordinal < 3;
+        if already_finalized {
+            assert!(
+                !res.finalized,
+                "slot {slot}: previously finalized → idempotent retry MUST report finalized=false"
+            );
+        } else {
+            assert!(
+                res.finalized,
+                "slot {slot}: not previously finalized → retry MUST land for first time (finalized=true)"
+            );
+        }
+        assert_eq!(
+            res.init_transcript_hash.to_lowercase(),
+            final_hash.to_lowercase(),
+            "slot {slot}: all 5 slots MUST converge on the same canonical init_transcript_hash"
+        );
+    }
+
+    // PHASE 5: KILLER — every worker now has init_transcript_hash = final_hash. MPCCA
+    // round1 with that hash MUST reach NotImplemented (the happy-path 501 equivalent) on
+    // every slot, proving the cluster has fully recovered from the partial-finalize state.
+    let round1_req_template = MpccaRound1Request {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "partial-finalize-withdraw-req".to_string(),
+        session_id: "partial-finalize-withdraw-sess".to_string(),
+        vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+        registration_transcript_hash: fix.registration_transcript_hash.clone(),
+        vault_state_init_transcript_hash: final_hash.clone(),
+        observed_deposit_transcript_hashes: vec![],
+        observed_deposit_cursors: vec![],
+        roster_hash: fix.roster_hash.clone(),
+        selected_slots: fix.selected_slots.clone(),
+        self_slot: 0,
+        player_id: 0,
+        vault_ek: fix.vault_ek_hex.clone(),
+        sender_address: fix.sender.clone(),
+        asset_type: fix.asset.clone(),
+        chain_id: fix.chain_id,
+        root: "66".repeat(32),
+        nullifier_hash: "77".repeat(32),
+        recipient: "88".repeat(32),
+        recipient_hash: "99".repeat(32),
+        amount_tag: "0a".repeat(32),
+        vault_sequence: 0,
+        expiry_secs: 1_700_000_000,
+        request_hash: "0b".repeat(32),
+        deposit_count: 0,
+    };
+    for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
+        let mut req = round1_req_template.clone();
+        req.self_slot = slot;
+        req.player_id = ordinal;
+        let err = run_round1_v2(&fix.slot_dirs[slot], &req)
+            .expect_err("post-recovery MPCCA round1 reaches NotImplemented");
+        match err {
+            WorkerError::NotImplemented(phase) => assert_eq!(
+                phase, "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4"
+            ),
+            other => panic!(
+                "slot {slot}: expected NotImplemented post-recovery; partial-finalize recovery \
+                 is NOT FIXED if this slot surfaces {other:?}"
+            ),
+        }
+    }
+}
+
+// =============================================================================================
+// Codex M3a P1 v3 KILLER — init replay returns frozen worker_transcript_hash after finalize.
+//
+// The micro-version of the partial-finalize recovery test, focused on the single load-
+// bearing property: after init → finalize, an init replay must STILL return the per-slot
+// worker_transcript_hash (NOT the canonical final hash). This is what makes the partial-
+// finalize recovery path coordinator-retryable.
+// =============================================================================================
+#[test]
+fn vault_state_init_replay_returns_frozen_worker_hash_after_finalize() {
+    let fix = build_fixture("init-replay-frozen");
+    let slot = 2_usize;
+    let ordinal = 2_usize;
+
+    // PHASE 1: fresh init on slot 2; capture the returned per-slot hash.
+    let init_req = VaultStateInitRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "frozen-replay-req".to_string(),
+        session_id: "frozen-replay-sess".to_string(),
+        ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+        vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+        registration_transcript_hash: fix.registration_transcript_hash.clone(),
+        roster_hash: fix.roster_hash.clone(),
+        selected_slots: fix.selected_slots.clone(),
+        self_slot: slot,
+        player_id: ordinal,
+        vault_ek: fix.vault_ek_hex.clone(),
+        sender_address: fix.sender.clone(),
+        asset_type: fix.asset.clone(),
+        chain_id: fix.chain_id,
+        aggregate_commitment: fix.aggregate_commitment.clone(),
+        aggregate_response: fix.aggregate_response.clone(),
+        challenge: fix.challenge.clone(),
+    };
+    let first = init_vault_state_v2(&fix.slot_dirs[slot], &init_req).expect("first init");
+    let frozen_per_slot_hash = first.worker_transcript_hash.clone();
+    assert!(first.initialized);
+
+    // PHASE 2: init the other 4 slots (we need 5 contributions to build the FINAL_V1 hash).
+    let mut per_slot_contribs: Vec<FinalizeContribution> = Vec::with_capacity(5);
+    for (other_ordinal, &other_slot) in fix.selected_slots.iter().enumerate() {
+        if other_slot == slot {
+            per_slot_contribs.push(FinalizeContribution {
+                slot,
+                vault_state_hash: first.vault_state_hash.clone(),
+                worker_transcript_hash: frozen_per_slot_hash.clone(),
+                vault_sequence: 0,
+                deposit_count_observed: 0,
+                initialized: true,
+            });
+            continue;
+        }
+        let req = VaultStateInitRequest {
+            dkg_epoch: DKG_EPOCH.to_string(),
+            request_id: "frozen-replay-req".to_string(),
+            session_id: "frozen-replay-sess".to_string(),
+            ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+            vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: fix.registration_transcript_hash.clone(),
+            roster_hash: fix.roster_hash.clone(),
+            selected_slots: fix.selected_slots.clone(),
+            self_slot: other_slot,
+            player_id: other_ordinal,
+            vault_ek: fix.vault_ek_hex.clone(),
+            sender_address: fix.sender.clone(),
+            asset_type: fix.asset.clone(),
+            chain_id: fix.chain_id,
+            aggregate_commitment: fix.aggregate_commitment.clone(),
+            aggregate_response: fix.aggregate_response.clone(),
+            challenge: fix.challenge.clone(),
+        };
+        let r = init_vault_state_v2(&fix.slot_dirs[other_slot], &req).expect("init other slot");
+        per_slot_contribs.push(FinalizeContribution {
+            slot: other_slot,
+            vault_state_hash: r.vault_state_hash,
+            worker_transcript_hash: r.worker_transcript_hash,
+            vault_sequence: 0,
+            deposit_count_observed: 0,
+            initialized: true,
+        });
+    }
+    per_slot_contribs.sort_by_key(|c| c.slot);
+
+    let mut sorted_slots = fix.selected_slots.clone();
+    sorted_slots.sort_unstable();
+    let final_hash = final_transcript_hash(
+        DKG_EPOCH,
+        &fix.ca_transcript,
+        &fix.vault_ek_transcript_hash,
+        &fix.registration_transcript_hash,
+        &fix.roster_hash,
+        &sorted_slots,
+        &fix.vault_ek_hex,
+        &fix.sender,
+        &fix.asset,
+        fix.chain_id,
+        &fix.aggregate_commitment,
+        &fix.aggregate_response,
+        &fix.challenge,
+        &per_slot_contribs,
+    );
+    // The final hash MUST differ from the per-slot hash — otherwise this test would prove nothing.
+    assert_ne!(final_hash.to_lowercase(), frozen_per_slot_hash.to_lowercase());
+
+    // PHASE 3: finalize slot 2 with the canonical final hash. After this, the persisted
+    // `init_transcript_hash = Some(final_hash)`.
+    let finalize_req = FinalizeRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "frozen-replay-req".to_string(),
+        session_id: "frozen-replay-sess".to_string(),
+        ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+        vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+        registration_transcript_hash: fix.registration_transcript_hash.clone(),
+        roster_hash: fix.roster_hash.clone(),
+        selected_slots: fix.selected_slots.clone(),
+        self_slot: slot,
+        player_id: ordinal,
+        vault_ek: fix.vault_ek_hex.clone(),
+        sender_address: fix.sender.clone(),
+        asset_type: fix.asset.clone(),
+        chain_id: fix.chain_id,
+        aggregate_commitment: fix.aggregate_commitment.clone(),
+        aggregate_response: fix.aggregate_response.clone(),
+        challenge: fix.challenge.clone(),
+        per_slot_contributions: per_slot_contribs.clone(),
+        final_transcript_hash: final_hash.clone(),
+    };
+    let f_res = finalize_vault_state_v2(&fix.slot_dirs[slot], &finalize_req).expect("finalize");
+    assert!(f_res.finalized);
+    assert_eq!(f_res.init_transcript_hash.to_lowercase(), final_hash.to_lowercase());
+
+    // Sanity check persisted state: worker_transcript_hash = per-slot (frozen);
+    // init_transcript_hash = final_hash.
+    let persisted = load_vault_state_v2(&fix.slot_dirs[slot])
+        .expect("load")
+        .expect("file");
+    assert_eq!(
+        persisted.worker_transcript_hash.to_lowercase(),
+        frozen_per_slot_hash.to_lowercase(),
+        "frozen field MUST equal per-slot hash"
+    );
+    assert_eq!(
+        persisted.init_transcript_hash.as_deref().map(str::to_lowercase),
+        Some(final_hash.to_lowercase()),
+        "post-finalize init_transcript_hash MUST equal final hash"
+    );
+
+    // PHASE 4 KILLER: init replay — MUST return the FROZEN per-slot hash, NOT the final hash.
+    // Pre-v3 this returned final_hash, breaking the coordinator's per-slot recomputation gate.
+    let replay = init_vault_state_v2(&fix.slot_dirs[slot], &init_req).expect("init replay");
+    assert!(!replay.initialized, "init replay MUST be idempotent");
+    assert_eq!(
+        replay.worker_transcript_hash.to_lowercase(),
+        frozen_per_slot_hash.to_lowercase(),
+        "init replay MUST return the FROZEN per-slot worker_transcript_hash — NOT the canonical \
+         final hash. This is the load-bearing invariant for partial-finalize recovery."
+    );
+    assert_ne!(
+        replay.worker_transcript_hash.to_lowercase(),
+        final_hash.to_lowercase(),
+        "init replay MUST NOT return the final hash (distinguishability KILLER — the regression \
+         this test pins is exactly the pre-v3 behaviour of returning final_hash here)"
+    );
+}
+
+// =============================================================================================
+// Codex M3a P2 KILLER — finalize replay after observe-deposit succeeds.
+//
+// observe_deposit_v2 bumps `deposit_count_observed` while preserving identity bindings. Pre-v3
+// finalize re-computed the per-slot init hash from MUTABLE current state (using the bumped
+// cursor), so a finalize replay AFTER even one observe-deposit would diverge from the original
+// per-slot hash and fail closed with `vault_state_v2_finalize_self_contribution_mismatch`.
+//
+// v3 fix: finalize uses the FROZEN `worker_transcript_hash` from disk — no dependency on the
+// cursor. Replay is idempotent across cursor bumps.
+// =============================================================================================
+#[test]
+fn finalize_replay_after_observe_deposit_succeeds() {
+    let fix = build_fixture("finalize-replay-obs");
+
+    // PHASE 1: init all 5 + capture contributions + compute canonical final hash.
+    let mut per_slot_contribs: Vec<FinalizeContribution> = Vec::with_capacity(5);
+    for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
+        let req = VaultStateInitRequest {
+            dkg_epoch: DKG_EPOCH.to_string(),
+            request_id: "fin-replay-obs-req".to_string(),
+            session_id: "fin-replay-obs-sess".to_string(),
+            ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+            vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: fix.registration_transcript_hash.clone(),
+            roster_hash: fix.roster_hash.clone(),
+            selected_slots: fix.selected_slots.clone(),
+            self_slot: slot,
+            player_id: ordinal,
+            vault_ek: fix.vault_ek_hex.clone(),
+            sender_address: fix.sender.clone(),
+            asset_type: fix.asset.clone(),
+            chain_id: fix.chain_id,
+            aggregate_commitment: fix.aggregate_commitment.clone(),
+            aggregate_response: fix.aggregate_response.clone(),
+            challenge: fix.challenge.clone(),
+        };
+        let result = init_vault_state_v2(&fix.slot_dirs[slot], &req).expect("init");
+        per_slot_contribs.push(FinalizeContribution {
+            slot,
+            vault_state_hash: result.vault_state_hash,
+            worker_transcript_hash: result.worker_transcript_hash,
+            vault_sequence: 0,
+            deposit_count_observed: 0,
+            initialized: true,
+        });
+    }
+    let mut sorted_slots = fix.selected_slots.clone();
+    sorted_slots.sort_unstable();
+    let mut sorted_contribs = per_slot_contribs.clone();
+    sorted_contribs.sort_by_key(|c| c.slot);
+    let final_hash = final_transcript_hash(
+        DKG_EPOCH,
+        &fix.ca_transcript,
+        &fix.vault_ek_transcript_hash,
+        &fix.registration_transcript_hash,
+        &fix.roster_hash,
+        &sorted_slots,
+        &fix.vault_ek_hex,
+        &fix.sender,
+        &fix.asset,
+        fix.chain_id,
+        &fix.aggregate_commitment,
+        &fix.aggregate_response,
+        &fix.challenge,
+        &sorted_contribs,
+    );
+
+    let make_finalize_req = |slot: usize, ordinal: usize| FinalizeRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "fin-replay-obs-req".to_string(),
+        session_id: "fin-replay-obs-sess".to_string(),
+        ca_dkg_transcript_hash: fix.ca_transcript.clone(),
+        vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+        registration_transcript_hash: fix.registration_transcript_hash.clone(),
+        roster_hash: fix.roster_hash.clone(),
+        selected_slots: fix.selected_slots.clone(),
+        self_slot: slot,
+        player_id: ordinal,
+        vault_ek: fix.vault_ek_hex.clone(),
+        sender_address: fix.sender.clone(),
+        asset_type: fix.asset.clone(),
+        chain_id: fix.chain_id,
+        aggregate_commitment: fix.aggregate_commitment.clone(),
+        aggregate_response: fix.aggregate_response.clone(),
+        challenge: fix.challenge.clone(),
+        per_slot_contributions: per_slot_contribs.clone(),
+        final_transcript_hash: final_hash.clone(),
+    };
+
+    // PHASE 2: finalize slot 0.
+    let slot = 0_usize;
+    let ordinal = 0_usize;
+    let res = finalize_vault_state_v2(&fix.slot_dirs[slot], &make_finalize_req(slot, ordinal))
+        .expect("first finalize");
+    assert!(res.finalized);
+
+    // PHASE 3: observe-deposit twice — cursor goes 0 → 1 → 2. This is what would normally
+    // happen between init/finalize and the next MPCCA withdraw (the observer polls the
+    // chain event stream).
+    for deposit_count in 1u64..=2 {
+        let obs_req = ObserveDepositRequest {
+            dkg_epoch: DKG_EPOCH.to_string(),
+            request_id: format!("fin-replay-obs-obs-{deposit_count}"),
+            session_id: format!("fin-replay-obs-obs-sess-{deposit_count}"),
+            vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: fix.registration_transcript_hash.clone(),
+            roster_hash: fix.roster_hash.clone(),
+            selected_slots: fix.selected_slots.clone(),
+            self_slot: slot,
+            player_id: ordinal,
+            vault_ek: fix.vault_ek_hex.clone(),
+            sender_address: fix.sender.clone(),
+            asset_type: fix.asset.clone(),
+            chain_id: fix.chain_id,
+            deposit_count,
+            commitment: format!("{:02x}", deposit_count).repeat(32),
+            amount_tag: format!("{:02x}", deposit_count + 1).repeat(32),
+            ca_payload_hash: format!("{:02x}", deposit_count + 2).repeat(32),
+            deposit_nonce: format!("{:02x}", deposit_count + 3).repeat(32),
+            sequence_number: (deposit_count - 1).to_string(),
+            tx_version: deposit_count.to_string(),
+            event_guid: format!("evt-{deposit_count}"),
+            previous_deposit_count_observed: deposit_count - 1,
+            new_deposit_count_observed: deposit_count,
+        };
+        observe_deposit_v2(&fix.slot_dirs[slot], &obs_req).expect("observe_deposit_v2");
+    }
+
+    // Sanity check: cursor bumped to 2; FROZEN worker_transcript_hash and init_transcript_hash
+    // both preserved.
+    let post_obs = load_vault_state_v2(&fix.slot_dirs[slot])
+        .expect("load")
+        .expect("file");
+    assert_eq!(post_obs.deposit_count_observed, 2);
+    assert_eq!(
+        post_obs.worker_transcript_hash.to_lowercase(),
+        per_slot_contribs[ordinal].worker_transcript_hash.to_lowercase(),
+        "observe-deposit MUST NOT mutate the FROZEN worker_transcript_hash"
+    );
+    assert_eq!(
+        post_obs.init_transcript_hash.as_deref().map(str::to_lowercase),
+        Some(final_hash.to_lowercase()),
+        "observe-deposit MUST NOT mutate the canonical init_transcript_hash"
+    );
+
+    // PHASE 4 KILLER: finalize REPLAY with the SAME body. Pre-v3 this failed closed with
+    // `vault_state_v2_finalize_self_contribution_mismatch` because finalize recomputed the
+    // per-slot init hash using `existing.deposit_count_observed` (now 2 — different from the
+    // 0 used at original init), and the recomputed value diverged from the supplied
+    // contribution. v3 uses the FROZEN field from disk, so the replay is idempotent.
+    let replay = finalize_vault_state_v2(&fix.slot_dirs[slot], &make_finalize_req(slot, ordinal))
+        .expect("finalize replay after observe-deposit MUST succeed (v3 partial-finalize-recovery + P2 idempotency)");
+    assert!(
+        !replay.finalized,
+        "finalize replay MUST be idempotent (finalized=false) — the body matched the persisted state"
+    );
+    assert_eq!(
+        replay.init_transcript_hash.to_lowercase(),
+        final_hash.to_lowercase(),
+        "finalize replay MUST return the same canonical init_transcript_hash"
+    );
+
+    // Final state: cursor still 2, init_transcript_hash still pinned. Nothing mutated.
+    let final_state = load_vault_state_v2(&fix.slot_dirs[slot])
+        .expect("load")
+        .expect("file");
+    assert_eq!(final_state.deposit_count_observed, 2);
+    assert_eq!(
+        final_state.init_transcript_hash.as_deref().map(str::to_lowercase),
+        Some(final_hash.to_lowercase())
     );
 }
