@@ -109,7 +109,7 @@ for (let i = 0; i < args.length; i += 1) {
         "usage: local_deposit_observer --coordinator-url URL --aptos-node-url URL\n" +
           "                              --bridge-address HEX --dkg-epoch N --vault-ek HEX\n" +
           "                              --sender-address HEX --asset-type HEX --chain-id N\n" +
-          "                              [--ca-dkg-transcript-hash HEX]\n" +
+          "                              --ca-dkg-transcript-hash HEX\n" +
           "                              [--events-url URL] [--start-sequence N] [--limit N]\n" +
           "                              [--max-iterations N] [--bearer-token TOKEN]\n" +
           "\n" +
@@ -117,8 +117,11 @@ for (let i = 0; i < args.length; i += 1) {
           "the per-handle sequence_number), POSTs each to /v2/vault_state/observe_deposit. The\n" +
           "coordinator advances every worker's deposit_count_observed cursor by one per call.\n" +
           "\n" +
-          "If --events-url is not supplied, the accessor URL is constructed as:\n" +
+          "Aptos events URL: --events-url is RECOMMENDED for testnet/prod because Aptos' REST\n" +
+          "spec for module events varies between fullnode versions. The default constructor\n" +
           "  ${aptosNodeUrl}/v1/accounts/${bridgeAddress}/events/${bridgeAddress}::eunoma_bridge::DepositEventV2\n" +
+          "works for some fullnodes but may return 404 on others — verify against your node before\n" +
+          "running this against real funds.\n" +
           "\n" +
           "Exit codes:\n" +
           `  ${EXIT_SUCCESS}   success — all events processed\n` +
@@ -160,6 +163,10 @@ if (!assetType) {
 }
 if (!chainId) {
   console.error("--chain-id is required");
+  process.exit(EXIT_USAGE_ERROR);
+}
+if (!caDkgTranscriptHash) {
+  console.error("--ca-dkg-transcript-hash is required (the coordinator validates this against the persisted Phase 2 transcript)");
   process.exit(EXIT_USAGE_ERROR);
 }
 const chainIdNum = Number.parseInt(chainId, 10);
