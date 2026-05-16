@@ -4377,10 +4377,17 @@ async function findVaultStateV2InitWithTranscriptHash(
 /**
  * Milestone 3a — verify Milestone 2b observe_deposit provenance for a given depositCount.
  *
- * Scans `<stateRoot>/coordinator/vault_state_v2_observed/` for the artifact whose
- * (dkgEpoch, depositCount, vaultEk, rosterHash, senderAddress, assetType, chainId) tuple matches.
- * Returns the `transcriptHash` of the matching observe transcript so the MPCCA withdraw
- * orchestrator can bind it into every round1 request body (and the milestone 4 chain).
+ * Codex M3a P2 #1: collect the FULL ORDERED VECTOR of observed-deposit transcripts from
+ * depositCount=1 to depositCount=N. The MPCCA withdraw transcript binds this ordering so the
+ * milestone 4 crypto can prove "every confirmed deposit through cursor N has been observed
+ * by 5-of-7 workers in the canonical order". A single-element vector (the pre-fix shape)
+ * gave the appearance of provenance but couldn't catch an out-of-order or skipped cursor.
+ *
+ * Scans `<stateRoot>/coordinator/vault_state_v2_observed/` for every artifact whose
+ * (dkgEpoch, vaultEk, rosterHash, senderAddress, assetType, chainId) tuple matches and
+ * whose depositCount is in `1..=N`. Returns the transcripts sorted ascending by depositCount,
+ * with a uniqueness check that every cursor 1..=N appears exactly once. Missing cursors →
+ * undefined.
  *
  * P3 residual: this scan is O(directory size). For high-deposit-count vaults the directory
  * grows linearly; production hardening could index by `(dkgEpoch, depositCount)` first.
@@ -4399,10 +4406,11 @@ async function findVaultStateV2ObservedProvenance(
 ): Promise<
   | {
       observedDepositTranscriptHashes: string[];
-      transcriptPath: string;
+      transcriptPaths: string[];
     }
   | undefined
 > {
+  if (expected.depositCount < 1) return undefined;
   const dir = join(stateRoot, "coordinator", "vault_state_v2_observed");
   let entries: string[];
   try {
@@ -4415,13 +4423,14 @@ async function findVaultStateV2ObservedProvenance(
   const lowerRoster = expected.rosterHash.replace(/^0x/i, "").toLowerCase();
   const lowerSender = expected.senderAddress.replace(/^0x/i, "").toLowerCase();
   const lowerAsset = expected.assetType.replace(/^0x/i, "").toLowerCase();
-  // The file name convention is `<dkgEpoch>__<depositCount>__<requestId>.json` so we narrow
-  // the scan upfront. Multiple withdraw calls can target the same depositCount (e.g. retries),
-  // so we accept the first matching artifact.
-  const prefix = `${expected.dkgEpoch}__${expected.depositCount}__`;
+  // Index matching artifacts by cursor. First-wins for retries at the same cursor (multiple
+  // observe-deposit calls can target the same cursor; we accept the first artifact present
+  // for that slot).
+  const byCursor = new Map<number, { transcriptHash: string; transcriptPath: string }>();
+  const epochPrefix = `${expected.dkgEpoch}__`;
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue;
-    if (!entry.startsWith(prefix)) continue;
+    if (!entry.startsWith(epochPrefix)) continue;
     const transcriptPath = join(dir, entry);
     let raw: string;
     try {
@@ -4449,16 +4458,32 @@ async function findVaultStateV2ObservedProvenance(
     if (artifact.senderAddress.replace(/^0x/i, "").toLowerCase() !== lowerSender) continue;
     if (artifact.assetType.replace(/^0x/i, "").toLowerCase() !== lowerAsset) continue;
     if (artifact.chainId !== expected.chainId) continue;
-    if (artifact.depositCount !== expected.depositCount) continue;
-    // MVP: we lift ONLY the matched observe transcript hash. Milestone 4 will extend the
-    // observed-deposit list to include every observe artifact up to depositCount (so the
-    // withdraw transcript binds the FULL deposit ordering since the last withdraw). For 3a
-    // the single-entry binding is sufficient — milestone 4 can extend without breaking the
-    // wire shape.
-    return {
-      observedDepositTranscriptHashes: [artifact.transcriptHash],
-      transcriptPath,
-    };
+    const cursor = artifact.depositCount;
+    if (cursor < 1 || cursor > expected.depositCount) continue;
+    // First-wins (in directory iteration order); retries at the same cursor are coalesced.
+    if (!byCursor.has(cursor)) {
+      byCursor.set(cursor, { transcriptHash: artifact.transcriptHash, transcriptPath });
+    }
   }
-  return undefined;
+  // Strict completeness gate: every cursor 1..=N must be present.
+  const orderedHashes: string[] = [];
+  const orderedPaths: string[] = [];
+  for (let c = 1; c <= expected.depositCount; c += 1) {
+    const entry = byCursor.get(c);
+    if (!entry) return undefined;
+    orderedHashes.push(entry.transcriptHash);
+    orderedPaths.push(entry.transcriptPath);
+  }
+  // Uniqueness: each transcriptHash must be distinct (defense in depth — catches a coordinator
+  // that's been tricked into reusing the same artifact for two different cursors).
+  const seen = new Set<string>();
+  for (const h of orderedHashes) {
+    const norm = h.replace(/^0x/i, "").toLowerCase();
+    if (seen.has(norm)) return undefined;
+    seen.add(norm);
+  }
+  return {
+    observedDepositTranscriptHashes: orderedHashes,
+    transcriptPaths: orderedPaths,
+  };
 }
