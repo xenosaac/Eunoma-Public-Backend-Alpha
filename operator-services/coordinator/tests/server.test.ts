@@ -1946,4 +1946,325 @@ describe("coordinator", () => {
     const firstRes = await firstPromise;
     expect(firstRes.statusCode).toBe(200);
   });
+
+  // =============================================================================================
+  // Codex P2 #1: vaultEk provenance verification.
+  //
+  // The coordinator accepts vaultEk from the request body. Without verifying that this
+  // value came from a real Phase 2 transcript, a stale or forged vaultEk would burn five
+  // workers' nonces before the aggregate verifier catches the mismatch. The fix scans
+  // the coordinator's persisted Phase 2 transcripts at
+  // `<stateRoot>/coordinator/vault_ek_derivation/` for a matching tuple BEFORE acquiring
+  // the lock or calling workers.
+  // =============================================================================================
+  it("ca_registration_v2 rejects unknown vaultEk provenance when stateRoot is configured", async () => {
+    const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-provenance-"));
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const realVaultEk = h32("c");
+    const otherVaultEk = h32("9"); // never persisted
+
+    // Persist a Phase 2 artifact for `realVaultEk` but NOT for `otherVaultEk`.
+    const phase2Dir = join(stateRoot, "coordinator", "vault_ek_derivation");
+    await mkdir(phase2Dir, { recursive: true });
+    const phase2Artifact = {
+      scheme: "vault_ek_derivation_v1",
+      dkgEpoch,
+      caDkgTranscriptHash: caDkgTranscriptHashHex,
+      selectedSlots: [0, 1, 2, 3, 4],
+      selectionRationale: "coordinator-chosen",
+      rosterHash: rosterHashHex,
+      verifierSlot: 0,
+      perSlotContributions: [],
+      vaultEk: realVaultEk,
+      finalTranscriptHash: h32("7"),
+      createdAtUnixMs: 1_700_000_000_000,
+    };
+    await writeFile(
+      join(phase2Dir, `${dkgEpoch}__some-prior-derive.json`),
+      JSON.stringify(phase2Artifact, null, 2),
+      { mode: 0o600 },
+    );
+
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async () => {
+        workerCalled = true;
+        return { slot: 0, ok: true, statusCode: 200, body: {} };
+      },
+    });
+
+    // Case 1: unknown vaultEk → 400 vault_ek_provenance_unknown, worker NEVER called.
+    const unknownRes = await server.inject({
+      method: "POST",
+      url: "/v2/derive/ca_registration/start",
+      payload: {
+        requestId: "ca-reg-unknown-provenance",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk: otherVaultEk,
+        senderAddress: h32("d"),
+        assetType: h32("e"),
+        chainId: 2,
+      },
+    });
+    expect(unknownRes.statusCode).toBe(400);
+    expect(unknownRes.json().error).toBe("vault_ek_provenance_unknown");
+    expect(workerCalled).toBe(false);
+
+    // Case 2: vaultEk for a Phase 2 transcript with a DIFFERENT dkgEpoch → still rejected.
+    const wrongEpochRes = await server.inject({
+      method: "POST",
+      url: "/v2/derive/ca_registration/start",
+      payload: {
+        requestId: "ca-reg-wrong-epoch",
+        dkgEpoch: "999", // never persisted
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk: realVaultEk,
+        senderAddress: h32("d"),
+        assetType: h32("e"),
+        chainId: 2,
+      },
+    });
+    expect(wrongEpochRes.statusCode).toBe(400);
+    // dkgEpoch != roster.dkgEpoch may surface either as stale_dkg_epoch (roster mismatch)
+    // OR vault_ek_provenance_unknown (no matching transcript). Both are fail-closed.
+    expect(["vault_ek_provenance_unknown", "stale_dkg_epoch"]).toContain(
+      wrongEpochRes.json().error,
+    );
+    expect(workerCalled).toBe(false);
+  });
+
+  it("ca_registration_v2 accepts the call + records vaultEkTranscriptHash when provenance matches", async () => {
+    const { caRegistrationV2Round1WorkerTranscriptHash, caRegistrationV2Round2WorkerTranscriptHash } =
+      await import("@eunoma/deop-protocol");
+    const { mkdtemp, writeFile, mkdir, readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-provenance-ok-"));
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const vaultEk = h32("c");
+    const senderAddress = h32("d");
+    const assetType = h32("e");
+    const chainId = 2;
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const persistedTranscriptHash = h32("7");
+
+    // Persist a Phase 2 artifact for the (dkgEpoch, vaultEk, caDkgTranscriptHash,
+    // rosterHash) tuple the request will use.
+    const phase2Dir = join(stateRoot, "coordinator", "vault_ek_derivation");
+    await mkdir(phase2Dir, { recursive: true });
+    await writeFile(
+      join(phase2Dir, `${dkgEpoch}__derive-ok.json`),
+      JSON.stringify({
+        scheme: "vault_ek_derivation_v1",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        selectedSlots: expectedSelectedSlots,
+        selectionRationale: "coordinator-chosen",
+        rosterHash: rosterHashHex,
+        verifierSlot: 0,
+        perSlotContributions: [],
+        vaultEk,
+        finalTranscriptHash: persistedTranscriptHash,
+        createdAtUnixMs: 1_700_000_000_000,
+      }, null, 2),
+      { mode: 0o600 },
+    );
+
+    const round1NonceIdBySlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      round1NonceIdBySlot[slot] = h32(String((slot + 6) % 16).slice(-1) || "f").slice(0, 64);
+    }
+    const round1CommitmentBySlot: Record<number, string> = {};
+    for (const slot of expectedSelectedSlots) {
+      round1CommitmentBySlot[slot] = h32(String((slot % 9) + 1));
+    }
+    const challengeFromAggregator = h32("3");
+    const finalAggregateCommitment = h32("4");
+    const finalAggregateResponse = h32("5");
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path.endsWith("/ca_registration/round1")) {
+          const commitmentHex = round1CommitmentBySlot[slot];
+          const nonceId = round1NonceIdBySlot[slot];
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const workerHash = caRegistrationV2Round1WorkerTranscriptHash({
+            sessionId: (body as Record<string, unknown>).sessionId as string,
+            requestId: (body as Record<string, unknown>).requestId as string,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashHex,
+            rosterHash: rosterHashHex,
+            sortedSelectedSlots: expectedSelectedSlots,
+            selfSlot: slot,
+            playerId,
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            commitmentHex,
+            nonceId,
+          });
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              slot,
+              commitmentHex,
+              commitmentHash: h32("a"),
+              nonceId,
+              workerTranscriptHash: workerHash,
+            },
+          };
+        }
+        if (path.endsWith("/ca_registration/challenge")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { aggregateCommitment: finalAggregateCommitment, challenge: challengeFromAggregator },
+          };
+        }
+        if (path.endsWith("/ca_registration/round2")) {
+          const responseHex = h32(String((slot % 7) + 1).padStart(1, "0"));
+          const { sha256 } = await import("@noble/hashes/sha256");
+          const { bytesToHex, hexToBytes } = await import("@noble/hashes/utils");
+          const responseHash = bytesToHex(sha256(hexToBytes(responseHex)));
+          const playerId = expectedSelectedSlots.indexOf(slot);
+          const workerHash = caRegistrationV2Round2WorkerTranscriptHash({
+            sessionId: (body as Record<string, unknown>).sessionId as string,
+            requestId: (body as Record<string, unknown>).requestId as string,
+            dkgEpoch,
+            caDkgTranscriptHash: caDkgTranscriptHashHex,
+            sortedSelectedSlots: expectedSelectedSlots,
+            selfSlot: slot,
+            playerId,
+            nonceId: round1NonceIdBySlot[slot],
+            challenge: challengeFromAggregator,
+            responseHash,
+          });
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: { slot, responseHex, responseHash, workerTranscriptHash: workerHash },
+          };
+        }
+        if (path.endsWith("/ca_registration/aggregate")) {
+          return {
+            slot,
+            ok: true,
+            statusCode: 200,
+            body: {
+              aggregateCommitment: finalAggregateCommitment,
+              aggregateResponse: finalAggregateResponse,
+              challenge: challengeFromAggregator,
+              proofHash: h32("9"),
+            },
+          };
+        }
+        return { slot, ok: false, statusCode: 500, body: { error: "unexpected" } };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/ca_registration/start",
+      payload: {
+        requestId: "ca-reg-provenance-ok",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.accepted).toBe(true);
+    // Response surfaces the Phase 2 cross-reference.
+    expect(body.vaultEkTranscriptHash).toBe(persistedTranscriptHash);
+    // Persisted artifact records the cross-reference too.
+    expect(typeof body.transcriptPath).toBe("string");
+    const artifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
+    expect(artifact.vaultEkTranscriptHash).toBe(persistedTranscriptHash);
+    expect(typeof artifact.vaultEkTranscriptPath).toBe("string");
+  });
+
+  it("ca_registration_v2 rejects vault_ek_provenance_mismatch when supplied hash disagrees", async () => {
+    const { mkdtemp, writeFile, mkdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-provenance-pin-"));
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const caDkgTranscriptHashHex = h32("a");
+    const realVaultEk = h32("c");
+    const persistedTranscriptHash = h32("7");
+
+    const phase2Dir = join(stateRoot, "coordinator", "vault_ek_derivation");
+    await mkdir(phase2Dir, { recursive: true });
+    await writeFile(
+      join(phase2Dir, `${dkgEpoch}__derive-x.json`),
+      JSON.stringify({
+        scheme: "vault_ek_derivation_v1",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        selectedSlots: [0, 1, 2, 3, 4],
+        selectionRationale: "coordinator-chosen",
+        rosterHash: rosterHashHex,
+        verifierSlot: 0,
+        perSlotContributions: [],
+        vaultEk: realVaultEk,
+        finalTranscriptHash: persistedTranscriptHash,
+        createdAtUnixMs: 1_700_000_000_000,
+      }, null, 2),
+      { mode: 0o600 },
+    );
+
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async () => {
+        workerCalled = true;
+        return { slot: 0, ok: true, statusCode: 200, body: {} };
+      },
+    });
+
+    // Caller pins the wrong transcript hash → 400 vault_ek_provenance_mismatch.
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/derive/ca_registration/start",
+      payload: {
+        requestId: "ca-reg-pin-mismatch",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk: realVaultEk,
+        vaultEkTranscriptHash: h32("9"), // does NOT match the persisted finalTranscriptHash
+        senderAddress: h32("d"),
+        assetType: h32("e"),
+        chainId: 2,
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("vault_ek_provenance_mismatch");
+    expect(workerCalled).toBe(false);
+  });
 });

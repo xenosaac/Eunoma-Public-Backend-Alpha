@@ -676,6 +676,13 @@ export interface CaRegistrationV2Contribution {
 /**
  * Coordinator-persisted transcript artifact for a V2 CA registration session. Same shape
  * as the vault_ek transcript artifact — atomic write, 0o600.
+ *
+ * Codex P2 #1: `vaultEkTranscriptHash` cross-references the Phase 2
+ * vault_ek_derivation transcript whose `finalTranscriptHash` matches. The coordinator
+ * verifies provenance against the persisted Phase 2 artifact dir before fan-out, so any
+ * mismatch surfaces as a 400 `vault_ek_provenance_unknown` BEFORE workers' nonces are
+ * burned. Optional because dev/test invocations without `stateRoot` skip the check —
+ * production deployments always populate this field.
  */
 export interface CaRegistrationV2Transcript {
   scheme: "ca_registration_v2";
@@ -685,6 +692,8 @@ export interface CaRegistrationV2Transcript {
   selectedSlots: number[];
   verifierSlot: number;
   vaultEk: HexString;
+  /** Phase 2 transcript hash that produced this `vaultEk`. */
+  vaultEkTranscriptHash?: HexString;
   senderAddress: HexString;
   assetType: HexString;
   chainId: number;

@@ -47,7 +47,7 @@ import {
 } from "@eunoma/deop-protocol";
 import { sha256, bytesToHex } from "@eunoma/shared";
 import { HttpError, requireBearer } from "@eunoma/shared";
-import { mkdir, rename, writeFile, chmod } from "node:fs/promises";
+import { mkdir, rename, writeFile, chmod, readdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
 
@@ -960,6 +960,62 @@ export function buildCoordinatorServer(
       const sortedSelectedSlots = [...selectedSlots].sort((a, b) => a - b);
       const sessionId = requestId;
 
+      // Codex P2 #1: verify vaultEk provenance BEFORE acquiring the session lock and
+      // BEFORE fanning out to workers. A stale/forged vaultEk would otherwise burn five
+      // workers' nonces and only fail at the aggregate check. We require an opt-in
+      // `vaultEkTranscriptHash` in the request body for the strongest binding; when not
+      // supplied, we scan the coordinator's persisted Phase 2 transcripts at
+      // `<stateRoot>/coordinator/vault_ek_derivation/` for a matching
+      // (dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash) tuple. When `stateRoot` is
+      // not configured (test/dev mode without persistence) we skip the check — same as
+      // Phase 2 itself, which only persists transcripts under stateRoot.
+      const claimedVaultEkTranscriptHash =
+        typeof raw.vaultEkTranscriptHash === "string" && raw.vaultEkTranscriptHash.length > 0
+          ? raw.vaultEkTranscriptHash
+          : undefined;
+      let vaultEkTranscriptHash: string | undefined;
+      let vaultEkTranscriptPath: string | undefined;
+      if (opts.stateRoot) {
+        const provenance = await findVaultEkProvenance(opts.stateRoot, {
+          dkgEpoch,
+          vaultEk,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          rosterHash: dkgRosterHash,
+        });
+        if (!provenance) {
+          return reply.code(400).send({
+            error: "vault_ek_provenance_unknown",
+            requestId,
+            message:
+              "no persisted Phase 2 vault_ek_derivation transcript matches the supplied " +
+              "(dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash). Run /v2/derive/vault_ek/start " +
+              "first or supply a vaultEk that the coordinator produced.",
+          });
+        }
+        // If the caller pinned a specific transcript hash, the persisted match must agree.
+        if (
+          claimedVaultEkTranscriptHash &&
+          claimedVaultEkTranscriptHash.replace(/^0x/i, "").toLowerCase() !==
+            provenance.vaultEkTranscriptHash.replace(/^0x/i, "").toLowerCase()
+        ) {
+          return reply.code(400).send({
+            error: "vault_ek_provenance_mismatch",
+            requestId,
+            message:
+              "vaultEkTranscriptHash supplied in the request does not match the persisted " +
+              "Phase 2 transcript that produced this vaultEk",
+            expected: provenance.vaultEkTranscriptHash,
+            received: claimedVaultEkTranscriptHash,
+          });
+        }
+        vaultEkTranscriptHash = provenance.vaultEkTranscriptHash;
+        vaultEkTranscriptPath = provenance.transcriptPath;
+      } else if (claimedVaultEkTranscriptHash) {
+        // No stateRoot persistence but the caller still pinned a hash — accept it
+        // verbatim (test/dev paths). Production deployments always configure stateRoot.
+        vaultEkTranscriptHash = claimedVaultEkTranscriptHash;
+      }
+
       const lock = await acquireCaRegistrationV2Lock();
       if (lock === "busy") {
         return reply.code(409).send({
@@ -1300,6 +1356,11 @@ export function buildCoordinatorServer(
           ...transcript,
           selectionRationale,
           requestId,
+          // Codex P2 #1: cross-reference the Phase 2 transcript that produced this
+          // vaultEk. Auditors can replay-verify by reading this hash + opening
+          // `<stateRoot>/coordinator/vault_ek_derivation/*.json` for the matching artifact.
+          vaultEkTranscriptHash,
+          vaultEkTranscriptPath,
           createdAtUnixMs: Date.now(),
         };
 
@@ -1329,6 +1390,7 @@ export function buildCoordinatorServer(
           selectionRationale,
           verifierSlot,
           vaultEk,
+          vaultEkTranscriptHash,
           senderAddress,
           assetType,
           chainId,
@@ -2020,4 +2082,83 @@ async function writeTranscriptArtifactAtomic(
   await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   await chmod(tmp, 0o600);
   await rename(tmp, path);
+}
+
+/**
+ * Codex P2 #1 — verify `vaultEk` provenance.
+ *
+ * The coordinator's /v2/derive/ca_registration/start accepts vaultEk from the request body.
+ * If we don't check that the value came from a real Phase 2 transcript, a stale or
+ * malicious vaultEk burns all selected workers' nonces before the aggregate verifier
+ * catches the mismatch. Worse, an attacker who can read the worker's round1 commitment
+ * could try to predict which (vaultEk, dkgEpoch, caDkgTranscriptHash, rosterHash) tuple
+ * the coordinator would accept and grief the system.
+ *
+ * Fix: scan the coordinator's persisted Phase 2 transcripts at
+ * `<stateRoot>/coordinator/vault_ek_derivation/` for an artifact whose
+ * `(dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash)` matches the supplied tuple. If
+ * none found, return 400 `vault_ek_provenance_unknown` and skip the worker fan-out.
+ * If found, return the artifact's `finalTranscriptHash` so the registration transcript
+ * can cross-reference its source.
+ *
+ * Bounds the attack to "burning the coordinator's transcript dir" — since the coordinator
+ * itself produced those transcripts (each behind the vault_ek_derivation lock), an
+ * attacker cannot fabricate them without first running a successful Phase 2 derive.
+ */
+async function findVaultEkProvenance(
+  stateRoot: string,
+  expected: {
+    dkgEpoch: string;
+    vaultEk: string;
+    caDkgTranscriptHash: string;
+    rosterHash: string;
+  },
+): Promise<{ vaultEkTranscriptHash: string; transcriptPath: string } | undefined> {
+  const dir = join(stateRoot, "coordinator", "vault_ek_derivation");
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch (err) {
+    // No directory → no transcripts → no provenance. Caller maps to 400.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+  const lowerVaultEk = expected.vaultEk.replace(/^0x/i, "").toLowerCase();
+  const lowerCaDkg = expected.caDkgTranscriptHash.replace(/^0x/i, "").toLowerCase();
+  const lowerRoster = expected.rosterHash.replace(/^0x/i, "").toLowerCase();
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    // Cheap optimization: file name is `<dkgEpoch>__<requestId>.json` so we can skip
+    // transcripts for the wrong epoch without parsing JSON. Mismatches across the rest
+    // of the tuple still need a JSON read.
+    const epochPrefix = `${expected.dkgEpoch}__`;
+    if (!entry.startsWith(epochPrefix)) continue;
+    const transcriptPath = join(dir, entry);
+    let raw: string;
+    try {
+      raw = await readFile(transcriptPath, "utf8");
+    } catch {
+      continue;
+    }
+    let artifact: Record<string, unknown>;
+    try {
+      artifact = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (artifact.scheme !== "vault_ek_derivation_v1") continue;
+    if (typeof artifact.dkgEpoch !== "string" || artifact.dkgEpoch !== expected.dkgEpoch) continue;
+    if (typeof artifact.vaultEk !== "string") continue;
+    if (typeof artifact.caDkgTranscriptHash !== "string") continue;
+    if (typeof artifact.rosterHash !== "string") continue;
+    if (typeof artifact.finalTranscriptHash !== "string") continue;
+    if (artifact.vaultEk.replace(/^0x/i, "").toLowerCase() !== lowerVaultEk) continue;
+    if (artifact.caDkgTranscriptHash.replace(/^0x/i, "").toLowerCase() !== lowerCaDkg) continue;
+    if (artifact.rosterHash.replace(/^0x/i, "").toLowerCase() !== lowerRoster) continue;
+    return {
+      vaultEkTranscriptHash: artifact.finalTranscriptHash,
+      transcriptPath,
+    };
+  }
+  return undefined;
 }
