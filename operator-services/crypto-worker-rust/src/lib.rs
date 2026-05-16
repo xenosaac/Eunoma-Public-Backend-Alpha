@@ -5050,21 +5050,96 @@ pub mod ca_registration_v2 {
         Ok(copy)
     }
 
+    /// Codex M2a P2 #2: atomic write for the ca_registration_v2 round1 nonce file.
+    ///
+    /// Previously this did `OpenOptions::create(true).truncate(true).open(path)`. A crash
+    /// between truncate and full write would leave a partial file at the canonical
+    /// nonce path, where round2 reads from. Two concurrent round1 calls hitting the same
+    /// session would also race the truncate.
+    ///
+    /// Fix: same atomic pattern as `vault_state_v2::write_secret_file` — write to a
+    /// `<path>.tmp.<pid>.<random>` file with `create_new(true)`, fsync + chmod 0o600,
+    /// then `rename` to the final path. The round1 idempotency replay branch (above)
+    /// already gates this function on `path.exists() && layout matches`, so by the time
+    /// we reach `write_secret_file` we have either no existing file or one whose
+    /// rename-replace is intentional.
     fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
+        use rand::RngCore as _;
         use std::io::Write as _;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        let parent = path.parent().ok_or_else(|| {
+            WorkerError::Crypto(format!("path {} has no parent dir", path.display()))
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                WorkerError::Crypto(format!("path {} has no file name", path.display()))
+            })?;
+        let pid = std::process::id();
+        let mut rng = rand::rngs::OsRng;
+        const MAX_ATTEMPTS: usize = 16;
+        for _ in 0..MAX_ATTEMPTS {
+            let suffix: u64 = rng.next_u64();
+            let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{suffix:016x}"));
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = match opts.open(&tmp_path) {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(WorkerError::Crypto(format!(
+                        "open tmp {}: {err}",
+                        tmp_path.display()
+                    )));
+                }
+            };
+            if let Err(err) = file.write_all(contents) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "write tmp {}: {err}",
+                    tmp_path.display()
+                )));
+            }
+            if let Err(err) = file.sync_all() {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "fsync tmp {}: {err}",
+                    tmp_path.display()
+                )));
+            }
+            drop(file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(WorkerError::Crypto(format!(
+                        "chmod 0o600 tmp {}: {err}",
+                        tmp_path.display()
+                    )));
+                }
+            }
+            if let Err(err) = fs::rename(&tmp_path, path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "rename {} -> {}: {err}",
+                    tmp_path.display(),
+                    path.display()
+                )));
+            }
+            return Ok(());
         }
-        let mut file = opts
-            .open(path)
-            .map_err(|err| WorkerError::Crypto(format!("open {}: {err}", path.display())))?;
-        file.write_all(contents)
-            .map_err(|err| WorkerError::Crypto(format!("write {}: {err}", path.display())))?;
-        Ok(())
+        Err(WorkerError::Crypto(format!(
+            "exhausted {MAX_ATTEMPTS} tmp-suffix retries writing {}",
+            path.display()
+        )))
     }
 
     fn compressed_hex(point: &RistrettoPoint) -> String {
@@ -5643,21 +5718,117 @@ pub mod vault_state_v2 {
         Ok(copy)
     }
 
+    /// Codex M2a P2 #2: atomic write for vault_state_v2.json.
+    ///
+    /// Previously this did `OpenOptions::create(true).truncate(true).open(path)`, which
+    /// writes directly to the final path. Two consequences:
+    ///   1. A crash between truncate and write leaves a partial / empty file at the final
+    ///      path that subsequent reads parse-fail on.
+    ///   2. Two concurrent fresh writers both pass the `file_path.exists()` idempotency
+    ///      check before either write begins; the second writer then truncates whatever
+    ///      the first wrote.
+    ///
+    /// Fix: write to `<path>.tmp.<pid>.<random>` with `create_new(true)` (atomic
+    /// exclusive create — fails if name collides; we retry with a fresh random suffix),
+    /// fsync + chmod 0o600, then `rename` to the final path. `rename(2)` on the same
+    /// filesystem is atomic, so a partial file is never observed.
+    ///
+    /// `AlreadyExists` on the tmp open → retry with a new suffix (handles the rare
+    /// collision when two writers happen to draw the same random+pid+time triple).
+    /// `AlreadyExists` on the final-path rename is NOT a failure mode here because
+    /// `rename` REPLACES the destination atomically; the caller is responsible for
+    /// having done the byte-level idempotency check upstream of this function (which
+    /// `init_vault_state_v2` does — see the `if file_path.exists()` branch).
     fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
+        use rand::RngCore as _;
         use std::io::Write as _;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        let parent = path.parent().ok_or_else(|| {
+            WorkerError::Crypto(format!("path {} has no parent dir", path.display()))
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                WorkerError::Crypto(format!("path {} has no file name", path.display()))
+            })?;
+        let pid = std::process::id();
+        let mut rng = rand::rngs::OsRng;
+        // Loop on AlreadyExists with a fresh suffix. 16 attempts is far more than enough
+        // — `OsRng` on a u64 with `create_new` collides with probability ~1 in 2^64 per
+        // attempt; if 16 retries don't succeed something else is broken (e.g. read-only
+        // dir, permissions, FS bug) and we fail closed.
+        const MAX_ATTEMPTS: usize = 16;
+        for _ in 0..MAX_ATTEMPTS {
+            let suffix: u64 = rng.next_u64();
+            let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{suffix:016x}"));
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = match opts.open(&tmp_path) {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(WorkerError::Crypto(format!(
+                        "open tmp {}: {err}",
+                        tmp_path.display()
+                    )));
+                }
+            };
+            // Write the full buffer.
+            if let Err(err) = file.write_all(contents) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "write tmp {}: {err}",
+                    tmp_path.display()
+                )));
+            }
+            // fsync so the bytes hit disk before the rename. On a crash between rename
+            // and fsync we could otherwise end up with the file's metadata pointing at
+            // an inode whose data hasn't been flushed.
+            if let Err(err) = file.sync_all() {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "fsync tmp {}: {err}",
+                    tmp_path.display()
+                )));
+            }
+            drop(file);
+            // Belt-and-suspenders chmod 0o600 in case the filesystem ignored
+            // OpenOptionsExt::mode (e.g. a Linux umask quirk on some setups).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(WorkerError::Crypto(format!(
+                        "chmod 0o600 tmp {}: {err}",
+                        tmp_path.display()
+                    )));
+                }
+            }
+            // Atomic rename — this is the operation that makes the new file visible
+            // under the canonical name. After this point a reader that opens `path` sees
+            // either the OLD file (if any) or the FRESH file, never a partial mix.
+            if let Err(err) = fs::rename(&tmp_path, path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(WorkerError::Crypto(format!(
+                    "rename {} -> {}: {err}",
+                    tmp_path.display(),
+                    path.display()
+                )));
+            }
+            return Ok(());
         }
-        let mut file = opts
-            .open(path)
-            .map_err(|err| WorkerError::Crypto(format!("open {}: {err}", path.display())))?;
-        file.write_all(contents)
-            .map_err(|err| WorkerError::Crypto(format!("write {}: {err}", path.display())))?;
-        Ok(())
+        Err(WorkerError::Crypto(format!(
+            "exhausted {MAX_ATTEMPTS} tmp-suffix retries writing {}",
+            path.display()
+        )))
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {

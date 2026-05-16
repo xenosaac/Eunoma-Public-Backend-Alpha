@@ -53,8 +53,9 @@ import {
 import { sha256, bytesToHex } from "@eunoma/shared";
 import { HttpError, requireBearer } from "@eunoma/shared";
 import { assertNoForbiddenPlaintextFields } from "@eunoma/deop-protocol";
-import { mkdir, rename, writeFile, chmod, readdir, readFile } from "node:fs/promises";
+import { mkdir, rename, writeFile, chmod, readdir, readFile, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
 
 export interface ProxyForwardResult {
@@ -2649,12 +2650,47 @@ async function writeTranscriptArtifactAtomic(
   path: string,
   value: unknown,
 ): Promise<void> {
+  // Codex M2a P2 #2: write to <path>.tmp.<pid>.<random> with flag 'wx' (O_EXCL +
+  // O_CREAT, fails if path exists), fsync via writeFile's flag chain isn't possible in
+  // Node's fs/promises — but the create_new + rename is the load-bearing atomicity
+  // guarantee: rename(2) on the same FS is atomic and the tmp name is unguessable, so
+  // a concurrent writer can't clobber an in-progress write.
+  // Loop on AlreadyExists with a fresh random suffix. 16 attempts is far more than
+  // enough — collisions on 8 random bytes + pid + ms are astronomically unlikely.
   const dir = dirname(path);
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
-  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await chmod(tmp, 0o600);
-  await rename(tmp, path);
+  const body = `${JSON.stringify(value, null, 2)}\n`;
+  const MAX_ATTEMPTS = 16;
+  let lastErr: unknown;
+  for (let i = 0; i < MAX_ATTEMPTS; i += 1) {
+    const suffix = randomBytes(8).toString("hex");
+    const tmp = `${path}.tmp.${process.pid}.${Date.now()}.${suffix}`;
+    try {
+      await writeFile(tmp, body, { mode: 0o600, flag: "wx" });
+      await chmod(tmp, 0o600);
+      try {
+        await rename(tmp, path);
+        return;
+      } catch (renameErr) {
+        // best-effort cleanup of the tmp we created
+        await unlink(tmp).catch(() => undefined);
+        throw renameErr;
+      }
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        (err as NodeJS.ErrnoException).code === "EEXIST"
+      ) {
+        // tmp suffix collided; retry
+        lastErr = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(
+    `writeTranscriptArtifactAtomic: exhausted ${MAX_ATTEMPTS} tmp-suffix retries for ${path}: ${lastErr}`,
+  );
 }
 
 /**
