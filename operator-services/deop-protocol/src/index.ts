@@ -2,6 +2,7 @@ export * from "./bcs.js";
 export * from "./ca_registration_v2.js";
 export * from "./constants.js";
 export * from "./forbidden.js";
+export * from "./frost_signing.js";
 export * from "./local_cluster.js";
 export * from "./mpcca_withdraw_submit.js";
 export * from "./mpcca_withdraw_v2.js";
