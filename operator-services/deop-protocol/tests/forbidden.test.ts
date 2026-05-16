@@ -33,4 +33,14 @@ describe("forbidden plaintext field gate", () => {
       }),
     ).toThrow(ForbiddenPlaintextFieldError);
   });
+
+  it("rejects CA DKG Shamir share field names (dk_share class)", () => {
+    for (const fieldName of ["dkShare", "dk_share", "caDkShare", "ca_dk_share", "shamirShare", "shamir_share"]) {
+      expect(() =>
+        assertNoForbiddenPlaintextFields({
+          [fieldName]: "00",
+        }),
+      ).toThrow(ForbiddenPlaintextFieldError);
+    }
+  });
 });

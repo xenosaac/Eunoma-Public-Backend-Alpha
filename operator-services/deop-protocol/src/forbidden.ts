@@ -34,6 +34,12 @@ const FORBIDDEN_FIELD_NAMES = new Set([
   "dkinverse",
   "invshare",
   "inverseshare",
+  "dkshare",
+  "dk_share",
+  "cadkshare",
+  "ca_dk_share",
+  "shamirshare",
+  "shamir_share",
 ]);
 
 export function assertNoForbiddenPlaintextFields(value: unknown): void {
