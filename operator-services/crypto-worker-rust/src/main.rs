@@ -28,8 +28,8 @@ use eunoma_crypto_worker::vault_ek_derivation_v2::{
     run_verify as run_vault_ek_verify, Round0Request, Round1Request, VerifyRequest,
 };
 use eunoma_crypto_worker::ca_registration_v2::{
-    create_registration_nonce_commitment_v2, create_registration_partial_response_v2,
-    run_aggregate_v2 as run_ca_registration_v2_aggregate,
+    aggregate_commitments_v2, challenge_v2, create_registration_nonce_commitment_v2,
+    create_registration_partial_response_v2, run_aggregate_v2 as run_ca_registration_v2_aggregate,
     run_verify_v2 as run_ca_registration_v2_verify, AggregateRequest as CaRegistrationV2AggregateRequest,
     Round1Request as CaRegistrationV2Round1Request,
     Round2Request as CaRegistrationV2Round2Request, VerifyRequest as CaRegistrationV2VerifyRequest,
@@ -132,6 +132,16 @@ async fn main() {
         .route(
             "/worker/v2/derive/ca_registration/round2",
             post(ca_registration_v2_round2),
+        )
+        // Codex P1 #2: interim aggregation endpoint — returns aggregateCommitment +
+        // challenge ONLY (no responses required). Coordinator needs the challenge BEFORE
+        // round2; the share-independent /aggregate endpoint also runs verify, which
+        // requires responses, so it can't be used here. Replaces the V1
+        // `/worker/v2/ca/registration/challenge` route the coordinator was calling — that
+        // route is not in the deop-node allowlist so production V2 stalled at round2.
+        .route(
+            "/worker/v2/derive/ca_registration/challenge",
+            post(ca_registration_v2_challenge),
         )
         .route(
             "/worker/v2/derive/ca_registration/verify",
@@ -900,6 +910,35 @@ async fn ca_registration_v2_round2(
 ) -> (StatusCode, Json<Value>) {
     match create_registration_partial_response_v2(&state.state_dir, &body) {
         Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => worker_error_response(err),
+    }
+}
+
+// Codex P1 #2: V2 interim aggregator. Same wire shape as the V1 challenge endpoint, same
+// math (share-independent public compute). Lives under /worker/v2/derive/ca_registration/*
+// so the deop-node's existing V2 allowlist forwards it correctly. The coordinator hits
+// this on the verifier slot AFTER round1 to derive (aggregateCommitment, challenge), then
+// fans out round2 with the challenge.
+async fn ca_registration_v2_challenge(
+    Json(body): Json<CaRegistrationChallengeRequest>,
+) -> impl IntoResponse {
+    match aggregate_commitments_v2(&body.commitments).and_then(|commitment| {
+        challenge_v2(
+            &body.vault_ek,
+            &body.sender_address,
+            &body.asset_type,
+            body.chain_id,
+            &commitment,
+        )
+        .map(|challenge| (commitment, challenge))
+    }) {
+        Ok((aggregate_commitment, challenge)) => (
+            StatusCode::OK,
+            Json(json!({
+                "aggregateCommitment": aggregate_commitment,
+                "challenge": challenge
+            })),
+        ),
         Err(err) => worker_error_response(err),
     }
 }

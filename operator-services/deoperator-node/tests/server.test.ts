@@ -889,7 +889,21 @@ describe("deoperator node", () => {
         },
       });
       expect(aggregateRes.statusCode).toBe(200);
-      expect(workerCallCount).toBe(2);
+      // Codex P1 #2: confirm the new V2 challenge passthrough is wired up. The deop-node
+      // must NOT 404 on this route; coordinator depends on it between round1 and round2.
+      const challengeRes = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/ca_registration/challenge",
+        payload: {
+          vaultEk: h32("c"),
+          senderAddress: h32("d"),
+          assetType: h32("e"),
+          chainId: 2,
+          commitments: [0, 1, 2, 3, 4].map((slot) => ({ slot, commitment: h32("4") })),
+        },
+      });
+      expect(challengeRes.statusCode).toBe(200);
+      expect(workerCallCount).toBe(3);
     } finally {
       globalThis.fetch = oldFetch;
     }

@@ -1578,7 +1578,7 @@ describe("coordinator", () => {
             },
           };
         }
-        if (path.endsWith("/ca/registration/challenge")) {
+        if (path.endsWith("/ca_registration/challenge")) {
           // Interim aggregator: returns aggregateCommitment + challenge.
           return {
             slot,
@@ -1728,7 +1728,7 @@ describe("coordinator", () => {
             },
           };
         }
-        if (path.endsWith("/ca/registration/challenge")) {
+        if (path.endsWith("/ca_registration/challenge")) {
           return {
             slot,
             ok: true,
@@ -1859,7 +1859,7 @@ describe("coordinator", () => {
             },
           };
         }
-        if (path.endsWith("/ca/registration/challenge")) {
+        if (path.endsWith("/ca_registration/challenge")) {
           return {
             slot,
             ok: true,

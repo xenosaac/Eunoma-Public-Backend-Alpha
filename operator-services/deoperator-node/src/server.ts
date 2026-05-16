@@ -277,6 +277,7 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/derive/vault_ek/verify"
       | "/worker/v2/derive/ca_registration/round1"
       | "/worker/v2/derive/ca_registration/round2"
+      | "/worker/v2/derive/ca_registration/challenge"
       | "/worker/v2/derive/ca_registration/verify"
       | "/worker/v2/derive/ca_registration/aggregate",
     body: unknown,
@@ -384,6 +385,14 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/worker/v2/derive/ca_registration/round2", req.body, reply);
+  });
+  server.post("/worker/v2/derive/ca_registration/challenge", async (req, reply) => {
+    // Codex P1 #2: V2 interim aggregator passthrough. Share-independent public compute
+    // over published round1 commitments; coordinator targets the verifier slot. No
+    // selfSlot binding — same shape as /verify and /aggregate. Replaces the V1
+    // `/worker/v2/ca/registration/challenge` route that this deop-node never
+    // allowlisted.
+    return forwardToWorker("/worker/v2/derive/ca_registration/challenge", req.body, reply);
   });
   server.post("/worker/v2/derive/ca_registration/verify", async (req, reply) => {
     // /verify body has no selfSlot — coordinator picks the verifier. The roster-hash

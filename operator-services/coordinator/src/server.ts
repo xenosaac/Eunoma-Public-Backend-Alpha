@@ -810,12 +810,14 @@ export function buildCoordinatorServer(
   //      Each worker draws r_i, persists nonce file (0o600), returns
   //      `(commitmentHex, commitmentHash, nonceId, workerTranscriptHash)`.
   //   4. Aggregate-commitments + challenge: hit the verifier-slot worker's
-  //      `/worker/v2/derive/ca_registration/aggregate` with all commitments + responses
-  //      (responses haven't been computed yet — we do round2 next, then a SECOND aggregate
-  //      call for the final tuple). Actually: do a first cheap call that computes the
-  //      aggregate commitment + challenge ONLY (we re-use the V1 worker
-  //      `/worker/v2/ca/registration/challenge` for that — share-independent public compute).
-  //      Then round2 fan-out, then the FINAL aggregate-and-verify call.
+  //      `/worker/v2/derive/ca_registration/challenge` route — share-independent public
+  //      compute that returns `(aggregateCommitment, challenge)` only. We need the
+  //      challenge BEFORE round2; the full `/aggregate` route also runs verify, which
+  //      requires responses we don't have yet. Then round2 fan-out, then the FINAL
+  //      aggregate-and-verify call. (Codex P1 #2: this used to call the V1
+  //      `/worker/v2/ca/registration/challenge` route, which was not in the deop-node
+  //      allowlist — fixed by adding a V2-shaped `/worker/v2/derive/ca_registration/challenge`
+  //      route on the worker + deop-node passthrough.)
   //   5. Round2 fan-out with the challenge → 5 responses.
   //   6. Final aggregate-and-verify via `/worker/v2/derive/ca_registration/aggregate` (does
   //      Lagrange on commitments + responses + Fiat-Shamir challenge + verify in one shot).
@@ -1057,19 +1059,20 @@ export function buildCoordinatorServer(
         }
 
         // ---------- Compute aggregate commitment + challenge ----------
-        // Hit the verifier-slot worker's aggregate endpoint with PLACEHOLDER responses
-        // (zero scalars) just to get the aggregateCommitment + challenge. We don't have
-        // real responses yet — we need the challenge BEFORE round2. We can't use the
-        // unified aggregate endpoint (which also runs verify), so we use the V1
-        // /worker/v2/ca/registration/challenge endpoint which does aggregate-commitment +
-        // challenge ONLY (share-independent public compute, identical math).
+        // Codex P1 #2: the coordinator was calling `/worker/v2/ca/registration/challenge`
+        // (a V1 route) but the deop-node only allowlists `/worker/v2/derive/*` paths, so
+        // every production V2 session stalled before round2 with a 404. Fix: call the new
+        // V2 interim aggregator `/worker/v2/derive/ca_registration/challenge`, which lives
+        // under the same prefix the deop-node already passes through. Share-independent
+        // public compute over published commitments — identical math as the V1 helper,
+        // just exposed under the V2 path.
         const verifierSlot = sortedSelectedSlots[0];
         const commitmentsForAggregate = sortedSelectedSlots.map((slot) => ({
           slot,
           commitment: round1ResponsesBySlot.get(slot)!.commitmentHex,
         }));
         const challengeForwarded = await singleNodeForwarder(
-          "/worker/v2/ca/registration/challenge",
+          "/worker/v2/derive/ca_registration/challenge",
           {
             vaultEk,
             senderAddress,
