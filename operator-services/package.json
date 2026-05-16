@@ -22,6 +22,8 @@
     "local:ca-dkg:v2": "node scripts/local_ca_dkg_v2.mjs",
     "local:vault-ek:derive": "node scripts/local_vault_ek_derive.mjs",
     "local:ca:registration": "node scripts/local_ca_registration.mjs",
+    "local:ca-registration:v2": "node scripts/local_ca_registration_v2.mjs",
+    "local:vault-setup:v2": "node scripts/local_vault_setup_v2.mjs",
     "local:online-frost-dkg-smoke": "node scripts/local_frost_dkg_v2.mjs",
     "local:frost-rotation-apply": "node scripts/local_frost_rotation_apply.mjs",
     "local:frost-rotation-smoke": "node scripts/local_frost_rotation_smoke.mjs",
