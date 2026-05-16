@@ -2027,6 +2027,47 @@ pub mod ca_dkg_v2 {
         pub created_at_unix_ms: u128,
     }
 
+    /// Codex M2a P2 #1: belt-and-suspenders zeroize for the secret-bearing share struct.
+    ///
+    /// `load_ca_dkg_v2_share` returns a `CaDkgV2ShareFile` whose `dk_share` and
+    /// `blind_share` fields hold the secret share material in hex. The metadata-only
+    /// loader (`load_ca_dkg_v2_share_metadata`) is preferred for init paths that don't
+    /// need the secret — but `load_ca_dkg_v2_share` is still used by paths that DO need
+    /// it (ca_registration_v2 round2, vault_ek_derivation_v2 round1). This Drop impl
+    /// wipes the underlying bytes of those two fields when the struct goes out of scope.
+    ///
+    /// We use `zeroize::Zeroize::zeroize` on each `String`, which clears the heap-owned
+    /// bytes in place. The struct is not `ZeroizeOnDrop` derive-able because of the
+    /// non-`Zeroize` `Vec<usize>` / `u128` fields, so we hand-write Drop for clarity
+    /// over what's wiped (the two secret fields) and what's intentionally left alone
+    /// (the public metadata).
+    impl Drop for CaDkgV2ShareFile {
+        fn drop(&mut self) {
+            use zeroize::Zeroize as _;
+            self.dk_share.zeroize();
+            self.blind_share.zeroize();
+        }
+    }
+
+    /// Codex M2a P2 #1: metadata-only view of `ca_dkg_share_v2.json`. Contains every
+    /// public binding init paths need to validate (slot/dkg_epoch/transcript_hash/
+    /// threshold/count/valid_dealers/aggregate_commitments) but EXCLUDES the secret
+    /// `dk_share` and `blind_share` fields by serde construction. Returned by
+    /// `load_ca_dkg_v2_share_metadata`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CaDkgV2ShareMetadata {
+        pub scheme: String,
+        pub slot: usize,
+        pub threshold: usize,
+        pub count: usize,
+        pub dkg_epoch: String,
+        pub valid_dealers: Vec<usize>,
+        pub aggregate_commitments: Vec<String>,
+        pub transcript_hash: String,
+        pub created_at_unix_ms: u128,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct DkgSharePlaintext {
@@ -2110,6 +2151,50 @@ pub mod ca_dkg_v2 {
             h_ristretto()?,
         )?;
         Ok(share)
+    }
+
+    /// Codex M2a P2 #1: metadata-only share loader.
+    ///
+    /// `init_vault_state_v2` needs only `(slot, dkg_epoch, transcript_hash, threshold,
+    /// count)` to validate the (Phase 2 + Milestone 1 + CA DKG V2) bindings. It does NOT
+    /// need the secret `dk_share` / `blind_share` material. The shared
+    /// `load_ca_dkg_v2_share` loader deserializes BOTH and runs a Pedersen-share verify
+    /// over them — that's correct for paths that actually use the share (e.g.
+    /// ca_registration_v2 round2), but for init-style paths it pulls secret bytes into
+    /// memory unnecessarily.
+    ///
+    /// This metadata-only loader deserializes the file into a separate struct that
+    /// EXPLICITLY excludes `dk_share` and `blind_share`. `serde(deny_unknown_fields)`
+    /// is intentionally NOT set — the on-disk file is allowed to contain `dk_share` /
+    /// `blind_share` (and does), but they are never bound to memory through this path.
+    ///
+    /// Init paths use this loader; ca_registration_v2 round2 still uses
+    /// `load_ca_dkg_v2_share` because it genuinely needs the secret share.
+    pub fn load_ca_dkg_v2_share_metadata(
+        state_dir: &Path,
+    ) -> WorkerResult<CaDkgV2ShareMetadata> {
+        let value = read_json(&state_dir.join(CA_DKG_V2_SHARE_FILE))?;
+        let meta: CaDkgV2ShareMetadata =
+            serde_json::from_value(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        assert_slot(meta.slot)?;
+        assert_v2_threshold(meta.threshold, meta.count)?;
+        if meta.valid_dealers.len() != DEOPERATOR_COUNT {
+            return Err(WorkerError::InvalidRequest(
+                "CA DKG V2 share must contain all 7 valid dealers".to_string(),
+            ));
+        }
+        if meta.aggregate_commitments.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(
+                "CA DKG V2 share must contain 5 aggregate commitments".to_string(),
+            ));
+        }
+        // Sanity-check the aggregate commitments parse as Ristretto points so we still
+        // fail closed on a corrupted file, but DO NOT decompress + verify_pedersen_share
+        // (which would require dk_share/blind_share — exactly what we are avoiding).
+        for commitment in &meta.aggregate_commitments {
+            ristretto_from_hex(commitment)?;
+        }
+        Ok(meta)
     }
 
     pub fn run_round(state_dir: &Path, req: CaDkgV2RoundRequest) -> WorkerResult<CaDkgV2RoundResult> {
@@ -2401,13 +2486,13 @@ pub mod ca_dkg_v2 {
             artifact_hash: artifact_hash(req, &share.transcript_hash, &[b"finalize".as_slice(), share_hash.as_bytes()]),
             dealer_broadcast: None,
             encrypted_shares: Vec::new(),
-            accepted_dealers: share.valid_dealers,
-            aggregate_commitments: share.aggregate_commitments,
+            accepted_dealers: share.valid_dealers.clone(),
+            aggregate_commitments: share.aggregate_commitments.clone(),
             ca_dkg_share_hash: Some(share_hash),
             complaints: Vec::new(),
             abort_evidence_hash: None,
             finalized: Some(true),
-            ca_dkg_transcript_hash: Some(share.transcript_hash),
+            ca_dkg_transcript_hash: Some(share.transcript_hash.clone()),
         })
     }
 
@@ -5101,7 +5186,12 @@ pub mod ca_registration_v2 {
 //   → sha256 → lowercase hex.
 // =================================================================================================
 pub mod vault_state_v2 {
-    use crate::ca_dkg_v2::load_ca_dkg_v2_share;
+    // Codex M2a P2 #1: init reads only the share's PUBLIC metadata
+    // (slot/dkg_epoch/transcript_hash/...), so we use the metadata-only loader rather
+    // than `load_ca_dkg_v2_share` (which deserializes + verifies dk_share/blind_share).
+    // The dedicated struct excludes secret fields by serde construction — they never
+    // enter this code path's memory.
+    use crate::ca_dkg_v2::load_ca_dkg_v2_share_metadata;
     // Codex M2a P1: V2 production code MUST NOT import from `crate::ca_local`. The public
     // sigma verifier + Fiat-Shamir challenge live in `crate::registration_verifier`.
     use crate::registration_verifier::verify_registration_proof;
@@ -5343,9 +5433,10 @@ pub mod vault_state_v2 {
         )?;
 
         // Cross-check: V2 share must exist and bind to (dkg_epoch, slot, ca_dkg_transcript_hash).
-        // We don't use the dk_share value itself — only the metadata — so no secret material is
-        // touched in this path.
-        let share = load_ca_dkg_v2_share(state_dir)?;
+        // Codex M2a P2 #1: We use `load_ca_dkg_v2_share_metadata`, which deserializes into a
+        // struct that does NOT include `dk_share` / `blind_share`, so no secret material is
+        // pulled into this code path's memory.
+        let share = load_ca_dkg_v2_share_metadata(state_dir)?;
         if share.slot != req.self_slot {
             return Err(WorkerError::InvalidRequest(format!(
                 "ca_dkg_share_v2 slot {} does not match self_slot {}",
