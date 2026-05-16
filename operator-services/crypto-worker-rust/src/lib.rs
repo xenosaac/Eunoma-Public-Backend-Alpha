@@ -3898,6 +3898,900 @@ pub mod vault_ek_derivation_v2 {
 
 }
 
+/// Milestone 1: V2 threshold CA registration sigma.
+///
+/// V1 (`ca_local::create_registration_nonce_commitment` / `create_registration_partial_response`)
+/// loads a centralized share file (`ca_dkg_share.json`) that carries both the Shamir share
+/// AND a hard-coded `vault_ek`. V2 has neither:
+///
+/// - The dk Shamir share lives in `ca_dkg_share_v2.json` (real Pedersen VSS, threshold 5-of-7).
+/// - `vault_ek` is dynamically derived per session via Phase 2 (`vault_ek_derivation_v2`) and
+///   passed into this module as a request parameter, not loaded from disk.
+///
+/// The wire-level sigma protocol is identical to V1 (Schnorr-style proof of knowledge of `dk`
+/// with `vault_ek` as the generator). What changes is the SOURCE of inputs. The aggregator
+/// path still re-uses `ca_local::aggregate_registration_commitment`, `registration_challenge`,
+/// and `verify_registration_proof` because those operate on inputs (commitments / responses /
+/// vault_ek_hex), not on the share file.
+pub mod ca_registration_v2 {
+    use crate::ca_dkg_v2::load_ca_dkg_v2_share;
+    use crate::ca_local::{
+        aggregate_registration_commitment, registration_challenge_scalar, verify_registration_proof,
+        RegistrationCommitmentInput, RegistrationResponseInput,
+    };
+    use crate::mpc_spdz_adapter::{is_safe_id, random_scalar};
+    use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
+    use curve25519_dalek::{
+        ristretto::{CompressedRistretto, RistrettoPoint},
+        scalar::Scalar,
+    };
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use zeroize::Zeroize;
+
+    pub(crate) const ROUND1_TRANSCRIPT_DOMAIN: &str = "EUNOMA_CA_REGISTRATION_V2_NONCE_V1";
+    pub(crate) const ROUND2_TRANSCRIPT_DOMAIN: &str = "EUNOMA_CA_REGISTRATION_V2_RESPONSE_V1";
+    pub(crate) const NONCE_FILE_NAME: &str = "ca_registration_v2_nonce.json";
+
+    /// Round 1 request: each selected worker generates a fresh per-session nonce `r_i`, commits
+    /// `T_i = vault_ek * r_i`, persists `r_i` to a per-session file (0o600), and returns
+    /// `(commitment_hex, commitment_hash, nonce_id, worker_transcript_hash)`. The dk Shamir
+    /// share is loaded from `ca_dkg_share_v2.json`; the public `vault_ek` MUST be supplied
+    /// by the coordinator (it is the Phase 2-derived value).
+    ///
+    /// Binding: this function asserts `share.transcript_hash == ca_dkg_transcript_hash`,
+    /// `share.dkg_epoch == dkg_epoch`, `share.slot == self_slot`. A mismatch on any → 400.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round1Request {
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub ca_dkg_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub player_id: usize,
+        /// Phase 2-derived `vault_ek = H * dk^-1` in compressed Ristretto hex. Used as the
+        /// generator of the sigma protocol — `commitment = vault_ek * r_i`.
+        pub vault_ek: String,
+        /// Asset metadata bound into the sigma proof. Mirror V1's `aggregate_registration_proof`
+        /// shape so the same Aptos CA payload can carry the V2-derived (commitment, response).
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round1Result {
+        pub slot: usize,
+        pub commitment_hex: String,
+        pub commitment_hash: String,
+        pub nonce_id: String,
+        pub worker_transcript_hash: String,
+    }
+
+    /// Round 2 request: coordinator delivers the aggregate-challenge scalar back to each worker;
+    /// worker reloads its `r_i` from the persisted nonce file, computes
+    /// `response_i = r_i + challenge * dk_share_i (mod q)`, returns `response_hex +
+    /// response_hash + worker_transcript_hash`. The nonce file is scrubbed + removed via
+    /// RAII regardless of success or failure. dk_share_i and r_i are zeroized after use.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round2Request {
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub ca_dkg_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub player_id: usize,
+        pub nonce_id: String,
+        /// Coordinator-computed aggregate challenge scalar (Fiat-Shamir over vault_ek,
+        /// sender_address, asset_type, chain_id, aggregate_commitment). Hex, 32 bytes.
+        pub challenge: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round2Result {
+        pub slot: usize,
+        pub response_hex: String,
+        pub response_hash: String,
+        pub worker_transcript_hash: String,
+    }
+
+    /// Local verifier endpoint: same equation as `ca_local::verify_registration_proof` —
+    /// `vault_ek * response == aggregate_commitment + h * challenge`. Coordinator runs this
+    /// against the verifier-slot worker before returning success.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VerifyRequest {
+        pub vault_ek: String,
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+        pub aggregate_commitment: String,
+        pub aggregate_response: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VerifyResult {
+        pub ok: bool,
+    }
+
+    /// On-disk shape for the per-session nonce file. Mode 0o600. Lives at
+    /// `state_dir/mpc-sessions/<request_id>__<session_id>/ca_registration_v2_nonce.json`.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) struct NonceFileLayout {
+        pub session_id: String,
+        pub request_id: String,
+        pub self_slot: usize,
+        pub player_id: usize,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub vault_ek_hex: String,
+        pub ca_dkg_transcript_hash: String,
+        pub dkg_epoch: String,
+        /// Canonical 32-byte little-endian Scalar, hex. Sensitive.
+        pub nonce_hex: String,
+        /// 32-byte compressed Ristretto point, hex. Public.
+        pub commitment_hex: String,
+        pub nonce_id: String,
+        pub created_at_unix_ms: u128,
+    }
+
+    fn session_dir(state_dir: &Path, request_id: &str, session_id: &str) -> PathBuf {
+        state_dir
+            .join("mpc-sessions")
+            .join(format!("{}__{}", request_id, session_id))
+    }
+
+    fn nonce_file_path(state_dir: &Path, request_id: &str, session_id: &str) -> PathBuf {
+        session_dir(state_dir, request_id, session_id).join(NONCE_FILE_NAME)
+    }
+
+    /// RAII guard: on drop, scrub + unlink the nonce file. Used by `run_round2` so even on
+    /// panic the plaintext `r_i` never lingers.
+    struct NonceFileGuard {
+        path: PathBuf,
+        active: bool,
+    }
+
+    impl NonceFileGuard {
+        fn new(path: PathBuf) -> Self {
+            Self { path, active: true }
+        }
+    }
+
+    impl Drop for NonceFileGuard {
+        fn drop(&mut self) {
+            if !self.active || !self.path.exists() {
+                return;
+            }
+            // Best-effort scrub before unlink. Same pattern as
+            // `vault_ek_derivation_v2::drop_round0_file`.
+            if let Ok(metadata) = fs::metadata(&self.path) {
+                let len = metadata.len() as usize;
+                let zeros = vec![0u8; len];
+                if let Ok(mut file) = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(false)
+                    .open(&self.path)
+                {
+                    use std::io::Write as _;
+                    let _ = file.write_all(&zeros);
+                    let _ = file.sync_all();
+                }
+            }
+            let _ = fs::remove_file(&self.path);
+            let parent = self.path.parent().map(Path::to_path_buf);
+            if let Some(parent) = parent {
+                // Best-effort directory cleanup (only succeeds if empty).
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+
+    /// Round 1 — generate nonce, commit, persist. Idempotency: if a nonce file already exists
+    /// for this (request_id, session_id) AND the persisted (vault_ek, dkg_epoch, slot,
+    /// player_id) match the request, return the same nonce + commitment instead of generating
+    /// a new one. This protects against commit-reveal violations under coordinator retries
+    /// (the broadcast set of T_i values must be fixed before challenge generation).
+    pub fn create_registration_nonce_commitment_v2(
+        state_dir: &Path,
+        req: &Round1Request,
+    ) -> WorkerResult<Round1Result> {
+        validate_selected_slots(&req.selected_slots)?;
+        assert_slot(req.self_slot)?;
+        if !req.selected_slots.contains(&req.self_slot) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot {} not in selected_slots",
+                req.self_slot
+            )));
+        }
+        if req.player_id >= DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "player_id {} out of range 0..{}",
+                req.player_id, DEOPERATOR_THRESHOLD
+            )));
+        }
+        let sorted = sorted_unique_slots(&req.selected_slots)?;
+        if sorted[req.player_id] != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                req.player_id, sorted[req.player_id], req.self_slot
+            )));
+        }
+        if req.request_id.is_empty() || !is_safe_id(&req.request_id) {
+            return Err(WorkerError::InvalidRequest(
+                "request_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.session_id.is_empty() || !is_safe_id(&req.session_id) {
+            return Err(WorkerError::InvalidRequest(
+                "session_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        let ca_transcript = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
+        let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        let vault_ek_hex = normalize_hex(&req.vault_ek, 32)?;
+        let sender = normalize_hex(&req.sender_address, 32)?;
+        let asset = normalize_hex(&req.asset_type, 32)?;
+
+        let vault_ek_point = decompress_hex(&vault_ek_hex)?;
+
+        // Cross-check: V2 share file must exist and bind to this request.
+        let share = load_ca_dkg_v2_share(state_dir)?;
+        if share.slot != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 slot {} does not match self_slot {}",
+                share.slot, req.self_slot
+            )));
+        }
+        if share.dkg_epoch != req.dkg_epoch {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 dkg_epoch {} does not match request {}",
+                share.dkg_epoch, req.dkg_epoch
+            )));
+        }
+        if share.transcript_hash.to_lowercase() != ca_transcript {
+            return Err(WorkerError::InvalidRequest(
+                "ca_dkg_transcript_hash does not match local share".to_string(),
+            ));
+        }
+
+        let file_path = nonce_file_path(state_dir, &req.request_id, &req.session_id);
+        if file_path.exists() {
+            // Idempotency replay.
+            let raw = fs::read(&file_path).map_err(|err| {
+                WorkerError::Crypto(format!("read existing nonce file: {err}"))
+            })?;
+            let layout: NonceFileLayout = serde_json::from_slice(&raw)
+                .map_err(|err| WorkerError::Crypto(format!("parse nonce file: {err}")))?;
+            if layout.session_id != req.session_id || layout.request_id != req.request_id {
+                return Err(WorkerError::InvalidDkgState(
+                    "ca_registration_v2_session_collision".to_string(),
+                ));
+            }
+            if layout.self_slot != req.self_slot || layout.player_id != req.player_id {
+                return Err(WorkerError::InvalidDkgState(
+                    "ca_registration_v2_self_slot_mismatch".to_string(),
+                ));
+            }
+            if normalize_hex(&layout.vault_ek_hex, 32)? != vault_ek_hex {
+                // Forbid commit-reveal under a different vault_ek — that's a different sigma
+                // statement and we MUST NOT silently reuse the persisted nonce.
+                return Err(WorkerError::InvalidDkgState(
+                    "ca_registration_v2_vault_ek_mismatch".to_string(),
+                ));
+            }
+            let commitment_hex = normalize_hex(&layout.commitment_hex, 32)?;
+            let commitment_hash =
+                sha256_hex(hex_decode(&commitment_hex)?.as_slice());
+            let worker_transcript_hash = round1_worker_transcript_hash(
+                &req.session_id,
+                &req.request_id,
+                &req.dkg_epoch,
+                &ca_transcript,
+                &roster_hash,
+                &sorted,
+                req.self_slot,
+                req.player_id,
+                &vault_ek_hex,
+                &sender,
+                &asset,
+                req.chain_id,
+                &commitment_hex,
+                &layout.nonce_id,
+            );
+            return Ok(Round1Result {
+                slot: req.self_slot,
+                commitment_hex,
+                commitment_hash,
+                nonce_id: layout.nonce_id,
+                worker_transcript_hash,
+            });
+        }
+
+        // Fresh round1. Draw r_i, compute T_i = vault_ek * r_i, persist with 0o600.
+        let mut r_i = random_scalar();
+        let commitment_point = vault_ek_point * r_i;
+        let commitment_hex = compressed_hex(&commitment_point);
+        let commitment_hash = sha256_hex(hex_decode(&commitment_hex)?.as_slice());
+        let nonce_id = nonce_id_hash(
+            &req.request_id,
+            &req.session_id,
+            req.self_slot,
+            &commitment_hash,
+        );
+        let r_i_hex = scalar_hex(&r_i);
+        let layout = NonceFileLayout {
+            session_id: req.session_id.clone(),
+            request_id: req.request_id.clone(),
+            self_slot: req.self_slot,
+            player_id: req.player_id,
+            roster_hash: roster_hash.clone(),
+            selected_slots: sorted.clone(),
+            vault_ek_hex: vault_ek_hex.clone(),
+            ca_dkg_transcript_hash: ca_transcript.clone(),
+            dkg_epoch: req.dkg_epoch.clone(),
+            nonce_hex: r_i_hex,
+            commitment_hex: commitment_hex.clone(),
+            nonce_id: nonce_id.clone(),
+            created_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        };
+        let sdir = session_dir(state_dir, &req.request_id, &req.session_id);
+        fs::create_dir_all(&sdir)
+            .map_err(|err| WorkerError::Crypto(format!("create session_dir: {err}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(0o700);
+            if let Err(err) = fs::set_permissions(&sdir, perm) {
+                return Err(WorkerError::Crypto(format!(
+                    "chmod 700 {}: {err}",
+                    sdir.display()
+                )));
+            }
+        }
+        let bytes = serde_json::to_vec(&layout)
+            .map_err(|err| WorkerError::Crypto(format!("encode nonce file: {err}")))?;
+        write_secret_file(&file_path, &bytes)?;
+        r_i.zeroize();
+
+        let worker_transcript_hash = round1_worker_transcript_hash(
+            &req.session_id,
+            &req.request_id,
+            &req.dkg_epoch,
+            &ca_transcript,
+            &roster_hash,
+            &sorted,
+            req.self_slot,
+            req.player_id,
+            &vault_ek_hex,
+            &sender,
+            &asset,
+            req.chain_id,
+            &commitment_hex,
+            &nonce_id,
+        );
+
+        Ok(Round1Result {
+            slot: req.self_slot,
+            commitment_hex,
+            commitment_hash,
+            nonce_id,
+            worker_transcript_hash,
+        })
+    }
+
+    /// Round 2 — compute partial response. Loads the persisted nonce file (which carries
+    /// `r_i` + the round1 bindings); reloads the V2 share to fetch `dk_share_i`; computes
+    /// `response_i = r_i + challenge * dk_share_i`. RAII removes the nonce file on every
+    /// return path. dk_share_i and r_i are zeroized after use.
+    pub fn create_registration_partial_response_v2(
+        state_dir: &Path,
+        req: &Round2Request,
+    ) -> WorkerResult<Round2Result> {
+        validate_selected_slots(&req.selected_slots)?;
+        assert_slot(req.self_slot)?;
+        if !req.selected_slots.contains(&req.self_slot) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot {} not in selected_slots",
+                req.self_slot
+            )));
+        }
+        if req.player_id >= DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "player_id {} out of range 0..{}",
+                req.player_id, DEOPERATOR_THRESHOLD
+            )));
+        }
+        let sorted = sorted_unique_slots(&req.selected_slots)?;
+        if sorted[req.player_id] != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                req.player_id, sorted[req.player_id], req.self_slot
+            )));
+        }
+        if req.request_id.is_empty() || !is_safe_id(&req.request_id) {
+            return Err(WorkerError::InvalidRequest(
+                "request_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.session_id.is_empty() || !is_safe_id(&req.session_id) {
+            return Err(WorkerError::InvalidRequest(
+                "session_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.nonce_id.is_empty() || req.nonce_id.len() != 64
+            || !req.nonce_id.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(WorkerError::InvalidRequest(
+                "nonce_id must be 64 hex chars (sha256)".to_string(),
+            ));
+        }
+        let ca_transcript = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
+        let _roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        let challenge = scalar_from_hex(&req.challenge)?;
+
+        // Load and validate the V2 share before touching the nonce file. If the share is
+        // wrong/missing we return without disturbing the persisted nonce.
+        let share = load_ca_dkg_v2_share(state_dir)?;
+        if share.slot != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 slot {} does not match self_slot {}",
+                share.slot, req.self_slot
+            )));
+        }
+        if share.dkg_epoch != req.dkg_epoch {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ca_dkg_share_v2 dkg_epoch {} does not match request {}",
+                share.dkg_epoch, req.dkg_epoch
+            )));
+        }
+        if share.transcript_hash.to_lowercase() != ca_transcript {
+            return Err(WorkerError::InvalidRequest(
+                "ca_dkg_transcript_hash does not match local share".to_string(),
+            ));
+        }
+
+        let path = nonce_file_path(state_dir, &req.request_id, &req.session_id);
+        if !path.exists() {
+            return Err(WorkerError::InvalidDkgState(
+                "ca_registration_v2_nonce_file_missing".to_string(),
+            ));
+        }
+        // Take the guard NOW so even if any of the subsequent fallible steps errors out, the
+        // plaintext r_i is scrubbed.
+        let guard = NonceFileGuard::new(path.clone());
+
+        let raw = fs::read(&path)
+            .map_err(|err| WorkerError::Crypto(format!("read nonce file: {err}")))?;
+        let layout: NonceFileLayout = serde_json::from_slice(&raw)
+            .map_err(|err| WorkerError::Crypto(format!("parse nonce file: {err}")))?;
+        if layout.session_id != req.session_id || layout.request_id != req.request_id {
+            return Err(WorkerError::InvalidDkgState(
+                "ca_registration_v2_session_mismatch".to_string(),
+            ));
+        }
+        if layout.self_slot != req.self_slot || layout.player_id != req.player_id {
+            return Err(WorkerError::InvalidDkgState(
+                "ca_registration_v2_slot_mismatch".to_string(),
+            ));
+        }
+        if layout.dkg_epoch != req.dkg_epoch {
+            return Err(WorkerError::InvalidDkgState(
+                "ca_registration_v2_dkg_epoch_mismatch".to_string(),
+            ));
+        }
+        if normalize_hex(&layout.ca_dkg_transcript_hash, 32)? != ca_transcript {
+            return Err(WorkerError::InvalidDkgState(
+                "ca_registration_v2_ca_dkg_transcript_mismatch".to_string(),
+            ));
+        }
+        if layout.nonce_id != req.nonce_id {
+            return Err(WorkerError::InvalidDkgState(
+                "ca_registration_v2_nonce_id_mismatch".to_string(),
+            ));
+        }
+
+        let mut r_i = scalar_from_hex(&layout.nonce_hex).map_err(|_| {
+            WorkerError::Crypto("ca_registration_v2_nonce_file_r_i_not_canonical".to_string())
+        })?;
+        let mut dk_share = scalar_from_hex(&share.dk_share)?;
+        let response = r_i + challenge * dk_share;
+        let response_hex = scalar_hex(&response);
+        // Scrub immediately after computing the public response.
+        r_i.zeroize();
+        dk_share.zeroize();
+
+        let response_hash = sha256_hex(hex_decode(&response_hex)?.as_slice());
+        let worker_transcript_hash = round2_worker_transcript_hash(
+            &req.session_id,
+            &req.request_id,
+            &req.dkg_epoch,
+            &ca_transcript,
+            &sorted,
+            req.self_slot,
+            req.player_id,
+            &req.nonce_id,
+            &req.challenge,
+            &response_hash,
+        );
+
+        // Successful response: the guard's Drop unlinks (scrub + remove) the nonce file. We
+        // WANT this on every return path because the nonce must not survive — replay would
+        // compromise dk. The guard stays armed; explicit drop here triggers cleanup before
+        // returning.
+        drop(guard);
+
+        Ok(Round2Result {
+            slot: req.self_slot,
+            response_hex,
+            response_hash,
+            worker_transcript_hash,
+        })
+    }
+
+    /// Local verifier — recompute the registration challenge from `(vault_ek, sender, asset,
+    /// chain_id, aggregate_commitment)`, then check `vault_ek * aggregate_response ==
+    /// aggregate_commitment + h * challenge`. Same equation as
+    /// `ca_local::verify_registration_proof`; this is just an HTTP-exposed wrapper.
+    pub fn run_verify_v2(req: &VerifyRequest) -> WorkerResult<VerifyResult> {
+        verify_registration_proof(
+            &req.vault_ek,
+            &req.sender_address,
+            &req.asset_type,
+            req.chain_id,
+            &req.aggregate_commitment,
+            &req.aggregate_response,
+        )?;
+        Ok(VerifyResult { ok: true })
+    }
+
+    /// Coordinator-side helpers exposed for the orchestrator: aggregate commitments via
+    /// Lagrange (re-uses `ca_local::aggregate_registration_commitment`), aggregate responses
+    /// via Lagrange, compute challenge. The worker NEVER calls these — only the coordinator.
+    pub fn aggregate_commitments_v2(
+        commitments: &[RegistrationCommitmentInput],
+    ) -> WorkerResult<String> {
+        aggregate_registration_commitment(commitments)
+    }
+
+    pub fn challenge_v2(
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        aggregate_commitment_hex: &str,
+    ) -> WorkerResult<String> {
+        Ok(scalar_hex(&registration_challenge_scalar(
+            vault_ek_hex,
+            sender_address_hex,
+            asset_type_hex,
+            chain_id,
+            aggregate_commitment_hex,
+        )?))
+    }
+
+    /// Lagrange-aggregate responses: `sum_i λ_i(0) * response_i (mod q)` where the λ_i are the
+    /// public Lagrange coefficients for the selected slot set evaluated at x=0. Same Shamir
+    /// recombination as V1 `aggregate_registration_proof`.
+    pub fn aggregate_responses_v2(
+        responses: &[RegistrationResponseInput],
+    ) -> WorkerResult<String> {
+        let slots = response_slots(responses)?;
+        let coeffs = lagrange_coefficients_at_zero(&slots)?;
+        let mut aggregate = Scalar::ZERO;
+        for (item, coeff) in responses.iter().zip(coeffs.iter()) {
+            aggregate += scalar_from_hex(&item.response)? * coeff;
+        }
+        Ok(scalar_hex(&aggregate))
+    }
+
+    fn response_slots(items: &[RegistrationResponseInput]) -> WorkerResult<Vec<usize>> {
+        if items.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "expected {DEOPERATOR_THRESHOLD} responses, got {}",
+                items.len()
+            )));
+        }
+        let mut slots = Vec::with_capacity(items.len());
+        for item in items {
+            assert_slot(item.slot)?;
+            if slots.contains(&item.slot) {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate response slot {}",
+                    item.slot
+                )));
+            }
+            slots.push(item.slot);
+        }
+        Ok(slots)
+    }
+
+    fn lagrange_coefficients_at_zero(slots: &[usize]) -> WorkerResult<Vec<Scalar>> {
+        if slots.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "lagrange: expected {DEOPERATOR_THRESHOLD} slots, got {}",
+                slots.len()
+            )));
+        }
+        let xs = slots
+            .iter()
+            .map(|slot| {
+                assert_slot(*slot)?;
+                Ok::<Scalar, WorkerError>(Scalar::from((*slot as u64) + 1))
+            })
+            .collect::<WorkerResult<Vec<_>>>()?;
+        let mut out = Vec::with_capacity(xs.len());
+        for (i, x_i) in xs.iter().enumerate() {
+            let mut numerator = Scalar::ONE;
+            let mut denominator = Scalar::ONE;
+            for (j, x_j) in xs.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                numerator *= -*x_j;
+                denominator *= *x_i - *x_j;
+            }
+            out.push(numerator * denominator.invert());
+        }
+        Ok(out)
+    }
+
+    pub fn round1_worker_transcript_hash(
+        session_id: &str,
+        request_id: &str,
+        dkg_epoch: &str,
+        ca_dkg_transcript_hash: &str,
+        roster_hash: &str,
+        sorted_selected_slots: &[usize],
+        self_slot: usize,
+        player_id: usize,
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        commitment_hex: &str,
+        nonce_id: &str,
+    ) -> String {
+        let joined = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(ROUND1_TRANSCRIPT_DOMAIN.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(request_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(ca_dkg_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(roster_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(self_slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(player_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(sender_address_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(asset_type_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(chain_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(commitment_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(nonce_id.as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    pub fn round2_worker_transcript_hash(
+        session_id: &str,
+        request_id: &str,
+        dkg_epoch: &str,
+        ca_dkg_transcript_hash: &str,
+        sorted_selected_slots: &[usize],
+        self_slot: usize,
+        player_id: usize,
+        nonce_id: &str,
+        challenge_hex: &str,
+        response_hash: &str,
+    ) -> String {
+        let joined = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(ROUND2_TRANSCRIPT_DOMAIN.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(request_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(ca_dkg_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(self_slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(player_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(nonce_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(challenge_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(response_hash.as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    /// nonce_id = sha256("EUNOMA_CA_REGISTRATION_V2_NONCE_ID" || request_id || session_id ||
+    /// self_slot || commitment_hash). 64 lowercase hex chars.
+    fn nonce_id_hash(
+        request_id: &str,
+        session_id: &str,
+        self_slot: usize,
+        commitment_hash: &str,
+    ) -> String {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"EUNOMA_CA_REGISTRATION_V2_NONCE_ID");
+        bytes.push(b':');
+        bytes.extend_from_slice(request_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(self_slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(commitment_hash.as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    fn validate_selected_slots(slots: &[usize]) -> WorkerResult<()> {
+        if slots.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "selected_slots must have {DEOPERATOR_THRESHOLD} entries, got {}",
+                slots.len()
+            )));
+        }
+        let mut seen = [false; DEOPERATOR_COUNT];
+        for slot in slots {
+            assert_slot(*slot)?;
+            if seen[*slot] {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "duplicate selected_slots entry {slot}"
+                )));
+            }
+            seen[*slot] = true;
+        }
+        Ok(())
+    }
+
+    fn sorted_unique_slots(slots: &[usize]) -> WorkerResult<Vec<usize>> {
+        validate_selected_slots(slots)?;
+        let mut copy = slots.to_vec();
+        copy.sort_unstable();
+        Ok(copy)
+    }
+
+    fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
+        use std::io::Write as _;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(path)
+            .map_err(|err| WorkerError::Crypto(format!("open {}: {err}", path.display())))?;
+        file.write_all(contents)
+            .map_err(|err| WorkerError::Crypto(format!("write {}: {err}", path.display())))?;
+        Ok(())
+    }
+
+    fn compressed_hex(point: &RistrettoPoint) -> String {
+        hex_encode(point.compress().as_bytes())
+    }
+
+    fn decompress_hex(hex: &str) -> WorkerResult<RistrettoPoint> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != 32 {
+            return Err(WorkerError::InvalidRequest(
+                "Ristretto point must be 32 bytes".to_string(),
+            ));
+        }
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&bytes);
+        CompressedRistretto(buf)
+            .decompress()
+            .ok_or_else(|| WorkerError::InvalidRequest("invalid Ristretto point".to_string()))
+    }
+
+    /// Same canonical-scalar gate as `vault_ek_derivation_v2::scalar_from_hex`. Reject
+    /// non-canonical encodings (bytes >= q).
+    fn scalar_from_hex(hex: &str) -> WorkerResult<Scalar> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != 32 {
+            return Err(WorkerError::InvalidRequest(format!(
+                "scalar must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&bytes);
+        Scalar::from_canonical_bytes(buf)
+            .into_option()
+            .ok_or_else(|| {
+                WorkerError::InvalidRequest("scalar bytes are not canonical (>= Q)".to_string())
+            })
+    }
+
+    fn scalar_hex(scalar: &Scalar) -> String {
+        hex_encode(&scalar.to_bytes())
+    }
+
+    fn normalize_hex(hex: &str, expected_bytes: usize) -> WorkerResult<String> {
+        let bytes = hex_decode(hex)?;
+        if bytes.len() != expected_bytes {
+            return Err(WorkerError::InvalidRequest(format!(
+                "expected {expected_bytes}-byte hex, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(hex_encode(&bytes))
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex_encode(Sha256::digest(bytes).as_slice())
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
+        }
+        (0..raw.len())
+            .step_by(2)
+            .map(|idx| {
+                u8::from_str_radix(&raw[idx..idx + 2], 16)
+                    .map_err(|err| WorkerError::InvalidRequest(err.to_string()))
+            })
+            .collect()
+    }
+}
+
 pub mod frost_dkg_v2 {
     use crate::hpke_aead::{self, HpkeEnvelope};
     use crate::local_state::slot_to_identifier;

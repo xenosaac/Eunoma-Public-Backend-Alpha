@@ -27,6 +27,11 @@ use eunoma_crypto_worker::vault_ek_derivation_v2::{
     run_round0 as run_vault_ek_round0, run_round1 as run_vault_ek_round1,
     run_verify as run_vault_ek_verify, Round0Request, Round1Request, VerifyRequest,
 };
+use eunoma_crypto_worker::ca_registration_v2::{
+    create_registration_nonce_commitment_v2, create_registration_partial_response_v2,
+    run_verify_v2 as run_ca_registration_v2_verify, Round1Request as CaRegistrationV2Round1Request,
+    Round2Request as CaRegistrationV2Round2Request, VerifyRequest as CaRegistrationV2VerifyRequest,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -118,6 +123,18 @@ async fn main() {
         .route("/worker/v2/derive/vault_ek/round0", post(vault_ek_round0))
         .route("/worker/v2/derive/vault_ek/round1", post(vault_ek_round1))
         .route("/worker/v2/derive/vault_ek/verify", post(vault_ek_verify))
+        .route(
+            "/worker/v2/derive/ca_registration/round1",
+            post(ca_registration_v2_round1),
+        )
+        .route(
+            "/worker/v2/derive/ca_registration/round2",
+            post(ca_registration_v2_round2),
+        )
+        .route(
+            "/worker/v2/derive/ca_registration/verify",
+            post(ca_registration_v2_verify),
+        )
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -856,6 +873,37 @@ async fn vault_ek_verify(Json(body): Json<VerifyRequest>) -> (StatusCode, Json<V
     match run_vault_ek_verify(&body) {
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => vault_ek_error_response(err),
+    }
+}
+
+// Milestone 1 V2 threshold CA registration sigma. Loads ca_dkg_share_v2.json (NOT
+// ca_share.json — V2 has no centralized vault_ek), accepts vault_ek from request body.
+async fn ca_registration_v2_round1(
+    State(state): State<AppState>,
+    Json(body): Json<CaRegistrationV2Round1Request>,
+) -> (StatusCode, Json<Value>) {
+    match create_registration_nonce_commitment_v2(&state.state_dir, &body) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => worker_error_response(err),
+    }
+}
+
+async fn ca_registration_v2_round2(
+    State(state): State<AppState>,
+    Json(body): Json<CaRegistrationV2Round2Request>,
+) -> (StatusCode, Json<Value>) {
+    match create_registration_partial_response_v2(&state.state_dir, &body) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => worker_error_response(err),
+    }
+}
+
+async fn ca_registration_v2_verify(
+    Json(body): Json<CaRegistrationV2VerifyRequest>,
+) -> (StatusCode, Json<Value>) {
+    match run_ca_registration_v2_verify(&body) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => worker_error_response(err),
     }
 }
 
