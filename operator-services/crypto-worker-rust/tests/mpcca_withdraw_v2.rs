@@ -374,6 +374,12 @@ fn fixture_observed_hashes() -> Vec<String> {
     vec!["44".repeat(32), "55".repeat(32)]
 }
 
+// Codex M3a P2 #1 v2: parallel cursor array. MUST be [1, 2, …, deposit_count] for the
+// worker's strict-monotonic-ordering check to accept the request.
+fn fixture_observed_cursors() -> Vec<u64> {
+    vec![1, 2]
+}
+
 fn build_round1_request(
     fix: &MpccaWithdrawFixture,
     self_slot: usize,
@@ -391,6 +397,7 @@ fn build_round1_request(
         // case the dedicated test below exercises.
         vault_state_init_transcript_hash: fix.init_transcript_hashes[player_id].clone(),
         observed_deposit_transcript_hashes: fixture_observed_hashes(),
+        observed_deposit_cursors: fixture_observed_cursors(),
         roster_hash: fix.roster_hash.clone(),
         selected_slots: fix.selected_slots.clone(),
         self_slot,
@@ -428,6 +435,7 @@ fn build_chained_request(
         // (same rationale as build_round1_request above).
         vault_state_init_transcript_hash: fix.init_transcript_hashes[player_id].clone(),
         observed_deposit_transcript_hashes: fixture_observed_hashes(),
+        observed_deposit_cursors: fixture_observed_cursors(),
         roster_hash: fix.roster_hash.clone(),
         selected_slots: fix.selected_slots.clone(),
         self_slot,
@@ -619,6 +627,49 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("duplicate observed_deposit_transcript_hashes")),
         "duplicate observed vector must surface InvalidRequest, got {err:?}"
+    );
+
+    // Codex M3a P2 #1 v2 (ordering KILLER): observed_deposit_cursors length != deposit_count
+    // → reject. Without the parallel cursor array the worker cannot enforce ordering.
+    let mut wrong_cursor_len = req.clone();
+    wrong_cursor_len.observed_deposit_cursors = vec![1]; // length 1 vs deposit_count=2
+    let err = run_round1_v2(&state_dir, &wrong_cursor_len)
+        .expect_err("cursor length mismatch should reject");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("observed_deposit_cursors length")),
+        "length-mismatched cursors must surface InvalidRequest, got {err:?}"
+    );
+
+    // Codex M3a P2 #1 v2 (ordering KILLER): out-of-order cursors (e.g. [2, 1] instead of
+    // [1, 2]) → reject. This is the EXACT regression — pre-fix, the worker accepted any
+    // permutation as long as length + hash-set uniqueness held.
+    let mut swapped = req.clone();
+    swapped.observed_deposit_cursors = vec![2, 1];
+    let err = run_round1_v2(&state_dir, &swapped)
+        .expect_err("out-of-order cursors should reject");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("observed_deposit_cursors[0]")),
+        "out-of-order cursors must surface InvalidRequest(observed_deposit_cursors[0]), got {err:?}"
+    );
+
+    // Cursor starts at 0 instead of 1 → reject.
+    let mut zero_indexed = req.clone();
+    zero_indexed.observed_deposit_cursors = vec![0, 1];
+    let err = run_round1_v2(&state_dir, &zero_indexed)
+        .expect_err("zero-indexed cursors should reject");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("observed_deposit_cursors[0]")),
+        "zero-indexed cursors must surface InvalidRequest, got {err:?}"
+    );
+
+    // Skipped cursor in the middle → reject (e.g. [1, 3] for deposit_count=2).
+    let mut skipped = req.clone();
+    skipped.observed_deposit_cursors = vec![1, 3];
+    let err = run_round1_v2(&state_dir, &skipped)
+        .expect_err("skipped cursors should reject");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("observed_deposit_cursors[1]")),
+        "skipped cursor must surface InvalidRequest(observed_deposit_cursors[1]), got {err:?}"
     );
 }
 

@@ -6938,6 +6938,16 @@ pub mod mpcca_withdraw_v2 {
         pub registration_transcript_hash: String,
         pub vault_state_init_transcript_hash: String,
         pub observed_deposit_transcript_hashes: Vec<String>,
+        /// Codex M3a P2 #1 v2 (regression fix): parallel cursor array for ordering
+        /// enforcement. `observed_deposit_cursors[i]` is the depositCount that
+        /// corresponds to `observed_deposit_transcript_hashes[i]`. The worker requires
+        /// strict monotonic ordering starting at 1: cursors MUST equal [1, 2, …, depositCount].
+        /// Pre-fix the worker only enforced length + duplicate-hash uniqueness — a
+        /// coordinator that scrambled the cursor mapping could submit out-of-order
+        /// observed transcripts without detection. With this field the worker rejects
+        /// any wrong-order or wrong-cursor mapping at the round1 gate.
+        #[serde(default)]
+        pub observed_deposit_cursors: Vec<u64>,
         pub roster_hash: String,
         pub selected_slots: Vec<usize>,
         pub self_slot: usize,
@@ -6968,6 +6978,11 @@ pub mod mpcca_withdraw_v2 {
         pub registration_transcript_hash: String,
         pub vault_state_init_transcript_hash: String,
         pub observed_deposit_transcript_hashes: Vec<String>,
+        /// See Round1Request::observed_deposit_cursors. The chained rounds enforce the
+        /// same shape so a tampered cursor mapping can't slip past round1 by being
+        /// reintroduced at round2/prove/finalize.
+        #[serde(default)]
+        pub observed_deposit_cursors: Vec<u64>,
         pub roster_hash: String,
         pub selected_slots: Vec<usize>,
         pub self_slot: usize,
@@ -7474,6 +7489,44 @@ pub mod mpcca_withdraw_v2 {
             observed_deposit_transcript_hashes.push(norm);
         }
 
+        // Codex M3a P2 #1 v2 (ordering regression fix): enforce strict monotonic cursor
+        // ordering on the observed deposit list. Pre-fix the worker checked length +
+        // hash-set uniqueness — sufficient against a coordinator that DROPPED a cursor or
+        // duplicated a hash, but BLIND to a coordinator that re-ORDERED entries within the
+        // depositCount window. A re-ordering would change the canonical observed-vector
+        // hash bound into the milestone 4 partial sigma transcript, so a tampered ordering
+        // here would silently produce a different signed transcript than the canonical run.
+        //
+        // The new field `observedDepositCursors[i]` is the depositCount the coordinator
+        // claims `observed_deposit_transcript_hashes[i]` was observed at. Worker enforces
+        // cursors == [1, 2, …, depositCount] BYTE-FOR-BYTE. Any out-of-order, skipped, or
+        // wrong-cursor mapping fails closed with `observed_deposit_cursors_*`.
+        //
+        // Empty-cursor backwards-compat: if the coordinator omits observedDepositCursors
+        // entirely (Vec::default → empty), we accept only when deposit_count == 0. Any
+        // depositCount >= 1 REQUIRES the parallel cursor array. This is a hard cutover —
+        // legacy clients must upgrade before sending a non-zero deposit_count.
+        if req.observed_deposit_cursors.is_empty() && req.deposit_count == 0 {
+            // depositCount=0 + missing cursors is OK (the observed list is empty too).
+        } else {
+            if req.observed_deposit_cursors.len() as u64 != req.deposit_count {
+                return Err(WorkerError::InvalidRequest(format!(
+                    "observed_deposit_cursors length {} does not match deposit_count {}",
+                    req.observed_deposit_cursors.len(),
+                    req.deposit_count,
+                )));
+            }
+            for (i, cursor) in req.observed_deposit_cursors.iter().enumerate() {
+                let expected = (i as u64) + 1;
+                if *cursor != expected {
+                    return Err(WorkerError::InvalidRequest(format!(
+                        "observed_deposit_cursors[{i}] = {cursor}, expected {expected} \
+                         (cursors MUST be the strict monotonic sequence [1..=deposit_count])"
+                    )));
+                }
+            }
+        }
+
         // 3. Load persisted vault_state_v2.json. Missing → fail closed with a specific code.
         let existing = load_vault_state_v2(state_dir)?.ok_or_else(|| {
             WorkerError::InvalidDkgState("missing_vault_state_file".to_string())
@@ -7593,6 +7646,11 @@ pub mod mpcca_withdraw_v2 {
             registration_transcript_hash: req.registration_transcript_hash.clone(),
             vault_state_init_transcript_hash: req.vault_state_init_transcript_hash.clone(),
             observed_deposit_transcript_hashes: req.observed_deposit_transcript_hashes.clone(),
+            // Codex M3a P2 #1 v2: forward the cursor mapping into the round1 envelope so
+            // common_public_binding_work enforces strict monotonic ordering for chained
+            // rounds too — a tampered ordering can't slip past round1 by being
+            // reintroduced at round2/prove/finalize.
+            observed_deposit_cursors: req.observed_deposit_cursors.clone(),
             roster_hash: req.roster_hash.clone(),
             selected_slots: req.selected_slots.clone(),
             self_slot: req.self_slot,

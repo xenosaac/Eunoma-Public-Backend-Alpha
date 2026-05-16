@@ -452,6 +452,8 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
         registration_transcript_hash: fix.registration_transcript_hash.clone(),
         vault_state_init_transcript_hash: final_hash.clone(),
         observed_deposit_transcript_hashes: vec![],
+        // Codex M3a P2 #1 v2: empty observed list + depositCount=0 → empty cursors OK.
+        observed_deposit_cursors: vec![],
         roster_hash: fix.roster_hash.clone(),
         selected_slots: fix.selected_slots.clone(),
         self_slot: 0,

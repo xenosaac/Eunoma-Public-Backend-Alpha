@@ -3118,6 +3118,24 @@ export function buildCoordinatorServer(
         });
       }
 
+      // Codex M3a P2 #1 v2 (ordering regression fix): build the parallel cursor mapping
+      // for the worker's strict-monotonic-ordering enforcement. The worker rejects any
+      // mismatch between observedDepositTranscriptHashes[i] and depositCount = i+1 with
+      // observed_deposit_cursors_*. We build [1, 2, …, depositCount] in cursor order
+      // since `findVaultStateV2ObservedProvenance` already sorts ascending by cursor.
+      const observedDepositCursors: number[] = [];
+      for (let c = 1; c <= depositCount; c += 1) {
+        observedDepositCursors.push(c);
+      }
+      if (observedDepositCursors.length !== observedDepositTranscriptHashes.length) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message:
+            `internal: observedDepositCursors length ${observedDepositCursors.length} ` +
+            `does not match observedDepositTranscriptHashes length ${observedDepositTranscriptHashes.length}`,
+        });
+      }
+
       // 6. Acquire the lock.
       const lock = await acquireVaultMpccaWithdrawLock();
       if (lock === "busy") {
@@ -3140,6 +3158,10 @@ export function buildCoordinatorServer(
           registrationTranscriptHash,
           vaultStateInitTranscriptHash,
           observedDepositTranscriptHashes,
+          // Codex M3a P2 #1 v2: parallel cursor mapping for worker ordering enforcement.
+          // Must be [1, 2, …, depositCount] in index order — the worker rejects any
+          // other shape with observed_deposit_cursors_*.
+          observedDepositCursors,
           rosterHash: dkgRosterHash,
           selectedSlots: sortedSelectedSlots,
           selfSlot: slot,
