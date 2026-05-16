@@ -2375,6 +2375,50 @@ export function parseMpccaWithdrawFinalizeDkResult(
 }
 
 /**
+ * M5 Commit 1 — `WithdrawFinalizeAttestationConfig` shape used to seal a withdraw
+ * attestation message. Mirrors the persisted `attestationConfig` field on the finalize
+ * transcript: chain-side identity (bridge, vault, asset) + operator-set version + roster
+ * hash + FROST group pubkey + circuit-versions hash. The FROST attestation route uses
+ * these fields when building the `WithdrawAttestationV2Message` that workers sign.
+ */
+export interface MpccaWithdrawFrostAttestConfig {
+  bridge: HexString;
+  vault: HexString;
+  operatorSetVersion: string;
+  frostGroupPubkey: HexString;
+  circuitVersionsHash: HexString;
+}
+
+/**
+ * M5 Commit 1 — coordinator-inbound `POST /v2/withdraw/mpcca/frost-attest` request body.
+ *
+ * Wire shape: base identity envelope + chain-side `attestationConfig` + user-supplied
+ * `withdrawProofHex` (the Groth16 zk-SNARK over (root, nullifierHash, asset_id,
+ * recipientHash, amountTag, caPayloadHash, requestHash, vaultSequence)).
+ *
+ * The coordinator reconstructs:
+ *   - the MPCCA-finalize artifact (aggregated A + e + sigma response + zkrp + perChunk)
+ *     by reading `__finalize.json`
+ *   - the Statement input fields by reading `__round2.json`
+ * Then it builds the CA payload + caPayloadHash, drives the 3-round FROST signing
+ * ceremony over the BCS-encoded `WithdrawAttestationV2Message`, and assembles the
+ * 27-field `withdrawV2CallArgsFields` written back into `__finalize.json` (removing
+ * the `notImplementedPhase = "m4_pending_frost_signature_assembly"` sentinel).
+ */
+export interface MpccaWithdrawFrostAttestStartRequest extends MpccaWithdrawBaseRequest {
+  /** Chain-side attestation context (bridge, vault, operator set, FROST group pubkey). */
+  attestationConfig: MpccaWithdrawFrostAttestConfig;
+  /**
+   * User-supplied withdraw Groth16 proof bytes. The coordinator does NOT generate this
+   * — the user proves Merkle membership + nullifier binding locally and submits the
+   * proof bytes. Move's `assert_valid_withdraw_proof` verifies the proof on-chain.
+   */
+  withdrawProofHex: HexString;
+  /** Optional memo bytes bound into the CA payload. Defaults to empty. */
+  memoHex?: HexString;
+}
+
+/**
  * M4 Commit 4 — coordinator-inbound orchestrate request for `POST /v2/withdraw/mpcca/finalize`.
  *
  * Wire shape: ONLY the base identity envelope. The coordinator reconstructs Statement inputs +
@@ -2386,6 +2430,85 @@ export function parseMpccaWithdrawFinalizeOrchestrateRequest(
   body: unknown,
 ): MpccaWithdrawFinalizeOrchestrateRequest {
   return parseBaseRequest(body);
+}
+
+/**
+ * M5 Commit 1 — coordinator-inbound parser for `POST /v2/withdraw/mpcca/frost-attest`.
+ *
+ * Validates the base identity envelope + the chain-side attestation config (bridge,
+ * vault, operatorSetVersion, frostGroupPubkey, circuitVersionsHash) + the user-supplied
+ * withdrawProofHex bytes. Forbidden plaintext fields rejected via parseBaseRequest.
+ */
+export function parseMpccaWithdrawFrostAttestStartRequest(
+  body: unknown,
+): MpccaWithdrawFrostAttestStartRequest {
+  const base = parseBaseRequest(body);
+  const obj = objectBody(body);
+  const attestationConfigRaw = obj.attestationConfig;
+  if (
+    !attestationConfigRaw ||
+    typeof attestationConfigRaw !== "object" ||
+    Array.isArray(attestationConfigRaw)
+  ) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_WITHDRAW_FIELD_SHAPE",
+      "attestationConfig must be an object",
+    );
+  }
+  const config = attestationConfigRaw as Record<string, unknown>;
+  const bridge = requireHex(config, "bridge", 32);
+  const vault = requireHex(config, "vault", 32);
+  const frostGroupPubkey = requireHex(config, "frostGroupPubkey", 32);
+  const circuitVersionsHash = requireHex(config, "circuitVersionsHash", 32);
+  const operatorSetVersionRaw = config.operatorSetVersion;
+  if (
+    typeof operatorSetVersionRaw !== "string" ||
+    !/^(0|[1-9][0-9]*)$/.test(operatorSetVersionRaw)
+  ) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_WITHDRAW_FIELD_SHAPE",
+      "attestationConfig.operatorSetVersion must be a decimal string",
+    );
+  }
+  const withdrawProofHex = obj.withdrawProofHex;
+  if (typeof withdrawProofHex !== "string" || withdrawProofHex.length === 0) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_BULLETPROOF_BYTES",
+      "withdrawProofHex must be a non-empty hex string (the user-supplied withdraw Groth16 proof)",
+    );
+  }
+  const withdrawProofNorm = normalizeHex(withdrawProofHex);
+  if (hexToBytes(withdrawProofNorm).length === 0) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_BULLETPROOF_BYTES",
+      "withdrawProofHex must decode to at least one byte",
+    );
+  }
+  let memoHex: HexString | undefined;
+  const memoRaw = obj.memoHex;
+  if (memoRaw !== undefined && memoRaw !== null) {
+    if (typeof memoRaw !== "string") {
+      throw new MpccaWithdrawV2Error(
+        "INVALID_WITHDRAW_FIELD_SHAPE",
+        "memoHex must be a hex string when present",
+      );
+    }
+    memoHex = normalizeHex(memoRaw);
+    // Sanity: decode to validate it's hex.
+    hexToBytes(memoHex);
+  }
+  return {
+    ...base,
+    attestationConfig: {
+      bridge,
+      vault,
+      operatorSetVersion: operatorSetVersionRaw,
+      frostGroupPubkey,
+      circuitVersionsHash,
+    },
+    withdrawProofHex: withdrawProofNorm,
+    ...(memoHex !== undefined ? { memoHex } : {}),
+  };
 }
 
 function requireFixedLengthHex(

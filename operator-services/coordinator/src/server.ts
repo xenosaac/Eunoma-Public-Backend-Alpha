@@ -42,8 +42,16 @@ import {
   parseDkgRoundResult,
   parseMpccaRoundRequest,
   parseMpccaRoundResult,
+  buildCaPayloadFromFinalizeArtifact,
+  caPayloadHashRawToFrV2,
+  caPayloadHashRawV2,
+  bcsEncodeWithdrawAttestationV2,
+  parseFrostAggregateSignatureResponse,
+  parseFrostNonceCommitmentResponse,
+  parseFrostPartialSignatureResponse,
   parseMpccaWithdrawFinalizeDkResult,
   parseMpccaWithdrawFinalizeOrchestrateRequest,
+  parseMpccaWithdrawFrostAttestStartRequest,
   parseMpccaWithdrawRound1Response,
   parseMpccaWithdrawRound2DkResult,
   parseMpccaWithdrawRound2OrchestrateRequest,
@@ -72,6 +80,7 @@ import {
   type FrostRound2Envelope,
   type MpccaWithdrawFinalizeDkResult,
   type MpccaWithdrawFinalizeOrchestrateRequest,
+  type MpccaWithdrawFrostAttestStartRequest,
   type MpccaWithdrawRound1Contribution,
   type MpccaWithdrawRound2DkPartial,
   type MpccaWithdrawRound2DkResult,
@@ -4958,6 +4967,525 @@ export function buildCoordinatorServer(
             "M4 commit 4 MPCCA finalize complete; M5 FROST attestation pass consumes " +
             "mpccaWithdrawFinalizeArtifact + signs caPayloadHash to assemble the 27-field " +
             "WithdrawV2CallArgs.",
+        });
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      if (requestId) await store.markAborted(requestId);
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof MpccaWithdrawV2Error) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // =================================================================================================
+  // Milestone 5 sub-milestone 5-c1 — MPCCA withdraw V2 FROST attestation orchestrator.
+  //
+  // POST /v2/withdraw/mpcca/frost-attest reads the persisted __round2.json + __finalize.json
+  // artifacts, builds the canonical Aptos CA TransferV1 payload via
+  // `buildCaPayloadFromFinalizeArtifact`, computes the caPayloadHash (raw via
+  // keccak256-over-BCS, then Fr-safe form via the canonical 32-byte-low-bit-clear), builds
+  // the `WithdrawAttestationV2Message`, BCS-encodes it, then drives the 3-round FROST
+  // signing ceremony across the 5 selected slots:
+  //   Phase A — fan out POST /worker/v2/frost/sign/nonce-commit; collect commitments.
+  //   Phase B — fan out POST /worker/v2/frost/sign/partial with (commitments[5],
+  //             messageBytes); collect signature shares.
+  //   Phase C — call POST /worker/v2/frost/sign/aggregate on slot[0] with
+  //             (commitments[5], signatureShares[5], messageBytes); receive the FROST
+  //             groupSignature.
+  //
+  // Then assembles the 27-field withdrawV2CallArgsFields (the M5b submit route consumes
+  // this shape) and persists the updated __finalize.json (removes
+  // `notImplementedPhase = "m4_pending_frost_signature_assembly"`, adds
+  // `withdrawV2CallArgsFields` and `attestationConfig`, keeps `mpccaWithdrawFinalizeArtifact`
+  // for audit forensics).
+  //
+  // Privacy contract: messageBytes is the public BCS-encoded WithdrawAttestationV2Message;
+  // workers see only Statement-bound CA-payload-bound public chain identity. No plaintext
+  // witness component crosses the worker boundary.
+  //
+  // Wire shape:
+  //   1. Forbidden-plaintext-field guard FIRST on raw body.
+  //   2. parseMpccaWithdrawFrostAttestStartRequest — base identity + attestationConfig +
+  //      withdrawProofHex (user-supplied Groth16) + optional memoHex.
+  //   3. isSafeId(requestId).
+  //   4. Roster + epoch validation.
+  //   5. Load __round2.json (Statement + userProofArtifacts) + __finalize.json
+  //      (mpccaWithdrawFinalizeArtifact).
+  //   6. Acquire vaultMpccaWithdrawInFlight lock (re-used from M3a; 409 on contention).
+  //   7. Build CA payload + caPayloadHash (raw + Fr-safe).
+  //   8. Build WithdrawAttestationV2Message + BCS-encode.
+  //   9. Phase A: nonce-commit fan-out with AbortController timeouts (default 30s).
+  //  10. Phase B: partial-sign fan-out with AbortController timeouts.
+  //  11. Phase C: aggregate on slot[0].
+  //  12. Assemble 27-field withdrawV2CallArgsFields.
+  //  13. Persist updated __finalize.json (atomic replace).
+  //  14. Return 200 with caPayloadHash + groupSignature + withdrawV2CallArgsFields.
+  // =================================================================================================
+  const mpccaWithdrawFrostAttestWorkerTimeoutMs =
+    opts.mpccaWithdrawFinalizeWorkerTimeoutMs ?? 30_000;
+  server.post("/v2/withdraw/mpcca/frost-attest", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      // 1+2. Forbidden-plaintext-field guard + parse.
+      let parsed: MpccaWithdrawFrostAttestStartRequest;
+      try {
+        parsed = parseMpccaWithdrawFrostAttestStartRequest(raw);
+      } catch (err) {
+        if (err instanceof ForbiddenPlaintextFieldError) {
+          return reply
+            .code(400)
+            .send({ error: "forbidden_plaintext_field", field: err.path });
+        }
+        if (err instanceof MpccaWithdrawV2Error) {
+          return reply.code(400).send({ error: err.code, message: err.message });
+        }
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: err instanceof Error ? err.message : "unknown",
+        });
+      }
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+      if (parsed.rosterHash !== dkgRosterHash) {
+        return reply.code(400).send({
+          error: "stale_roster_hash",
+          requestId: parsed.requestId,
+          message: `rosterHash mismatch (request=${parsed.rosterHash}, roster=${dkgRosterHash})`,
+        });
+      }
+      if (parsed.dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          requestId: parsed.requestId,
+          message: `dkgEpoch mismatch (request=${parsed.dkgEpoch}, roster=${dkgRoster.dkgEpoch})`,
+        });
+      }
+      // 3. Sanitize requestId BEFORE FS path construction.
+      requestId = parsed.requestId;
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds it into FS paths",
+        });
+      }
+      const sortedSelectedSlots = [...parsed.selectedSlots].sort((a, b) => a - b);
+
+      // 4. Read __round2.json + __finalize.json artifacts.
+      if (!opts.stateRoot) {
+        return reply.code(400).send({
+          error: "state_root_not_configured",
+          requestId,
+          message:
+            "MPCCA withdraw FROST attest requires stateRoot to be configured so __round2.json " +
+            "+ __finalize.json can be read from disk.",
+        });
+      }
+      const round2ArtifactPath = join(
+        opts.stateRoot,
+        "coordinator",
+        "mpcca_withdraw",
+        `${parsed.dkgEpoch}__${requestId}__round2.json`,
+      );
+      let round2Artifact: Record<string, unknown>;
+      try {
+        round2Artifact = JSON.parse(
+          await readFile(round2ArtifactPath, "utf8"),
+        ) as Record<string, unknown>;
+      } catch (err) {
+        return reply.code(400).send({
+          error: "round2_transcript_not_found",
+          requestId,
+          path: round2ArtifactPath,
+          message: err instanceof Error ? err.message : "unable to read round2 artifact",
+        });
+      }
+      const finalizeArtifactPath = join(
+        opts.stateRoot,
+        "coordinator",
+        "mpcca_withdraw",
+        `${parsed.dkgEpoch}__${requestId}__finalize.json`,
+      );
+      let finalizeArtifact: Record<string, unknown>;
+      try {
+        finalizeArtifact = JSON.parse(
+          await readFile(finalizeArtifactPath, "utf8"),
+        ) as Record<string, unknown>;
+      } catch (err) {
+        return reply.code(400).send({
+          error: "finalize_transcript_not_found",
+          requestId,
+          path: finalizeArtifactPath,
+          message: err instanceof Error ? err.message : "unable to read finalize artifact",
+        });
+      }
+      const mpccaArtifact = finalizeArtifact.mpccaWithdrawFinalizeArtifact as
+        | Record<string, unknown>
+        | undefined;
+      if (!mpccaArtifact || typeof mpccaArtifact !== "object") {
+        return reply.code(400).send({
+          error: "finalize_artifact_missing",
+          requestId,
+          message:
+            "__finalize.json is missing mpccaWithdrawFinalizeArtifact; the M4-c4 finalize " +
+            "route must run first",
+        });
+      }
+      const statementInputs = round2Artifact.statementInputs as Record<string, unknown>;
+      if (!statementInputs || typeof statementInputs !== "object") {
+        return reply.code(400).send({
+          error: "round2_statement_inputs_missing",
+          requestId,
+        });
+      }
+
+      // 5. Acquire MPCCA withdraw lock.
+      const lock = await acquireVaultMpccaWithdrawLock();
+      if (lock === "busy") {
+        return reply.code(409).send({
+          error: "vault_mpcca_withdraw_in_flight",
+          requestId,
+          message:
+            "another MPCCA withdraw session is in progress; retry shortly",
+        });
+      }
+      try {
+        // 7. Build CA payload + caPayloadHash.
+        const caPayload = buildCaPayloadFromFinalizeArtifact({
+          recipientAddressHex: parsed.recipient,
+          assetTypeHex: parsed.assetType,
+          statementInputs: {
+            recipientEk: statementInputs.recipientEk as string,
+            oldBalanceC: statementInputs.oldBalanceC as string[],
+            oldBalanceD: statementInputs.oldBalanceD as string[],
+            newBalanceC: statementInputs.newBalanceC as string[],
+            newBalanceD: statementInputs.newBalanceD as string[],
+            transferAmountC: statementInputs.transferAmountC as string[],
+            transferAmountDSender: statementInputs.transferAmountDSender as string[],
+            transferAmountDRecipient: statementInputs.transferAmountDRecipient as string[],
+          },
+          mpccaArtifact: {
+            aggregatedSigmaCommitmentsHex:
+              mpccaArtifact.aggregatedSigmaCommitmentsHex as string[],
+            sigmaResponseHex: mpccaArtifact.sigmaResponseHex as string[],
+            bulletproofZkrpAmountHex: mpccaArtifact.bulletproofZkrpAmountHex as string,
+            bulletproofZkrpNewBalanceHex:
+              mpccaArtifact.bulletproofZkrpNewBalanceHex as string,
+          },
+          memoHex: parsed.memoHex,
+        });
+        const caPayloadHashRaw = caPayloadHashRawV2(caPayload);
+        const caPayloadHashFr = caPayloadHashRawToFrV2(caPayloadHashRaw);
+
+        // 8. Build + BCS-encode WithdrawAttestationV2Message.
+        const attestationMessage = {
+          chainId: parsed.chainId,
+          bridge: parsed.attestationConfig.bridge,
+          vault: parsed.attestationConfig.vault,
+          assetType: parsed.assetType,
+          operatorSetVersion: parsed.attestationConfig.operatorSetVersion,
+          dkgEpoch: parsed.dkgEpoch,
+          rosterHash: dkgRosterHash,
+          frostGroupPubkey: parsed.attestationConfig.frostGroupPubkey,
+          root: parsed.root,
+          nullifierHash: parsed.nullifierHash,
+          recipient: parsed.recipient,
+          recipientHash: parsed.recipientHash,
+          amountTag: parsed.amountTag,
+          caPayloadHash: caPayloadHashFr,
+          requestHash: parsed.requestHash,
+          vaultSequence: String(parsed.vaultSequence),
+          expirySecs: String(parsed.expirySecs),
+          circuitVersionsHash: parsed.attestationConfig.circuitVersionsHash,
+        };
+        const messageBytes = bcsEncodeWithdrawAttestationV2(attestationMessage);
+        const messageHex = bytesToHex(messageBytes);
+
+        // 9. Phase A — fan out nonce-commit.
+        const nonceCommitPromises = sortedSelectedSlots.map((slot) => {
+          const controller = new AbortController();
+          const timer = setTimeout(
+            () => controller.abort(),
+            mpccaWithdrawFrostAttestWorkerTimeoutMs,
+          );
+          return singleNodeForwarder(
+            "/worker/v2/frost/sign/nonce-commit",
+            { requestId },
+            dkgRoster,
+            slot,
+            controller.signal,
+          )
+            .then(
+              (value) => ({
+                kind: "value" as const,
+                slot,
+                value,
+                aborted: controller.signal.aborted,
+              }),
+              (reason) => ({
+                kind: "rejected" as const,
+                slot,
+                reason,
+                aborted: controller.signal.aborted,
+              }),
+            )
+            .finally(() => clearTimeout(timer));
+        });
+        const nonceResults = await Promise.all(nonceCommitPromises);
+        const commitmentEntries: Array<{ slot: number; commitments: unknown }> = [];
+        const noncePerSlot = new Map<number, { nonceId: string; transcriptHash: string }>();
+        for (const r of nonceResults) {
+          if (r.kind === "rejected") {
+            return reply.code(502).send({
+              error: r.aborted ? "frost_nonce_worker_timeout" : "frost_nonce_forward_rejected",
+              slot: r.slot,
+              requestId,
+              reason: r.reason instanceof Error ? r.reason.message : String(r.reason),
+            });
+          }
+          if (r.aborted) {
+            return reply.code(502).send({
+              error: "frost_nonce_worker_timeout",
+              slot: r.slot,
+              requestId,
+            });
+          }
+          if (r.value.statusCode !== 200) {
+            return reply.code(502).send({
+              error: "frost_nonce_unexpected_status",
+              slot: r.slot,
+              requestId,
+              statusCode: r.value.statusCode,
+              body: r.value.body,
+            });
+          }
+          const parsedRes = parseFrostNonceCommitmentResponse(r.value.body);
+          commitmentEntries.push({ slot: r.slot, commitments: parsedRes.commitments });
+          noncePerSlot.set(r.slot, {
+            nonceId: parsedRes.nonceId,
+            transcriptHash: parsedRes.transcriptHash,
+          });
+        }
+        commitmentEntries.sort((a, b) => a.slot - b.slot);
+
+        // 10. Phase B — fan out partial-sign.
+        const partialSignPromises = sortedSelectedSlots.map((slot) => {
+          const controller = new AbortController();
+          const timer = setTimeout(
+            () => controller.abort(),
+            mpccaWithdrawFrostAttestWorkerTimeoutMs,
+          );
+          const body = {
+            nonceId: noncePerSlot.get(slot)!.nonceId,
+            messageBytes: messageHex,
+            commitments: commitmentEntries,
+          };
+          return singleNodeForwarder(
+            "/worker/v2/frost/sign/partial",
+            body,
+            dkgRoster,
+            slot,
+            controller.signal,
+          )
+            .then(
+              (value) => ({
+                kind: "value" as const,
+                slot,
+                value,
+                aborted: controller.signal.aborted,
+              }),
+              (reason) => ({
+                kind: "rejected" as const,
+                slot,
+                reason,
+                aborted: controller.signal.aborted,
+              }),
+            )
+            .finally(() => clearTimeout(timer));
+        });
+        const partialResults = await Promise.all(partialSignPromises);
+        const signatureShareEntries: Array<{ slot: number; signatureShare: unknown }> = [];
+        const partialPerSlot = new Map<number, { transcriptHash: string }>();
+        for (const r of partialResults) {
+          if (r.kind === "rejected") {
+            return reply.code(502).send({
+              error: r.aborted ? "frost_partial_worker_timeout" : "frost_partial_forward_rejected",
+              slot: r.slot,
+              requestId,
+              reason: r.reason instanceof Error ? r.reason.message : String(r.reason),
+            });
+          }
+          if (r.aborted) {
+            return reply.code(502).send({
+              error: "frost_partial_worker_timeout",
+              slot: r.slot,
+              requestId,
+            });
+          }
+          if (r.value.statusCode !== 200) {
+            return reply.code(502).send({
+              error: "frost_partial_unexpected_status",
+              slot: r.slot,
+              requestId,
+              statusCode: r.value.statusCode,
+              body: r.value.body,
+            });
+          }
+          const parsedRes = parseFrostPartialSignatureResponse(r.value.body);
+          if (parsedRes.nonceId !== noncePerSlot.get(r.slot)!.nonceId) {
+            return reply.code(502).send({
+              error: "frost_partial_nonce_id_drift",
+              slot: r.slot,
+              requestId,
+              expectedNonceId: noncePerSlot.get(r.slot)!.nonceId,
+              actualNonceId: parsedRes.nonceId,
+            });
+          }
+          signatureShareEntries.push({ slot: r.slot, signatureShare: parsedRes.signatureShare });
+          partialPerSlot.set(r.slot, { transcriptHash: parsedRes.transcriptHash });
+        }
+        signatureShareEntries.sort((a, b) => a.slot - b.slot);
+
+        // 11. Phase C — aggregate on slot[0].
+        const aggregateBody = {
+          messageBytes: messageHex,
+          commitments: commitmentEntries,
+          signatureShares: signatureShareEntries,
+        };
+        const aggregateSlot = sortedSelectedSlots[0];
+        let aggregateRes;
+        try {
+          aggregateRes = await singleNodeForwarder(
+            "/worker/v2/frost/sign/aggregate",
+            aggregateBody,
+            dkgRoster,
+            aggregateSlot,
+          );
+        } catch (err) {
+          return reply.code(502).send({
+            error: "frost_aggregate_forward_rejected",
+            slot: aggregateSlot,
+            requestId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+        if (aggregateRes.statusCode !== 200) {
+          return reply.code(502).send({
+            error: "frost_aggregate_unexpected_status",
+            slot: aggregateSlot,
+            requestId,
+            statusCode: aggregateRes.statusCode,
+            body: aggregateRes.body,
+          });
+        }
+        const aggregateParsed = parseFrostAggregateSignatureResponse(aggregateRes.body);
+        const groupSignature = aggregateParsed.signature;
+
+        // 12. Assemble 27-field withdrawV2CallArgsFields.
+        const withdrawV2CallArgsFields = {
+          root: parsed.root,
+          nullifierHash: parsed.nullifierHash,
+          recipient: parsed.recipient,
+          recipientHash: parsed.recipientHash,
+          amountTag: parsed.amountTag,
+          caPayloadHash: caPayloadHashFr,
+          requestHash: parsed.requestHash,
+          vaultSequence: String(parsed.vaultSequence),
+          withdrawProof: parsed.withdrawProofHex,
+          expirySecs: String(parsed.expirySecs),
+          groupSignature,
+          fallbackBitmap: 0,
+          fallbackSignatures: [] as string[],
+          newBalanceP: caPayload.newBalanceP,
+          newBalanceR: caPayload.newBalanceR,
+          newBalanceREffAud: caPayload.newBalanceREffAud,
+          amountP: caPayload.amountP,
+          amountRSender: caPayload.amountRSender,
+          amountRRecip: caPayload.amountRRecip,
+          amountREffAud: caPayload.amountREffAud,
+          ekVolunAuds: caPayload.ekVolunAuds,
+          amountRVolunAuds: caPayload.amountRVolunAuds,
+          zkrpNewBalance: caPayload.zkrpNewBalance,
+          zkrpAmount: caPayload.zkrpAmount,
+          sigmaProtoComm: caPayload.sigmaProtoComm,
+          sigmaProtoResp: caPayload.sigmaProtoResp,
+          memo: caPayload.memo,
+        };
+
+        // 13. Persist updated __finalize.json (write_atomic_replace — overwrites the M4-c4
+        //     stub with the M5-c1 fully-assembled artifact).
+        const attestationConfig = {
+          chainId: parsed.chainId,
+          bridge: parsed.attestationConfig.bridge,
+          vault: parsed.attestationConfig.vault,
+          assetType: parsed.assetType,
+          operatorSetVersion: parsed.attestationConfig.operatorSetVersion,
+          rosterHash: dkgRosterHash,
+          frostGroupPubkey: parsed.attestationConfig.frostGroupPubkey,
+          circuitVersionsHash: parsed.attestationConfig.circuitVersionsHash,
+        };
+        const newFinalizeArtifact = {
+          scheme: "mpcca_withdraw_v2_finalize" as const,
+          dkgEpoch: parsed.dkgEpoch,
+          requestId,
+          // notImplementedPhase REMOVED — assembly is complete.
+          attestationConfig,
+          withdrawV2CallArgsFields,
+          mpccaWithdrawFinalizeArtifact: mpccaArtifact,
+          frostAttestationTranscriptHashes: {
+            nonceCommit: Array.from(noncePerSlot.entries()).map(([slot, v]) => ({
+              slot,
+              transcriptHash: v.transcriptHash,
+            })),
+            partialSign: Array.from(partialPerSlot.entries()).map(([slot, v]) => ({
+              slot,
+              transcriptHash: v.transcriptHash,
+            })),
+            aggregate: aggregateParsed.transcriptHash,
+          },
+          transcriptHash: finalizeArtifact.transcriptHash,
+          caPayloadHashRaw,
+          caPayloadHashFr,
+          messageBytes: messageHex,
+          createdAtUnixMs: Date.now(),
+        };
+        const finalizeJson = JSON.stringify(newFinalizeArtifact, null, 2) + "\n";
+        // Atomic replace (tmp + rename) — this overwrites the M4-c4 stub.
+        const { writeFile: writeFileAtomic, rename: renameAtomic, chmod: chmodAtomic } =
+          await import("node:fs/promises");
+        const tmpPath = `${finalizeArtifactPath}.tmp.${process.pid}.${Date.now()}`;
+        await writeFileAtomic(tmpPath, finalizeJson, { mode: 0o600 });
+        await chmodAtomic(tmpPath, 0o600);
+        await renameAtomic(tmpPath, finalizeArtifactPath);
+
+        // 14. Return 200.
+        return reply.code(200).send({
+          accepted: true,
+          requestId,
+          dkgEpoch: parsed.dkgEpoch,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          caPayloadHashRaw,
+          caPayloadHashFr,
+          groupSignature,
+          withdrawV2CallArgsFields,
+          transcriptPath: finalizeArtifactPath,
+          message:
+            "M5-c1 FROST attestation complete; __finalize.json updated with full 27-field " +
+            "WithdrawV2CallArgs. The M5b submit route is now unblocked.",
         });
       } finally {
         lock.release();

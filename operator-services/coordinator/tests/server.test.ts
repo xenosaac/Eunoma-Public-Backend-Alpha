@@ -5450,6 +5450,215 @@ describe("coordinator", () => {
   });
 
   // ---------------------------------------------------------------------------------------------
+  // Milestone 5 sub-milestone 5-c1 — POST /v2/withdraw/mpcca/frost-attest orchestrator.
+  //
+  // Reads __round2.json + __finalize.json, builds CA payload + caPayloadHash, drives the
+  // 3-round FROST signing ceremony, assembles 27-field WithdrawV2CallArgs, and persists the
+  // updated __finalize.json (removes notImplementedPhase, adds withdrawV2CallArgsFields).
+  //
+  // Happy-path with canonical Ristretto + real FROST keys is deferred to local cluster
+  // smoke (M6-prep); these c1 coordinator tests focus on orchestration error paths.
+  // ---------------------------------------------------------------------------------------------
+  describe("MPCCA withdraw V2 FROST attest — M5 commit 1 orchestrator", () => {
+    function genHex32(group: string, i: number): string {
+      const idx = i.toString(16).padStart(2, "0");
+      return (group + idx).repeat(16);
+    }
+
+    function buildFrostAttestBody(
+      overrides: Record<string, unknown> = {},
+    ): Record<string, unknown> {
+      return {
+        dkgEpoch: "1",
+        requestId: "mpcca-wdr-frost",
+        sessionId: "mpcca-wdr-frost",
+        vaultEkTranscriptHash: h32("7"),
+        registrationTranscriptHash: h32("8"),
+        vaultStateInitTranscriptHash: h32("9"),
+        observedDepositTranscriptHashes: [h32("0")],
+        rosterHash: "aa".repeat(32),
+        selectedSlots: [0, 1, 2, 3, 4],
+        selfSlot: 0,
+        playerId: 0,
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        root: h32("1"),
+        nullifierHash: h32("2"),
+        recipient: h32("3"),
+        recipientHash: h32("4"),
+        amountTag: h32("5"),
+        vaultSequence: 0,
+        expirySecs: 1_700_000_000,
+        requestHash: h32("6"),
+        depositCount: 1,
+        attestationConfig: {
+          bridge: "11".repeat(32),
+          vault: "22".repeat(32),
+          operatorSetVersion: "1",
+          frostGroupPubkey: "33".repeat(32),
+          circuitVersionsHash: "44".repeat(32),
+        },
+        withdrawProofHex: "ee".repeat(96),
+        ...overrides,
+      };
+    }
+
+    async function makeStateRoot(prefix: string): Promise<string> {
+      const { mkdtemp } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const os = await import("node:os");
+      return mkdtemp(join(os.tmpdir(), prefix));
+    }
+
+    function stubForbid(): typeof singleNodeForwarder {
+      return async (_path, _body, _roster, slot) => ({
+        slot,
+        ok: false,
+        statusCode: 500,
+        body: { error: "should_not_be_called" },
+      });
+    }
+
+    it("frost_attest_rejects_state_root_not_configured", async () => {
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFrostAttestBody({ rosterHash: rosterHashHex });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        singleNodeForwarder: stubForbid(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/frost-attest",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("state_root_not_configured");
+    });
+
+    it("frost_attest_rejects_round2_transcript_missing", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-frost-no-r2-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFrostAttestBody({ rosterHash: rosterHashHex });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubForbid(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/frost-attest",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("round2_transcript_not_found");
+    });
+
+    it("frost_attest_rejects_stale_roster_hash", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-frost-stale-roster-");
+      const caDkgV2Roster = dkgRoster();
+      const body = buildFrostAttestBody({ rosterHash: "ee".repeat(32) });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubForbid(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/frost-attest",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("stale_roster_hash");
+    });
+
+    it("frost_attest_rejects_stale_dkg_epoch", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-frost-stale-epoch-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFrostAttestBody({
+        rosterHash: rosterHashHex,
+        dkgEpoch: "999",
+      });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubForbid(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/frost-attest",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("stale_dkg_epoch");
+    });
+
+    it("frost_attest_rejects_missing_withdrawProofHex", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-frost-no-proof-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFrostAttestBody({ rosterHash: rosterHashHex });
+      // strip required field
+      delete (body as Record<string, unknown>).withdrawProofHex;
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubForbid(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/frost-attest",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("INVALID_BULLETPROOF_BYTES");
+    });
+
+    it("frost_attest_rejects_missing_attestationConfig", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-frost-no-cfg-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFrostAttestBody({ rosterHash: rosterHashHex });
+      delete (body as Record<string, unknown>).attestationConfig;
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubForbid(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/frost-attest",
+        payload: body,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("INVALID_WITHDRAW_FIELD_SHAPE");
+    });
+
+    it("frost_attest_rejects_forbidden_plaintext_field_amount", async () => {
+      const stateRoot = await makeStateRoot("eunoma-coord-frost-forbidden-");
+      const caDkgV2Roster = dkgRoster();
+      const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+      const body = buildFrostAttestBody({ rosterHash: rosterHashHex });
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        stateRoot,
+        singleNodeForwarder: stubForbid(),
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/frost-attest",
+        payload: { ...body, amount: 1_000_000 },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("forbidden_plaintext_field");
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------------
   // Milestone 5 sub-milestone 5b — POST /v2/withdraw/mpcca/submit orchestrator.
   //
   // M5b is plumbing-only: the finalize transcript is still the M3a NotImplemented stub today,
