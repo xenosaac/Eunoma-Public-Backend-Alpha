@@ -3,6 +3,7 @@ import {
   assembleCaRegistrationV2Transcript,
   assembleVaultEkTranscript,
   assembleVaultStateV2InitTranscript,
+  assembleVaultStateV2ObserveDepositTranscript,
   CaRegistrationV2Error,
   DEOPERATOR_COUNT,
   DEOPERATOR_THRESHOLD,
@@ -28,6 +29,7 @@ import {
   parseDkgRoundResult,
   parseMpccaRoundRequest,
   parseMpccaRoundResult,
+  parseObserveDepositResponse,
   parseSessionShareEnvelope,
   parseVaultEkContributions,
   parseVaultStateV2InitResponse,
@@ -39,13 +41,16 @@ import {
   validateRoster,
   VaultEkDerivationError,
   VaultStateV2InitError,
+  VaultStateV2ObserveDepositError,
   vaultStateV2InitWorkerTranscriptHash,
+  vaultStateV2ObserveWorkerTranscriptHash,
   type CaDkgV2Roster,
   type CaRegistrationV2Contribution,
   type DeoperatorRoster,
   type FrostDkgV2Roster,
   type FrostRound1Broadcast,
   type FrostRound2Envelope,
+  type ObserveDepositContribution,
   type SessionShareEnvelope,
   type VaultEkContribution,
   type VaultStateV2InitContribution,
@@ -245,6 +250,43 @@ export function buildCoordinatorServer(
     return {
       release: () => {
         vaultStateV2InitInFlight = null;
+        resolveHeld();
+      },
+    };
+  }
+
+  // Milestone 2b: separate session lock for /v2/vault_state/observe_deposit. We keep it
+  // distinct from the init lock because the observer + initializer are different operator
+  // workflows that can run concurrently against each other. But TWO concurrent observe calls
+  // for the SAME vault would race on the worker's cursor: both could pass `deposit_count > existing`
+  // (strict), both could write the same new cursor, both could persist artifacts under DIFFERENT
+  // requestIds. The serialization keeps the cursor monotonic across the orchestrator surface,
+  // mirroring the strict monotonicity check on the worker itself.
+  let vaultStateV2ObserveInFlight: Promise<unknown> | null = null;
+  const vaultStateV2ObserveLockAcquireTimeoutMs = 100;
+  async function acquireVaultStateV2ObserveLock(): Promise<{ release: () => void } | "busy"> {
+    const start = Date.now();
+    while (vaultStateV2ObserveInFlight !== null) {
+      if (Date.now() - start > vaultStateV2ObserveLockAcquireTimeoutMs) {
+        return "busy";
+      }
+      try {
+        await Promise.race([
+          vaultStateV2ObserveInFlight,
+          new Promise((resolve) => setTimeout(resolve, 25)),
+        ]);
+      } catch {
+        // Holder failed; loop re-checks.
+      }
+    }
+    let resolveHeld: (value: void) => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      resolveHeld = resolve;
+    });
+    vaultStateV2ObserveInFlight = held;
+    return {
+      release: () => {
+        vaultStateV2ObserveInFlight = null;
         resolveHeld();
       },
     };
@@ -2056,6 +2098,545 @@ export function buildCoordinatorServer(
     }
   });
 
+  // =============================================================================================
+  // Milestone 2 sub-milestone 2b: confirmed-deposit observer orchestrator.
+  //
+  // Flow:
+  //   1. Forbidden-field guard on the raw body (catches extra amount*/blind*/secret*/dk*/share*/
+  //      nullifier* fields before any downstream code touches them).
+  //   2. Sanitize requestId via isSafeId before any FS path construction.
+  //   3. Parse the 14 required fields: dkgEpoch, caDkgTranscriptHash (used to look up the
+  //      Milestone 2a init transcript), vaultEk, senderAddress, assetType, chainId, depositCount
+  //      (positive u64 the observer derives as sequenceNumber+1), commitment, amountTag,
+  //      caPayloadHash, depositNonce, sequenceNumber, txVersion, eventGuid.
+  //   4. Provenance gate: scan <stateRoot>/coordinator/vault_state_v2/ for the matching
+  //      Milestone 2a init transcript (which itself binds Phase 2 + Milestone 1 transcripts).
+  //      Extract selectedSlots + vaultEkTranscriptHash + registrationTranscriptHash from it. If
+  //      not found → 400 vault_state_init_provenance_unknown.
+  //   5. Acquire the observe lock (409 vault_state_v2_observe_in_flight on contention).
+  //   6. Fan-out POST /worker/v2/vault_state/observe_deposit to all 5 selectedSlots concurrently.
+  //   7. For each response: parseObserveDepositResponse, re-derive expectedWorkerHash via
+  //      vaultStateV2ObserveWorkerTranscriptHash, byte-equality assert → 502
+  //      worker_transcript_hash_mismatch.
+  //   8. Cursor consistency: every worker's `depositCountObserved` MUST equal req.depositCount.
+  //      Otherwise → 502 cursor_divergence.
+  //   9. assemble + persist ObserveDepositTranscript at
+  //      <stateRoot>/coordinator/vault_state_v2_observed/<dkgEpoch>__<depositCount>__<requestId>.json
+  //      (atomic 0o600).
+  //   10. Return { accepted, requestId, dkgEpoch, depositCount, vaultEk, perSlotContributions,
+  //       transcriptHash, transcriptPath }.
+  //
+  // Failure modes:
+  //   - 400 forbidden_plaintext_field / unsafe_request_id / under_quorum / duplicate_slot / unknown_slot
+  //   - 400 invalid_request (malformed body)
+  //   - 400 vault_state_init_provenance_unknown
+  //   - 400 stale_dkg_epoch / stale_deposit_count
+  //   - 409 vault_state_v2_observe_in_flight
+  //   - 502 observe_forward_rejected / observe_forward_failed / observe_returned_invalid
+  //   - 502 worker_transcript_hash_mismatch
+  //   - 502 cursor_divergence
+  // =============================================================================================
+  server.post("/v2/vault_state/observe_deposit", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      // Codex M2b P1 — forbidden-plaintext-field guard runs FIRST on the raw body.
+      assertNoForbiddenPlaintextFields(raw);
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+
+      const dkgEpoch =
+        typeof raw.dkgEpoch === "string" && raw.dkgEpoch.length > 0 ? raw.dkgEpoch : undefined;
+      if (!dkgEpoch || !/^[0-9]+$/.test(dkgEpoch)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "dkgEpoch must be a non-empty decimal string",
+        });
+      }
+      if (dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          message: `request.dkgEpoch ${dkgEpoch} does not match caDkgV2Roster.dkgEpoch ${dkgRoster.dkgEpoch}`,
+        });
+      }
+      const caDkgTranscriptHashInput = raw.caDkgTranscriptHash;
+      if (typeof caDkgTranscriptHashInput !== "string" || caDkgTranscriptHashInput.length === 0) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message:
+            "caDkgTranscriptHash is required; supply the value from the CA DKG V2 artifact",
+        });
+      }
+      const vaultEk = raw.vaultEk;
+      if (typeof vaultEk !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(vaultEk)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "vaultEk must be a 32-byte hex string",
+        });
+      }
+      const senderAddress = raw.senderAddress;
+      if (
+        typeof senderAddress !== "string" ||
+        !/^(0x)?[0-9a-fA-F]{64}$/.test(senderAddress)
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "senderAddress must be a 32-byte hex string",
+        });
+      }
+      const assetType = raw.assetType;
+      if (typeof assetType !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(assetType)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "assetType must be a 32-byte hex string",
+        });
+      }
+      const chainIdRaw = raw.chainId;
+      if (
+        !Number.isInteger(chainIdRaw) ||
+        (chainIdRaw as number) < 0 ||
+        (chainIdRaw as number) > 255
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "chainId must be a u8",
+        });
+      }
+      const chainId = chainIdRaw as number;
+      const depositCountRaw = raw.depositCount;
+      if (
+        !Number.isInteger(depositCountRaw) ||
+        (depositCountRaw as number) < 1
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "depositCount must be a positive integer (= sequenceNumber + 1)",
+        });
+      }
+      const depositCount = depositCountRaw as number;
+      const commitmentField = raw.commitment;
+      const amountTagField = raw.amountTag;
+      const caPayloadHashField = raw.caPayloadHash;
+      const depositNonceField = raw.depositNonce;
+      for (const [name, value] of [
+        ["commitment", commitmentField],
+        ["amountTag", amountTagField],
+        ["caPayloadHash", caPayloadHashField],
+        ["depositNonce", depositNonceField],
+      ] as const) {
+        if (typeof value !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(value)) {
+          return reply.code(400).send({
+            error: "invalid_request",
+            message: `${name} must be a 32-byte hex string`,
+          });
+        }
+      }
+      const commitment = commitmentField as string;
+      const amountTag = amountTagField as string;
+      const caPayloadHash = caPayloadHashField as string;
+      const depositNonce = depositNonceField as string;
+      const sequenceNumber = raw.sequenceNumber;
+      const txVersion = raw.txVersion;
+      const eventGuid = raw.eventGuid;
+      if (typeof sequenceNumber !== "string" || !/^[0-9]+$/.test(sequenceNumber)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "sequenceNumber must be a non-empty decimal string",
+        });
+      }
+      if (typeof txVersion !== "string" || !/^[0-9]+$/.test(txVersion)) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "txVersion must be a non-empty decimal string",
+        });
+      }
+      if (typeof eventGuid !== "string" || eventGuid.length === 0 || eventGuid.length > 256) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "eventGuid must be a non-empty string up to 256 chars",
+        });
+      }
+
+      requestId =
+        typeof raw.requestId === "string" && raw.requestId.length > 0
+          ? raw.requestId
+          : `vault-state-observe-${Date.now()}`;
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds this into " +
+            "filesystem paths",
+        });
+      }
+      const sessionId = requestId;
+
+      // Provenance gate: look up the Milestone 2a init transcript so we can lift the
+      // (selectedSlots, vaultEkTranscriptHash, registrationTranscriptHash) without trusting
+      // the caller's body. The init transcript itself binds Phase 2 + Milestone 1, so a
+      // matching init transcript implies the entire chain of derivation prerequisites is in
+      // place. No-stateRoot mode (dev/test) requires the caller to supply these inline.
+      const claimedVaultEkTranscriptHash =
+        typeof raw.vaultEkTranscriptHash === "string" && raw.vaultEkTranscriptHash.length > 0
+          ? raw.vaultEkTranscriptHash
+          : undefined;
+      const claimedRegistrationTranscriptHash =
+        typeof raw.registrationTranscriptHash === "string" &&
+        raw.registrationTranscriptHash.length > 0
+          ? raw.registrationTranscriptHash
+          : undefined;
+      const claimedSelectedSlots = Array.isArray(raw.selectedSlots)
+        ? (raw.selectedSlots as unknown[])
+        : undefined;
+      let vaultEkTranscriptHash: string | undefined;
+      let registrationTranscriptHash: string | undefined;
+      let selectedSlots: number[] | undefined;
+      let initTranscriptPath: string | undefined;
+      if (opts.stateRoot) {
+        const provenance = await findVaultStateV2InitProvenance(opts.stateRoot, {
+          dkgEpoch,
+          vaultEk,
+          caDkgTranscriptHash: caDkgTranscriptHashInput,
+          rosterHash: dkgRosterHash,
+          senderAddress,
+          assetType,
+          chainId,
+        });
+        if (!provenance) {
+          return reply.code(400).send({
+            error: "vault_state_init_provenance_unknown",
+            requestId,
+            message:
+              "no persisted Milestone 2a vault_state_v2 init transcript matches the supplied " +
+              "(dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash, senderAddress, assetType, chainId). " +
+              "Run /v2/vault_state/init first.",
+          });
+        }
+        vaultEkTranscriptHash = provenance.vaultEkTranscriptHash;
+        registrationTranscriptHash = provenance.registrationTranscriptHash;
+        selectedSlots = provenance.selectedSlots;
+        initTranscriptPath = provenance.transcriptPath;
+      } else {
+        if (
+          !claimedVaultEkTranscriptHash ||
+          !claimedRegistrationTranscriptHash ||
+          !claimedSelectedSlots ||
+          claimedSelectedSlots.length !== DEOPERATOR_THRESHOLD
+        ) {
+          return reply.code(400).send({
+            error: "invalid_request",
+            message:
+              "stateRoot is not configured; caller must supply vaultEkTranscriptHash, " +
+              "registrationTranscriptHash, and selectedSlots inline",
+          });
+        }
+        const arr: number[] = [];
+        const seen = new Set<number>();
+        for (const slot of claimedSelectedSlots) {
+          if (
+            !Number.isInteger(slot) ||
+            (slot as number) < 0 ||
+            (slot as number) >= DEOPERATOR_COUNT
+          ) {
+            return reply.code(400).send({
+              error: "invalid_request",
+              message: `selectedSlots entry ${slot} out of range`,
+            });
+          }
+          if (seen.has(slot as number)) {
+            return reply.code(400).send({
+              error: "duplicate_slot",
+              message: `duplicate selectedSlots entry ${slot}`,
+            });
+          }
+          seen.add(slot as number);
+          arr.push(slot as number);
+        }
+        vaultEkTranscriptHash = claimedVaultEkTranscriptHash;
+        registrationTranscriptHash = claimedRegistrationTranscriptHash;
+        selectedSlots = arr;
+      }
+      if (!vaultEkTranscriptHash || !registrationTranscriptHash || !selectedSlots) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "internal: provenance fields unresolved",
+        });
+      }
+      const sortedSelectedSlots = [...selectedSlots].sort((a, b) => a - b);
+
+      const lock = await acquireVaultStateV2ObserveLock();
+      if (lock === "busy") {
+        return reply.code(409).send({
+          error: "vault_state_v2_observe_in_flight",
+          requestId,
+          message:
+            "another vault_state_v2 observe_deposit session is in progress; retry shortly",
+        });
+      }
+
+      try {
+        // Bound the observer-claimed `previousDepositCountObserved` to `depositCount - 1`. The
+        // worker's strict-monotonicity check enforces this too, but capturing the convention
+        // here lets the transcript hash bind a single canonical cursor delta per call.
+        const previousDepositCountObserved = depositCount - 1;
+        const newDepositCountObserved = depositCount;
+
+        const observeBodies = sortedSelectedSlots.map((slot, ordinalIndex) => ({
+          dkgEpoch,
+          requestId: requestId!,
+          sessionId,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          selfSlot: slot,
+          playerId: ordinalIndex,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          depositCount,
+          commitment,
+          amountTag,
+          caPayloadHash,
+          depositNonce,
+          sequenceNumber,
+          txVersion,
+          eventGuid,
+          previousDepositCountObserved,
+          newDepositCountObserved,
+        }));
+
+        // Concurrent fan-out (KILLER): all 5 worker calls launched before any completes. The
+        // strict cursor-monotonicity check on the worker means concurrent in-flight observes
+        // at the SAME cursor MUST not both succeed — but a coordinator-side serialisation
+        // already prevents two observe calls from being in flight at once anyway.
+        const forwarded = await Promise.all(
+          sortedSelectedSlots.map((slot, ordinalIndex) =>
+            singleNodeForwarder(
+              "/worker/v2/vault_state/observe_deposit",
+              observeBodies[ordinalIndex],
+              dkgRoster,
+              slot,
+            ).then(
+              (value) => ({ kind: "value" as const, slot, value }),
+              (reason) => ({ kind: "rejected" as const, slot, reason }),
+            ),
+          ),
+        );
+        const responsesBySlot = new Map<
+          number,
+          ReturnType<typeof parseObserveDepositResponse>
+        >();
+        for (const res of forwarded) {
+          if (res.kind === "rejected") {
+            return reply.code(502).send({
+              error: "observe_forward_rejected",
+              slot: res.slot,
+              requestId,
+              reason:
+                res.reason instanceof Error ? res.reason.message : String(res.reason),
+            });
+          }
+          if (!res.value.ok || !res.value.body) {
+            return reply.code(502).send({
+              error: "observe_forward_failed",
+              slot: res.slot,
+              statusCode: res.value.statusCode,
+              body: res.value.body,
+              requestId,
+            });
+          }
+          let parsed;
+          try {
+            parsed = parseObserveDepositResponse(res.value.body);
+          } catch (err) {
+            return reply.code(502).send({
+              error: "observe_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: err instanceof Error ? err.message : "unknown",
+            });
+          }
+          // Defense in depth: re-derive the worker transcript hash from public inputs and
+          // assert byte-equality with the worker's claim. Catches a deop-node tricked into
+          // proxying a tampered response.
+          const expectedWorkerHash = vaultStateV2ObserveWorkerTranscriptHash({
+            sessionId,
+            requestId: requestId!,
+            dkgEpoch,
+            sortedSelectedSlots,
+            selfSlot: res.slot,
+            playerId: sortedSelectedSlots.indexOf(res.slot),
+            vaultEkTranscriptHash,
+            registrationTranscriptHash,
+            vaultEk,
+            senderAddress,
+            assetType,
+            chainId,
+            depositCount,
+            commitment,
+            amountTag,
+            caPayloadHash,
+            depositNonce,
+            sequenceNumber,
+            txVersion,
+            eventGuid,
+            previousDepositCountObserved: parsed.previousDepositCountObserved,
+            newDepositCountObserved: parsed.depositCountObserved,
+          });
+          if (parsed.workerTranscriptHash !== expectedWorkerHash) {
+            return reply.code(502).send({
+              error: "worker_transcript_hash_mismatch",
+              slot: res.slot,
+              requestId,
+              expected: expectedWorkerHash,
+              actual: parsed.workerTranscriptHash,
+            });
+          }
+          if (parsed.slot !== res.slot) {
+            return reply.code(502).send({
+              error: "observe_returned_invalid",
+              slot: res.slot,
+              requestId,
+              message: `worker returned slot ${parsed.slot} for selfSlot ${res.slot}`,
+            });
+          }
+          responsesBySlot.set(res.slot, parsed);
+        }
+
+        // Cursor consistency: every worker MUST report depositCountObserved == request.depositCount.
+        // If any worker reports a different cursor (e.g. one was already at depositCount, or
+        // observed a different one), the orchestrator cannot proceed — that worker's state
+        // disagrees with the others. Operator runbook: investigate per-slot vault_state_v2.json
+        // and re-run after manual reconciliation.
+        for (const slot of sortedSelectedSlots) {
+          const r = responsesBySlot.get(slot)!;
+          if (r.depositCountObserved !== depositCount) {
+            return reply.code(502).send({
+              error: "cursor_divergence",
+              slot,
+              requestId,
+              expected: depositCount,
+              actual: r.depositCountObserved,
+              message:
+                "worker reported depositCountObserved that does not match request.depositCount",
+            });
+          }
+        }
+
+        const perSlotContributions: ObserveDepositContribution[] = sortedSelectedSlots.map(
+          (slot) => {
+            const r = responsesBySlot.get(slot)!;
+            return {
+              slot,
+              vaultStateHash: r.vaultStateHash,
+              workerTranscriptHash: r.workerTranscriptHash,
+              previousDepositCountObserved: r.previousDepositCountObserved,
+              depositCountObserved: r.depositCountObserved,
+              vaultSequence: r.vaultSequence,
+            };
+          },
+        );
+        const transcript = assembleVaultStateV2ObserveDepositTranscript({
+          dkgEpoch,
+          requestId,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          depositCount,
+          commitment,
+          amountTag,
+          caPayloadHash,
+          depositNonce,
+          sequenceNumber,
+          txVersion,
+          eventGuid,
+          previousDepositCountObserved,
+          newDepositCountObserved,
+          perSlotContributions,
+        });
+        const transcriptArtifact = {
+          ...transcript,
+          initTranscriptPath,
+          observedAtUnixMs: Date.now(),
+        };
+
+        let transcriptPath: string | undefined;
+        if (opts.stateRoot) {
+          const dir = join(opts.stateRoot, "coordinator", "vault_state_v2_observed");
+          transcriptPath = join(
+            dir,
+            `${dkgEpoch}__${depositCount}__${requestId}.json`,
+          );
+          await writeTranscriptArtifactAtomic(transcriptPath, transcriptArtifact);
+        }
+        for (const slot of sortedSelectedSlots) {
+          const r = responsesBySlot.get(slot)!;
+          await store.recordPartialArtifact({
+            requestId,
+            sessionId,
+            rosterHash: dkgRosterHash,
+            slot,
+            artifactKind: "vault-state-v2-observe-deposit",
+            artifactHash: r.vaultStateHash,
+            transcriptHash: r.workerTranscriptHash,
+          });
+        }
+        await store.markComplete(requestId);
+
+        return reply.code(200).send({
+          accepted: true,
+          requestId,
+          dkgEpoch,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          vaultEk,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          senderAddress,
+          assetType,
+          chainId,
+          depositCount,
+          commitment,
+          amountTag,
+          caPayloadHash,
+          depositNonce,
+          sequenceNumber,
+          txVersion,
+          eventGuid,
+          previousDepositCountObserved,
+          newDepositCountObserved,
+          perSlotContributions,
+          transcriptHash: transcript.transcriptHash,
+          transcriptPath,
+        });
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      if (requestId) await store.markAborted(requestId);
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof VaultStateV2ObserveDepositError) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
   server.post("/v2/dkg/frost/v2/start", async (req, reply) => {
     try {
       const raw = (req.body ?? {}) as Record<string, unknown>;
@@ -2928,6 +3509,109 @@ async function findCaRegistrationV2Provenance(
       aggregateResponse: artifact.aggregateResponse,
       challenge: artifact.challenge,
       verifierSlot,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Milestone 2b — verify Milestone 2a (vault_state_v2 init) provenance.
+ *
+ * Mirrors `findCaRegistrationV2Provenance`. Scans `<stateRoot>/coordinator/vault_state_v2/` for
+ * an artifact whose (dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash, senderAddress, assetType,
+ * chainId) tuple matches. Returns the persisted (vaultEkTranscriptHash, registrationTranscriptHash,
+ * selectedSlots) so the observe-deposit orchestrator can fan out without re-trusting the caller.
+ *
+ * The init transcript itself binds Phase 2 + Milestone 1 provenance, so a matching init
+ * transcript implies the entire chain of prerequisites is in place. We don't re-scan Phase 2
+ * + Milestone 1 here — the init orchestrator already did, and an attacker would need to
+ * fabricate a matching init transcript (gated by the init lock + atomic write).
+ */
+async function findVaultStateV2InitProvenance(
+  stateRoot: string,
+  expected: {
+    dkgEpoch: string;
+    vaultEk: string;
+    caDkgTranscriptHash: string;
+    rosterHash: string;
+    senderAddress: string;
+    assetType: string;
+    chainId: number;
+  },
+): Promise<
+  | {
+      vaultEkTranscriptHash: string;
+      registrationTranscriptHash: string;
+      selectedSlots: number[];
+      transcriptPath: string;
+    }
+  | undefined
+> {
+  const dir = join(stateRoot, "coordinator", "vault_state_v2");
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+  const lowerVaultEk = expected.vaultEk.replace(/^0x/i, "").toLowerCase();
+  const lowerCaDkg = expected.caDkgTranscriptHash.replace(/^0x/i, "").toLowerCase();
+  const lowerRoster = expected.rosterHash.replace(/^0x/i, "").toLowerCase();
+  const lowerSender = expected.senderAddress.replace(/^0x/i, "").toLowerCase();
+  const lowerAsset = expected.assetType.replace(/^0x/i, "").toLowerCase();
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const epochPrefix = `${expected.dkgEpoch}__`;
+    if (!entry.startsWith(epochPrefix)) continue;
+    const transcriptPath = join(dir, entry);
+    let raw: string;
+    try {
+      raw = await readFile(transcriptPath, "utf8");
+    } catch {
+      continue;
+    }
+    let artifact: Record<string, unknown>;
+    try {
+      artifact = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (artifact.scheme !== "vault_state_v2") continue;
+    if (typeof artifact.dkgEpoch !== "string" || artifact.dkgEpoch !== expected.dkgEpoch) continue;
+    if (typeof artifact.vaultEk !== "string") continue;
+    if (typeof artifact.caDkgTranscriptHash !== "string") continue;
+    if (typeof artifact.rosterHash !== "string") continue;
+    if (typeof artifact.vaultEkTranscriptHash !== "string") continue;
+    if (typeof artifact.registrationTranscriptHash !== "string") continue;
+    if (typeof artifact.senderAddress !== "string") continue;
+    if (typeof artifact.assetType !== "string") continue;
+    if (typeof artifact.chainId !== "number") continue;
+    if (!Array.isArray(artifact.selectedSlots)) continue;
+    if (artifact.vaultEk.replace(/^0x/i, "").toLowerCase() !== lowerVaultEk) continue;
+    if (artifact.caDkgTranscriptHash.replace(/^0x/i, "").toLowerCase() !== lowerCaDkg) continue;
+    if (artifact.rosterHash.replace(/^0x/i, "").toLowerCase() !== lowerRoster) continue;
+    if (artifact.senderAddress.replace(/^0x/i, "").toLowerCase() !== lowerSender) continue;
+    if (artifact.assetType.replace(/^0x/i, "").toLowerCase() !== lowerAsset) continue;
+    if (artifact.chainId !== expected.chainId) continue;
+    const selectedSlots: number[] = [];
+    for (const slot of artifact.selectedSlots) {
+      if (
+        !Number.isInteger(slot) ||
+        (slot as number) < 0 ||
+        (slot as number) >= DEOPERATOR_COUNT
+      ) {
+        // malformed init transcript; skip
+        continue;
+      }
+      selectedSlots.push(slot as number);
+    }
+    if (selectedSlots.length !== DEOPERATOR_THRESHOLD) continue;
+    return {
+      vaultEkTranscriptHash: artifact.vaultEkTranscriptHash,
+      registrationTranscriptHash: artifact.registrationTranscriptHash,
+      selectedSlots,
+      transcriptPath,
     };
   }
   return undefined;

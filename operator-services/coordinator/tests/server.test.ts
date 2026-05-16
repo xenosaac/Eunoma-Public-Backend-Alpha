@@ -2832,4 +2832,554 @@ describe("coordinator", () => {
     expect(res.json().error).toBe("ca_registration_provenance_unknown");
     expect(workerCalled).toBe(false);
   });
+
+  // =============================================================================================
+  // Milestone 2 sub-milestone 2b: observe-deposit orchestrator tests.
+  //
+  // All these tests run without `stateRoot`, requiring the caller to supply
+  // `vaultEkTranscriptHash`, `registrationTranscriptHash`, and `selectedSlots` inline. One test
+  // covers the stateRoot-resolved path explicitly.
+  // =============================================================================================
+
+  function observeDepositPayload(
+    rosterHashHex: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return {
+      requestId: "vault-state-observe-1",
+      dkgEpoch: "1",
+      caDkgTranscriptHash: h32("a"),
+      vaultEk: h32("d"),
+      senderAddress: h32("e"),
+      assetType: h32("f"),
+      chainId: 2,
+      depositCount: 1,
+      commitment: h32("1"),
+      amountTag: h32("2"),
+      caPayloadHash: h32("3"),
+      depositNonce: h32("4"),
+      sequenceNumber: "0",
+      txVersion: "1234567",
+      eventGuid: "0:0xfeed",
+      vaultEkTranscriptHash: h32("b"),
+      registrationTranscriptHash: h32("c"),
+      selectedSlots: [0, 1, 2, 3, 4],
+      // rosterHashHex is unused inline; included only to mirror init test signature for
+      // consistency. The coordinator derives the dkg roster hash from caDkgV2Roster.
+      __rosterHashHex: rosterHashHex,
+    };
+  }
+
+  it("vault_state_v2 observe_deposit concurrent fan-out to all 5 selected slots", async () => {
+    const { vaultStateV2ObserveWorkerTranscriptHash } = await import("@eunoma/deop-protocol");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const vaultEkTranscriptHash = h32("b");
+    const registrationTranscriptHash = h32("c");
+    const vaultEk = h32("d");
+    const senderAddress = h32("e");
+    const assetType = h32("f");
+    const chainId = 2;
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const depositCount = 1;
+    const commitment = h32("1");
+    const amountTag = h32("2");
+    const caPayloadHash = h32("3");
+    const depositNonce = h32("4");
+    const sequenceNumber = "0";
+    const txVersion = "1234567";
+    const eventGuid = "0:0xfeed";
+
+    let observeInFlight = 0;
+    let observePeak = 0;
+    let releaseObserve: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      releaseObserve = resolve;
+    });
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path !== "/worker/v2/vault_state/observe_deposit") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path", path } };
+        }
+        observeInFlight += 1;
+        observePeak = Math.max(observePeak, observeInFlight);
+        if (observeInFlight === 5) queueMicrotask(() => releaseObserve());
+        await barrier;
+        observeInFlight -= 1;
+
+        const playerId = expectedSelectedSlots.indexOf(slot);
+        const vaultStateHash = h32(String((slot + 5) % 9));
+        const workerTranscriptHash = vaultStateV2ObserveWorkerTranscriptHash({
+          sessionId: (body as Record<string, unknown>).sessionId as string,
+          requestId: (body as Record<string, unknown>).requestId as string,
+          dkgEpoch,
+          sortedSelectedSlots: expectedSelectedSlots,
+          selfSlot: slot,
+          playerId,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          depositCount,
+          commitment,
+          amountTag,
+          caPayloadHash,
+          depositNonce,
+          sequenceNumber,
+          txVersion,
+          eventGuid,
+          previousDepositCountObserved: 0,
+          newDepositCountObserved: depositCount,
+        });
+        return {
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {
+            slot,
+            playerId,
+            vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+            vaultStateHash,
+            workerTranscriptHash,
+            previousDepositCountObserved: 0,
+            depositCountObserved: depositCount,
+            vaultSequence: 0,
+            observedAtUnixMs: 1_700_000_000_000 + slot,
+            observed: true,
+          },
+        };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: observeDepositPayload(rosterHashHex),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.accepted).toBe(true);
+    expect(body.depositCount).toBe(depositCount);
+    expect(body.previousDepositCountObserved).toBe(0);
+    expect(body.newDepositCountObserved).toBe(depositCount);
+    expect(body.perSlotContributions).toHaveLength(5);
+    expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
+    // KILLER ASSERTION: concurrent fan-out — all 5 workers in flight simultaneously.
+    expect(observePeak).toBe(5);
+  });
+
+  it("vault_state_v2 observe_deposit returns 502 worker_transcript_hash_mismatch on tampered worker reply", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path !== "/worker/v2/vault_state/observe_deposit") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
+        }
+        return {
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {
+            slot,
+            playerId: slot,
+            vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+            vaultStateHash: h32("a"),
+            // Tamper: return a hash that DOESN'T match the TS-side reconstruction.
+            workerTranscriptHash: h32(String((slot % 9) + 1)),
+            previousDepositCountObserved: 0,
+            depositCountObserved: 1,
+            vaultSequence: 0,
+            observedAtUnixMs: 1_700_000_000_000,
+            observed: true,
+          },
+        };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: observeDepositPayload(rosterHashHex),
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("worker_transcript_hash_mismatch");
+  });
+
+  it("vault_state_v2 observe_deposit returns 502 cursor_divergence when one worker reports a different cursor", async () => {
+    const { vaultStateV2ObserveWorkerTranscriptHash } = await import("@eunoma/deop-protocol");
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const vaultEkTranscriptHash = h32("b");
+    const registrationTranscriptHash = h32("c");
+    const vaultEk = h32("d");
+    const senderAddress = h32("e");
+    const assetType = h32("f");
+    const chainId = 2;
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const depositCount = 1;
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path !== "/worker/v2/vault_state/observe_deposit") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
+        }
+        const playerId = expectedSelectedSlots.indexOf(slot);
+        // KILLER: slot 4 reports depositCountObserved=2 (different from request.depositCount=1).
+        // This simulates a worker whose persisted cursor disagreed with the others. The
+        // orchestrator MUST detect it and return cursor_divergence.
+        const reportedCursor = slot === 4 ? 2 : 1;
+        const workerTranscriptHash = vaultStateV2ObserveWorkerTranscriptHash({
+          sessionId: (body as Record<string, unknown>).sessionId as string,
+          requestId: (body as Record<string, unknown>).requestId as string,
+          dkgEpoch,
+          sortedSelectedSlots: expectedSelectedSlots,
+          selfSlot: slot,
+          playerId,
+          vaultEkTranscriptHash,
+          registrationTranscriptHash,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          depositCount,
+          commitment: h32("1"),
+          amountTag: h32("2"),
+          caPayloadHash: h32("3"),
+          depositNonce: h32("4"),
+          sequenceNumber: "0",
+          txVersion: "1234567",
+          eventGuid: "0:0xfeed",
+          previousDepositCountObserved: 0,
+          newDepositCountObserved: reportedCursor,
+        });
+        return {
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {
+            slot,
+            playerId,
+            vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+            vaultStateHash: h32("a"),
+            workerTranscriptHash,
+            previousDepositCountObserved: 0,
+            depositCountObserved: reportedCursor,
+            vaultSequence: 0,
+            observedAtUnixMs: 1_700_000_000_000,
+            observed: true,
+          },
+        };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: observeDepositPayload(rosterHashHex),
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("cursor_divergence");
+    expect(res.json().slot).toBe(4);
+    expect(res.json().expected).toBe(1);
+    expect(res.json().actual).toBe(2);
+  });
+
+  it("vault_state_v2 observe_deposit returns 409 vault_state_v2_observe_in_flight on concurrent calls", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+
+    let releaseHung: () => void = () => {};
+    const hungBarrier = new Promise<void>((resolve) => {
+      releaseHung = resolve;
+    });
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (_path, _body, _roster, slot) => {
+        // First call hangs forever (until released).
+        await hungBarrier;
+        return { slot, ok: false, statusCode: 500, body: {} };
+      },
+    });
+
+    const firstPromise = server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: { ...observeDepositPayload(rosterHashHex), requestId: "hung-1" },
+    });
+    // Give the first request time to acquire the lock + start fanning out before sending the
+    // second. 50ms is more than enough for a fastify route handler entry.
+    await new Promise((r) => setTimeout(r, 50));
+    const secondRes = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: { ...observeDepositPayload(rosterHashHex), requestId: "hung-2" },
+    });
+    expect(secondRes.statusCode).toBe(409);
+    expect(secondRes.json().error).toBe("vault_state_v2_observe_in_flight");
+
+    releaseHung();
+    await firstPromise.catch(() => undefined);
+  });
+
+  it("vault_state_v2 observe_deposit rejects forbidden plaintext fields recursively", async () => {
+    const caDkgV2Roster = dkgRoster();
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async () => {
+        workerCalled = true;
+        return { slot: 0, ok: true, statusCode: 200, body: {} };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: {
+        ...observeDepositPayload(caDkgV2RosterHash(caDkgV2Roster)),
+        // FORBIDDEN — nested
+        metadata: { nullifier_secret: "leak" },
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("forbidden_plaintext_field");
+    expect(workerCalled).toBe(false);
+  });
+
+  it("vault_state_v2 observe_deposit rejects stale dkgEpoch", async () => {
+    const caDkgV2Roster = dkgRoster();
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async () => {
+        workerCalled = true;
+        return { slot: 0, ok: true, statusCode: 200, body: {} };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: {
+        ...observeDepositPayload(caDkgV2RosterHash(caDkgV2Roster)),
+        dkgEpoch: "99", // dkgRoster's dkgEpoch is "1"
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("stale_dkg_epoch");
+    expect(workerCalled).toBe(false);
+  });
+
+  it("vault_state_v2 observe_deposit rejects unsafe requestId", async () => {
+    const caDkgV2Roster = dkgRoster();
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async () => {
+        workerCalled = true;
+        return { slot: 0, ok: true, statusCode: 200, body: {} };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: {
+        ...observeDepositPayload(caDkgV2RosterHash(caDkgV2Roster)),
+        requestId: "../../etc/passwd",
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("unsafe_request_id");
+    expect(workerCalled).toBe(false);
+  });
+
+  it("vault_state_v2 observe_deposit resolves provenance from persisted init transcript when stateRoot configured", async () => {
+    const { mkdtemp, writeFile, mkdir, readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const { vaultStateV2ObserveWorkerTranscriptHash } = await import("@eunoma/deop-protocol");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-observe-stateroot-"));
+    const caDkgV2Roster = dkgRoster();
+    const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);
+    const dkgEpoch = "1";
+    const vaultEk = h32("d");
+    const caDkgTranscriptHashHex = h32("a");
+    const persistedVaultEkTranscriptHash = h32("b");
+    const persistedRegistrationTranscriptHash = h32("c");
+    const senderAddress = h32("e");
+    const assetType = h32("f");
+    const chainId = 2;
+    const expectedSelectedSlots = [0, 1, 2, 3, 4];
+    const depositCount = 1;
+    const commitment = h32("1");
+    const amountTag = h32("2");
+    const caPayloadHash = h32("3");
+    const depositNonce = h32("4");
+    const sequenceNumber = "0";
+    const txVersion = "1234567";
+    const eventGuid = "0:0xfeed";
+
+    // Persist the Milestone 2a init transcript at the expected path.
+    const initDir = join(stateRoot, "coordinator", "vault_state_v2");
+    await mkdir(initDir, { recursive: true });
+    await writeFile(
+      join(initDir, `${dkgEpoch}__init.json`),
+      JSON.stringify(
+        {
+          scheme: "vault_state_v2",
+          dkgEpoch,
+          caDkgTranscriptHash: caDkgTranscriptHashHex,
+          vaultEkTranscriptHash: persistedVaultEkTranscriptHash,
+          registrationTranscriptHash: persistedRegistrationTranscriptHash,
+          rosterHash: rosterHashHex,
+          selectedSlots: expectedSelectedSlots,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          aggregateCommitment: h32("1"),
+          aggregateResponse: h32("2"),
+          challenge: h32("3"),
+          perSlotContributions: [],
+          transcriptHash: h32("7"),
+          createdAtUnixMs: 1_700_000_000_000,
+        },
+        null,
+        2,
+      ),
+      { mode: 0o600 },
+    );
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path !== "/worker/v2/vault_state/observe_deposit") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
+        }
+        const playerId = expectedSelectedSlots.indexOf(slot);
+        const workerTranscriptHash = vaultStateV2ObserveWorkerTranscriptHash({
+          sessionId: (body as Record<string, unknown>).sessionId as string,
+          requestId: (body as Record<string, unknown>).requestId as string,
+          dkgEpoch,
+          sortedSelectedSlots: expectedSelectedSlots,
+          selfSlot: slot,
+          playerId,
+          vaultEkTranscriptHash: persistedVaultEkTranscriptHash,
+          registrationTranscriptHash: persistedRegistrationTranscriptHash,
+          vaultEk,
+          senderAddress,
+          assetType,
+          chainId,
+          depositCount,
+          commitment,
+          amountTag,
+          caPayloadHash,
+          depositNonce,
+          sequenceNumber,
+          txVersion,
+          eventGuid,
+          previousDepositCountObserved: 0,
+          newDepositCountObserved: depositCount,
+        });
+        return {
+          slot,
+          ok: true,
+          statusCode: 200,
+          body: {
+            slot,
+            playerId,
+            vaultStatePath: `/tmp/slot-${slot}/vault_state_v2.json`,
+            vaultStateHash: h32("a"),
+            workerTranscriptHash,
+            previousDepositCountObserved: 0,
+            depositCountObserved: depositCount,
+            vaultSequence: 0,
+            observedAtUnixMs: 1_700_000_000_000,
+            observed: true,
+          },
+        };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: {
+        requestId: "observe-with-stateroot",
+        dkgEpoch,
+        caDkgTranscriptHash: caDkgTranscriptHashHex,
+        vaultEk,
+        senderAddress,
+        assetType,
+        chainId,
+        depositCount,
+        commitment,
+        amountTag,
+        caPayloadHash,
+        depositNonce,
+        sequenceNumber,
+        txVersion,
+        eventGuid,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.vaultEkTranscriptHash).toBe(persistedVaultEkTranscriptHash);
+    expect(body.registrationTranscriptHash).toBe(persistedRegistrationTranscriptHash);
+    expect(body.selectedSlots).toEqual(expectedSelectedSlots);
+    expect(body.depositCount).toBe(depositCount);
+    expect(body.transcriptPath).toBeDefined();
+
+    // Sanity-check the persisted artifact under <stateRoot>/coordinator/vault_state_v2_observed/
+    const artifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
+    expect(artifact.scheme).toBe("vault_state_v2_observe_deposit");
+    expect(artifact.depositCount).toBe(depositCount);
+    expect(artifact.initTranscriptPath).toContain("vault_state_v2");
+  });
+
+  it("vault_state_v2 observe_deposit returns 400 vault_state_init_provenance_unknown when stateRoot present but no Milestone 2a init transcript", async () => {
+    const { mkdtemp } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-observe-no-init-"));
+    const caDkgV2Roster = dkgRoster();
+    let workerCalled = false;
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      stateRoot,
+      singleNodeForwarder: async () => {
+        workerCalled = true;
+        return { slot: 0, ok: true, statusCode: 200, body: {} };
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault_state/observe_deposit",
+      payload: {
+        dkgEpoch: "1",
+        caDkgTranscriptHash: h32("a"),
+        vaultEk: h32("d"),
+        senderAddress: h32("e"),
+        assetType: h32("f"),
+        chainId: 2,
+        depositCount: 1,
+        commitment: h32("1"),
+        amountTag: h32("2"),
+        caPayloadHash: h32("3"),
+        depositNonce: h32("4"),
+        sequenceNumber: "0",
+        txVersion: "1234567",
+        eventGuid: "0:0xfeed",
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("vault_state_init_provenance_unknown");
+    expect(workerCalled).toBe(false);
+  });
 });
