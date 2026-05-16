@@ -367,6 +367,13 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
     }
 }
 
+// Canonical observed-deposit vector used by the round1 / chained-round fixtures. Length
+// equals `deposit_count` (= 2 below) and each entry is unique — Codex M3a P2 #1 worker
+// enforcement rejects mismatched length or duplicate entries.
+fn fixture_observed_hashes() -> Vec<String> {
+    vec!["44".repeat(32), "55".repeat(32)]
+}
+
 fn build_round1_request(
     fix: &MpccaWithdrawFixture,
     self_slot: usize,
@@ -383,7 +390,7 @@ fn build_round1_request(
         // InvalidDkgState("vault_state_init_transcript_hash_mismatch") — that's the negative
         // case the dedicated test below exercises.
         vault_state_init_transcript_hash: fix.init_transcript_hashes[player_id].clone(),
-        observed_deposit_transcript_hashes: vec!["44".repeat(32), "55".repeat(32)],
+        observed_deposit_transcript_hashes: fixture_observed_hashes(),
         roster_hash: fix.roster_hash.clone(),
         selected_slots: fix.selected_slots.clone(),
         self_slot,
@@ -400,7 +407,9 @@ fn build_round1_request(
         vault_sequence: 0,
         expiry_secs: 1_700_000_000,
         request_hash: "0b".repeat(32),
-        deposit_count: 0,
+        // Codex M3a P2 #1: deposit_count MUST equal observed_deposit_transcript_hashes.len()
+        // — the worker now enforces this byte-for-byte. Two observed entries → deposit_count = 2.
+        deposit_count: 2,
     }
 }
 
@@ -418,7 +427,7 @@ fn build_chained_request(
         // Codex M3a P1: bind the SAME init_transcript_hash the worker persisted at init time
         // (same rationale as build_round1_request above).
         vault_state_init_transcript_hash: fix.init_transcript_hashes[player_id].clone(),
-        observed_deposit_transcript_hashes: vec!["44".repeat(32), "55".repeat(32)],
+        observed_deposit_transcript_hashes: fixture_observed_hashes(),
         roster_hash: fix.roster_hash.clone(),
         selected_slots: fix.selected_slots.clone(),
         self_slot,
@@ -435,7 +444,7 @@ fn build_chained_request(
         vault_sequence: 0,
         expiry_secs: 1_700_000_000,
         request_hash: "0b".repeat(32),
-        deposit_count: 0,
+        deposit_count: 2,
         previous_round_transcript_hash: "0c".repeat(32),
         previous_round_commitments: vec![
             "0d".repeat(32),
@@ -530,9 +539,17 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
         0,
         1_700_000_000,
         &"0b".repeat(32),
-        0,
+        2,
     );
     assert_eq!(loaded.worker_transcript_hash, expected_hash);
+
+    // Codex M3a P2 #1: the persisted round state carries the full ordered observe-deposit
+    // vector verbatim so milestone 4's crypto can bind the canonical ordering.
+    assert_eq!(
+        loaded.observed_deposit_transcript_hashes,
+        req.observed_deposit_transcript_hashes,
+        "round state must persist the ordered observe-deposit vector"
+    );
 
     // Tampered vault_ek → CRYPTO error (sigma rejects BEFORE NotImplemented).
     let mut tampered = req.clone();
@@ -584,6 +601,24 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("stale_vault_sequence")),
         "stale vault_sequence must surface InvalidRequest(stale_vault_sequence), got {err:?}"
+    );
+
+    // Codex M3a P2 #1: observed_deposit_transcript_hashes.len() != deposit_count → reject.
+    let mut wrong_length = req.clone();
+    wrong_length.observed_deposit_transcript_hashes = vec!["44".repeat(32)]; // 1 vs deposit_count=2
+    let err = run_round1_v2(&state_dir, &wrong_length).expect_err("length mismatch should reject");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("observed_deposit_transcript_hashes length")),
+        "length-mismatched observed vector must surface InvalidRequest, got {err:?}"
+    );
+
+    // Codex M3a P2 #1: duplicate entries in observed_deposit_transcript_hashes → reject.
+    let mut dup = req.clone();
+    dup.observed_deposit_transcript_hashes = vec!["44".repeat(32), "44".repeat(32)];
+    let err = run_round1_v2(&state_dir, &dup).expect_err("duplicate observed entries should reject");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("duplicate observed_deposit_transcript_hashes")),
+        "duplicate observed vector must surface InvalidRequest, got {err:?}"
     );
 }
 

@@ -6497,6 +6497,11 @@ pub mod mpcca_withdraw_v2 {
         pub worker_transcript_hash: String,
         pub not_implemented_phase: String,
         pub created_at_unix_ms: u128,
+        /// Codex M3a P2 #1: persist the full ordered vector of observe-deposit transcript
+        /// hashes that the request body bound (length must equal deposit_count). Milestone 4's
+        /// crypto reads this back to bind the full deposit ordering since the last withdraw.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub observed_deposit_transcript_hashes: Vec<String>,
     }
 
     /// Build the per-session directory path under the worker's state_dir. Caller-supplied
@@ -6784,6 +6789,7 @@ pub mod mpcca_withdraw_v2 {
             req.deposit_count,
             &worker_transcript_hash,
             ROUND1_NOT_IMPLEMENTED_PHASE,
+            &normalised.observed_deposit_transcript_hashes,
         )?;
         Err(WorkerError::NotImplemented(ROUND1_NOT_IMPLEMENTED_PHASE))
     }
@@ -6906,11 +6912,34 @@ pub mod mpcca_withdraw_v2 {
         let recipient_hash = normalize_hex(&req.recipient_hash, 32)?;
         let amount_tag = normalize_hex(&req.amount_tag, 32)?;
         let request_hash = normalize_hex(&req.request_hash, 32)?;
+        // Codex M3a P2 #1: observed_deposit_transcript_hashes is the ORDERED vector of every
+        // Milestone 2b observe-deposit transcript hash from cursor 1..=deposit_count. The
+        // coordinator builds this from <state_root>/coordinator/vault_state_v2_observed/ and
+        // asserts strict completeness + uniqueness BEFORE fan-out; the worker re-enforces both
+        // properties here as defense in depth. Milestone 4's crypto will bind these into the
+        // partial sigma transcript so a tampered ordering is provably distinguishable from a
+        // canonical run.
+        if req.observed_deposit_transcript_hashes.len() as u64 != req.deposit_count {
+            return Err(WorkerError::InvalidRequest(format!(
+                "observed_deposit_transcript_hashes length {} does not match deposit_count {}",
+                req.observed_deposit_transcript_hashes.len(),
+                req.deposit_count,
+            )));
+        }
         let mut observed_deposit_transcript_hashes = Vec::with_capacity(
             req.observed_deposit_transcript_hashes.len(),
         );
+        let mut seen_observed_hashes = std::collections::HashSet::with_capacity(
+            req.observed_deposit_transcript_hashes.len(),
+        );
         for h in &req.observed_deposit_transcript_hashes {
-            observed_deposit_transcript_hashes.push(normalize_hex(h, 32)?);
+            let norm = normalize_hex(h, 32)?;
+            if !seen_observed_hashes.insert(norm.clone()) {
+                return Err(WorkerError::InvalidRequest(
+                    "duplicate observed_deposit_transcript_hashes entry".to_string(),
+                ));
+            }
+            observed_deposit_transcript_hashes.push(norm);
         }
 
         // 3. Load persisted vault_state_v2.json. Missing → fail closed with a specific code.
@@ -7106,6 +7135,7 @@ pub mod mpcca_withdraw_v2 {
             req.deposit_count,
             &worker_transcript_hash,
             not_implemented_phase,
+            &normalised.observed_deposit_transcript_hashes,
         )?;
         Err(WorkerError::NotImplemented(not_implemented_phase))
     }
@@ -7128,6 +7158,7 @@ pub mod mpcca_withdraw_v2 {
         deposit_count: u64,
         worker_transcript_hash: &str,
         not_implemented_phase: &str,
+        observed_deposit_transcript_hashes: &[String],
     ) -> WorkerResult<()> {
         let file_path = session_dir.join(round_file_name(round_name));
         let created_at = std::time::SystemTime::now()
@@ -7148,6 +7179,7 @@ pub mod mpcca_withdraw_v2 {
             worker_transcript_hash: worker_transcript_hash.to_string(),
             not_implemented_phase: not_implemented_phase.to_string(),
             created_at_unix_ms: created_at,
+            observed_deposit_transcript_hashes: observed_deposit_transcript_hashes.to_vec(),
         };
         let bytes = serde_json::to_vec_pretty(&layout).map_err(|err| {
             WorkerError::Crypto(format!("encode mpcca_withdraw_v2 round state: {err}"))
