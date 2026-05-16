@@ -367,6 +367,7 @@ dependencies = [
  "merlin",
  "rand",
  "rand_chacha",
+ "rand_core 0.6.4",
  "rand_core 0.9.5",
  "serde",
  "serde_json",

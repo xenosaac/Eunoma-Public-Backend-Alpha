@@ -3107,6 +3107,8 @@ pub mod mpc_spdz_adapter;
 
 pub mod transfer_sigma_reference;
 
+pub mod bulletproof_reference;
+
 // =================================================================================================
 // Codex M3a P2 #2: atomic write helper applied uniformly across V2 production sites.
 //
