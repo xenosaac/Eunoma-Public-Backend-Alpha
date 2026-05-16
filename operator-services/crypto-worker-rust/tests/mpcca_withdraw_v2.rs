@@ -25,14 +25,16 @@ use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
 };
 use eunoma_crypto_worker::{
+    ca_dkg_v2::init_hpke_local,
     ca_registration_v2::{
         create_registration_nonce_commitment_v2, create_registration_partial_response_v2,
         run_aggregate_v2, AggregateRequest, Round1Request as CaRound1Request,
         Round2Request as CaRound2Request,
     },
     mpcca_withdraw_v2::{
-        load_round_state_file, mpcca_withdraw_session_dir, round1_worker_transcript_hash,
-        run_finalize_v2, run_prove_v2, run_round1_v2, run_round2_v2,
+        load_ingress_state_file, load_round_state_file, m1_ingress_aad_for_test,
+        mpcca_withdraw_session_dir, round1_worker_transcript_hash, run_finalize_v2,
+        run_prove_v2, run_round1_v2, run_round2_v2, seal_ingress_envelope_for_test,
         ChainedRoundRequest as MpccaChainedRoundRequest, Round1Request as MpccaRound1Request,
     },
     registration_verifier::{
@@ -210,6 +212,12 @@ struct MpccaWithdrawFixture {
     /// worker, and what MPCCA withdraw round1/2/prove/finalize binds against. Distinct from
     /// (and necessarily different from) any per-slot worker_transcript_hash.
     canonical_final_hash: String,
+    /// M1: per-slot HPKE public keys (length 7, one per slot). Required for sealing real
+    /// ingress envelopes that the worker can decrypt with its own private key.
+    hpke_public_keys: Vec<String>,
+    /// M1 test seed derived from the fixture label. Used to produce deterministic `(a_j, b_j)`
+    /// shares so byte-parity probes stay stable across test runs.
+    test_seed: [u8; 32],
 }
 
 fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
@@ -410,6 +418,24 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
         finalize_vault_state_v2(&slot_dirs[slot], &req).expect("finalize vault_state_v2");
     }
 
+    // M1: init HPKE keypairs for all 7 slots so run_round1_v2 can load self_slot's keypair
+    // for ingress decryption.
+    let hpke_summary = init_hpke_local(&root, false).expect("init HPKE local");
+    let hpke_public_keys: Vec<String> = hpke_summary
+        .slots
+        .iter()
+        .map(|s| s.hpke_public_key.clone())
+        .collect();
+    assert_eq!(hpke_public_keys.len(), 7);
+
+    // Deterministic seed from the label so tests are reproducible.
+    let mut test_seed = [0_u8; 32];
+    let label_bytes = label.as_bytes();
+    for (i, b) in label_bytes.iter().enumerate().take(32) {
+        test_seed[i] = *b;
+    }
+    test_seed[31] = label_bytes.len() as u8;
+
     MpccaWithdrawFixture {
         vault_ek_hex,
         aggregate_commitment: aggregate.aggregate_commitment,
@@ -425,6 +451,8 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
         vault_ek_transcript_hash,
         registration_transcript_hash,
         canonical_final_hash,
+        hpke_public_keys,
+        test_seed,
     }
 }
 
@@ -441,10 +469,109 @@ fn fixture_observed_cursors() -> Vec<u64> {
     vec![1, 2]
 }
 
-// Stub HPKE envelope for round1 ingress shape validation. The ingress crypto (decrypt +
-// per-share Pedersen verify) is gated for Commit 3; this commit only validates wire shape
-// + folds the ingress fields into the V2 transcript hash. So the envelope's `ciphertext`
-// just needs the 80-byte length (64-byte plaintext + 16-byte GCM tag) the validator expects.
+// =============================================================================================
+// M1 ingress real-payload builder. Generates deterministic `(a_j, b_j)` shares from the
+// fixture's seed + slot ordinal, computes per-share Pedersen commitments, builds AAD bytes
+// matching the request, and HPKE-seals each share under the corresponding worker's pubkey.
+// The returned payload is byte-equivalent across all 5 worker requests (only the AAD per
+// slot differs).
+// =============================================================================================
+struct IngressTestPayload {
+    amount_commitment: String,
+    per_share_commitments: Vec<String>,
+    ingress_envelopes: Vec<eunoma_crypto_worker::mpcca_withdraw_v2::HpkeEnvelope>,
+}
+
+fn deterministic_share_scalar(seed: &[u8; 32], slot_ordinal: usize, leg: u8) -> Scalar {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"EUNOMA_M1_INGRESS_TEST_SHARE_V1");
+    hasher.update(seed);
+    hasher.update(&slot_ordinal.to_le_bytes());
+    hasher.update(&[leg]);
+    let digest = hasher.finalize();
+    let mut wide = [0_u8; 64];
+    wide[..32].copy_from_slice(&digest);
+    // Second half: re-hash to get extra entropy and ensure result != 0 in practice.
+    let mut hasher2 = sha2::Sha256::new();
+    hasher2.update(&digest);
+    hasher2.update(b"v2");
+    wide[32..].copy_from_slice(&hasher2.finalize());
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+fn build_real_ingress_payload(
+    fix: &MpccaWithdrawFixture,
+    request_id: &str,
+    session_id: &str,
+    dkg_epoch: &str,
+    roster_hash_hex: &str,
+    vault_ek_hex: &str,
+    root_hex: &str,
+    nullifier_hash_hex: &str,
+    recipient_hash_hex: &str,
+    amount_tag_hex: &str,
+    vault_sequence: u64,
+    deposit_count: u64,
+) -> IngressTestPayload {
+    let h = h_point();
+    // 1. Generate (a_j, b_j) for each of the 5 selected slots.
+    let mut shares: Vec<(Scalar, Scalar)> = Vec::with_capacity(5);
+    let mut per_share_commitments: Vec<String> = Vec::with_capacity(5);
+    let mut aggregate_a = Scalar::ZERO;
+    let mut aggregate_b = Scalar::ZERO;
+    for ordinal in 0..5 {
+        let a = deterministic_share_scalar(&fix.test_seed, ordinal, 0);
+        let b = deterministic_share_scalar(&fix.test_seed, ordinal, 1);
+        let commitment = RISTRETTO_BASEPOINT_POINT * a + h * b;
+        per_share_commitments.push(compressed_hex(&commitment));
+        aggregate_a += a;
+        aggregate_b += b;
+        shares.push((a, b));
+    }
+    // 2. Compute aggregate amount_commitment = G·Σa_j + H·Σb_j.
+    let amount_commitment = compressed_hex(&(RISTRETTO_BASEPOINT_POINT * aggregate_a + h * aggregate_b));
+
+    // 3. Seal each (a_j, b_j) under selected_slots[j]'s HPKE pubkey with slot-j-specific AAD.
+    let mut envelopes: Vec<eunoma_crypto_worker::mpcca_withdraw_v2::HpkeEnvelope> =
+        Vec::with_capacity(5);
+    for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
+        let aad = m1_ingress_aad_for_test(
+            request_id,
+            session_id,
+            dkg_epoch,
+            slot,
+            ordinal,
+            roster_hash_hex,
+            vault_ek_hex,
+            root_hex,
+            nullifier_hash_hex,
+            recipient_hash_hex,
+            amount_tag_hex,
+            vault_sequence,
+            deposit_count,
+            &amount_commitment,
+            &per_share_commitments,
+        );
+        let mut plaintext = Vec::with_capacity(64);
+        plaintext.extend_from_slice(&shares[ordinal].0.to_bytes());
+        plaintext.extend_from_slice(&shares[ordinal].1.to_bytes());
+        let env =
+            seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext)
+                .expect("seal ingress envelope");
+        envelopes.push(env);
+    }
+    IngressTestPayload {
+        amount_commitment,
+        per_share_commitments,
+        ingress_envelopes: envelopes,
+    }
+}
+
+/// Sentinel fixture envelope that is wire-shape-valid (matching ciphersuite + 80-byte ciphertext)
+/// but NOT a real HPKE encryption under any keypair. Used by the negative-path tests that
+/// flip a field on a baseline ingress payload — those tests never reach HPKE decrypt, so the
+/// envelope only needs to pass the wire-shape gate.
 fn fixture_ingress_envelope(seed: u8) -> eunoma_crypto_worker::mpcca_withdraw_v2::HpkeEnvelope {
     let seedhex = format!("{seed:02x}");
     eunoma_crypto_worker::mpcca_withdraw_v2::HpkeEnvelope {
@@ -477,8 +604,27 @@ fn fixture_per_share_commitments() -> Vec<String> {
     ]
 }
 
-fn fixture_amount_commitment() -> String {
-    "ac".repeat(32)
+// Constants used across all round1 fixtures so AAD remains stable per (fix.label, request).
+const FIX_REQUEST_ID: &str = "mpcca-withdraw-req";
+const FIX_SESSION_ID: &str = "mpcca-withdraw-sess";
+
+fn fixture_request_root_hex() -> String {
+    "66".repeat(32)
+}
+fn fixture_request_nullifier_hex() -> String {
+    "77".repeat(32)
+}
+fn fixture_request_recipient_hex() -> String {
+    "88".repeat(32)
+}
+fn fixture_request_recipient_hash_hex() -> String {
+    "99".repeat(32)
+}
+fn fixture_request_amount_tag_hex() -> String {
+    "0a".repeat(32)
+}
+fn fixture_request_hash_hex() -> String {
+    "0b".repeat(32)
 }
 
 fn build_round1_request(
@@ -486,10 +632,30 @@ fn build_round1_request(
     self_slot: usize,
     player_id: usize,
 ) -> MpccaRound1Request {
+    let root_hex = fixture_request_root_hex();
+    let nullifier_hex = fixture_request_nullifier_hex();
+    let recipient_hex = fixture_request_recipient_hex();
+    let recipient_hash_hex = fixture_request_recipient_hash_hex();
+    let amount_tag_hex = fixture_request_amount_tag_hex();
+    let request_hash_hex = fixture_request_hash_hex();
+    let payload = build_real_ingress_payload(
+        fix,
+        FIX_REQUEST_ID,
+        FIX_SESSION_ID,
+        DKG_EPOCH,
+        &fix.roster_hash,
+        &fix.vault_ek_hex,
+        &root_hex,
+        &nullifier_hex,
+        &recipient_hash_hex,
+        &amount_tag_hex,
+        0,
+        2,
+    );
     MpccaRound1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
-        request_id: "mpcca-withdraw-req".to_string(),
-        session_id: "mpcca-withdraw-sess".to_string(),
+        request_id: FIX_REQUEST_ID.to_string(),
+        session_id: FIX_SESSION_ID.to_string(),
         vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
         registration_transcript_hash: fix.registration_transcript_hash.clone(),
         // Codex M3a P1 v3: bind the CANONICAL FINAL_V1 transcript hash the worker pinned at
@@ -506,22 +672,21 @@ fn build_round1_request(
         sender_address: fix.sender.clone(),
         asset_type: fix.asset.clone(),
         chain_id: fix.chain_id,
-        root: "66".repeat(32),
-        nullifier_hash: "77".repeat(32),
-        recipient: "88".repeat(32),
-        recipient_hash: "99".repeat(32),
-        amount_tag: "0a".repeat(32),
+        root: root_hex,
+        nullifier_hash: nullifier_hex,
+        recipient: recipient_hex,
+        recipient_hash: recipient_hash_hex,
+        amount_tag: amount_tag_hex,
         vault_sequence: 0,
         expiry_secs: 1_700_000_000,
-        request_hash: "0b".repeat(32),
+        request_hash: request_hash_hex,
         // Codex M3a P2 #1: deposit_count MUST equal observed_deposit_transcript_hashes.len()
         // — the worker now enforces this byte-for-byte. Two observed entries → deposit_count = 2.
         deposit_count: 2,
-        // M1: amount ingress fields. Commit 2 only validates wire shape + folds into
-        // transcript hash; Commit 3 will fully decrypt + verify per-share commitments.
-        amount_commitment: fixture_amount_commitment(),
-        per_share_commitments: fixture_per_share_commitments(),
-        ingress_envelopes: fixture_ingress_envelopes(),
+        // M1 real ingress payload — sealed under the 5 worker HPKE pubkeys.
+        amount_commitment: payload.amount_commitment,
+        per_share_commitments: payload.per_share_commitments,
+        ingress_envelopes: payload.ingress_envelopes,
     }
 }
 
@@ -570,27 +735,31 @@ fn build_chained_request(
 }
 
 // =============================================================================================
-// KILLER test — milestone 3a's load-bearing assertion. The handler does FULL public binding
-// before returning NotImplemented; a tampered request fails closed with a SPECIFIC validation
-// error long before the NotImplemented surface.
+// M1 KILLER test — round1 happy path completes ingress (HPKE decrypt + Pedersen verify +
+// HPKE-encrypted-at-rest persist) and returns Round1IngressResult { completed: true }. The
+// public binding gates run BEFORE the ingress crypto; a tampered request fails closed with a
+// SPECIFIC validation error long before the M1 ingress surface.
 // =============================================================================================
 #[test]
-fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies() {
-    let fix = build_milestone1_fixture("killer-r1-not-impl");
+fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
+    let fix = build_milestone1_fixture("m1-r1-happy");
     let slot = 0_usize;
     let player_id = 0_usize;
     let state_dir = fix.slot_dirs[slot].clone();
     let req = build_round1_request(&fix, slot, player_id);
 
-    // Happy path: NotImplemented surfaced AFTER all public binding succeeds.
-    let err = run_round1_v2(&state_dir, &req).expect_err("happy-path stub");
-    let phase = match err {
-        WorkerError::NotImplemented(p) => p,
-        other => panic!("expected NotImplemented, got {other:?}"),
-    };
+    // Happy path: ingress crypto succeeds, round1 returns completed:true.
+    let result = run_round1_v2(&state_dir, &req).expect("M1 ingress happy path");
+    assert!(result.completed, "M1 round1 result.completed must be true");
+    assert_eq!(result.slot, slot);
+    assert_eq!(result.player_id, player_id);
     assert_eq!(
-        phase, "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
-        "round1 phase string must be byte-stable across the codebase"
+        result.ingress_transcript_hash, result.worker_transcript_hash,
+        "ingressTranscriptHash MUST equal workerTranscriptHash"
+    );
+    assert!(
+        result.worker_transcript_hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "worker_transcript_hash must be hex"
     );
 
     // Session state file exists, mode 0o600.
@@ -599,7 +768,7 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
     let session_state_path = session_dir.join("mpcca_withdraw_v2_round1.json");
     assert!(
         session_state_path.exists(),
-        "round1 must persist its session-state file before returning NotImplemented"
+        "round1 must persist its session-state file after M1 ingress completes"
     );
     #[cfg(unix)]
     {
@@ -616,6 +785,39 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
         );
     }
 
+    // M1: ingress state file MUST exist + mode 0o600 + NOT contain plaintext share bytes.
+    let ingress_path = session_dir.join("mpcca_withdraw_v2_ingress.json");
+    assert!(
+        ingress_path.exists(),
+        "M1 ingress state file must be persisted after successful round1"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(&ingress_path)
+            .expect("stat file")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "ingress state file mode != 0o600 (got {:o})",
+            mode & 0o777
+        );
+    }
+    let ingress_file_loaded =
+        load_ingress_state_file(&session_dir).expect("load ingress state").expect("present");
+    assert_eq!(ingress_file_loaded.scheme, "mpcca_withdraw_v2_ingress");
+    assert_eq!(ingress_file_loaded.slot, slot);
+    assert_eq!(ingress_file_loaded.player_id, player_id);
+    assert_eq!(ingress_file_loaded.amount_commitment, req.amount_commitment);
+    assert_eq!(
+        ingress_file_loaded.per_share_commitments,
+        req.per_share_commitments
+    );
+    // The encrypted_share_envelope MUST be a valid HpkeEnvelope (X25519/HKDF/AES-256-GCM).
+    assert_eq!(ingress_file_loaded.encrypted_share_envelope.kem, "DHKEM_X25519_HKDF_SHA256");
+
     // Persisted file parses cleanly and the worker_transcript_hash matches the reconstructor.
     let loaded = load_round_state_file(&session_dir, "round1")
         .expect("load round state")
@@ -624,7 +826,11 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
     assert_eq!(loaded.slot, slot);
     assert_eq!(loaded.player_id, player_id);
     assert_eq!(loaded.dkg_epoch, DKG_EPOCH);
-    assert_eq!(loaded.not_implemented_phase, phase);
+    // M1 round1 completes — not_implemented_phase is empty (sentinel for "completed").
+    assert!(
+        loaded.not_implemented_phase.is_empty(),
+        "M1 round1 must persist not_implemented_phase=\"\" (sentinel for completed)"
+    );
 
     let mut sorted = fix.selected_slots.clone();
     sorted.sort_unstable();
@@ -649,14 +855,14 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
         &fix.sender,
         &fix.asset,
         fix.chain_id,
-        &"66".repeat(32),
-        &"77".repeat(32),
-        &"88".repeat(32),
-        &"99".repeat(32),
-        &"0a".repeat(32),
+        &fixture_request_root_hex(),
+        &fixture_request_nullifier_hex(),
+        &fixture_request_recipient_hex(),
+        &fixture_request_recipient_hash_hex(),
+        &fixture_request_amount_tag_hex(),
         0,
         1_700_000_000,
-        &"0b".repeat(32),
+        &fixture_request_hash_hex(),
         2,
         &amount_commitment,
         &per_share_commitments,
@@ -672,24 +878,19 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
         "round state must persist the ordered observe-deposit vector"
     );
 
-    // Tampered vault_ek → CRYPTO error (sigma rejects BEFORE NotImplemented).
+    // Tampered vault_ek → CRYPTO error (sigma rejects BEFORE M1 ingress crypto).
     let mut tampered = req.clone();
     tampered.vault_ek = "07".repeat(32);
     let err = run_round1_v2(&state_dir, &tampered).expect_err("tampered vault_ek should reject");
     // Provenance gate runs BEFORE sigma re-verify, so a tampered vault_ek hits the provenance
     // mismatch path first. Either failure mode is acceptable: both are SPECIFIC validation
-    // errors, NOT NotImplemented.
+    // errors, NOT a successful Ok.
     assert!(
         matches!(
             err,
             WorkerError::InvalidDkgState(ref s) if s == "mpcca_withdraw_v2_provenance_mismatch"
         ) || matches!(err, WorkerError::Crypto(_)),
-        "tampered vault_ek must surface a specific error (not NotImplemented), got {err:?}"
-    );
-    // Confirm it's NOT NotImplemented — the negative-control proves the public binding ran.
-    assert!(
-        !matches!(err, WorkerError::NotImplemented(_)),
-        "tampered vault_ek MUST fail BEFORE NotImplemented, got NotImplemented"
+        "tampered vault_ek must surface a specific error, got {err:?}"
     );
 
     // Tampered dkg_epoch → InvalidDkgState (provenance mismatch).
@@ -799,18 +1000,15 @@ fn mpcca_withdraw_v2_round1_rejects_forged_init_transcript_hash() {
     let player_id = 0_usize;
     let state_dir = fix.slot_dirs[slot].clone();
 
-    // Sanity baseline: with the genuine init_transcript_hash the request reaches the
-    // NotImplemented stub (public binding succeeds).
+    // Sanity baseline: with the genuine init_transcript_hash the request completes M1
+    // ingress successfully (public binding succeeds + ingress crypto succeeds).
     let baseline = build_round1_request(&fix, slot, player_id);
-    let baseline_err =
-        run_round1_v2(&state_dir, &baseline).expect_err("baseline reaches NotImplemented");
-    assert!(
-        matches!(baseline_err, WorkerError::NotImplemented(_)),
-        "baseline must reach NotImplemented, got {baseline_err:?}"
-    );
+    let baseline_ok =
+        run_round1_v2(&state_dir, &baseline).expect("baseline must complete M1 ingress");
+    assert!(baseline_ok.completed, "baseline must complete: {baseline_ok:?}");
 
     // KILLER: tamper the init_transcript_hash with a random 32-byte hex. Expectation:
-    // InvalidDkgState("vault_state_init_transcript_hash_mismatch"), NOT NotImplemented.
+    // InvalidDkgState("vault_state_init_transcript_hash_mismatch"), NOT a successful Ok.
     let mut tampered = build_round1_request(&fix, slot, player_id);
     tampered.vault_state_init_transcript_hash = "ab".repeat(32);
     let err = run_round1_v2(&state_dir, &tampered)
@@ -821,11 +1019,6 @@ fn mpcca_withdraw_v2_round1_rejects_forged_init_transcript_hash() {
             WorkerError::InvalidDkgState(ref s) if s == "vault_state_init_transcript_hash_mismatch"
         ),
         "forged init_transcript_hash must surface InvalidDkgState(vault_state_init_transcript_hash_mismatch), got {err:?}"
-    );
-    // Negative control: confirm it's NOT NotImplemented.
-    assert!(
-        !matches!(err, WorkerError::NotImplemented(_)),
-        "tampered init_transcript_hash MUST fail BEFORE NotImplemented"
     );
 
     // Same check for the chained round handlers — defense-in-depth: every round verifies
@@ -876,8 +1069,7 @@ fn mpcca_withdraw_v2_session_state_hash_idempotent() {
     let req = build_round1_request(&fix, slot, player_id);
 
     // First call.
-    let _ = run_round1_v2(&state_dir, &req)
-        .expect_err("expected NotImplemented");
+    let first_result = run_round1_v2(&state_dir, &req).expect("M1 ingress");
     let session_dir = mpcca_withdraw_session_dir(&state_dir, &req.request_id, &req.session_id)
         .expect("dir");
     let first = load_round_state_file(&session_dir, "round1")
@@ -885,17 +1077,19 @@ fn mpcca_withdraw_v2_session_state_hash_idempotent() {
         .expect("file 1");
 
     // Second call with same inputs.
-    let _ = run_round1_v2(&state_dir, &req)
-        .expect_err("expected NotImplemented");
+    let second_result = run_round1_v2(&state_dir, &req).expect("M1 ingress replay");
     let second = load_round_state_file(&session_dir, "round1")
         .expect("load 2")
         .expect("file 2");
 
-    // Worker transcript hash is byte-stable across replays.
+    // Worker transcript hash is byte-stable across replays (idempotent under M1).
     assert_eq!(first.worker_transcript_hash, second.worker_transcript_hash);
     assert_eq!(first.dkg_epoch, second.dkg_epoch);
     assert_eq!(first.slot, second.slot);
     assert_eq!(first.not_implemented_phase, second.not_implemented_phase);
+    assert_eq!(
+        first_result.ingress_transcript_hash, second_result.ingress_transcript_hash
+    );
 }
 
 #[test]
@@ -1121,103 +1315,152 @@ fn m1_round1_rejects_non_32_byte_amount_commitment() {
     );
 }
 
+/// Pure-function binding test: prove that `round1_worker_transcript_hash` folds the M1
+/// ingress fields (amount_commitment, per_share_commitments, ingress_envelopes_hash) into
+/// its output. Using the function directly avoids the AAD-mismatch issue that arises if you
+/// try to mutate a sealed envelope after the fact — we just call the hash with two different
+/// inputs and observe the digest changes.
+fn baseline_hash_args() -> (Vec<String>, [&'static str; 16]) {
+    let observed = vec!["44".repeat(32), "55".repeat(32)];
+    let raw_strs: [&'static str; 16] = [
+        "sess-x", "req-x", "1", // session/request/dkg
+        // intentionally placeholder; we'll override in calls below
+        "44", "55", "66", "77", "88", "99", "0a", "0b", "0c", "0d", "0e", "0f", "10",
+    ];
+    (observed, raw_strs)
+}
+
 #[test]
 fn m1_round1_transcript_hash_binds_amount_commitment() {
-    // Flipping amount_commitment changes the persisted worker_transcript_hash. Proves the V2
-    // domain folds the ingress fields into the hash, so a tampered amountCommitment can't slip
-    // past the coordinator's defense-in-depth re-derivation.
-    let fix = build_milestone1_fixture("m1-amount-binding");
-    let slot = 0_usize;
-    let state_dir_a = fix.slot_dirs[slot].clone();
-    let req_a = build_round1_request(&fix, slot, 0);
-    let _ = run_round1_v2(&state_dir_a, &req_a).expect_err("stub");
-    let session_dir_a =
-        mpcca_withdraw_session_dir(&state_dir_a, &req_a.request_id, &req_a.session_id)
-            .expect("dir");
-    let loaded_a = load_round_state_file(&session_dir_a, "round1")
-        .expect("ok")
-        .expect("present");
-
-    let fix_b = build_milestone1_fixture("m1-amount-binding-b");
-    let state_dir_b = fix_b.slot_dirs[slot].clone();
-    let mut req_b = build_round1_request(&fix_b, slot, 0);
-    req_b.amount_commitment = "ff".repeat(32); // flip amount commitment
-    let _ = run_round1_v2(&state_dir_b, &req_b).expect_err("stub");
-    let session_dir_b =
-        mpcca_withdraw_session_dir(&state_dir_b, &req_b.request_id, &req_b.session_id)
-            .expect("dir");
-    let loaded_b = load_round_state_file(&session_dir_b, "round1")
-        .expect("ok")
-        .expect("present");
-
+    // Hash with amount_commitment = "aa".repeat(32) vs "bb".repeat(32). Everything else identical.
+    let (observed, _) = baseline_hash_args();
+    let sorted = vec![0_usize, 1, 2, 3, 4];
+    let per_share = vec![
+        "11".repeat(32),
+        "22".repeat(32),
+        "33".repeat(32),
+        "44".repeat(32),
+        "55".repeat(32),
+    ];
+    let envs_hash = "ff".repeat(32);
+    let hash_a = round1_worker_transcript_hash(
+        "sess-x", "req-x", "1",
+        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
+        &observed,
+        &"dd".repeat(32),
+        &sorted,
+        0, 0,
+        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
+        2,
+        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
+        &"07".repeat(32), 4, 1_700_000_000,
+        &"08".repeat(32), 7,
+        &"aa".repeat(32), // amount_commitment v1
+        &per_share, &envs_hash,
+    );
+    let hash_b = round1_worker_transcript_hash(
+        "sess-x", "req-x", "1",
+        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
+        &observed,
+        &"dd".repeat(32),
+        &sorted,
+        0, 0,
+        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
+        2,
+        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
+        &"07".repeat(32), 4, 1_700_000_000,
+        &"08".repeat(32), 7,
+        &"bb".repeat(32), // amount_commitment v2 — only change
+        &per_share, &envs_hash,
+    );
     assert_ne!(
-        loaded_a.worker_transcript_hash, loaded_b.worker_transcript_hash,
+        hash_a, hash_b,
         "M1 V2 round1 hash must change when amount_commitment flips"
     );
 }
 
 #[test]
 fn m1_round1_transcript_hash_binds_per_share_commitments() {
-    let fix = build_milestone1_fixture("m1-per-share-binding");
-    let slot = 0_usize;
-    let state_dir_a = fix.slot_dirs[slot].clone();
-    let req_a = build_round1_request(&fix, slot, 0);
-    let _ = run_round1_v2(&state_dir_a, &req_a).expect_err("stub");
-    let session_dir_a =
-        mpcca_withdraw_session_dir(&state_dir_a, &req_a.request_id, &req_a.session_id)
-            .expect("dir");
-    let loaded_a = load_round_state_file(&session_dir_a, "round1")
-        .expect("ok")
-        .expect("present");
-
-    let fix_b = build_milestone1_fixture("m1-per-share-binding-b");
-    let state_dir_b = fix_b.slot_dirs[slot].clone();
-    let mut req_b = build_round1_request(&fix_b, slot, 0);
-    req_b.per_share_commitments[2] = "ff".repeat(32); // flip one per-share commitment
-    let _ = run_round1_v2(&state_dir_b, &req_b).expect_err("stub");
-    let session_dir_b =
-        mpcca_withdraw_session_dir(&state_dir_b, &req_b.request_id, &req_b.session_id)
-            .expect("dir");
-    let loaded_b = load_round_state_file(&session_dir_b, "round1")
-        .expect("ok")
-        .expect("present");
-
+    let (observed, _) = baseline_hash_args();
+    let sorted = vec![0_usize, 1, 2, 3, 4];
+    let per_share_a = vec![
+        "11".repeat(32),
+        "22".repeat(32),
+        "33".repeat(32),
+        "44".repeat(32),
+        "55".repeat(32),
+    ];
+    let mut per_share_b = per_share_a.clone();
+    per_share_b[2] = "ff".repeat(32); // flip [2]
+    let envs_hash = "ee".repeat(32);
+    let hash_a = round1_worker_transcript_hash(
+        "sess-x", "req-x", "1",
+        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
+        &observed, &"dd".repeat(32), &sorted, 0, 0,
+        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
+        2,
+        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
+        &"07".repeat(32), 4, 1_700_000_000,
+        &"08".repeat(32), 7,
+        &"aa".repeat(32),
+        &per_share_a, &envs_hash,
+    );
+    let hash_b = round1_worker_transcript_hash(
+        "sess-x", "req-x", "1",
+        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
+        &observed, &"dd".repeat(32), &sorted, 0, 0,
+        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
+        2,
+        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
+        &"07".repeat(32), 4, 1_700_000_000,
+        &"08".repeat(32), 7,
+        &"aa".repeat(32),
+        &per_share_b, &envs_hash,
+    );
     assert_ne!(
-        loaded_a.worker_transcript_hash, loaded_b.worker_transcript_hash,
+        hash_a, hash_b,
         "M1 V2 round1 hash must change when any per_share_commitments[i] flips"
     );
 }
 
 #[test]
-fn m1_round1_transcript_hash_binds_ingress_envelopes() {
-    let fix = build_milestone1_fixture("m1-envelope-binding");
-    let slot = 0_usize;
-    let state_dir_a = fix.slot_dirs[slot].clone();
-    let req_a = build_round1_request(&fix, slot, 0);
-    let _ = run_round1_v2(&state_dir_a, &req_a).expect_err("stub");
-    let session_dir_a =
-        mpcca_withdraw_session_dir(&state_dir_a, &req_a.request_id, &req_a.session_id)
-            .expect("dir");
-    let loaded_a = load_round_state_file(&session_dir_a, "round1")
-        .expect("ok")
-        .expect("present");
-
-    let fix_b = build_milestone1_fixture("m1-envelope-binding-b");
-    let state_dir_b = fix_b.slot_dirs[slot].clone();
-    let mut req_b = build_round1_request(&fix_b, slot, 0);
-    // Flip envelope[3].ciphertext.
-    req_b.ingress_envelopes[3].ciphertext = "ff".repeat(80);
-    let _ = run_round1_v2(&state_dir_b, &req_b).expect_err("stub");
-    let session_dir_b =
-        mpcca_withdraw_session_dir(&state_dir_b, &req_b.request_id, &req_b.session_id)
-            .expect("dir");
-    let loaded_b = load_round_state_file(&session_dir_b, "round1")
-        .expect("ok")
-        .expect("present");
-
+fn m1_round1_transcript_hash_binds_ingress_envelopes_hash() {
+    let (observed, _) = baseline_hash_args();
+    let sorted = vec![0_usize, 1, 2, 3, 4];
+    let per_share = vec![
+        "11".repeat(32),
+        "22".repeat(32),
+        "33".repeat(32),
+        "44".repeat(32),
+        "55".repeat(32),
+    ];
+    let hash_a = round1_worker_transcript_hash(
+        "sess-x", "req-x", "1",
+        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
+        &observed, &"dd".repeat(32), &sorted, 0, 0,
+        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
+        2,
+        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
+        &"07".repeat(32), 4, 1_700_000_000,
+        &"08".repeat(32), 7,
+        &"aa".repeat(32),
+        &per_share, &"aa".repeat(32),
+    );
+    let hash_b = round1_worker_transcript_hash(
+        "sess-x", "req-x", "1",
+        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
+        &observed, &"dd".repeat(32), &sorted, 0, 0,
+        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
+        2,
+        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
+        &"07".repeat(32), 4, 1_700_000_000,
+        &"08".repeat(32), 7,
+        &"aa".repeat(32),
+        &per_share, &"bb".repeat(32), // flip ingress_envelopes_hash
+    );
     assert_ne!(
-        loaded_a.worker_transcript_hash, loaded_b.worker_transcript_hash,
-        "M1 V2 round1 hash must change when any ingress envelope flips"
+        hash_a, hash_b,
+        "M1 V2 round1 hash must change when ingress_envelopes_hash flips"
     );
 }
 
@@ -1251,4 +1494,220 @@ fn m1_ingress_envelopes_hash_ts_rust_parity() {
     let h_d =
         eunoma_crypto_worker::mpcca_withdraw_v2::ingress_envelopes_hash(&reordered).expect("hash");
     assert_ne!(h_a, h_d, "ingress_envelopes_hash must change on order flip");
+}
+
+// =============================================================================================
+// M1 ingress crypto killer tests — exercise the decrypt + verify path. These complement the
+// wire-shape rejection tests above by proving the crypto layer fails closed on tampered
+// envelopes, zero shares, and per-share-commitment mismatch.
+// =============================================================================================
+
+#[test]
+fn m1_ingress_zero_share_rejected() {
+    // Construct a real ingress payload with valid commitments + sealing, then SWAP one
+    // envelope's plaintext for an a_j = 0 payload. The worker must reject with
+    // ingress_zero_share_rejected.
+    use eunoma_crypto_worker::mpcca_withdraw_v2::seal_ingress_envelope_for_test;
+    let fix = build_milestone1_fixture("m1-zero-share");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let mut req = build_round1_request(&fix, slot, player_id);
+
+    // Re-seal slot-0's envelope with a_0 = 0 (b_0 random). The AAD must match the original
+    // envelopes' AAD bytes; otherwise we'd hit HPKE decrypt failure first.
+    let zero_a = Scalar::ZERO;
+    let real_b = deterministic_share_scalar(&fix.test_seed, 0, 1);
+    let mut plaintext = Vec::with_capacity(64);
+    plaintext.extend_from_slice(&zero_a.to_bytes());
+    plaintext.extend_from_slice(&real_b.to_bytes());
+    // Compute the per-share commitment for (0, b_0) so the worker passes the commitment
+    // check first; the zero-share gate runs BEFORE the commitment check.
+    let h = h_point();
+    let new_commit_0 =
+        compressed_hex(&(RISTRETTO_BASEPOINT_POINT * zero_a + h * real_b));
+    req.per_share_commitments[0] = new_commit_0.clone();
+    // Also rebuild aggregate amount_commitment so the wire stays internally consistent.
+    // Note: we don't bother recomputing — the AAD only binds the per_share_commitments_hash,
+    // and we updated per_share_commitments[0]. We need to re-seal slot 0 envelope with the
+    // NEW AAD that reflects the new per_share_commitments[0]. Actually simplest: rebuild
+    // the whole payload with the new commitments, but we'd lose the (0, b) plaintext.
+    //
+    // Quick path: re-seal slot-0 envelope with AAD built from req.per_share_commitments.
+    let aad = m1_ingress_aad_for_test(
+        &req.request_id,
+        &req.session_id,
+        &req.dkg_epoch,
+        slot,
+        player_id,
+        &req.roster_hash,
+        &req.vault_ek,
+        &req.root,
+        &req.nullifier_hash,
+        &req.recipient_hash,
+        &req.amount_tag,
+        req.vault_sequence,
+        req.deposit_count,
+        &req.amount_commitment,
+        &req.per_share_commitments,
+    );
+    req.ingress_envelopes[0] =
+        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext).expect("seal");
+    // Re-seal envelope 1..5 with AAD that reflects the updated commitments. Since the
+    // commitments hash is bound in AAD, every slot's envelope AAD changed → re-seal all.
+    for (ordinal, &s) in fix.selected_slots.iter().enumerate().skip(1) {
+        let a_s = deterministic_share_scalar(&fix.test_seed, ordinal, 0);
+        let b_s = deterministic_share_scalar(&fix.test_seed, ordinal, 1);
+        let mut pt = Vec::with_capacity(64);
+        pt.extend_from_slice(&a_s.to_bytes());
+        pt.extend_from_slice(&b_s.to_bytes());
+        let aad_s = m1_ingress_aad_for_test(
+            &req.request_id,
+            &req.session_id,
+            &req.dkg_epoch,
+            s,
+            ordinal,
+            &req.roster_hash,
+            &req.vault_ek,
+            &req.root,
+            &req.nullifier_hash,
+            &req.recipient_hash,
+            &req.amount_tag,
+            req.vault_sequence,
+            req.deposit_count,
+            &req.amount_commitment,
+            &req.per_share_commitments,
+        );
+        req.ingress_envelopes[ordinal] =
+            seal_ingress_envelope_for_test(&fix.hpke_public_keys[s], &aad_s, &pt).expect("seal");
+    }
+
+    let err = run_round1_v2(&state_dir, &req).expect_err("zero a_j must reject");
+    assert!(
+        matches!(err, WorkerError::Crypto(ref s) if s == "ingress_zero_share_rejected"),
+        "expected Crypto(ingress_zero_share_rejected), got {err:?}"
+    );
+}
+
+#[test]
+fn m1_ingress_share_commitment_mismatch_rejected() {
+    // Seal the slot-0 envelope with a (a, b) pair whose Pedersen commitment does NOT match
+    // per_share_commitments[0]. Worker rejects with ingress_share_commitment_mismatch.
+    use eunoma_crypto_worker::mpcca_withdraw_v2::seal_ingress_envelope_for_test;
+    let fix = build_milestone1_fixture("m1-commit-mismatch");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let mut req = build_round1_request(&fix, slot, player_id);
+
+    // Replace slot-0 envelope plaintext with random (a', b') that DOES NOT match the
+    // claimed per_share_commitments[0]. We rebuild AAD to match the original commitments
+    // (otherwise HPKE decrypt fails first, not commitment mismatch).
+    let bogus_a = deterministic_share_scalar(&fix.test_seed, 99, 0);
+    let bogus_b = deterministic_share_scalar(&fix.test_seed, 99, 1);
+    let mut plaintext = Vec::with_capacity(64);
+    plaintext.extend_from_slice(&bogus_a.to_bytes());
+    plaintext.extend_from_slice(&bogus_b.to_bytes());
+    let aad = m1_ingress_aad_for_test(
+        &req.request_id,
+        &req.session_id,
+        &req.dkg_epoch,
+        slot,
+        player_id,
+        &req.roster_hash,
+        &req.vault_ek,
+        &req.root,
+        &req.nullifier_hash,
+        &req.recipient_hash,
+        &req.amount_tag,
+        req.vault_sequence,
+        req.deposit_count,
+        &req.amount_commitment,
+        &req.per_share_commitments,
+    );
+    req.ingress_envelopes[0] =
+        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext).expect("seal");
+
+    let err =
+        run_round1_v2(&state_dir, &req).expect_err("commitment mismatch must reject");
+    assert!(
+        matches!(err, WorkerError::Crypto(ref s) if s == "ingress_share_commitment_mismatch"),
+        "expected Crypto(ingress_share_commitment_mismatch), got {err:?}"
+    );
+}
+
+#[test]
+fn m1_ingress_aad_mismatch_rejected_as_hpke_decrypt_failure() {
+    // Seal an envelope with a different AAD (e.g., wrong vault_ek). The worker re-derives
+    // AAD from the request and HPKE open fails → Crypto(ingress_hpke_decrypt_failed).
+    use eunoma_crypto_worker::mpcca_withdraw_v2::seal_ingress_envelope_for_test;
+    let fix = build_milestone1_fixture("m1-aad-mismatch");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let mut req = build_round1_request(&fix, slot, player_id);
+
+    let a_0 = deterministic_share_scalar(&fix.test_seed, 0, 0);
+    let b_0 = deterministic_share_scalar(&fix.test_seed, 0, 1);
+    let mut plaintext = Vec::with_capacity(64);
+    plaintext.extend_from_slice(&a_0.to_bytes());
+    plaintext.extend_from_slice(&b_0.to_bytes());
+    // Build AAD with a DIFFERENT vault_ek so the worker's re-derived AAD diverges.
+    let wrong_vault_ek = "07".repeat(32);
+    let bad_aad = m1_ingress_aad_for_test(
+        &req.request_id,
+        &req.session_id,
+        &req.dkg_epoch,
+        slot,
+        player_id,
+        &req.roster_hash,
+        &wrong_vault_ek,
+        &req.root,
+        &req.nullifier_hash,
+        &req.recipient_hash,
+        &req.amount_tag,
+        req.vault_sequence,
+        req.deposit_count,
+        &req.amount_commitment,
+        &req.per_share_commitments,
+    );
+    req.ingress_envelopes[0] =
+        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &bad_aad, &plaintext).expect("seal");
+
+    let err = run_round1_v2(&state_dir, &req).expect_err("AAD mismatch must reject");
+    assert!(
+        matches!(err, WorkerError::Crypto(ref s) if s == "ingress_hpke_decrypt_failed"),
+        "expected Crypto(ingress_hpke_decrypt_failed), got {err:?}"
+    );
+}
+
+#[test]
+fn m1_ingress_state_file_does_not_contain_plaintext_shares_on_disk() {
+    // After a successful M1 ingress, the worker's on-disk mpcca_withdraw_v2_ingress.json
+    // MUST NOT contain the plaintext share bytes — only the HPKE-encrypted-at-rest envelope.
+    let fix = build_milestone1_fixture("m1-no-plaintext-on-disk");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+    let req = build_round1_request(&fix, slot, player_id);
+    run_round1_v2(&state_dir, &req).expect("M1 ingress");
+
+    let session_dir =
+        mpcca_withdraw_session_dir(&state_dir, &req.request_id, &req.session_id).expect("dir");
+    let ingress_path = session_dir.join("mpcca_withdraw_v2_ingress.json");
+    let raw = fs::read_to_string(&ingress_path).expect("read ingress file");
+
+    // Recompute the plaintext share hex for slot 0 and assert it does NOT appear on disk.
+    let a_0 = deterministic_share_scalar(&fix.test_seed, 0, 0);
+    let b_0 = deterministic_share_scalar(&fix.test_seed, 0, 1);
+    let a_hex = hex_encode(&a_0.to_bytes());
+    let b_hex = hex_encode(&b_0.to_bytes());
+    assert!(
+        !raw.contains(&a_hex),
+        "ingress file MUST NOT contain plaintext a_0 hex bytes on disk"
+    );
+    assert!(
+        !raw.contains(&b_hex),
+        "ingress file MUST NOT contain plaintext b_0 hex bytes on disk"
+    );
 }

@@ -51,13 +51,15 @@ use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
 };
 use eunoma_crypto_worker::{
+    ca_dkg_v2::init_hpke_local,
     ca_registration_v2::{
         create_registration_nonce_commitment_v2, create_registration_partial_response_v2,
         run_aggregate_v2, AggregateRequest, Round1Request as CaRound1Request,
         Round2Request as CaRound2Request,
     },
     mpcca_withdraw_v2::{
-        run_round1_v2, HpkeEnvelope as MpccaHpkeEnvelope, Round1Request as MpccaRound1Request,
+        m1_ingress_aad_for_test, run_round1_v2, seal_ingress_envelope_for_test,
+        HpkeEnvelope as MpccaHpkeEnvelope, Round1Request as MpccaRound1Request,
     },
     registration_verifier::{
         aggregate_registration_commitment, registration_challenge, verify_registration_proof,
@@ -223,6 +225,8 @@ struct Fixture {
     slot_dirs: Vec<PathBuf>,
     vault_ek_transcript_hash: String,
     registration_transcript_hash: String,
+    /// M1: per-slot HPKE pubkeys. Length 7. Required for sealing real ingress envelopes.
+    hpke_public_keys: Vec<String>,
 }
 
 fn build_fixture(label: &str) -> Fixture {
@@ -334,6 +338,14 @@ fn build_fixture(label: &str) -> Fixture {
     )
     .expect("verify_registration_proof");
 
+    // M1: init HPKE keypairs for all 7 slots so run_round1_v2 can decrypt ingress envelopes.
+    let hpke_summary = init_hpke_local(&root, false).expect("init HPKE local");
+    let hpke_public_keys: Vec<String> = hpke_summary
+        .slots
+        .iter()
+        .map(|s| s.hpke_public_key.clone())
+        .collect();
+
     Fixture {
         vault_ek_hex,
         aggregate_commitment: aggregate.aggregate_commitment,
@@ -348,7 +360,94 @@ fn build_fixture(label: &str) -> Fixture {
         slot_dirs,
         vault_ek_transcript_hash: "11".repeat(32),
         registration_transcript_hash: "22".repeat(32),
+        hpke_public_keys,
     }
+}
+
+/// Build a real-Pedersen + HPKE-sealed M1 ingress payload for the e2e tests. Returns
+/// (amount_commitment_hex, per_share_commitments[5], ingress_envelopes[5]).
+#[allow(clippy::too_many_arguments)]
+fn build_e2e_ingress_payload(
+    fix: &Fixture,
+    request_id: &str,
+    session_id: &str,
+    dkg_epoch: &str,
+    roster_hash_hex: &str,
+    vault_ek_hex: &str,
+    root_hex: &str,
+    nullifier_hash_hex: &str,
+    recipient_hash_hex: &str,
+    amount_tag_hex: &str,
+    vault_sequence: u64,
+    deposit_count: u64,
+) -> (String, Vec<String>, Vec<MpccaHpkeEnvelope>) {
+    let h = h_point();
+    // Deterministic seed bound to (request_id, session_id) so test runs are reproducible.
+    let mut seed = [0_u8; 32];
+    let composite = format!("{request_id}|{session_id}");
+    let composite_bytes = composite.as_bytes();
+    for (i, b) in composite_bytes.iter().enumerate().take(32) {
+        seed[i] = *b;
+    }
+    seed[31] = composite_bytes.len() as u8;
+    fn det_scalar(seed: &[u8; 32], ordinal: usize, leg: u8) -> Scalar {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"EUNOMA_E2E_INGRESS_SHARE_V1");
+        hasher.update(seed);
+        hasher.update(&ordinal.to_le_bytes());
+        hasher.update(&[leg]);
+        let digest = hasher.finalize();
+        let mut wide = [0_u8; 64];
+        wide[..32].copy_from_slice(&digest);
+        let mut h2 = sha2::Sha256::new();
+        h2.update(&digest);
+        h2.update(b"v2");
+        wide[32..].copy_from_slice(&h2.finalize());
+        Scalar::from_bytes_mod_order_wide(&wide)
+    }
+    let mut shares = Vec::with_capacity(5);
+    let mut per_share_commitments = Vec::with_capacity(5);
+    let mut sum_a = Scalar::ZERO;
+    let mut sum_b = Scalar::ZERO;
+    for ordinal in 0..5 {
+        let a = det_scalar(&seed, ordinal, 0);
+        let b = det_scalar(&seed, ordinal, 1);
+        let commit = RISTRETTO_BASEPOINT_POINT * a + h * b;
+        per_share_commitments.push(compressed_hex(&commit));
+        sum_a += a;
+        sum_b += b;
+        shares.push((a, b));
+    }
+    let amount_commitment =
+        compressed_hex(&(RISTRETTO_BASEPOINT_POINT * sum_a + h * sum_b));
+    let mut envelopes = Vec::with_capacity(5);
+    for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
+        let aad = m1_ingress_aad_for_test(
+            request_id,
+            session_id,
+            dkg_epoch,
+            slot,
+            ordinal,
+            roster_hash_hex,
+            vault_ek_hex,
+            root_hex,
+            nullifier_hash_hex,
+            recipient_hash_hex,
+            amount_tag_hex,
+            vault_sequence,
+            deposit_count,
+            &amount_commitment,
+            &per_share_commitments,
+        );
+        let mut pt = Vec::with_capacity(64);
+        pt.extend_from_slice(&shares[ordinal].0.to_bytes());
+        pt.extend_from_slice(&shares[ordinal].1.to_bytes());
+        let env =
+            seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &pt).expect("seal");
+        envelopes.push(env);
+    }
+    (amount_commitment, per_share_commitments, envelopes)
 }
 
 /// KILLER end-to-end test pinning the Codex M3a P1 regression. The previous fix's unit test
@@ -547,49 +646,39 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
         assert_eq!(res.vault_state_hash, res2.vault_state_hash);
     }
 
-    // M1 ingress envelopes/commitments — wire-shape valid so the post-finalize happy path
-    // reaches the NotImplemented surface rather than failing at ingress validation.
-    let m1_envelopes: Vec<MpccaHpkeEnvelope> = (0..5_u8)
-        .map(|i| {
-            let seed = format!("{i:02x}");
-            MpccaHpkeEnvelope {
-                kem: "DHKEM_X25519_HKDF_SHA256".to_string(),
-                kdf: "HKDF_SHA256".to_string(),
-                aead: "AES_256_GCM".to_string(),
-                enc: seed.repeat(32),
-                ciphertext: seed.repeat(80),
-                aad_hash: seed.repeat(32),
-            }
-        })
-        .collect();
-    let m1_commitments: Vec<String> = (0..5_u8)
-        .map(|i| format!("{i:02x}").repeat(32))
-        .collect();
+    // M1 ingress: build a REAL Pedersen+HPKE-sealed payload so every worker can decrypt its
+    // share, verify the per-share commitment, and complete round1 with completed:true.
+    let (m1_amount_commitment, m1_commitments, m1_envelopes) = build_e2e_ingress_payload(
+        &fix,
+        &round1_req_pre_finalize.request_id,
+        &round1_req_pre_finalize.session_id,
+        &round1_req_pre_finalize.dkg_epoch,
+        &round1_req_pre_finalize.roster_hash,
+        &round1_req_pre_finalize.vault_ek,
+        &round1_req_pre_finalize.root,
+        &round1_req_pre_finalize.nullifier_hash,
+        &round1_req_pre_finalize.recipient_hash,
+        &round1_req_pre_finalize.amount_tag,
+        round1_req_pre_finalize.vault_sequence,
+        round1_req_pre_finalize.deposit_count,
+    );
 
     // 5. KILLER ASSERTION: post-finalize, MPCCA withdraw round1 with the canonical final
-    //    hash MUST surface NotImplemented (the happy-path 501 equivalent). Exercise all
-    //    5 selected slots — if any one fails closed, the regression isn't actually fixed.
+    //    hash MUST complete M1 ingress on every selected slot.
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
         let mut req = round1_req_pre_finalize.clone();
         req.self_slot = slot;
         req.player_id = ordinal;
-        req.amount_commitment = "ac".repeat(32);
+        req.amount_commitment = m1_amount_commitment.clone();
         req.per_share_commitments = m1_commitments.clone();
         req.ingress_envelopes = m1_envelopes.clone();
-        let err = run_round1_v2(&fix.slot_dirs[slot], &req)
-            .expect_err("happy-path MPCCA round1 reaches the NotImplemented stub");
-        match err {
-            WorkerError::NotImplemented(phase) => {
-                assert_eq!(
-                    phase, "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
-                    "slot {slot}: round1 phase string must be byte-stable across the codebase"
-                );
-            }
-            other => panic!(
-                "slot {slot}: expected NotImplemented (post-finalize happy-path); the \
-                 regression is NOT FIXED if this slot surfaces {other:?}"
-            ),
-        }
+        let result = run_round1_v2(&fix.slot_dirs[slot], &req).unwrap_or_else(|err| {
+            panic!(
+                "slot {slot}: M1 ingress happy-path must complete; the regression is NOT \
+                 FIXED if this slot surfaces {err:?}"
+            )
+        });
+        assert!(result.completed, "slot {slot}: M1 ingress must complete: {result:?}");
     }
 }
 
@@ -1146,31 +1235,34 @@ fn vault_state_init_partial_finalize_recoverable() {
     }
 
     // PHASE 5: KILLER — every worker now has init_transcript_hash = final_hash. MPCCA
-    // round1 with that hash MUST reach NotImplemented (the happy-path 501 equivalent) on
-    // every slot, proving the cluster has fully recovered from the partial-finalize state.
-    // M1 ingress envelopes/commitments — wire-shape-valid so the test reaches the
-    // NotImplemented surface in run_round1_v2 (rather than failing at the ingress
-    // validation gate).
-    let m1_envelopes: Vec<MpccaHpkeEnvelope> = (0..5_u8)
-        .map(|i| {
-            let seed = format!("{i:02x}");
-            MpccaHpkeEnvelope {
-                kem: "DHKEM_X25519_HKDF_SHA256".to_string(),
-                kdf: "HKDF_SHA256".to_string(),
-                aead: "AES_256_GCM".to_string(),
-                enc: seed.repeat(32),
-                ciphertext: seed.repeat(80),
-                aad_hash: seed.repeat(32),
-            }
-        })
-        .collect();
-    let m1_commitments: Vec<String> = (0..5_u8)
-        .map(|i| format!("{i:02x}").repeat(32))
-        .collect();
+    // round1 with that hash MUST complete M1 ingress on every slot, proving the cluster has
+    // fully recovered from the partial-finalize state.
+    let pf_request_id = "partial-finalize-withdraw-req".to_string();
+    let pf_session_id = "partial-finalize-withdraw-sess".to_string();
+    let pf_root = "66".repeat(32);
+    let pf_nullifier = "77".repeat(32);
+    let pf_recipient = "88".repeat(32);
+    let pf_recipient_hash = "99".repeat(32);
+    let pf_amount_tag = "0a".repeat(32);
+    let pf_request_hash = "0b".repeat(32);
+    let (m1_amount_commitment, m1_commitments, m1_envelopes) = build_e2e_ingress_payload(
+        &fix,
+        &pf_request_id,
+        &pf_session_id,
+        DKG_EPOCH,
+        &fix.roster_hash,
+        &fix.vault_ek_hex,
+        &pf_root,
+        &pf_nullifier,
+        &pf_recipient_hash,
+        &pf_amount_tag,
+        0,
+        0,
+    );
     let round1_req_template = MpccaRound1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
-        request_id: "partial-finalize-withdraw-req".to_string(),
-        session_id: "partial-finalize-withdraw-sess".to_string(),
+        request_id: pf_request_id,
+        session_id: pf_session_id,
         vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
         registration_transcript_hash: fix.registration_transcript_hash.clone(),
         vault_state_init_transcript_hash: final_hash.clone(),
@@ -1184,16 +1276,16 @@ fn vault_state_init_partial_finalize_recoverable() {
         sender_address: fix.sender.clone(),
         asset_type: fix.asset.clone(),
         chain_id: fix.chain_id,
-        root: "66".repeat(32),
-        nullifier_hash: "77".repeat(32),
-        recipient: "88".repeat(32),
-        recipient_hash: "99".repeat(32),
-        amount_tag: "0a".repeat(32),
+        root: pf_root,
+        nullifier_hash: pf_nullifier,
+        recipient: pf_recipient,
+        recipient_hash: pf_recipient_hash,
+        amount_tag: pf_amount_tag,
         vault_sequence: 0,
         expiry_secs: 1_700_000_000,
-        request_hash: "0b".repeat(32),
+        request_hash: pf_request_hash,
         deposit_count: 0,
-        amount_commitment: "ac".repeat(32),
+        amount_commitment: m1_amount_commitment,
         per_share_commitments: m1_commitments,
         ingress_envelopes: m1_envelopes,
     };
@@ -1201,17 +1293,16 @@ fn vault_state_init_partial_finalize_recoverable() {
         let mut req = round1_req_template.clone();
         req.self_slot = slot;
         req.player_id = ordinal;
-        let err = run_round1_v2(&fix.slot_dirs[slot], &req)
-            .expect_err("post-recovery MPCCA round1 reaches NotImplemented");
-        match err {
-            WorkerError::NotImplemented(phase) => assert_eq!(
-                phase, "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4"
-            ),
-            other => panic!(
-                "slot {slot}: expected NotImplemented post-recovery; partial-finalize recovery \
-                 is NOT FIXED if this slot surfaces {other:?}"
-            ),
-        }
+        let result = run_round1_v2(&fix.slot_dirs[slot], &req).unwrap_or_else(|err| {
+            panic!(
+                "slot {slot}: post-recovery M1 ingress must complete; partial-finalize \
+                 recovery is NOT FIXED if this slot surfaces {err:?}"
+            )
+        });
+        assert!(
+            result.completed,
+            "slot {slot}: post-recovery M1 ingress must complete: {result:?}"
+        );
     }
 
     // PHASE 6 (Codex M3a P1 v5 audit): we've already asserted `final_hash_v2 == final_hash_v1`

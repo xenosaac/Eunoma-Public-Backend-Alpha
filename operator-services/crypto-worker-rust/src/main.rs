@@ -1006,34 +1006,16 @@ async fn mpcca_withdraw_round1(
     State(state): State<AppState>,
     Json(body): Json<MpccaWithdrawRound1Request>,
 ) -> (StatusCode, Json<Value>) {
-    let request_id = body.request_id.clone();
-    let session_id = body.session_id.clone();
-    let self_slot = body.self_slot;
-    let player_id = body.player_id;
     match run_mpcca_withdraw_round1_v2(&state.state_dir, &body) {
-        Ok(_result) => {
-            // Should never happen under milestone 3a — the stub ALWAYS returns NotImplemented.
-            // If milestone 4 lands the crypto and forgets to update this surface, we want a
-            // load-bearing assert here.
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "mpcca_withdraw_v2_stub_unexpectedly_returned_ok",
-                    "message": "milestone 3a stub returned Ok; this is a wire-shape regression"
-                })),
-            )
-        }
-        Err(eunoma_crypto_worker::WorkerError::NotImplemented(phase)) => {
-            mpcca_not_implemented_response(
-                &state.state_dir,
-                &request_id,
-                &session_id,
-                self_slot,
-                player_id,
-                "round1",
-                phase,
-            )
-        }
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(result).unwrap_or_else(|err| {
+                json!({
+                    "error": "mpcca_withdraw_v2_serialize_error",
+                    "message": err.to_string(),
+                })
+            })),
+        ),
         Err(err) => worker_error_response(err),
     }
 }

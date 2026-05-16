@@ -2802,7 +2802,10 @@ pub mod ca_dkg_v2 {
         }
     }
 
-    fn load_hpke_keypair_for_slot(state_dir: &Path, slot: usize) -> WorkerResult<HpkeKeypairFile> {
+    pub(crate) fn load_hpke_keypair_for_slot(
+        state_dir: &Path,
+        slot: usize,
+    ) -> WorkerResult<HpkeKeypairFile> {
         let value = read_json(&state_dir.join(HPKE_KEYPAIR_FILE))?;
         let keypair: HpkeKeypairFile =
             serde_json::from_value(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
@@ -7122,16 +7125,22 @@ pub mod vault_state_v2 {
 // allocate the on-disk slot for milestone 4 so the file layout is committed.
 // =================================================================================================
 pub mod mpcca_withdraw_v2 {
+    use crate::ca_dkg_v2::{load_hpke_keypair_for_slot, HpkeKeypairFile};
+    use crate::h_ristretto;
     use crate::hpke_aead;
     pub use crate::hpke_aead::HpkeEnvelope;
     use crate::registration_verifier::verify_registration_proof;
     use crate::mpc_spdz_adapter::is_safe_id;
     use crate::vault_state_v2::{load_vault_state_v2, VaultStateFile};
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    use curve25519_dalek::scalar::Scalar;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use zeroize::Zeroize;
 
     // One domain string per round + a final-transcript domain. Cross-round transcript replay is
     // impossible by construction because each domain is distinct.
@@ -7258,7 +7267,8 @@ pub mod mpcca_withdraw_v2 {
     /// partial_response, etc.) are `None` because the crypto is not implemented yet — but
     /// session_state_path, session_state_hash, and worker_transcript_hash are FULLY populated
     /// because the public-binding work happens BEFORE the NotImplemented surface. Milestone 4
-    /// will swap the `None`s for `Some(...)` and `completed: true`.
+    /// will swap the `None`s for `Some(...)` and `completed: true`. Round1 already returns
+    /// `Round1IngressResult` under M1; the stub shape is preserved for rounds 2/prove/finalize.
     #[derive(Debug, Clone, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct StubRoundResult {
@@ -7268,8 +7278,26 @@ pub mod mpcca_withdraw_v2 {
         pub session_state_hash: String,
         pub worker_transcript_hash: String,
         pub observed_at_unix_ms: u128,
-        pub completed: bool, // always false in 3a
+        pub completed: bool, // always false for rounds 2/prove/finalize stub
         pub not_implemented_phase: String,
+    }
+
+    /// Milestone 1 round1 result: ingress (HPKE decrypt + per-share Pedersen verify + zero-
+    /// share reject + HPKE-encrypted-at-rest persist) succeeded. Mirrors the TS
+    /// `MpccaWithdrawRound1Response` shape used by `parseMpccaWithdrawRound1Response`.
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Round1IngressResult {
+        pub slot: usize,
+        pub player_id: usize,
+        pub session_state_path: String,
+        pub session_state_hash: String,
+        pub worker_transcript_hash: String,
+        pub observed_at_unix_ms: u128,
+        pub completed: bool, // always true under M1
+        /// Equals `worker_transcript_hash`. Named explicitly so the M1 binding contract is
+        /// searchable across the codebase.
+        pub ingress_transcript_hash: String,
     }
 
     /// On-disk per-session-per-round state file. Holds only public binding metadata + a copy of
@@ -7604,13 +7632,344 @@ pub mod mpcca_withdraw_v2 {
     }
 
     /// Normalised + validated M1 ingress fields. Length-checked envelope and commitment counts,
-    /// per-commitment hex shape, but no crypto evaluation yet (Pedersen verification + HPKE
-    /// decrypt land in Commit 3).
+    /// per-commitment hex shape. Pedersen verification + HPKE decrypt happen downstream in
+    /// `process_m1_ingress`.
     pub(crate) struct NormalisedIngress {
         pub amount_commitment: String,
         pub per_share_commitments: Vec<String>,
         pub ingress_envelopes: Vec<HpkeEnvelope>,
         pub ingress_envelopes_hash: String,
+    }
+
+    /// File written by the worker after a successful M1 round1 ingress. Holds public
+    /// commitments + an HPKE-encrypted-at-rest envelope sealing `(a_i || b_i)` under the
+    /// worker's own HPKE pubkey. Downstream M4 rounds re-open this file (worker-local read,
+    /// never leaves process) to consume the share for sigma + Bulletproof MPC.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct IngressStateFile {
+        pub scheme: String,
+        pub slot: usize,
+        pub player_id: usize,
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub amount_commitment: String,
+        pub per_share_commitments: Vec<String>,
+        pub encrypted_share_envelope: HpkeEnvelope,
+        pub created_at_unix_ms: u128,
+    }
+
+    /// `info` string for the on-wire HPKE seal (user → worker). LOCKED — any change is a
+    /// wire-protocol break and must bump the AAD domain version.
+    pub(crate) const HPKE_INFO_INGRESS: &[u8] = b"EUNOMA_M1_AMOUNT_INGRESS_V1";
+
+    /// `info` string for the at-rest HPKE seal (worker self-seals the share). LOCKED.
+    pub(crate) const HPKE_INFO_INGRESS_AT_REST: &[u8] = b"EUNOMA_M1_INGRESS_AT_REST_V1";
+
+    /// Build the AAD bytes for the M1 ingress HPKE envelope. Byte-identical to TS
+    /// `m1IngressAad(...)` — keys sorted alphabetically, no whitespace, all values as JSON
+    /// strings (numeric fields are stringified before encoding).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn m1_ingress_aad(
+        request_id: &str,
+        session_id: &str,
+        dkg_epoch: &str,
+        self_slot: usize,
+        player_id: usize,
+        roster_hash_hex: &str,
+        vault_ek_hex: &str,
+        root_hex: &str,
+        nullifier_hash_hex: &str,
+        recipient_hash_hex: &str,
+        amount_tag_hex: &str,
+        vault_sequence: u64,
+        deposit_count: u64,
+        amount_commitment_hex: &str,
+        per_share_commitments_hex: &[String],
+    ) -> Vec<u8> {
+        let per_share_commitments_hash = per_share_commitments_hash_hex(per_share_commitments_hex);
+        // Keys MUST be alphabetically sorted to match TS `canonicalJsonStringify`.
+        let mut s = String::new();
+        s.push('{');
+        push_field(&mut s, "amountCommitmentHex", amount_commitment_hex, true);
+        push_field(&mut s, "amountTag", amount_tag_hex, false);
+        push_field(&mut s, "depositCount", &deposit_count.to_string(), false);
+        push_field(&mut s, "dkgEpoch", dkg_epoch, false);
+        push_field(&mut s, "domain", M1_INGRESS_AAD_DOMAIN, false);
+        push_field(&mut s, "nullifierHash", nullifier_hash_hex, false);
+        push_field(
+            &mut s,
+            "perShareCommitmentsHashHex",
+            &per_share_commitments_hash,
+            false,
+        );
+        push_field(&mut s, "playerId", &player_id.to_string(), false);
+        push_field(&mut s, "recipientHash", recipient_hash_hex, false);
+        push_field(&mut s, "requestId", request_id, false);
+        push_field(&mut s, "root", root_hex, false);
+        push_field(&mut s, "rosterHash", roster_hash_hex, false);
+        push_field(&mut s, "selfSlot", &self_slot.to_string(), false);
+        push_field(&mut s, "sessionId", session_id, false);
+        push_field(&mut s, "vaultEk", vault_ek_hex, false);
+        push_field(&mut s, "vaultSequence", &vault_sequence.to_string(), false);
+        s.push('}');
+        s.into_bytes()
+    }
+
+    fn push_field(out: &mut String, key: &'static str, value: &str, first: bool) {
+        if !first {
+            out.push(',');
+        }
+        json_string_into(out, key);
+        out.push(':');
+        json_string_into(out, value);
+    }
+
+    fn json_string_into(out: &mut String, s: &str) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0c}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+
+    /// sha256_hex over `concat(perShareCommitmentsHexBytes...)`. Byte-identical to TS
+    /// `perShareCommitmentsHash(perShareCommitments)`.
+    fn per_share_commitments_hash_hex(per_share_commitments_hex: &[String]) -> String {
+        let mut hasher = Sha256::new();
+        for c in per_share_commitments_hex {
+            // Normalize to lowercase + no `0x` prefix to match TS `normalizeHex`.
+            let normalised: String = c
+                .strip_prefix("0x")
+                .or_else(|| c.strip_prefix("0X"))
+                .unwrap_or(c.as_str())
+                .to_ascii_lowercase();
+            hasher.update(normalised.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// AAD for the at-rest HPKE seal. Binds `(scheme, sessionId, requestId, selfSlot)` so the
+    /// at-rest envelope cannot be misrouted across sessions.
+    fn at_rest_aad(session_id: &str, request_id: &str, self_slot: usize) -> Vec<u8> {
+        format!(
+            "scheme=mpcca_withdraw_v2_ingress|session={session_id}|request={request_id}|slot={self_slot}"
+        )
+        .into_bytes()
+    }
+
+    /// HPKE-decrypt the M1 ingress envelope for this slot's player_id, validate the per-share
+    /// Pedersen commitment, reject zero shares. Returns the recovered `(a_j, b_j)` pair.
+    ///
+    /// Error surface (all fail-closed BEFORE any persist):
+    /// - `Crypto("ingress_hpke_decrypt_failed")` — HPKE open failed (wrong AAD / wrong key /
+    ///   tampered envelope).
+    /// - `Crypto("ingress_share_non_canonical_scalar")` — plaintext bytes don't decode to
+    ///   canonical Ed25519 scalars.
+    /// - `Crypto("ingress_zero_share_rejected")` — `a_j` or `b_j` is the zero scalar
+    ///   (per goal.md decision #9).
+    /// - `Crypto("ingress_share_commitment_mismatch")` — `G·a_j + H·b_j != C_j`.
+    /// - `Crypto("ingress_invalid_per_share_commitment_encoding")` — non-canonical Ristretto
+    ///   compressed bytes in `perShareCommitments[player_id]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decrypt_and_verify_ingress_share(
+        keypair: &HpkeKeypairFile,
+        envelope: &HpkeEnvelope,
+        per_share_commitment_hex: &str,
+        aad: &[u8],
+    ) -> WorkerResult<(Scalar, Scalar)> {
+        let mut plaintext = hpke_aead::open(&keypair.private_key, HPKE_INFO_INGRESS, aad, envelope)
+            .map_err(|_| WorkerError::Crypto("ingress_hpke_decrypt_failed".to_string()))?;
+        if plaintext.len() != 64 {
+            // Zero the plaintext before erroring.
+            plaintext.zeroize();
+            return Err(WorkerError::Crypto(
+                "ingress_share_plaintext_wrong_length".to_string(),
+            ));
+        }
+        let mut a_bytes = [0u8; 32];
+        a_bytes.copy_from_slice(&plaintext[0..32]);
+        let mut b_bytes = [0u8; 32];
+        b_bytes.copy_from_slice(&plaintext[32..64]);
+        plaintext.zeroize();
+
+        let a_opt = Scalar::from_canonical_bytes(a_bytes);
+        let b_opt = Scalar::from_canonical_bytes(b_bytes);
+        if a_opt.is_none().into() || b_opt.is_none().into() {
+            a_bytes.zeroize();
+            b_bytes.zeroize();
+            return Err(WorkerError::Crypto(
+                "ingress_share_non_canonical_scalar".to_string(),
+            ));
+        }
+        let a = a_opt.unwrap();
+        let b = b_opt.unwrap();
+        a_bytes.zeroize();
+        b_bytes.zeroize();
+
+        // Zero-share rejection (goal.md decision #9). a == 0 makes per-share commitment
+        // leak structural info; b == 0 is a weaker but still security-degraded case.
+        if a == Scalar::ZERO || b == Scalar::ZERO {
+            return Err(WorkerError::Crypto(
+                "ingress_zero_share_rejected".to_string(),
+            ));
+        }
+
+        // Decompress the claimed per-share commitment.
+        let commit_raw = per_share_commitment_hex
+            .strip_prefix("0x")
+            .or_else(|| per_share_commitment_hex.strip_prefix("0X"))
+            .unwrap_or(per_share_commitment_hex);
+        if commit_raw.len() != 64 {
+            return Err(WorkerError::Crypto(
+                "ingress_invalid_per_share_commitment_encoding".to_string(),
+            ));
+        }
+        let mut commit_bytes = [0u8; 32];
+        for idx in 0..32 {
+            commit_bytes[idx] =
+                u8::from_str_radix(&commit_raw[idx * 2..idx * 2 + 2], 16).map_err(|_| {
+                    WorkerError::Crypto(
+                        "ingress_invalid_per_share_commitment_encoding".to_string(),
+                    )
+                })?;
+        }
+        let commit_decompressed = CompressedRistretto(commit_bytes).decompress().ok_or_else(
+            || WorkerError::Crypto("ingress_invalid_per_share_commitment_encoding".to_string()),
+        )?;
+        let h = h_ristretto()?;
+        let recomputed = RISTRETTO_BASEPOINT_POINT * a + h * b;
+        if recomputed != commit_decompressed {
+            return Err(WorkerError::Crypto(
+                "ingress_share_commitment_mismatch".to_string(),
+            ));
+        }
+        Ok((a, b))
+    }
+
+    /// Seal `(a_j || b_j)` under the slot's own HPKE pubkey with at-rest AAD; return the
+    /// envelope ready for IngressStateFile.encrypted_share_envelope. The caller is responsible
+    /// for zeroing `a` and `b` after this returns.
+    pub(crate) fn seal_ingress_at_rest(
+        keypair: &HpkeKeypairFile,
+        session_id: &str,
+        request_id: &str,
+        self_slot: usize,
+        a: &Scalar,
+        b: &Scalar,
+    ) -> WorkerResult<HpkeEnvelope> {
+        let mut plaintext = Vec::with_capacity(64);
+        plaintext.extend_from_slice(&a.to_bytes());
+        plaintext.extend_from_slice(&b.to_bytes());
+        let aad = at_rest_aad(session_id, request_id, self_slot);
+        let env =
+            hpke_aead::seal(&keypair.public_key, HPKE_INFO_INGRESS_AT_REST, &aad, &plaintext)?;
+        plaintext.zeroize();
+        Ok(env)
+    }
+
+    /// Per-session-per-round file name for the M1 ingress state file (HPKE-encrypted-at-rest
+    /// share container).
+    fn ingress_state_file_name() -> &'static str {
+        "mpcca_withdraw_v2_ingress.json"
+    }
+
+    /// Persist the M1 IngressStateFile to disk with mode 0o600. The file does NOT contain
+    /// plaintext shares — only public commitments + the at-rest HPKE envelope.
+    pub(crate) fn persist_ingress_state(
+        session_dir: &Path,
+        file: &IngressStateFile,
+    ) -> WorkerResult<()> {
+        let path = session_dir.join(ingress_state_file_name());
+        let json = serde_json::to_string_pretty(file)
+            .map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, json.as_bytes()).map_err(|err| WorkerError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&tmp, permissions)
+                .map_err(|err| WorkerError::Io(err.to_string()))?;
+        }
+        fs::rename(&tmp, &path).map_err(|err| WorkerError::Io(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Test-friendly HPKE seal helper. Wraps `hpke_aead::seal` so integration tests + local
+    /// smoke scripts can build wire-valid `ingress_envelopes` against a known worker pubkey
+    /// without depending on internal module visibility. The `info` argument MUST be
+    /// `HPKE_INFO_INGRESS` for envelopes the worker will decrypt under M1 ingress; using any
+    /// other info string causes HPKE open to fail and surfaces `ingress_hpke_decrypt_failed`.
+    pub fn seal_ingress_envelope_for_test(
+        recipient_public_key_hex: &str,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> WorkerResult<HpkeEnvelope> {
+        hpke_aead::seal(recipient_public_key_hex, HPKE_INFO_INGRESS, aad, plaintext)
+    }
+
+    /// Test-friendly AAD builder. Re-exports the canonical AAD construction so integration
+    /// tests can build the exact bytes used by `decrypt_and_verify_ingress_share`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn m1_ingress_aad_for_test(
+        request_id: &str,
+        session_id: &str,
+        dkg_epoch: &str,
+        self_slot: usize,
+        player_id: usize,
+        roster_hash_hex: &str,
+        vault_ek_hex: &str,
+        root_hex: &str,
+        nullifier_hash_hex: &str,
+        recipient_hash_hex: &str,
+        amount_tag_hex: &str,
+        vault_sequence: u64,
+        deposit_count: u64,
+        amount_commitment_hex: &str,
+        per_share_commitments_hex: &[String],
+    ) -> Vec<u8> {
+        m1_ingress_aad(
+            request_id,
+            session_id,
+            dkg_epoch,
+            self_slot,
+            player_id,
+            roster_hash_hex,
+            vault_ek_hex,
+            root_hex,
+            nullifier_hash_hex,
+            recipient_hash_hex,
+            amount_tag_hex,
+            vault_sequence,
+            deposit_count,
+            amount_commitment_hex,
+            per_share_commitments_hex,
+        )
+    }
+
+    /// Load the persisted M1 ingress state file (public-binding view only; secret bytes stay
+    /// inside the HPKE envelope).
+    pub fn load_ingress_state_file(session_dir: &Path) -> WorkerResult<Option<IngressStateFile>> {
+        let path = session_dir.join(ingress_state_file_name());
+        match fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str::<IngressStateFile>(&s)
+                .map(Some)
+                .map_err(|err| WorkerError::Serde(err.to_string())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(WorkerError::Io(err.to_string())),
+        }
     }
 
     /// Validate the wire shape of the M1 ingress fields:
@@ -7664,11 +8023,22 @@ pub mod mpcca_withdraw_v2 {
         })
     }
 
-    /// Round 1 worker entrypoint. Returns `Err(NotImplemented(ROUND1_NOT_IMPLEMENTED_PHASE))`
-    /// AFTER doing the full public binding work, including M1 ingress field shape validation.
-    /// The actual ingress crypto (per-share Pedersen verify + HPKE decrypt + zero-share reject +
-    /// HPKE-encrypted-at-rest persist) lands in Commit 3.
-    pub fn run_round1_v2(state_dir: &Path, req: &Round1Request) -> WorkerResult<StubRoundResult> {
+    /// Milestone 1 round1 worker entrypoint. Runs the full public binding gate, then validates
+    /// M1 ingress envelope wire shape, then performs the M1 ingress crypto:
+    ///   1. Load self HPKE keypair from state_dir.
+    ///   2. Build AAD bytes (m1_ingress_aad) and HPKE-decrypt envelope[player_id].
+    ///   3. Decode `(a_j, b_j)` from canonical Ed25519 scalar bytes; reject non-canonical.
+    ///   4. Reject zero shares (a_j == 0 OR b_j == 0).
+    ///   5. Verify `G·a_j + H·b_j == per_share_commitments[player_id]`; reject mismatch.
+    ///   6. Seal `(a_j || b_j)` at-rest under self HPKE pubkey with at-rest AAD.
+    ///   7. Persist `mpcca_withdraw_v2_ingress.json` (public commitments + at-rest envelope only).
+    ///   8. Persist `mpcca_withdraw_v2_round1.json` carrying the V2 worker_transcript_hash.
+    ///   9. Return `Ok(Round1IngressResult { completed: true, ingress_transcript_hash: ... })`.
+    /// Any failure surfaces a SPECIFIC Crypto/InvalidRequest error and persists nothing.
+    pub fn run_round1_v2(
+        state_dir: &Path,
+        req: &Round1Request,
+    ) -> WorkerResult<Round1IngressResult> {
         let (normalised, _existing, session_dir) =
             common_public_binding_work(state_dir, req)?;
         let ingress = normalise_ingress_fields(
@@ -7705,9 +8075,68 @@ pub mod mpcca_withdraw_v2 {
             &ingress.per_share_commitments,
             &ingress.ingress_envelopes_hash,
         );
-        persist_and_stub(
+
+        // Load HPKE keypair for self_slot.
+        let keypair = load_hpke_keypair_for_slot(state_dir, req.self_slot)?;
+
+        // Build M1 AAD bytes.
+        let aad = m1_ingress_aad(
+            &req.request_id,
+            &req.session_id,
+            &req.dkg_epoch,
+            req.self_slot,
+            req.player_id,
+            &normalised.roster_hash,
+            &normalised.vault_ek_hex,
+            &normalised.root,
+            &normalised.nullifier_hash,
+            &normalised.recipient_hash,
+            &normalised.amount_tag,
+            req.vault_sequence,
+            req.deposit_count,
+            &ingress.amount_commitment,
+            &ingress.per_share_commitments,
+        );
+
+        // Decrypt + verify the M1 ingress share for this slot.
+        let envelope = &ingress.ingress_envelopes[req.player_id];
+        let per_share_commitment_hex = &ingress.per_share_commitments[req.player_id];
+        let (mut a, mut b) =
+            decrypt_and_verify_ingress_share(&keypair, envelope, per_share_commitment_hex, &aad)?;
+
+        // Seal the share at-rest under self HPKE pubkey.
+        let encrypted_share_envelope = seal_ingress_at_rest(
+            &keypair,
+            &req.session_id,
+            &req.request_id,
+            req.self_slot,
+            &a,
+            &b,
+        )?;
+        // Stack-frame zeroize: drop the plaintext share now that it's been sealed at rest.
+        a.zeroize();
+        b.zeroize();
+
+        // Persist the ingress state file (public commitments + at-rest envelope only).
+        let ingress_file = IngressStateFile {
+            scheme: "mpcca_withdraw_v2_ingress".to_string(),
+            slot: req.self_slot,
+            player_id: req.player_id,
+            dkg_epoch: req.dkg_epoch.clone(),
+            request_id: req.request_id.clone(),
+            session_id: req.session_id.clone(),
+            amount_commitment: ingress.amount_commitment.clone(),
+            per_share_commitments: ingress.per_share_commitments.clone(),
+            encrypted_share_envelope,
+            created_at_unix_ms: now_millis_local(),
+        };
+        // Create the session dir before writing.
+        fs::create_dir_all(&session_dir).map_err(|err| WorkerError::Io(err.to_string()))?;
+        persist_ingress_state(&session_dir, &ingress_file)?;
+
+        // Persist the round1 state file (M1 success: completed = true, no NotImplemented phase).
+        let session_state_path = persist_round1_completed(
             &session_dir,
-            "round1",
             req.self_slot,
             req.player_id,
             &req.dkg_epoch,
@@ -7717,10 +8146,82 @@ pub mod mpcca_withdraw_v2 {
             req.vault_sequence,
             req.deposit_count,
             &worker_transcript_hash,
-            ROUND1_NOT_IMPLEMENTED_PHASE,
             &normalised.observed_deposit_transcript_hashes,
         )?;
-        Err(WorkerError::NotImplemented(ROUND1_NOT_IMPLEMENTED_PHASE))
+
+        let session_state_hash = file_sha256_hex(&session_state_path)?;
+        Ok(Round1IngressResult {
+            slot: req.self_slot,
+            player_id: req.player_id,
+            session_state_path: session_state_path.display().to_string(),
+            session_state_hash,
+            worker_transcript_hash: worker_transcript_hash.clone(),
+            observed_at_unix_ms: now_millis_local(),
+            completed: true,
+            ingress_transcript_hash: worker_transcript_hash,
+        })
+    }
+
+    /// Local now-millis helper. The crate-root `now_millis` is private to ca_dkg_v2.
+    fn now_millis_local() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+
+    /// sha256 of a file's contents, hex-encoded.
+    fn file_sha256_hex(path: &Path) -> WorkerResult<String> {
+        let bytes = fs::read(path).map_err(|err| WorkerError::Io(err.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Persist the M1 round1 state file with completed: true. Returns the absolute path.
+    #[allow(clippy::too_many_arguments)]
+    fn persist_round1_completed(
+        session_dir: &Path,
+        self_slot: usize,
+        player_id: usize,
+        dkg_epoch: &str,
+        request_id: &str,
+        session_id: &str,
+        vault_ek_hex: &str,
+        vault_sequence: u64,
+        deposit_count: u64,
+        worker_transcript_hash: &str,
+        observed_deposit_transcript_hashes: &[String],
+    ) -> WorkerResult<PathBuf> {
+        let file = RoundStateFile {
+            scheme: "mpcca_withdraw_v2".to_string(),
+            round: "round1".to_string(),
+            slot: self_slot,
+            player_id,
+            dkg_epoch: dkg_epoch.to_string(),
+            request_id: request_id.to_string(),
+            session_id: session_id.to_string(),
+            vault_ek_hex: vault_ek_hex.to_string(),
+            vault_sequence,
+            deposit_count,
+            worker_transcript_hash: worker_transcript_hash.to_string(),
+            // Empty string sentinel for "M1 round1 completed, no NotImplemented phase".
+            not_implemented_phase: String::new(),
+            created_at_unix_ms: now_millis_local(),
+            observed_deposit_transcript_hashes: observed_deposit_transcript_hashes.to_vec(),
+        };
+        let path = session_dir.join(round_file_name("round1"));
+        let json =
+            serde_json::to_string_pretty(&file).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, json.as_bytes()).map_err(|err| WorkerError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&tmp, permissions)
+                .map_err(|err| WorkerError::Io(err.to_string()))?;
+        }
+        fs::rename(&tmp, &path).map_err(|err| WorkerError::Io(err.to_string()))?;
+        Ok(path)
     }
 
     /// Round 2 entrypoint — chained off round1's transcript. Same shape as round1 with
