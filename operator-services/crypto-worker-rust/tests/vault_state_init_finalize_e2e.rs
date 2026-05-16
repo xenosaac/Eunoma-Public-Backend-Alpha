@@ -57,7 +57,7 @@ use eunoma_crypto_worker::{
         Round2Request as CaRound2Request,
     },
     mpcca_withdraw_v2::{
-        run_round1_v2, Round1Request as MpccaRound1Request,
+        run_round1_v2, HpkeEnvelope as MpccaHpkeEnvelope, Round1Request as MpccaRound1Request,
     },
     registration_verifier::{
         aggregate_registration_commitment, registration_challenge, verify_registration_proof,
@@ -471,6 +471,12 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
         expiry_secs: 1_700_000_000,
         request_hash: "0b".repeat(32),
         deposit_count: 0,
+        // M1 ingress fields — wire shape only; this test runs the pre-finalize negative-control
+        // path that rejects BEFORE the ingress validation runs (the vault_state_v2_not_finalized
+        // error fires earlier in common_public_binding_work).
+        amount_commitment: String::new(),
+        per_share_commitments: vec![],
+        ingress_envelopes: vec![],
     };
     let pre_err = run_round1_v2(&fix.slot_dirs[0], &round1_req_pre_finalize)
         .expect_err("pre-finalize must fail closed (the regression baseline)");
@@ -541,6 +547,25 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
         assert_eq!(res.vault_state_hash, res2.vault_state_hash);
     }
 
+    // M1 ingress envelopes/commitments — wire-shape valid so the post-finalize happy path
+    // reaches the NotImplemented surface rather than failing at ingress validation.
+    let m1_envelopes: Vec<MpccaHpkeEnvelope> = (0..5_u8)
+        .map(|i| {
+            let seed = format!("{i:02x}");
+            MpccaHpkeEnvelope {
+                kem: "DHKEM_X25519_HKDF_SHA256".to_string(),
+                kdf: "HKDF_SHA256".to_string(),
+                aead: "AES_256_GCM".to_string(),
+                enc: seed.repeat(32),
+                ciphertext: seed.repeat(80),
+                aad_hash: seed.repeat(32),
+            }
+        })
+        .collect();
+    let m1_commitments: Vec<String> = (0..5_u8)
+        .map(|i| format!("{i:02x}").repeat(32))
+        .collect();
+
     // 5. KILLER ASSERTION: post-finalize, MPCCA withdraw round1 with the canonical final
     //    hash MUST surface NotImplemented (the happy-path 501 equivalent). Exercise all
     //    5 selected slots — if any one fails closed, the regression isn't actually fixed.
@@ -548,6 +573,9 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
         let mut req = round1_req_pre_finalize.clone();
         req.self_slot = slot;
         req.player_id = ordinal;
+        req.amount_commitment = "ac".repeat(32);
+        req.per_share_commitments = m1_commitments.clone();
+        req.ingress_envelopes = m1_envelopes.clone();
         let err = run_round1_v2(&fix.slot_dirs[slot], &req)
             .expect_err("happy-path MPCCA round1 reaches the NotImplemented stub");
         match err {
@@ -1120,6 +1148,25 @@ fn vault_state_init_partial_finalize_recoverable() {
     // PHASE 5: KILLER — every worker now has init_transcript_hash = final_hash. MPCCA
     // round1 with that hash MUST reach NotImplemented (the happy-path 501 equivalent) on
     // every slot, proving the cluster has fully recovered from the partial-finalize state.
+    // M1 ingress envelopes/commitments — wire-shape-valid so the test reaches the
+    // NotImplemented surface in run_round1_v2 (rather than failing at the ingress
+    // validation gate).
+    let m1_envelopes: Vec<MpccaHpkeEnvelope> = (0..5_u8)
+        .map(|i| {
+            let seed = format!("{i:02x}");
+            MpccaHpkeEnvelope {
+                kem: "DHKEM_X25519_HKDF_SHA256".to_string(),
+                kdf: "HKDF_SHA256".to_string(),
+                aead: "AES_256_GCM".to_string(),
+                enc: seed.repeat(32),
+                ciphertext: seed.repeat(80),
+                aad_hash: seed.repeat(32),
+            }
+        })
+        .collect();
+    let m1_commitments: Vec<String> = (0..5_u8)
+        .map(|i| format!("{i:02x}").repeat(32))
+        .collect();
     let round1_req_template = MpccaRound1Request {
         dkg_epoch: DKG_EPOCH.to_string(),
         request_id: "partial-finalize-withdraw-req".to_string(),
@@ -1146,6 +1193,9 @@ fn vault_state_init_partial_finalize_recoverable() {
         expiry_secs: 1_700_000_000,
         request_hash: "0b".repeat(32),
         deposit_count: 0,
+        amount_commitment: "ac".repeat(32),
+        per_share_commitments: m1_commitments,
+        ingress_envelopes: m1_envelopes,
     };
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
         let mut req = round1_req_template.clone();

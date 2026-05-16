@@ -7122,6 +7122,8 @@ pub mod vault_state_v2 {
 // allocate the on-disk slot for milestone 4 so the file layout is committed.
 // =================================================================================================
 pub mod mpcca_withdraw_v2 {
+    use crate::hpke_aead;
+    pub use crate::hpke_aead::HpkeEnvelope;
     use crate::registration_verifier::verify_registration_proof;
     use crate::mpc_spdz_adapter::is_safe_id;
     use crate::vault_state_v2::{load_vault_state_v2, VaultStateFile};
@@ -7133,10 +7135,19 @@ pub mod mpcca_withdraw_v2 {
 
     // One domain string per round + a final-transcript domain. Cross-round transcript replay is
     // impossible by construction because each domain is distinct.
-    pub(crate) const ROUND1_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V1";
+    //
+    // M1 (Threshold ElGamal Amount Ingress) bumped round1's domain from V1 to V2: the V2 hash
+    // additionally binds (amount_commitment, per_share_commitments, ingress_envelopes_hash) so
+    // any tampered ingress field flips the per-worker transcript hash. Stale V1 stub-mode
+    // artifacts deserialised against the V2 domain will fail closed at the worker-hash mismatch
+    // gate.
+    pub(crate) const ROUND1_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND1_V2";
     pub(crate) const ROUND2_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_ROUND2_V1";
     pub(crate) const PROVE_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_PROVE_V1";
     pub(crate) const FINALIZE_TRANSCRIPT_DOMAIN: &str = "EUNOMA_MPCCA_WITHDRAW_V2_FINALIZE_V1";
+
+    /// M1 AAD domain — byte-identical to the TS constant `EUNOMA_M1_AMOUNT_INGRESS_V1`.
+    pub(crate) const M1_INGRESS_AAD_DOMAIN: &str = "EUNOMA_M1_AMOUNT_INGRESS_V1";
 
     // NotImplemented phase strings — surfaced by the milestone 3a stub to distinguish per-round
     // missing crypto. Milestone 4 will remove each one as its round lands.
@@ -7188,6 +7199,18 @@ pub mod mpcca_withdraw_v2 {
         pub expiry_secs: u64,
         pub request_hash: String,
         pub deposit_count: u64,
+        /// Milestone 1 — Threshold ElGamal Amount Ingress fields. Empty under M3a stub
+        /// (handled via serde default for backwards-test compatibility); populated by the
+        /// coordinator's M1 fan-out in production. Worker validates per-share commitment
+        /// + decrypts HPKE envelope[player_id] in `run_round1_v2` once Commit 3 lands the
+        /// ingress crypto path. This commit only adds wire-shape acceptance + folds the
+        /// fields into the V2 transcript hash so downstream tampering fails closed.
+        #[serde(default)]
+        pub amount_commitment: String,
+        #[serde(default)]
+        pub per_share_commitments: Vec<String>,
+        #[serde(default)]
+        pub ingress_envelopes: Vec<HpkeEnvelope>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -7303,7 +7326,12 @@ pub mod mpcca_withdraw_v2 {
     }
 
     /// Byte-identical with the TS reconstructor in `deop-protocol::mpcca_withdraw_v2::
-    /// mpccaWithdrawRound1WorkerTranscriptHash`. Round 1 has no `previousRound*` fields.
+    /// mpccaWithdrawRound1WorkerTranscriptHash`. Round 1 V2 binds the three M1 ingress fields
+    /// after the base envelope:
+    ///   ... base_parts (V2 domain)
+    ///   || ":" || amount_commitment_hex
+    ///   || ":" || joined(per_share_commitments_hex, "|")
+    ///   || ":" || ingress_envelopes_hash_hex
     #[allow(clippy::too_many_arguments)]
     pub fn round1_worker_transcript_hash(
         session_id: &str,
@@ -7330,8 +7358,11 @@ pub mod mpcca_withdraw_v2 {
         expiry_secs: u64,
         request_hash_hex: &str,
         deposit_count: u64,
+        amount_commitment_hex: &str,
+        per_share_commitments_hex: &[String],
+        ingress_envelopes_hash_hex: &str,
     ) -> String {
-        let bytes = base_hash_parts(
+        let mut bytes = base_hash_parts(
             ROUND1_TRANSCRIPT_DOMAIN,
             session_id,
             request_id,
@@ -7358,7 +7389,66 @@ pub mod mpcca_withdraw_v2 {
             request_hash_hex,
             deposit_count,
         );
+        bytes.push(b':');
+        bytes.extend_from_slice(amount_commitment_hex.as_bytes());
+        bytes.push(b':');
+        let joined = per_share_commitments_hex.join("|");
+        bytes.extend_from_slice(joined.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(ingress_envelopes_hash_hex.as_bytes());
         sha256_hex(&bytes)
+    }
+
+    /// Compute the public `ingress_envelopes_hash` over the 5 envelopes in sorted-selectedSlots
+    /// order. Byte-identical to TS `ingressEnvelopesHash(envelopes)`:
+    ///   sha256_hex(concat(canonical_json(envelope_i) utf8 bytes for i in 0..5)).
+    pub fn ingress_envelopes_hash(envelopes: &[HpkeEnvelope]) -> WorkerResult<String> {
+        let mut hasher = Sha256::new();
+        for env in envelopes {
+            let canonical = canonical_envelope_json(env)?;
+            hasher.update(canonical.as_bytes());
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Canonical JSON for an HpkeEnvelope, sorted keys: `aadHash`, `aead`, `ciphertext`, `enc`,
+    /// `kdf`, `kem`. The encoding mirrors TS's `canonicalJsonStringify` byte-for-byte.
+    fn canonical_envelope_json(env: &HpkeEnvelope) -> WorkerResult<String> {
+        // We do NOT use serde_json's default ordering because the HpkeEnvelope struct's
+        // field order is `kem,kdf,aead,enc,ciphertext,aadHash` (non-alphabetical). TS
+        // canonicalJsonStringify sorts alphabetically: aadHash, aead, ciphertext, enc, kdf, kem.
+        Ok(format!(
+            "{{\"aadHash\":{},\"aead\":{},\"ciphertext\":{},\"enc\":{},\"kdf\":{},\"kem\":{}}}",
+            json_string(&env.aad_hash),
+            json_string(&env.aead),
+            json_string(&env.ciphertext),
+            json_string(&env.enc),
+            json_string(&env.kdf),
+            json_string(&env.kem),
+        ))
+    }
+
+    fn json_string(s: &str) -> String {
+        // Minimal JSON-string encoder mirroring TS `JSON.stringify(string)`. Hex strings + the
+        // 3 ciphersuite labels are all ASCII with no special chars, so we only need to wrap
+        // in quotes — but escape conservatively in case future fields aren't ASCII-clean.
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0c}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7513,13 +7603,79 @@ pub mod mpcca_withdraw_v2 {
         sha256_hex(&bytes)
     }
 
+    /// Normalised + validated M1 ingress fields. Length-checked envelope and commitment counts,
+    /// per-commitment hex shape, but no crypto evaluation yet (Pedersen verification + HPKE
+    /// decrypt land in Commit 3).
+    pub(crate) struct NormalisedIngress {
+        pub amount_commitment: String,
+        pub per_share_commitments: Vec<String>,
+        pub ingress_envelopes: Vec<HpkeEnvelope>,
+        pub ingress_envelopes_hash: String,
+    }
+
+    /// Validate the wire shape of the M1 ingress fields:
+    /// - per_share_commitments length == DEOPERATOR_THRESHOLD, each entry 32-byte hex
+    /// - ingress_envelopes length == DEOPERATOR_THRESHOLD, each via hpke_aead::validate
+    /// - amount_commitment is 32-byte hex
+    /// Returns the normalised hex strings (lower-cased, no `0x` prefix) + the canonical
+    /// ingress_envelopes_hash.
+    pub(crate) fn normalise_ingress_fields(
+        amount_commitment: &str,
+        per_share_commitments: &[String],
+        ingress_envelopes: &[HpkeEnvelope],
+    ) -> WorkerResult<NormalisedIngress> {
+        if per_share_commitments.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "per_share_commitments must have exactly {} entries, got {}",
+                DEOPERATOR_THRESHOLD,
+                per_share_commitments.len()
+            )));
+        }
+        if ingress_envelopes.len() != DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "ingress_envelopes must have exactly {} entries, got {}",
+                DEOPERATOR_THRESHOLD,
+                ingress_envelopes.len()
+            )));
+        }
+        let amount_commitment_norm = normalize_hex(amount_commitment, 32)?;
+        let mut per_share_norm = Vec::with_capacity(DEOPERATOR_THRESHOLD);
+        for (i, c) in per_share_commitments.iter().enumerate() {
+            let n = normalize_hex(c, 32).map_err(|_| {
+                WorkerError::InvalidRequest(format!(
+                    "per_share_commitments[{i}] must be 32-byte hex (compressed Ristretto)"
+                ))
+            })?;
+            per_share_norm.push(n);
+        }
+        for (i, env) in ingress_envelopes.iter().enumerate() {
+            crate::hpke_aead::validate(env).map_err(|e| {
+                WorkerError::InvalidRequest(format!(
+                    "ingress_envelopes[{i}] failed HPKE shape validation: {e:?}"
+                ))
+            })?;
+        }
+        let ingress_envelopes_hash_hex = ingress_envelopes_hash(ingress_envelopes)?;
+        Ok(NormalisedIngress {
+            amount_commitment: amount_commitment_norm,
+            per_share_commitments: per_share_norm,
+            ingress_envelopes: ingress_envelopes.to_vec(),
+            ingress_envelopes_hash: ingress_envelopes_hash_hex,
+        })
+    }
+
     /// Round 1 worker entrypoint. Returns `Err(NotImplemented(ROUND1_NOT_IMPLEMENTED_PHASE))`
-    /// AFTER doing the full public binding work. A tampered request fails closed BEFORE the
-    /// NotImplemented surface (Crypto for sigma reject, InvalidDkgState for provenance mismatch,
-    /// InvalidRequest for id-safety / shape / vault_sequence violations).
+    /// AFTER doing the full public binding work, including M1 ingress field shape validation.
+    /// The actual ingress crypto (per-share Pedersen verify + HPKE decrypt + zero-share reject +
+    /// HPKE-encrypted-at-rest persist) lands in Commit 3.
     pub fn run_round1_v2(state_dir: &Path, req: &Round1Request) -> WorkerResult<StubRoundResult> {
         let (normalised, _existing, session_dir) =
             common_public_binding_work(state_dir, req)?;
+        let ingress = normalise_ingress_fields(
+            &req.amount_commitment,
+            &req.per_share_commitments,
+            &req.ingress_envelopes,
+        )?;
         let worker_transcript_hash = round1_worker_transcript_hash(
             &req.session_id,
             &req.request_id,
@@ -7545,6 +7701,9 @@ pub mod mpcca_withdraw_v2 {
             req.expiry_secs,
             &normalised.request_hash,
             req.deposit_count,
+            &ingress.amount_commitment,
+            &ingress.per_share_commitments,
+            &ingress.ingress_envelopes_hash,
         );
         persist_and_stub(
             &session_dir,
@@ -7892,6 +8051,13 @@ pub mod mpcca_withdraw_v2 {
             expiry_secs: req.expiry_secs,
             request_hash: req.request_hash.clone(),
             deposit_count: req.deposit_count,
+            // M1 ingress fields are round1-only — chained rounds inherit nothing from them
+            // because the M3a chained-stub path runs against the un-ingressed envelope. M4
+            // will load the M1 (a_i, b_i) shares from the worker-local session state file,
+            // NOT from the wire body, so leaving these empty here is safe.
+            amount_commitment: String::new(),
+            per_share_commitments: Vec::new(),
+            ingress_envelopes: Vec::new(),
         };
         let (normalised, _existing, session_dir) =
             common_public_binding_work(state_dir, &envelope)?;
