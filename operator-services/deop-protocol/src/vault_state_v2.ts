@@ -58,7 +58,27 @@ export interface VaultStateV2InitResponse {
   vaultSequence: number;
   depositCountObserved: number;
   createdAtUnixMs: number;
-  /** True when this call wrote a new file; false on idempotent replay. */
+  /**
+   * Codex M3a P1 v5 (partial-finalize recovery — `initialized` mutability removal):
+   * monotonic "the vault state file has been written" flag. ALWAYS `true` on every
+   * successful response — both on a fresh init (file just materialised) AND on an idempotent
+   * replay (file already exists). Once a vault is initialized, this stays true; the field
+   * never flips back to false.
+   *
+   * Pre-v5 semantic was "did THIS call write a new file" (true on fresh init, false on replay).
+   * That made the coordinator's per-slot contribution non-stable across retries: a partial-
+   * finalize recovery would re-init all 5 workers (file exists for every worker → all 5
+   * return initialized=false) and recompute a final_transcript_hash that differed from the
+   * original. Already-finalized workers then rejected the new final hash as
+   * `vault_state_v2_finalize_already_pinned_with_different_value`, leaving the cluster
+   * permanently wedged.
+   *
+   * v5 makes `initialized` a property of the VAULT (has the file been written?) rather than
+   * the CALL (did this invocation do the writing?). Init replays therefore return byte-
+   * identical responses to the first init, the final_transcript_hash is stable across
+   * retries, and partial-finalize recovery genuinely works without any coordinator-side
+   * normalisation.
+   */
   initialized: boolean;
 }
 

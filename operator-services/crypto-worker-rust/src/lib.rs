@@ -5516,7 +5516,26 @@ pub mod vault_state_v2 {
         pub vault_sequence: u64,
         pub deposit_count_observed: u64,
         pub created_at_unix_ms: u128,
-        /// `true` when this call materialised a new file; `false` on idempotent replay.
+        /// Codex M3a P1 v5 (partial-finalize recovery — `initialized` mutability removal):
+        /// monotonic "the vault state file has been written" flag. ALWAYS `true` on every
+        /// successful response — both on a fresh init (file just materialised) AND on an
+        /// idempotent replay (file already exists). Once a vault is initialized, it stays
+        /// initialized; this flag never flips back to `false`.
+        ///
+        /// Pre-v5 semantic was "did THIS call write a new file" (true on fresh init, false
+        /// on replay). That made the coordinator's per-slot contribution non-stable across
+        /// retries: a partial-finalize recovery would re-init all 5 workers (file exists for
+        /// every worker → all 5 return initialized=false) and recompute a final_transcript_hash
+        /// that differed from the original (every worker had returned initialized=true on
+        /// the first round). Already-finalized workers then rejected the new final hash as
+        /// `vault_state_v2_finalize_already_pinned_with_different_value`, leaving the cluster
+        /// permanently wedged.
+        ///
+        /// v5 makes `initialized` a property of the VAULT (has the file been written?) rather
+        /// than the CALL (did this invocation do the writing?). Init replays therefore return
+        /// byte-identical responses to the first init for the same vault, the
+        /// final_transcript_hash is stable across retries, and partial-finalize recovery
+        /// genuinely works without any coordinator-side normalisation.
         pub initialized: bool,
     }
 
@@ -5887,9 +5906,21 @@ pub mod vault_state_v2 {
     /// CA DKG V2 share) bindings, then writes `vault_state_v2.json` atomically with mode 0o600.
     /// Idempotent: a subsequent call with the SAME `(dkg_epoch, vault_ek, vault_ek_transcript_hash,
     /// registration_transcript_hash, sender_address, asset_type, chain_id, aggregate_commitment,
-    /// aggregate_response, challenge)` returns the same response (with `initialized: false`); a
+    /// aggregate_response, challenge)` returns the same response (Codex M3a P1 v5: byte-identical
+    /// to the first call, including `initialized: true` — the file IS initialized); a
     /// call with ANY of these changed is rejected `vault_state_v2_already_initialized_with_different_inputs`
     /// — operator must rotate epoch + re-derive.
+    ///
+    /// Codex M3a P1 v5 (partial-finalize recovery — `initialized` mutability removal):
+    /// the response is now byte-stable across init replays for the same vault, regardless of
+    /// finalize state. `initialized` is monotonic ("the vault state file has been written");
+    /// `vault_state_hash` is computed via `compute_vault_state_hash_canonical` over the
+    /// immutable field subset; `worker_transcript_hash` is frozen at init time and read back
+    /// from disk on replay; `vault_sequence` and `deposit_count_observed` are read back from
+    /// disk and only mutate through their own dedicated endpoints (withdraw / observe-deposit).
+    /// The ONLY field that drifts on replay is `created_at_unix_ms` — which is NOT part of
+    /// `perSlotContributions` and therefore not bound into the coordinator's
+    /// `final_transcript_hash`. See server.ts:2041 for the contribution mapping.
     pub fn init_vault_state_v2(state_dir: &Path, req: &InitRequest) -> WorkerResult<InitResult> {
         validate_selected_slots(&req.selected_slots)?;
         assert_slot(req.self_slot)?;
@@ -6062,6 +6093,11 @@ pub mod vault_state_v2 {
             //
             // Legacy v2 files (pre-v3 layout — `worker_transcript_hash` field absent on disk)
             // are rejected by `load_vault_state_v2` with `vault_state_v2_legacy_layout_requires_reinit`.
+            // Codex M3a P1 v5: `initialized` is a monotonic VAULT-level property — "the
+            // vault state file has been written". Once true, stays true. An idempotent replay
+            // returns `true` here (the file IS initialized) so the coordinator's per-slot
+            // contribution is byte-stable across init replays, enabling partial-finalize
+            // recovery without any test-side or coordinator-side normalisation.
             return Ok(InitResult {
                 slot: req.self_slot,
                 player_id: req.player_id,
@@ -6071,7 +6107,7 @@ pub mod vault_state_v2 {
                 vault_sequence: existing.vault_sequence,
                 deposit_count_observed: existing.deposit_count_observed,
                 created_at_unix_ms: existing.created_at_unix_ms,
-                initialized: false,
+                initialized: true,
             });
         }
 
