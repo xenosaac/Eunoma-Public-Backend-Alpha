@@ -474,14 +474,19 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
     };
     let pre_err = run_round1_v2(&fix.slot_dirs[0], &round1_req_pre_finalize)
         .expect_err("pre-finalize must fail closed (the regression baseline)");
+    // Codex M3a P1 v3 (partial-finalize recovery): pre-finalize, the persisted
+    // `init_transcript_hash` is None — the worker rejects with the distinct
+    // `vault_state_v2_not_finalized` code (NOT `vault_state_init_transcript_hash_mismatch`).
+    // This lets the coordinator distinguish "transient — run finalize" from "permanent —
+    // investigate tamper". The original P1 regression manifested as either error; either
+    // surfacing post-binding-work proves the finalize round is load-bearing.
     assert!(
         matches!(
             pre_err,
-            WorkerError::InvalidDkgState(ref s)
-                if s == "vault_state_init_transcript_hash_mismatch"
+            WorkerError::InvalidDkgState(ref s) if s == "vault_state_v2_not_finalized"
         ),
-        "pre-finalize MUST surface InvalidDkgState(vault_state_init_transcript_hash_mismatch); \
-         this is the EXACT regression the finalize round fixes, got {pre_err:?}"
+        "pre-finalize MUST surface InvalidDkgState(vault_state_v2_not_finalized) — the v3 \
+         layout's distinct error code for the recoverable not-finalized-yet state; got {pre_err:?}"
     );
 
     // 4. FINALIZE: fan out the canonical hash to every slot. Each worker re-derives the
@@ -635,15 +640,20 @@ fn vault_state_init_finalize_rejects_tampered_final_hash() {
          got {err:?}"
     );
 
-    // Persisted init_transcript_hash UNCHANGED (still the per-slot init hash from the
-    // init call above; finalize never touched the file).
+    // Codex M3a P1 v3: after init (no finalize), `init_transcript_hash` is None and
+    // `worker_transcript_hash` is the frozen per-slot init hash. A tampered finalize call
+    // must leave both untouched.
     let persisted = load_vault_state_v2(&fix.slot_dirs[slot])
         .expect("load")
         .expect("file");
     assert_eq!(
-        persisted.init_transcript_hash.as_deref(),
-        Some(per_slot_contribs[0].worker_transcript_hash.as_str()),
-        "tampered finalize MUST NOT mutate persisted init_transcript_hash"
+        persisted.init_transcript_hash, None,
+        "tampered finalize MUST NOT mutate init_transcript_hash (still None — never finalized)"
+    );
+    assert_eq!(
+        persisted.worker_transcript_hash,
+        per_slot_contribs[0].worker_transcript_hash,
+        "tampered finalize MUST NOT mutate the frozen worker_transcript_hash"
     );
 }
 

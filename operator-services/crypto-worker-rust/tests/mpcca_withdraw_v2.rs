@@ -39,7 +39,11 @@ use eunoma_crypto_worker::{
         aggregate_registration_commitment, registration_challenge, verify_registration_proof,
         RegistrationCommitmentInput, RegistrationResponseInput,
     },
-    vault_state_v2::{init_vault_state_v2, InitRequest as VaultStateInitRequest},
+    vault_state_v2::{
+        final_transcript_hash, finalize_vault_state_v2, init_vault_state_v2,
+        FinalizeContribution, FinalizeRequest as VaultStateFinalizeRequest,
+        InitRequest as VaultStateInitRequest,
+    },
     WorkerError,
 };
 use rand_chacha::{
@@ -200,11 +204,12 @@ struct MpccaWithdrawFixture {
     slot_dirs: Vec<PathBuf>,
     vault_ek_transcript_hash: String,
     registration_transcript_hash: String,
-    /// Codex M3a P1: the per-slot init worker_transcript_hash returned by init_vault_state_v2.
-    /// MPCCA withdraw round1 binds this byte-for-byte against the persisted vault_state_v2.json
-    /// `init_transcript_hash` field — a tampered request fails closed with InvalidDkgState.
-    /// Indexed by selected_slots[ordinal] order: slot 0 → init_transcript_hashes[0], etc.
-    init_transcript_hashes: Vec<String>,
+    /// Codex M3a P1 v3 (partial-finalize recovery): the CANONICAL final transcript hash
+    /// (EUNOMA_VAULT_STATE_V2_FINAL_V1 domain over public inputs + sorted contributions).
+    /// This is what `finalize_vault_state_v2` pins as `init_transcript_hash` on every selected
+    /// worker, and what MPCCA withdraw round1/2/prove/finalize binds against. Distinct from
+    /// (and necessarily different from) any per-slot worker_transcript_hash.
+    canonical_final_hash: String,
 }
 
 fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
@@ -321,10 +326,12 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
     let registration_transcript_hash = "22".repeat(32);
 
     // Run Milestone 2a init for every selected worker so vault_state_v2.json exists with the
-    // sigma tuple bound. Codex M3a P1: capture each worker's returned init_transcript_hash
-    // so the round1 fixture below sends the SAME value back — the worker rejects a forged
-    // hash with InvalidDkgState("vault_state_init_transcript_hash_mismatch").
-    let mut init_transcript_hashes = Vec::with_capacity(selected_slots.len());
+    // sigma tuple bound. Codex M3a P1 v3 (partial-finalize recovery): the per-slot
+    // worker_transcript_hash is FROZEN at init, but the value MPCCA withdraw binds against is
+    // the CANONICAL FINAL hash set by `finalize_vault_state_v2`. So we run init AND finalize
+    // here to produce a fully-canonical fixture that mirrors what the coordinator's
+    // /v2/vault_state/init produces in production.
+    let mut per_slot_contribs: Vec<FinalizeContribution> = Vec::with_capacity(selected_slots.len());
     for (ordinal, &slot) in selected_slots.iter().enumerate() {
         let req = VaultStateInitRequest {
             dkg_epoch: DKG_EPOCH.to_string(),
@@ -346,7 +353,61 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
             challenge: aggregate.challenge.clone(),
         };
         let result = init_vault_state_v2(&slot_dirs[slot], &req).expect("init vault_state_v2");
-        init_transcript_hashes.push(result.worker_transcript_hash);
+        per_slot_contribs.push(FinalizeContribution {
+            slot,
+            vault_state_hash: result.vault_state_hash,
+            worker_transcript_hash: result.worker_transcript_hash,
+            vault_sequence: 0,
+            deposit_count_observed: 0,
+            initialized: true,
+        });
+    }
+    // Compute the canonical FINAL_V1 transcript hash byte-for-byte the way the coordinator
+    // does (sorted contributions, sorted selected slots).
+    let mut sorted_slots = selected_slots.clone();
+    sorted_slots.sort_unstable();
+    let mut sorted_contribs = per_slot_contribs.clone();
+    sorted_contribs.sort_by_key(|c| c.slot);
+    let canonical_final_hash = final_transcript_hash(
+        DKG_EPOCH,
+        &ca_transcript,
+        &vault_ek_transcript_hash,
+        &registration_transcript_hash,
+        &roster_hash,
+        &sorted_slots,
+        &vault_ek_hex,
+        &sender,
+        &asset,
+        chain_id,
+        &aggregate.aggregate_commitment,
+        &aggregate.aggregate_response,
+        &aggregate.challenge,
+        &sorted_contribs,
+    );
+    // Finalize each worker so `init_transcript_hash = canonical_final_hash`.
+    for (ordinal, &slot) in selected_slots.iter().enumerate() {
+        let req = VaultStateFinalizeRequest {
+            dkg_epoch: DKG_EPOCH.to_string(),
+            request_id: format!("mpcca-init-req-{label}"),
+            session_id: format!("mpcca-init-sess-{label}"),
+            ca_dkg_transcript_hash: ca_transcript.clone(),
+            vault_ek_transcript_hash: vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: registration_transcript_hash.clone(),
+            roster_hash: roster_hash.clone(),
+            selected_slots: selected_slots.clone(),
+            self_slot: slot,
+            player_id: ordinal,
+            vault_ek: vault_ek_hex.clone(),
+            sender_address: sender.clone(),
+            asset_type: asset.clone(),
+            chain_id,
+            aggregate_commitment: aggregate.aggregate_commitment.clone(),
+            aggregate_response: aggregate.aggregate_response.clone(),
+            challenge: aggregate.challenge.clone(),
+            per_slot_contributions: per_slot_contribs.clone(),
+            final_transcript_hash: canonical_final_hash.clone(),
+        };
+        finalize_vault_state_v2(&slot_dirs[slot], &req).expect("finalize vault_state_v2");
     }
 
     MpccaWithdrawFixture {
@@ -363,7 +424,7 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
         slot_dirs,
         vault_ek_transcript_hash,
         registration_transcript_hash,
-        init_transcript_hashes,
+        canonical_final_hash,
     }
 }
 
@@ -391,11 +452,10 @@ fn build_round1_request(
         session_id: "mpcca-withdraw-sess".to_string(),
         vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
         registration_transcript_hash: fix.registration_transcript_hash.clone(),
-        // Codex M3a P1: bind the SAME init_transcript_hash the worker persisted at init time.
-        // A different value here would fail closed with
-        // InvalidDkgState("vault_state_init_transcript_hash_mismatch") — that's the negative
-        // case the dedicated test below exercises.
-        vault_state_init_transcript_hash: fix.init_transcript_hashes[player_id].clone(),
+        // Codex M3a P1 v3: bind the CANONICAL FINAL_V1 transcript hash the worker pinned at
+        // finalize. A different value here surfaces InvalidDkgState — see the dedicated
+        // negative-case tests below.
+        vault_state_init_transcript_hash: fix.canonical_final_hash.clone(),
         observed_deposit_transcript_hashes: fixture_observed_hashes(),
         observed_deposit_cursors: fixture_observed_cursors(),
         roster_hash: fix.roster_hash.clone(),
@@ -431,9 +491,9 @@ fn build_chained_request(
         session_id: "mpcca-withdraw-sess".to_string(),
         vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
         registration_transcript_hash: fix.registration_transcript_hash.clone(),
-        // Codex M3a P1: bind the SAME init_transcript_hash the worker persisted at init time
-        // (same rationale as build_round1_request above).
-        vault_state_init_transcript_hash: fix.init_transcript_hashes[player_id].clone(),
+        // Codex M3a P1 v3: bind the CANONICAL FINAL_V1 transcript hash (same rationale as
+        // build_round1_request above).
+        vault_state_init_transcript_hash: fix.canonical_final_hash.clone(),
         observed_deposit_transcript_hashes: fixture_observed_hashes(),
         observed_deposit_cursors: fixture_observed_cursors(),
         roster_hash: fix.roster_hash.clone(),
@@ -529,7 +589,7 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
         &req.dkg_epoch,
         &fix.vault_ek_transcript_hash,
         &fix.registration_transcript_hash,
-        &fix.init_transcript_hashes[player_id],
+        &fix.canonical_final_hash,
         &req.observed_deposit_transcript_hashes,
         &fix.roster_hash,
         &sorted,

@@ -5503,6 +5503,24 @@ pub mod vault_state_v2 {
     /// On-disk shape for the per-worker vault-state file. Mode 0o600 (no secret material, but
     /// the directory layout mirrors `ca_dkg_share_v2.json` so we keep the same posture).
     /// Persisted at `state_dir/vault_state_v2.json`.
+    ///
+    /// Codex M3a P1 v3 (partial-finalize recovery): two distinct hash fields encode the
+    /// two-phase init/finalize lifecycle:
+    ///   - `worker_transcript_hash` — FROZEN at init time, NEVER overwritten. The per-slot
+    ///     `EUNOMA_VAULT_STATE_V2_INIT_V1` digest the worker returns from `/v2/vault_state/init`.
+    ///     Idempotent replays of init return this exact value byte-for-byte regardless of how
+    ///     many finalize / observe-deposit calls landed in between. This is what the coordinator
+    ///     uses to build the FINAL_V1 transcript; it's also what `finalize_vault_state_v2`
+    ///     cross-checks the supplied `per_slot_contributions[self_slot]` against.
+    ///   - `init_transcript_hash: Option<String>` — set ONLY by `finalize_vault_state_v2` once
+    ///     the FINAL_V1 transcript is canonical. `None` means "init ran but finalize hasn't
+    ///     landed yet" — the legitimate partial-finalize recovery state. MPCCA withdraw rounds
+    ///     read this field; `None` surfaces `InvalidDkgState("vault_state_v2_not_finalized")`
+    ///     distinct from a mismatch.
+    ///
+    /// Pre-v3 layout (single `init_transcript_hash` field doing double duty as per-slot init
+    /// hash + finalized canonical hash) is rejected on load with
+    /// `vault_state_v2_legacy_layout_requires_reinit`. Operators upgrading must wipe + re-init.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
     pub struct VaultStateFile {
@@ -5529,19 +5547,21 @@ pub mod vault_state_v2 {
         /// this vault. Starts at 0; sub-milestone 2b will increment.
         pub deposit_count_observed: u64,
         pub created_at_unix_ms: u128,
-        /// Codex M3a P1: per-worker init transcript hash. This is the EXACT same value the
-        /// worker returns as `worker_transcript_hash` from its init call — by persisting it,
-        /// downstream MPCCA withdraw rounds can verify a caller-supplied
-        /// `vault_state_init_transcript_hash` byte-for-byte against the worker's own bound
-        /// init transcript. Without this field the MPCCA round1 path could only shape-check
-        /// the value, and a forged init transcript hash would reach NotImplemented instead of
-        /// `InvalidDkgState("vault_state_init_transcript_hash_mismatch")`.
+        /// Codex M3a P1 v3: FROZEN per-slot init transcript hash. Computed and persisted by
+        /// `init_vault_state_v2`; NEVER overwritten by finalize or observe_deposit. Idempotent
+        /// init replays return this exact value, which is critical for partial-finalize
+        /// recovery: a coordinator re-running init after a partial finalize MUST receive the
+        /// SAME per-slot hash on every retry so it can rebuild the canonical FINAL_V1
+        /// transcript byte-for-byte.
+        pub worker_transcript_hash: String,
+        /// Codex M3a P1 v3: canonical FINAL_V1 transcript hash, set ONLY by
+        /// `finalize_vault_state_v2`. `None` between init and finalize. The MPCCA withdraw
+        /// rounds read this; `None` surfaces a distinct error code so a coordinator can
+        /// re-finalize the slots that didn't acknowledge a previous finalize round.
         ///
-        /// Wrapped in `Option` for backwards-compatibility with on-disk files written by the
-        /// Milestone 2a code that pre-dates this fix: `load_vault_state_v2` auto-migrates a
-        /// `None` value by recomputing the per-worker init worker_transcript_hash from the
-        /// persisted bindings and writing the file back atomically. New files (and migrated
-        /// files) always carry `Some(_)` from this point forward.
+        /// Idempotent finalize replay: persisted value equals the request's claim → return OK
+        /// with `finalized=false`. Persisted value differs from the claim → fail closed with
+        /// `vault_state_v2_finalize_already_pinned_with_different_value`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub init_transcript_hash: Option<String>,
     }
@@ -5931,28 +5951,21 @@ pub mod vault_state_v2 {
                 ));
             }
             let vault_state_hash = sha256_hex(&raw);
-            // Codex M3a P1: the persisted `init_transcript_hash` is the FIRST-init worker
-            // transcript hash — frozen. Idempotent replays return that same hash so the
-            // coordinator + MPCCA withdraw rounds see a STABLE value regardless of how many
-            // re-init calls happened.
+            // Codex M3a P1 v3 (partial-finalize recovery): return the FROZEN per-slot
+            // `worker_transcript_hash` from disk. This value is set at init time and NEVER
+            // overwritten — not by finalize, not by observe_deposit. A coordinator re-running
+            // init after a partial finalize MUST receive the same per-slot hash on every retry,
+            // so it can rebuild the canonical FINAL_V1 transcript byte-for-byte and resume
+            // finalize on the slots that didn't acknowledge a previous round.
             //
-            // Legacy file (pre-fix) → field is absent. We fail closed with a specific code so
-            // operators know to wipe + re-init (per the load_vault_state_v2 backwards-compat
-            // policy above).
-            let worker_transcript_hash = existing.init_transcript_hash.clone().ok_or_else(|| {
-                WorkerError::InvalidDkgState(
-                    "vault_state_v2_init_transcript_hash_missing: legacy vault_state_v2.json \
-                     written before Codex M3a P1 landed; remove the file and re-run \
-                     /v2/vault_state/init to populate the init_transcript_hash field"
-                        .to_string(),
-                )
-            })?;
+            // Legacy v2 files (pre-v3 layout — `worker_transcript_hash` field absent on disk)
+            // are rejected by `load_vault_state_v2` with `vault_state_v2_legacy_layout_requires_reinit`.
             return Ok(InitResult {
                 slot: req.self_slot,
                 player_id: req.player_id,
                 vault_state_path: file_path.display().to_string(),
                 vault_state_hash,
-                worker_transcript_hash,
+                worker_transcript_hash: existing.worker_transcript_hash.clone(),
                 vault_sequence: existing.vault_sequence,
                 deposit_count_observed: existing.deposit_count_observed,
                 created_at_unix_ms: existing.created_at_unix_ms,
@@ -5965,9 +5978,13 @@ pub mod vault_state_v2 {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        // Codex M3a P1: compute the per-worker init transcript hash NOW so we can persist it.
-        // The mpcca_withdraw_v2 round1/2/prove/finalize handlers verify a caller-supplied
-        // `vault_state_init_transcript_hash` against this exact value byte-for-byte.
+        // Codex M3a P1 v3 (partial-finalize recovery): compute and FREEZE the per-slot init
+        // transcript hash. This goes into `worker_transcript_hash` — a separate field from
+        // `init_transcript_hash`. The `init_transcript_hash` (canonical FINAL_V1) is set later
+        // by `finalize_vault_state_v2`; until then it stays `None`. This separation is the
+        // load-bearing fix for the partial-finalize recovery story: a coordinator re-running
+        // init after a partial finalize must receive the SAME per-slot hash on every retry,
+        // regardless of whether some slots already finalized.
         let worker_transcript_hash = init_worker_transcript_hash(
             &req.session_id,
             &req.request_id,
@@ -6009,7 +6026,13 @@ pub mod vault_state_v2 {
             vault_sequence: 0,
             deposit_count_observed: 0,
             created_at_unix_ms: created_at,
-            init_transcript_hash: Some(worker_transcript_hash.clone()),
+            // Frozen at init time; never overwritten downstream.
+            worker_transcript_hash: worker_transcript_hash.clone(),
+            // Set by finalize_vault_state_v2; None until then. The MPCCA withdraw rounds
+            // reject `None` with InvalidDkgState("vault_state_v2_not_finalized") — distinct
+            // from a hash mismatch — so coordinators can distinguish "needs finalize" from
+            // "tampered request".
+            init_transcript_hash: None,
         };
         // pretty-print so the file is human-auditable. JSON canonicalisation isn't needed for
         // the integrity hash because `vault_state_hash` is over the EXACT byte buffer the worker
@@ -6033,7 +6056,8 @@ pub mod vault_state_v2 {
         })
     }
 
-    /// Codex M3a P1 (regression fix): worker entrypoint for `/worker/v2/vault_state/init/finalize`.
+    /// Codex M3a P1 (regression fix) + v3 (partial-finalize recovery): worker entrypoint for
+    /// `/worker/v2/vault_state/init/finalize`.
     ///
     /// Background: pre-fix, each worker persisted its OWN per-slot `worker_transcript_hash` as
     /// `init_transcript_hash` in `vault_state_v2.json`. The coordinator then sent the FINAL
@@ -6042,8 +6066,21 @@ pub mod vault_state_v2 {
     /// matched → ALL legitimate withdraws failed closed with
     /// `vault_state_init_transcript_hash_mismatch`. This was a P1 prod regression.
     ///
-    /// The fix: introduce a second fan-out from the coordinator AFTER it has collected all 5
-    /// per-slot init responses + computed the final transcript hash. Each worker:
+    /// v2 fix (Codex M3a P1 round 1): introduced a finalize round so every worker re-derives
+    /// the same final hash. Working — but had a critical recovery gap: if finalize succeeded
+    /// on some slots but failed on others (network partition mid-fan-out), the finalized
+    /// slots had `init_transcript_hash = finalHash`, and an init replay returned that final
+    /// hash as `worker_transcript_hash` — breaking the coordinator's per-slot recomputation
+    /// gate. There was NO normal recovery path.
+    ///
+    /// v3 fix (Codex M3a P1 round 2): separate `worker_transcript_hash` (frozen at init) from
+    /// `init_transcript_hash` (set by finalize). Init replays return the FROZEN per-slot hash
+    /// regardless of finalize state, so a coordinator can ALWAYS re-run init → collect
+    /// per-slot hashes → recompute the FINAL_V1 transcript → re-fan-out finalize. Already-
+    /// finalized slots accept the same final hash idempotently; not-yet-finalized slots
+    /// finalize for the first time.
+    ///
+    /// What this entrypoint does:
     ///   1. Re-derives the final transcript hash locally from the supplied
     ///      `per_slot_contributions` (sorted by slot) + public inputs, using the SAME
     ///      `EUNOMA_VAULT_STATE_V2_FINAL_V1` domain and field order as the TS
@@ -6053,10 +6090,14 @@ pub mod vault_state_v2 {
     ///      `InvalidDkgState("vault_state_v2_finalize_hash_mismatch")` — a coordinator that
     ///      lied about either the contributions or the digest cannot tamper this worker's
     ///      persisted state.
-    ///   3. UPDATES the persisted `vault_state_v2.json` with `init_transcript_hash =
-    ///      final_transcript_hash`. The persisted file is the source of truth the MPCCA
-    ///      withdraw cross-check reads at the round1/2/prove/finalize gates.
-    ///   4. Re-binds the public inputs (dkg_epoch, vault_ek, etc.) against the persisted file
+    ///   3. Cross-checks `per_slot_contributions[player_id].worker_transcript_hash` against
+    ///      the worker's OWN FROZEN `existing.worker_transcript_hash` (read from disk — not
+    ///      recomputed from current state, since `observe_deposit_v2` mutates the cursor and
+    ///      a recomputation would diverge). A mismatch fails closed with
+    ///      `vault_state_v2_finalize_self_contribution_mismatch`.
+    ///   4. Sets `init_transcript_hash = Some(final_transcript_hash)` and persists the file
+    ///      atomically. `worker_transcript_hash` and all other fields are preserved verbatim.
+    ///   5. Re-binds the public inputs (dkg_epoch, vault_ek, etc.) against the persisted file
     ///      to refuse a finalize call against a state that was initialised for a different
     ///      vault.
     ///
@@ -6064,6 +6105,12 @@ pub mod vault_state_v2 {
     /// and leaves the file unchanged. A re-finalize with a DIFFERENT value fails closed with
     /// `vault_state_v2_finalize_already_pinned_with_different_value` so an operator cannot
     /// silently swap the canonical init binding mid-vault-lifetime.
+    ///
+    /// Partial-finalize recovery: the idempotent replay branch is what makes the recovery
+    /// flow work. A coordinator can re-fan-out finalize to all 5 slots; the slots that
+    /// already finalized return OK with `finalized=false`; the slots that didn't, finalize
+    /// for the first time and return `finalized=true`. All 5 end up with the same
+    /// `init_transcript_hash` and MPCCA withdraw rounds proceed.
     pub fn finalize_vault_state_v2(
         state_dir: &Path,
         req: &FinalizeRequest,
@@ -6218,49 +6265,43 @@ pub mod vault_state_v2 {
             ));
         }
 
-        // Cross-check this slot's per-init worker_transcript_hash matches what was returned at
-        // init time. We compare against a freshly-computed init transcript hash from the
-        // persisted file (using cursor values 0,0 — pre-finalize they're always 0 by init
-        // semantics). A mismatch here means the supplied per_slot_contributions[self_slot] was
-        // tampered.
+        // Codex M3a P1 v3 (partial-finalize recovery): the self-slot contribution's
+        // worker_transcript_hash MUST match the worker's OWN FROZEN value from disk. We do
+        // NOT recompute the per-slot init hash from mutable state here — `observe_deposit_v2`
+        // bumps `deposit_count_observed`, and a recomputation using current cursor values
+        // would diverge from the value the worker returned at init time. The FROZEN field
+        // captures the per-slot hash as it was at init, regardless of how many observe-
+        // deposit calls landed between init and finalize.
+        //
+        // This is the load-bearing P2 fix: finalize replay is idempotent ACROSS observe-
+        // deposit cursor bumps. Pre-v3, a finalize replay after even one observe-deposit
+        // would fail closed with self_contribution_mismatch because the recomputed hash
+        // differed from the original.
         let self_contrib = &contribs[req.player_id];
         if self_contrib.slot != req.self_slot {
             return Err(WorkerError::InvalidRequest(
                 "self_slot_contribution_mismatch".to_string(),
             ));
         }
-        let expected_self_init = init_worker_transcript_hash(
-            &req.session_id,
-            &req.request_id,
-            &req.dkg_epoch,
-            &ca_transcript,
-            &vault_ek_transcript,
-            &registration_transcript,
-            &roster_hash,
-            &sorted,
-            req.self_slot,
-            req.player_id,
-            &vault_ek_hex,
-            &sender,
-            &asset,
-            req.chain_id,
-            &aggregate_commitment,
-            &aggregate_response,
-            &challenge,
-            existing.vault_sequence,
-            existing.deposit_count_observed,
-        );
-        if self_contrib.worker_transcript_hash.to_lowercase() != expected_self_init.to_lowercase()
-        {
+        let frozen_self_init = existing.worker_transcript_hash.to_lowercase();
+        if self_contrib.worker_transcript_hash.to_lowercase() != frozen_self_init {
             return Err(WorkerError::InvalidDkgState(
                 "vault_state_v2_finalize_self_contribution_mismatch".to_string(),
             ));
         }
 
-        // Idempotency: if persisted init_transcript_hash already equals the claimed final,
-        // no-op and return. If it differs, we are switching identities — fail closed unless
-        // the persisted value is the legacy per-slot worker hash (no Some(_) at all means
-        // legacy or never-finalized; we accept that by writing the canonical value).
+        // Idempotency (Codex M3a P1 v3 partial-finalize recovery): the canonical state
+        // machine has two terminal states for `init_transcript_hash`:
+        //   - `None` (just-init, finalize hasn't landed yet) → write Some(claimed_final).
+        //   - `Some(canonical)` (finalize landed at least once) → must equal the new claim.
+        //     If equal → idempotent OK with `finalized=false`. If different → fail closed.
+        //
+        // The "different value" case CAN'T happen on a legitimate retry: a coordinator that
+        // re-runs init after a partial finalize collects the SAME frozen per-slot hashes
+        // from every slot, rebuilds the SAME canonical final hash, and re-fans-out finalize
+        // with that value. A different claimed_final implies either operator surgery (e.g.
+        // re-init under a new epoch — should have wiped this file) or coordinator tamper.
+        // Both are rejected.
         match existing.init_transcript_hash.as_deref() {
             Some(persisted) if persisted.to_lowercase() == claimed_final.to_lowercase() => {
                 // Idempotent replay: same canonical value. No write.
@@ -6279,34 +6320,22 @@ pub mod vault_state_v2 {
                     finalized: false,
                 });
             }
-            Some(persisted) => {
+            Some(_persisted) => {
                 // Already-pinned with a DIFFERENT canonical value. Refuse to switch — a fresh
-                // re-init would be required, which is intentional friction.
-                //
-                // NOTE: the pre-fix init path persisted the per-slot worker_transcript_hash
-                // here. Such files exist in pre-finalize state, and finalize SHOULD be allowed
-                // to overwrite them with the canonical final hash. We detect that case by
-                // re-computing the per-slot init hash from public inputs and accepting the
-                // overwrite if the persisted value matches that AND differs from the canonical
-                // final. Without this allowance, the regression fix can't roll out against any
-                // already-initialised vault.
-                let legacy_per_slot = expected_self_init.clone();
-                if persisted.to_lowercase() != legacy_per_slot.to_lowercase() {
-                    return Err(WorkerError::InvalidDkgState(
-                        "vault_state_v2_finalize_already_pinned_with_different_value"
-                            .to_string(),
-                    ));
-                }
-                // Fall through: persisted == legacy per-slot init hash; overwrite with the
-                // canonical final.
+                // re-init (wipe the file) would be required. With the v3 layout there is no
+                // ambiguity: `init_transcript_hash` ONLY ever holds the canonical FINAL_V1
+                // hash, so a divergence here is a hard error.
+                return Err(WorkerError::InvalidDkgState(
+                    "vault_state_v2_finalize_already_pinned_with_different_value".to_string(),
+                ));
             }
             None => {
-                // Never finalized (and the init path that wrote this file pre-dates the
-                // finalize-as-separate-round design — i.e. legacy file). Overwrite.
+                // Never finalized — write the canonical value for the first time.
             }
         }
 
-        // Build the updated file. Only `init_transcript_hash` changes.
+        // Build the updated file. Only `init_transcript_hash` changes. The FROZEN
+        // `worker_transcript_hash` is preserved verbatim.
         let updated = VaultStateFile {
             scheme: existing.scheme.clone(),
             slot: existing.slot,
@@ -6327,6 +6356,7 @@ pub mod vault_state_v2 {
             vault_sequence: existing.vault_sequence,
             deposit_count_observed: existing.deposit_count_observed,
             created_at_unix_ms: existing.created_at_unix_ms,
+            worker_transcript_hash: existing.worker_transcript_hash.clone(),
             init_transcript_hash: Some(claimed_final.to_lowercase()),
         };
         let bytes = serde_json::to_vec_pretty(&updated)
@@ -6350,18 +6380,24 @@ pub mod vault_state_v2 {
     /// `Ok(None)` if the file does not exist; `Err` on any parse/IO failure. Used by 2b's
     /// observer to read the cursor without going through the HTTP endpoint.
     ///
-    /// Codex M3a P1 backwards-compat policy: the `init_transcript_hash` field is a load-bearing
-    /// binding for the MPCCA withdraw rounds. Files written by the Milestone 2a code that
-    /// pre-dates this field will not have it. We do NOT attempt to auto-migrate by recomputing
-    /// a placeholder hash — that would produce a value that doesn't match anything the
-    /// original init returned, breaking the coordinator's cross-check. Instead, the field
-    /// stays `None` on read for legacy files. Code paths that REQUIRE the field present must
-    /// fail closed with a specific `vault_state_v2_init_transcript_hash_missing` error.
-    /// Operators upgrading from pre-fix code MUST re-init the vault by removing
-    /// `vault_state_v2.json` and re-running `/v2/vault_state/init`.
+    /// Codex M3a P1 v3 backwards-compat policy: the v3 layout adds a dedicated FROZEN
+    /// `worker_transcript_hash` field separate from the canonical `init_transcript_hash`.
+    /// Pre-v3 files have a single `init_transcript_hash: String` field that did double duty
+    /// (per-slot init hash AND finalize-canonical hash, depending on lifecycle stage).
+    /// Auto-migrating a pre-v3 file is risky:
+    ///   - If the persisted value is the per-slot hash (init ran but finalize didn't), we
+    ///     could backfill `worker_transcript_hash` and clear `init_transcript_hash` to None.
+    ///   - If the persisted value is the canonical final hash (finalize ran), we have NO
+    ///     way to recover the per-slot hash without re-running init from scratch.
+    ///   - We can't reliably distinguish which case applies without external context.
     ///
-    /// This is the safer policy per the codex playbook's "if migration is risky, prefer
-    /// re-init" guidance: a wrong migration would silently bind the wrong identity.
+    /// Since the prior v2 fix already required operators to re-init when fields were missing,
+    /// we keep the same posture: reject the load with `vault_state_v2_legacy_layout_requires_reinit`.
+    /// Operators upgrading from pre-v3 code MUST remove `vault_state_v2.json` and re-run
+    /// `/v2/vault_state/init` followed by `/v2/vault_state/init/finalize`.
+    ///
+    /// Implementation: we deserialize into a permissive shape that accepts the legacy schema,
+    /// detect the missing field, and fail closed.
     pub fn load_vault_state_v2(state_dir: &Path) -> WorkerResult<Option<VaultStateFile>> {
         let file_path = vault_state_file_path(state_dir);
         if !file_path.exists() {
@@ -6369,6 +6405,33 @@ pub mod vault_state_v2 {
         }
         let raw = fs::read(&file_path)
             .map_err(|err| WorkerError::Crypto(format!("read vault_state_v2 file: {err}")))?;
+        // Use a probe shape to detect legacy layouts before the strict deserialize fails with
+        // a cryptic "missing field" message. The probe captures only the fields we use for
+        // backwards-compat detection.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct LegacyProbe {
+            #[serde(default)]
+            scheme: Option<String>,
+            #[serde(default)]
+            worker_transcript_hash: Option<String>,
+        }
+        let probe: LegacyProbe = serde_json::from_slice(&raw).map_err(|err| {
+            WorkerError::Crypto(format!("parse vault_state_v2 file: {err}"))
+        })?;
+        if probe.scheme.as_deref() != Some("vault_state_v2") {
+            return Err(WorkerError::InvalidDkgState(
+                "vault_state_v2_unexpected_scheme_on_disk".to_string(),
+            ));
+        }
+        if probe.worker_transcript_hash.is_none() {
+            return Err(WorkerError::InvalidDkgState(
+                "vault_state_v2_legacy_layout_requires_reinit: vault_state_v2.json was written \
+                 before the Codex M3a P1 v3 partial-finalize-recovery layout landed; remove the \
+                 file and re-run /v2/vault_state/init followed by /v2/vault_state/init/finalize"
+                    .to_string(),
+            ));
+        }
         let existing: VaultStateFile = serde_json::from_slice(&raw)
             .map_err(|err| WorkerError::Crypto(format!("parse vault_state_v2 file: {err}")))?;
         if existing.scheme != "vault_state_v2" {
@@ -6724,9 +6787,10 @@ pub mod vault_state_v2 {
             vault_sequence: existing.vault_sequence, // untouched by observe
             deposit_count_observed: req.deposit_count,
             created_at_unix_ms: existing.created_at_unix_ms,
-            // Codex M3a P1: preserve the persisted init transcript hash verbatim across
-            // cursor bumps. Observe does not touch identity, so the original init binding
-            // remains valid.
+            // Codex M3a P1 v3: preserve BOTH the frozen per-slot worker_transcript_hash and
+            // the canonical init_transcript_hash (if finalize landed). Observe does not touch
+            // identity, so both bindings remain valid across cursor bumps.
+            worker_transcript_hash: existing.worker_transcript_hash.clone(),
             init_transcript_hash: existing.init_transcript_hash.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&updated)
@@ -7554,21 +7618,22 @@ pub mod mpcca_withdraw_v2 {
             ));
         }
 
-        // Codex M3a P1: req.vault_state_init_transcript_hash MUST equal the worker's persisted
-        // init_transcript_hash byte-for-byte. The Milestone 2a init code persists this value
-        // alongside the vault state — see VaultStateFile::init_transcript_hash. This is the
-        // load-bearing fence: a tampered request body fails closed with InvalidDkgState here,
-        // long before reaching the NotImplemented surface.
+        // Codex M3a P1 v3 (partial-finalize recovery): req.vault_state_init_transcript_hash
+        // MUST equal the worker's persisted CANONICAL init_transcript_hash (set by
+        // finalize_vault_state_v2) byte-for-byte.
         //
-        // Legacy file (pre-fix init): existing.init_transcript_hash is None. We fail closed
-        // with a specific code so operators know to re-init. The mpcca_withdraw_v2 path is
-        // load-bearing in production; we do NOT accept a missing field.
+        // Two distinct error codes encode the two failure modes:
+        //   - `vault_state_v2_not_finalized`: persisted init_transcript_hash is None — init
+        //     ran but finalize hasn't landed on this slot. The coordinator should re-run the
+        //     init finalize round (idempotent across slots that already finalized).
+        //   - `vault_state_init_transcript_hash_mismatch`: persisted init_transcript_hash is
+        //     Some(v) but v != req.vault_state_init_transcript_hash. Either tamper, or a
+        //     coordinator that submitted the wrong canonical hash for this vault.
+        //
+        // These were a single error in v1/v2; splitting them lets the coordinator distinguish
+        // "transient — retry finalize" from "permanent — investigate".
         let persisted_init_hash = existing.init_transcript_hash.as_deref().ok_or_else(|| {
-            WorkerError::InvalidDkgState(
-                "vault_state_v2_init_transcript_hash_missing: vault_state_v2.json was written \
-                 before Codex M3a P1 landed; remove the file and re-run /v2/vault_state/init"
-                    .to_string(),
-            )
+            WorkerError::InvalidDkgState("vault_state_v2_not_finalized".to_string())
         })?;
         if persisted_init_hash.to_lowercase() != vault_state_init_transcript_hash.to_lowercase() {
             return Err(WorkerError::InvalidDkgState(
