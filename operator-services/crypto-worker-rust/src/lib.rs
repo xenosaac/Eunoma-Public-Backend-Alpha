@@ -4396,11 +4396,67 @@ pub mod ca_registration_v2 {
                 "ca_registration_v2_nonce_file_missing".to_string(),
             ));
         }
-        // Take the guard NOW so even if any of the subsequent fallible steps errors out, the
-        // plaintext r_i is scrubbed.
-        let guard = NonceFileGuard::new(path.clone());
+        // Codex P1 #1 (nonce-reuse → dk_share recovery attack): atomic single-use of the
+        // nonce file. Two concurrent /round2 requests with the same nonceId but DIFFERENT
+        // challenges could both read r_i before either deleted the file. Computing
+        //   s1 = r_i + c1*dk_share
+        //   s2 = r_i + c2*dk_share
+        // lets the attacker recover dk_share = (s1 - s2)*(c1 - c2)^-1. Five such races on
+        // five slots reconstruct dk and break the vault.
+        //
+        // Fix: `std::fs::rename` is atomic on POSIX within the same filesystem. We rename
+        // the nonce file to a unique `*.consuming-<random>` path BEFORE reading it; only
+        // ONE concurrent caller can win the rename. The loser sees ENOENT and is rejected
+        // with `ca_registration_v2_nonce_already_consumed`. The random suffix guarantees
+        // that even if two callers race the rename itself, they land on distinct paths and
+        // neither clobbers the other.
+        let consuming_suffix: [u8; 16] = {
+            let mut buf = [0u8; 16];
+            use rand::rngs::OsRng;
+            use rand::RngCore as _;
+            OsRng.fill_bytes(&mut buf);
+            buf
+        };
+        let consuming_name = {
+            let base = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(NONCE_FILE_NAME);
+            let mut hex = String::with_capacity(base.len() + ".consuming-".len() + 32);
+            hex.push_str(base);
+            hex.push_str(".consuming-");
+            for byte in consuming_suffix {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex
+        };
+        let consuming_path = path
+            .parent()
+            .map(|parent| parent.join(&consuming_name))
+            .unwrap_or_else(|| PathBuf::from(&consuming_name));
+        match fs::rename(&path, &consuming_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Race-loser branch: another concurrent caller already renamed (and is
+                // consuming) this file. Distinct error code so callers can distinguish
+                // "no round1 ever ran" (file_missing above) from "lost a concurrent race"
+                // (already_consumed). Both fail closed; neither reveals r_i.
+                return Err(WorkerError::InvalidDkgState(
+                    "ca_registration_v2_nonce_already_consumed".to_string(),
+                ));
+            }
+            Err(err) => {
+                return Err(WorkerError::InvalidDkgState(format!(
+                    "ca_registration_v2_nonce_consume_failed: {err}"
+                )));
+            }
+        }
+        // Atomic single-use is now guaranteed: only this caller holds the path. Arm the
+        // guard so any subsequent failure (parse error, share mismatch, etc.) still scrubs
+        // and unlinks the consumed file.
+        let guard = NonceFileGuard::new(consuming_path.clone());
 
-        let raw = fs::read(&path)
+        let raw = fs::read(&consuming_path)
             .map_err(|err| WorkerError::Crypto(format!("read nonce file: {err}")))?;
         let layout: NonceFileLayout = serde_json::from_slice(&raw)
             .map_err(|err| WorkerError::Crypto(format!("parse nonce file: {err}")))?;

@@ -731,3 +731,220 @@ fn round2_without_round1_returns_missing_nonce_file() {
         "expected nonce_file_missing, got: {err:?}"
     );
 }
+
+// =============================================================================================
+// Codex P1 #1: nonce-reuse → dk_share recovery attack-resistance tests.
+//
+// The vulnerability: if `create_registration_partial_response_v2` were not atomic-single-use,
+// two concurrent /round2 requests with the same nonceId but DIFFERENT challenges (c1, c2)
+// would each return a valid response (s1, s2). The attacker computes
+//   dk_share_i = (s1 - s2) * (c1 - c2)^{-1} (mod q)
+// — the worker's actual Shamir share of dk. Five such attacks across slots reconstruct dk.
+//
+// The fix uses `std::fs::rename` to atomically claim the nonce file before reading it. Only
+// ONE of two concurrent callers can win the rename; the loser sees ENOENT and is rejected
+// with `ca_registration_v2_nonce_already_consumed`.
+// =============================================================================================
+
+/// Sequential re-use must fail: same nonceId, two calls in a row. First succeeds; second
+/// returns `ca_registration_v2_nonce_already_consumed` (or `_file_missing` if the rename + drop
+/// finished before the second call — both are valid fail-closed outcomes; the SECOND CALL
+/// MUST NOT RETURN A VALID RESPONSE).
+#[test]
+fn nonce_reuse_returns_invalid_request() {
+    let state_dir = temp_state_dir("nonce-reuse-sequential");
+    let ca_transcript = "55".repeat(32);
+    let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
+    write_v2_share(&state_dir, 0, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    let h = h_point();
+    let vault_ek_hex = compressed_hex(&(h * coeffs[0].invert()));
+
+    // Round1 to populate the nonce file.
+    let req1 = Round1Request {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "reuse-req".to_string(),
+        session_id: "reuse-sess".to_string(),
+        ca_dkg_transcript_hash: ca_transcript.clone(),
+        roster_hash: "11".repeat(32),
+        selected_slots: vec![0, 1, 2, 3, 4],
+        self_slot: 0,
+        player_id: 0,
+        vault_ek: vault_ek_hex.clone(),
+        sender_address: "01".repeat(32),
+        asset_type: "02".repeat(32),
+        chain_id: 2,
+    };
+    let round1 = create_registration_nonce_commitment_v2(&state_dir, &req1).expect("round1");
+
+    let req2 = Round2Request {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "reuse-req".to_string(),
+        session_id: "reuse-sess".to_string(),
+        ca_dkg_transcript_hash: ca_transcript.clone(),
+        roster_hash: "11".repeat(32),
+        selected_slots: vec![0, 1, 2, 3, 4],
+        self_slot: 0,
+        player_id: 0,
+        nonce_id: round1.nonce_id.clone(),
+        challenge: scalar_hex(&det_scalar(0xC1)),
+    };
+    // First call: must succeed and consume the nonce file.
+    create_registration_partial_response_v2(&state_dir, &req2).expect("first round2 succeeds");
+
+    // Second call with the SAME inputs: must fail. The nonce file is gone after the first
+    // call's RAII drop unlinked it; we accept either "already_consumed" (if the rename loses
+    // a race with concurrent cleanup) or "file_missing" (the typical sequential outcome).
+    let mut req2_replay = req2.clone();
+    // Even attacker-chosen challenge MUST be rejected.
+    req2_replay.challenge = scalar_hex(&det_scalar(0xC2));
+    let err = create_registration_partial_response_v2(&state_dir, &req2_replay).unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::InvalidDkgState(msg)
+            if msg.contains("nonce_already_consumed") || msg.contains("nonce_file_missing")),
+        "expected nonce_already_consumed or nonce_file_missing, got: {err:?}"
+    );
+}
+
+/// **Attack-resistance test for the dk_share recovery vulnerability.**
+///
+/// Spawns two threads, both attempt /round2 with the SAME nonceId but DIFFERENT challenges
+/// concurrently. The atomic rename guarantee says:
+///   - Exactly ONE thread must return a valid response.
+///   - The OTHER thread must return an InvalidDkgState error (nonce_already_consumed).
+///
+/// If the protection breaks, BOTH would succeed and the test fails — exposing dk_share.
+#[test]
+fn nonce_consuming_race_no_share_leak() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let state_dir = temp_state_dir("nonce-race");
+    let ca_transcript = "55".repeat(32);
+    let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
+    write_v2_share(&state_dir, 0, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    let h = h_point();
+    let vault_ek_hex = compressed_hex(&(h * coeffs[0].invert()));
+
+    // Run a fresh round1 per iteration; each iteration races two round2 calls with
+    // DIFFERENT challenges. Repeat to give the race a real chance to surface a bug.
+    //
+    // Important: we drop the round1 file with the SAME (request_id, session_id) before
+    // each iteration so the consuming rename targets exactly one file.
+    let iterations = 16;
+    let mut any_double_success = false;
+
+    for iter in 0..iterations {
+        let req1 = Round1Request {
+            dkg_epoch: DKG_EPOCH.to_string(),
+            request_id: format!("race-req-{iter}"),
+            session_id: format!("race-sess-{iter}"),
+            ca_dkg_transcript_hash: ca_transcript.clone(),
+            roster_hash: "11".repeat(32),
+            selected_slots: vec![0, 1, 2, 3, 4],
+            self_slot: 0,
+            player_id: 0,
+            vault_ek: vault_ek_hex.clone(),
+            sender_address: "01".repeat(32),
+            asset_type: "02".repeat(32),
+            chain_id: 2,
+        };
+        let round1 = create_registration_nonce_commitment_v2(&state_dir, &req1)
+            .expect("round1 succeeds for race iteration");
+
+        let state_dir_a = state_dir.clone();
+        let ca_transcript_a = ca_transcript.clone();
+        let nonce_id_a = round1.nonce_id.clone();
+        let req_id_a = req1.request_id.clone();
+        let sess_id_a = req1.session_id.clone();
+        let challenge_a = scalar_hex(&det_scalar(0x1_0000 + iter as u64));
+
+        let state_dir_b = state_dir.clone();
+        let ca_transcript_b = ca_transcript.clone();
+        let nonce_id_b = round1.nonce_id.clone();
+        let req_id_b = req1.request_id.clone();
+        let sess_id_b = req1.session_id.clone();
+        let challenge_b = scalar_hex(&det_scalar(0x2_0000 + iter as u64));
+        // Different challenges → DIFFERENT responses if both succeed. THIS IS THE ATTACK.
+        assert_ne!(challenge_a, challenge_b, "challenges must differ for the race to surface the bug");
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b_a = Arc::clone(&barrier);
+        let b_b = Arc::clone(&barrier);
+
+        let t_a = thread::spawn(move || {
+            b_a.wait();
+            create_registration_partial_response_v2(
+                &state_dir_a,
+                &Round2Request {
+                    dkg_epoch: DKG_EPOCH.to_string(),
+                    request_id: req_id_a,
+                    session_id: sess_id_a,
+                    ca_dkg_transcript_hash: ca_transcript_a,
+                    roster_hash: "11".repeat(32),
+                    selected_slots: vec![0, 1, 2, 3, 4],
+                    self_slot: 0,
+                    player_id: 0,
+                    nonce_id: nonce_id_a,
+                    challenge: challenge_a,
+                },
+            )
+        });
+        let t_b = thread::spawn(move || {
+            b_b.wait();
+            create_registration_partial_response_v2(
+                &state_dir_b,
+                &Round2Request {
+                    dkg_epoch: DKG_EPOCH.to_string(),
+                    request_id: req_id_b,
+                    session_id: sess_id_b,
+                    ca_dkg_transcript_hash: ca_transcript_b,
+                    roster_hash: "11".repeat(32),
+                    selected_slots: vec![0, 1, 2, 3, 4],
+                    self_slot: 0,
+                    player_id: 0,
+                    nonce_id: nonce_id_b,
+                    challenge: challenge_b,
+                },
+            )
+        });
+
+        let r_a = t_a.join().expect("thread A");
+        let r_b = t_b.join().expect("thread B");
+
+        let a_ok = r_a.is_ok();
+        let b_ok = r_b.is_ok();
+        match (a_ok, b_ok) {
+            (true, true) => {
+                any_double_success = true;
+            }
+            (false, false) => {
+                // Both could conceivably lose if the rename races destructively — but with
+                // a unique random suffix per consume, this should NOT happen. Treat as a
+                // separate test failure.
+                panic!(
+                    "iter {iter}: BOTH threads errored — rename race is destructive. \
+                     a={:?} b={:?}",
+                    r_a.unwrap_err(),
+                    r_b.unwrap_err()
+                );
+            }
+            _ => {
+                // Exactly one succeeded → atomic single-use is honored. Verify the loser
+                // returned the expected InvalidDkgState code.
+                let loser_err = if a_ok { r_b.unwrap_err() } else { r_a.unwrap_err() };
+                assert!(
+                    matches!(&loser_err, WorkerError::InvalidDkgState(msg)
+                        if msg.contains("nonce_already_consumed") || msg.contains("nonce_file_missing")),
+                    "loser must return nonce_already_consumed/missing, got: {loser_err:?}"
+                );
+            }
+        }
+    }
+
+    assert!(
+        !any_double_success,
+        "ATTACK SUCCEEDED: at least one race iteration returned valid responses on BOTH \
+         concurrent calls — dk_share is recoverable via (s1 - s2)*(c1 - c2)^-1. \
+         The atomic single-use guard is broken."
+    );
+}
