@@ -2153,7 +2153,7 @@ pub mod ca_dkg_v2 {
         Ok(share)
     }
 
-    /// Codex M2a P2 #1: metadata-only share loader.
+    /// Codex M2a v2 P2 #1 + M3a tightening: metadata-only share loader.
     ///
     /// `init_vault_state_v2` needs only `(slot, dkg_epoch, transcript_hash, threshold,
     /// count)` to validate the (Phase 2 + Milestone 1 + CA DKG V2) bindings. It does NOT
@@ -2163,19 +2163,39 @@ pub mod ca_dkg_v2 {
     /// ca_registration_v2 round2), but for init-style paths it pulls secret bytes into
     /// memory unnecessarily.
     ///
-    /// This metadata-only loader deserializes the file into a separate struct that
-    /// EXPLICITLY excludes `dk_share` and `blind_share`. `serde(deny_unknown_fields)`
-    /// is intentionally NOT set — the on-disk file is allowed to contain `dk_share` /
-    /// `blind_share` (and does), but they are never bound to memory through this path.
+    /// Codex M2a v2 P2 #1 residual fix: the previous implementation routed through
+    /// `read_json` → `serde_json::Value` → `from_value(value)`. The intermediate `Value`
+    /// owned ALL the file's fields including `dk_share` / `blind_share` as `String`s
+    /// (allocated on the heap, with no zeroize semantics). The metadata struct then
+    /// extracted only the public fields, but the secret strings lingered in the `Value`
+    /// for the lifetime of the parse.
+    ///
+    /// New flow:
+    ///   1. Read raw bytes into a `Vec<u8>` (carried in a `Zeroizing` wrapper so the
+    ///      buffer is wiped before drop).
+    ///   2. Deserialize via `serde_json::from_slice::<CaDkgV2ShareMetadata>` — serde walks
+    ///      the JSON tokens in place, allocating String storage only for fields the target
+    ///      struct claims. The struct excludes `dk_share` / `blind_share`, so those tokens
+    ///      are decoded-then-discarded without persistent heap allocation.
+    ///   3. The raw byte buffer is zeroized on Drop (Zeroizing).
     ///
     /// Init paths use this loader; ca_registration_v2 round2 still uses
     /// `load_ca_dkg_v2_share` because it genuinely needs the secret share.
     pub fn load_ca_dkg_v2_share_metadata(
         state_dir: &Path,
     ) -> WorkerResult<CaDkgV2ShareMetadata> {
-        let value = read_json(&state_dir.join(CA_DKG_V2_SHARE_FILE))?;
-        let meta: CaDkgV2ShareMetadata =
-            serde_json::from_value(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        use zeroize::Zeroizing;
+        let path = state_dir.join(CA_DKG_V2_SHARE_FILE);
+        let raw_bytes = fs::read(&path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                WorkerError::MissingLocalState(path.display().to_string())
+            } else {
+                WorkerError::Io(err.to_string())
+            }
+        })?;
+        let raw_bytes = Zeroizing::new(raw_bytes);
+        let meta: CaDkgV2ShareMetadata = serde_json::from_slice(&raw_bytes)
+            .map_err(|err| WorkerError::Serde(err.to_string()))?;
         assert_slot(meta.slot)?;
         assert_v2_threshold(meta.threshold, meta.count)?;
         if meta.valid_dealers.len() != DEOPERATOR_COUNT {
@@ -2194,6 +2214,7 @@ pub mod ca_dkg_v2 {
         for commitment in &meta.aggregate_commitments {
             ristretto_from_hex(commitment)?;
         }
+        // `raw_bytes` is zeroized on drop here.
         Ok(meta)
     }
 

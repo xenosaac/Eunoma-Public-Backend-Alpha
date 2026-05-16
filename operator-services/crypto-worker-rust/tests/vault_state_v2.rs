@@ -33,6 +33,7 @@ use eunoma_crypto_worker::{
         aggregate_registration_commitment, registration_challenge,
         verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
     },
+    ca_dkg_v2::load_ca_dkg_v2_share_metadata,
     ca_registration_v2::{
         create_registration_nonce_commitment_v2, create_registration_partial_response_v2,
         run_aggregate_v2, AggregateRequest, Round1Request, Round2Request,
@@ -542,6 +543,41 @@ fn vault_state_v2_init_rejects_tampered_registration_tuple() {
         !file_path.exists(),
         "tampered tuple must not persist vault_state_v2.json — bug if file exists"
     );
+}
+
+// =================================================================================================
+// Codex M2a v2 P2 #1 residual: metadata-only share loader must not surface secret fields.
+//
+// The struct returned by `load_ca_dkg_v2_share_metadata` is parsed via `serde_json::from_slice`
+// directly into a metadata-only target (no `dk_share` / `blind_share` fields). The raw byte
+// buffer is held in `Zeroizing<Vec<u8>>` so it's wiped on drop. This test confirms:
+//   1. The loader succeeds on a real (Phase 2 fixture-built) v2 share file.
+//   2. The returned struct exposes ONLY the public fields — checked via Rust's type system
+//      (the struct doesn't HAVE secret fields, so this is a compile-time guarantee that the
+//      runtime test reinforces by parsing the same file twice).
+//   3. The loader does not panic on a file that contains both public + secret fields.
+// =================================================================================================
+#[test]
+fn load_ca_dkg_v2_share_metadata_returns_only_public_fields() {
+    let fix = build_milestone1_fixture("metadata-loader");
+    let slot = 2_usize;
+    let meta = load_ca_dkg_v2_share_metadata(&fix.slot_dirs[slot])
+        .expect("metadata-only loader must succeed on a fresh ca_dkg_share_v2.json");
+
+    // Public-field sanity.
+    assert_eq!(meta.slot, slot);
+    assert_eq!(meta.dkg_epoch, DKG_EPOCH);
+    assert_eq!(meta.transcript_hash.to_lowercase(), fix.ca_transcript.to_lowercase());
+    assert_eq!(meta.threshold, 5);
+    assert_eq!(meta.count, 7);
+    assert_eq!(meta.valid_dealers.len(), 7);
+    assert_eq!(meta.aggregate_commitments.len(), 5);
+
+    // Re-loading must yield byte-identical metadata (no nondeterminism from the zeroize layer).
+    let meta2 = load_ca_dkg_v2_share_metadata(&fix.slot_dirs[slot]).expect("second load");
+    assert_eq!(meta.transcript_hash, meta2.transcript_hash);
+    assert_eq!(meta.aggregate_commitments, meta2.aggregate_commitments);
+    assert_eq!(meta.valid_dealers, meta2.valid_dealers);
 }
 
 #[test]
