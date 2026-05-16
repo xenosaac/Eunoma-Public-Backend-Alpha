@@ -200,6 +200,11 @@ struct MpccaWithdrawFixture {
     slot_dirs: Vec<PathBuf>,
     vault_ek_transcript_hash: String,
     registration_transcript_hash: String,
+    /// Codex M3a P1: the per-slot init worker_transcript_hash returned by init_vault_state_v2.
+    /// MPCCA withdraw round1 binds this byte-for-byte against the persisted vault_state_v2.json
+    /// `init_transcript_hash` field — a tampered request fails closed with InvalidDkgState.
+    /// Indexed by selected_slots[ordinal] order: slot 0 → init_transcript_hashes[0], etc.
+    init_transcript_hashes: Vec<String>,
 }
 
 fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
@@ -316,7 +321,10 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
     let registration_transcript_hash = "22".repeat(32);
 
     // Run Milestone 2a init for every selected worker so vault_state_v2.json exists with the
-    // sigma tuple bound.
+    // sigma tuple bound. Codex M3a P1: capture each worker's returned init_transcript_hash
+    // so the round1 fixture below sends the SAME value back — the worker rejects a forged
+    // hash with InvalidDkgState("vault_state_init_transcript_hash_mismatch").
+    let mut init_transcript_hashes = Vec::with_capacity(selected_slots.len());
     for (ordinal, &slot) in selected_slots.iter().enumerate() {
         let req = VaultStateInitRequest {
             dkg_epoch: DKG_EPOCH.to_string(),
@@ -337,7 +345,8 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
             aggregate_response: aggregate.aggregate_response.clone(),
             challenge: aggregate.challenge.clone(),
         };
-        init_vault_state_v2(&slot_dirs[slot], &req).expect("init vault_state_v2");
+        let result = init_vault_state_v2(&slot_dirs[slot], &req).expect("init vault_state_v2");
+        init_transcript_hashes.push(result.worker_transcript_hash);
     }
 
     MpccaWithdrawFixture {
@@ -354,6 +363,7 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
         slot_dirs,
         vault_ek_transcript_hash,
         registration_transcript_hash,
+        init_transcript_hashes,
     }
 }
 
@@ -368,7 +378,11 @@ fn build_round1_request(
         session_id: "mpcca-withdraw-sess".to_string(),
         vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
         registration_transcript_hash: fix.registration_transcript_hash.clone(),
-        vault_state_init_transcript_hash: "33".repeat(32),
+        // Codex M3a P1: bind the SAME init_transcript_hash the worker persisted at init time.
+        // A different value here would fail closed with
+        // InvalidDkgState("vault_state_init_transcript_hash_mismatch") — that's the negative
+        // case the dedicated test below exercises.
+        vault_state_init_transcript_hash: fix.init_transcript_hashes[player_id].clone(),
         observed_deposit_transcript_hashes: vec!["44".repeat(32), "55".repeat(32)],
         roster_hash: fix.roster_hash.clone(),
         selected_slots: fix.selected_slots.clone(),
@@ -401,7 +415,9 @@ fn build_chained_request(
         session_id: "mpcca-withdraw-sess".to_string(),
         vault_ek_transcript_hash: fix.vault_ek_transcript_hash.clone(),
         registration_transcript_hash: fix.registration_transcript_hash.clone(),
-        vault_state_init_transcript_hash: "33".repeat(32),
+        // Codex M3a P1: bind the SAME init_transcript_hash the worker persisted at init time
+        // (same rationale as build_round1_request above).
+        vault_state_init_transcript_hash: fix.init_transcript_hashes[player_id].clone(),
         observed_deposit_transcript_hashes: vec!["44".repeat(32), "55".repeat(32)],
         roster_hash: fix.roster_hash.clone(),
         selected_slots: fix.selected_slots.clone(),
@@ -496,7 +512,7 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
         &req.dkg_epoch,
         &fix.vault_ek_transcript_hash,
         &fix.registration_transcript_hash,
-        &"33".repeat(32),
+        &fix.init_transcript_hashes[player_id],
         &req.observed_deposit_transcript_hashes,
         &fix.roster_hash,
         &sorted,
@@ -568,6 +584,87 @@ fn mpcca_withdraw_v2_round1_surfaces_not_implemented_after_provenance_verifies()
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("stale_vault_sequence")),
         "stale vault_sequence must surface InvalidRequest(stale_vault_sequence), got {err:?}"
+    );
+}
+
+// =============================================================================================
+// Codex M3a P1 KILLER: a tampered vault_state_init_transcript_hash MUST fail closed with
+// `InvalidDkgState("vault_state_init_transcript_hash_mismatch")` BEFORE the NotImplemented
+// surface. Pre-fix the same forgery would reach NotImplemented because the worker only
+// shape-checked the field without comparing it against persisted state.
+// =============================================================================================
+#[test]
+fn mpcca_withdraw_v2_round1_rejects_forged_init_transcript_hash() {
+    let fix = build_milestone1_fixture("forged-init-hash");
+    let slot = 0_usize;
+    let player_id = 0_usize;
+    let state_dir = fix.slot_dirs[slot].clone();
+
+    // Sanity baseline: with the genuine init_transcript_hash the request reaches the
+    // NotImplemented stub (public binding succeeds).
+    let baseline = build_round1_request(&fix, slot, player_id);
+    let baseline_err =
+        run_round1_v2(&state_dir, &baseline).expect_err("baseline reaches NotImplemented");
+    assert!(
+        matches!(baseline_err, WorkerError::NotImplemented(_)),
+        "baseline must reach NotImplemented, got {baseline_err:?}"
+    );
+
+    // KILLER: tamper the init_transcript_hash with a random 32-byte hex. Expectation:
+    // InvalidDkgState("vault_state_init_transcript_hash_mismatch"), NOT NotImplemented.
+    let mut tampered = build_round1_request(&fix, slot, player_id);
+    tampered.vault_state_init_transcript_hash = "ab".repeat(32);
+    let err = run_round1_v2(&state_dir, &tampered)
+        .expect_err("forged init_transcript_hash must reject");
+    assert!(
+        matches!(
+            err,
+            WorkerError::InvalidDkgState(ref s) if s == "vault_state_init_transcript_hash_mismatch"
+        ),
+        "forged init_transcript_hash must surface InvalidDkgState(vault_state_init_transcript_hash_mismatch), got {err:?}"
+    );
+    // Negative control: confirm it's NOT NotImplemented.
+    assert!(
+        !matches!(err, WorkerError::NotImplemented(_)),
+        "tampered init_transcript_hash MUST fail BEFORE NotImplemented"
+    );
+
+    // Same check for the chained round handlers — defense-in-depth: every round verifies
+    // the binding through common_public_binding_work.
+    let mut tampered2 = build_chained_request(&fix, slot, player_id);
+    tampered2.vault_state_init_transcript_hash = "cd".repeat(32);
+    let err = run_round2_v2(&state_dir, &tampered2)
+        .expect_err("forged init_transcript_hash must reject in round2");
+    assert!(
+        matches!(
+            err,
+            WorkerError::InvalidDkgState(ref s) if s == "vault_state_init_transcript_hash_mismatch"
+        ),
+        "round2 forged init_transcript_hash must surface InvalidDkgState, got {err:?}"
+    );
+
+    let mut tampered3 = build_chained_request(&fix, slot, player_id);
+    tampered3.vault_state_init_transcript_hash = "ef".repeat(32);
+    let err = run_prove_v2(&state_dir, &tampered3)
+        .expect_err("forged init_transcript_hash must reject in prove");
+    assert!(
+        matches!(
+            err,
+            WorkerError::InvalidDkgState(ref s) if s == "vault_state_init_transcript_hash_mismatch"
+        ),
+        "prove forged init_transcript_hash must surface InvalidDkgState, got {err:?}"
+    );
+
+    let mut tampered4 = build_chained_request(&fix, slot, player_id);
+    tampered4.vault_state_init_transcript_hash = "01".repeat(32);
+    let err = run_finalize_v2(&state_dir, &tampered4)
+        .expect_err("forged init_transcript_hash must reject in finalize");
+    assert!(
+        matches!(
+            err,
+            WorkerError::InvalidDkgState(ref s) if s == "vault_state_init_transcript_hash_mismatch"
+        ),
+        "finalize forged init_transcript_hash must surface InvalidDkgState, got {err:?}"
     );
 }
 

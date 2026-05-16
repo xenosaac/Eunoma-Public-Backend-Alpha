@@ -6940,14 +6940,27 @@ pub mod mpcca_withdraw_v2 {
             ));
         }
 
-        // Per spec — req.vault_state_init_transcript_hash MUST cross-reference an init transcript
-        // bound to this worker's persisted state. We don't have the init transcript hash inside
-        // vault_state_v2.json (Milestone 2a doesn't persist it on the worker — only on the
-        // coordinator), so we can only verify that the bound 32-byte hex shape is provided and
-        // the coordinator's provenance gate caught any mismatch. The coordinator's transcript-hash
-        // check at the response layer is the load-bearing cross-check; the worker's job here is
-        // to ensure the value is well-formed and bound into the worker_transcript_hash so a
-        // tampered value moves the hash.
+        // Codex M3a P1: req.vault_state_init_transcript_hash MUST equal the worker's persisted
+        // init_transcript_hash byte-for-byte. The Milestone 2a init code persists this value
+        // alongside the vault state — see VaultStateFile::init_transcript_hash. This is the
+        // load-bearing fence: a tampered request body fails closed with InvalidDkgState here,
+        // long before reaching the NotImplemented surface.
+        //
+        // Legacy file (pre-fix init): existing.init_transcript_hash is None. We fail closed
+        // with a specific code so operators know to re-init. The mpcca_withdraw_v2 path is
+        // load-bearing in production; we do NOT accept a missing field.
+        let persisted_init_hash = existing.init_transcript_hash.as_deref().ok_or_else(|| {
+            WorkerError::InvalidDkgState(
+                "vault_state_v2_init_transcript_hash_missing: vault_state_v2.json was written \
+                 before Codex M3a P1 landed; remove the file and re-run /v2/vault_state/init"
+                    .to_string(),
+            )
+        })?;
+        if persisted_init_hash.to_lowercase() != vault_state_init_transcript_hash.to_lowercase() {
+            return Err(WorkerError::InvalidDkgState(
+                "vault_state_init_transcript_hash_mismatch".to_string(),
+            ));
+        }
 
         // 5. vault_sequence gate. existing.vault_sequence MUST equal req.vault_sequence. A stale
         //    or future sequence is rejected here BEFORE any crypto work. Milestone 4's finalize
