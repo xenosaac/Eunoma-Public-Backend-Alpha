@@ -271,7 +271,10 @@ export function buildDeoperatorNodeServer(
   // CA_DKG_V2_ROSTER_JSON and (for round1) `selfSlot` matches this node's slot. Otherwise
   // a stale or wrong-roster request can reach MP-SPDZ.
   const forwardToWorker = async (
-    path: "/worker/v2/derive/vault_ek/round1" | "/worker/v2/derive/vault_ek/verify",
+    path:
+      | "/worker/v2/derive/vault_ek/round0"
+      | "/worker/v2/derive/vault_ek/round1"
+      | "/worker/v2/derive/vault_ek/verify",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -298,6 +301,24 @@ export function buildDeoperatorNodeServer(
       });
     }
   };
+  // Codex P1 #4 round0: pre-MPC commitment passthrough. Mirrors round1's roster + slot
+  // assertion pattern; without it a stale-roster or wrong-slot request could persist
+  // a round0 commitment under this node's state_dir.
+  server.post("/worker/v2/derive/vault_ek/round0", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const selfSlot = body.selfSlot;
+      if (typeof selfSlot !== "number") {
+        throw new Error("selfSlot must be a number");
+      }
+      assertSlot(selfSlot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/derive/vault_ek/round0", req.body, reply);
+  });
   server.post("/worker/v2/derive/vault_ek/round1", async (req, reply) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;

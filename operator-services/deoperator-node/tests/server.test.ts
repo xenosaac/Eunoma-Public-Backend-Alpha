@@ -504,6 +504,87 @@ describe("deoperator node", () => {
     ]);
   });
 
+  it("vault_ek round0 passthrough rejects mismatched rosterHash before forwarding", async () => {
+    // Codex P1 #4 round0: the deop-node passthrough must validate rosterHash + selfSlot
+    // BEFORE forwarding to the local crypto worker. Otherwise a stale-roster or
+    // wrong-slot request can persist a round0 commitment under the wrong identity.
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/vault_ek/round0",
+        payload: {
+          dkgEpoch: "1",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: h32("d"), // bogus — not the configured CA DKG V2 roster hash
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 0,
+          requestId: "vault-ek-r0-bogus",
+          sessionId: "vault-ek-r0-bogus",
+          playerId: 0,
+          peerAddresses: Array.from({ length: 5 }, (_, i) => `127.0.0.1:${14000 + i}`),
+          lagrangeCoefficients: Array.from({ length: 5 }, () => h32("0")),
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("vault_ek round0 passthrough rejects wrong selfSlot before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/derive/vault_ek/round0",
+        payload: {
+          dkgEpoch: "1",
+          caDkgTranscriptHash: h32("a"),
+          rosterHash: caDkgV2RosterHash(caDkgV2Roster),
+          selectedSlots: [0, 1, 2, 3, 4],
+          selfSlot: 4, // wrong: this node is slot 0
+          requestId: "vault-ek-r0-wrong-slot",
+          sessionId: "vault-ek-r0-wrong-slot",
+          playerId: 4,
+          peerAddresses: Array.from({ length: 5 }, (_, i) => `127.0.0.1:${14000 + i}`),
+          lagrangeCoefficients: Array.from({ length: 5 }, () => h32("0")),
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
   it("vault_ek round1 passthrough rejects mismatched rosterHash before forwarding", async () => {
     // Codex P1 #5: the new /worker/v2/derive/vault_ek/round1 + /verify passthroughs must
     // validate rosterHash (against CA_DKG_V2_ROSTER_JSON) and selfSlot before forwarding to
