@@ -7,3 +7,4 @@ export * from "./roster.js";
 export * from "./types.js";
 export * from "./validation.js";
 export * from "./vault_ek_derivation.js";
+export * from "./vault_state_v2.js";
