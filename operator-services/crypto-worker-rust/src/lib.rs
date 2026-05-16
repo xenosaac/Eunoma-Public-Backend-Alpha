@@ -5702,7 +5702,7 @@ pub mod vault_state_v2 {
 
     /// Pure helper: read + parse the on-disk vault-state file for the given state_dir. Returns
     /// `Ok(None)` if the file does not exist; `Err` on any parse/IO failure. Used by 2b's
-    /// observer (forthcoming) to read the cursor without going through the HTTP endpoint.
+    /// observer to read the cursor without going through the HTTP endpoint.
     pub fn load_vault_state_v2(state_dir: &Path) -> WorkerResult<Option<VaultStateFile>> {
         let file_path = vault_state_file_path(state_dir);
         if !file_path.exists() {
@@ -5718,6 +5718,400 @@ pub mod vault_state_v2 {
             ));
         }
         Ok(Some(existing))
+    }
+
+    // =============================================================================================
+    // Milestone 2 sub-milestone 2b — confirmed-deposit observer endpoint.
+    //
+    // The off-chain observer polls the Aptos REST event handle for the bridge module's
+    // DepositEventV2, parses each event, and posts to `/v2/vault_state/observe_deposit` on the
+    // coordinator. The coordinator fans out `/worker/v2/vault_state/observe_deposit` to all 5
+    // selected workers. Each worker:
+    //   1. Validates id safety, decimal epoch, hex shapes (same defense-in-depth posture as
+    //      Milestone 2a init: applies even though the coordinator already sanitises).
+    //   2. Loads the persisted vault_state_v2.json. Missing → MISSING_VAULT_STATE_FILE
+    //      (`InvalidDkgState("missing_vault_state_file")`).
+    //   3. Provenance gate: existing.{dkg_epoch, slot, player_id, vault_ek_hex,
+    //      sender_address, asset_type, chain_id, vault_ek_transcript_hash,
+    //      registration_transcript_hash, roster_hash, selected_slots} MUST equal req.*.
+    //      Otherwise InvalidDkgState("vault_state_v2_provenance_mismatch") and no cursor bump.
+    //   4. Cursor monotonicity (KILLER, strict >): req.deposit_count > existing.deposit_count_observed.
+    //      Equality is rejected — prevents an already-observed deposit from being replayed.
+    //      InvalidRequest("stale_deposit_count: req=X existing=Y").
+    //   5. Atomic update: read existing, set deposit_count_observed = req.deposit_count,
+    //      re-serialise, atomic write via the same tmp + create_new + rename helper used by init.
+    //      vault_sequence is NOT touched here — that's a separate cursor mirroring on-chain state.
+    //   6. Recompute the worker transcript hash from public inputs and return it alongside the
+    //      cursor delta. The coordinator re-derives the same hash and asserts byte equality
+    //      (defense in depth — catches a deop-node tricked into proxying a forged response).
+    //
+    // No secret material reaches this endpoint: the request body contains only the (deposit
+    // commitment, amount tag, CA payload hash, single-use deposit nonce, sequence_number,
+    // tx_version, event GUID) tuple parsed from the chain event, plus the provenance + cursor
+    // bindings. The forbidden-field guard at the deop-node + coordinator catches any extra
+    // amount/blind/dk/share/nullifier/secret/etc. fields before they reach the worker.
+    //
+    // Transcript shape — byte-identical with `deop-protocol::vault_state_v2`:
+    //   "EUNOMA_VAULT_STATE_V2_OBSERVE_V1"
+    //   || ":" || session_id || ":" || request_id || ":" || dkg_epoch
+    //   || ":" || joined(sorted_selected_slots, ",")
+    //   || ":" || self_slot || ":" || player_id
+    //   || ":" || vault_ek_transcript_hash (norm lower hex)
+    //   || ":" || registration_transcript_hash (norm lower hex)
+    //   || ":" || vault_ek (norm lower hex)
+    //   || ":" || sender_address (norm lower hex)
+    //   || ":" || asset_type (norm lower hex)
+    //   || ":" || chain_id (decimal)
+    //   || ":" || deposit_count (decimal)
+    //   || ":" || commitment (norm lower hex)
+    //   || ":" || amount_tag (norm lower hex)
+    //   || ":" || ca_payload_hash (norm lower hex)
+    //   || ":" || deposit_nonce (norm lower hex)
+    //   || ":" || sequence_number (decimal passthrough)
+    //   || ":" || tx_version (decimal passthrough)
+    //   || ":" || event_guid (passthrough)
+    //   || ":" || previous_deposit_count_observed (decimal)
+    //   || ":" || new_deposit_count_observed (decimal)
+    //   → sha256 → lowercase hex.
+    // =============================================================================================
+
+    pub(crate) const OBSERVE_TRANSCRIPT_DOMAIN: &str = "EUNOMA_VAULT_STATE_V2_OBSERVE_V1";
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ObserveDepositRequest {
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub session_id: String,
+        pub vault_ek_transcript_hash: String,
+        pub registration_transcript_hash: String,
+        pub roster_hash: String,
+        pub selected_slots: Vec<usize>,
+        pub self_slot: usize,
+        pub player_id: usize,
+        pub vault_ek: String,
+        pub sender_address: String,
+        pub asset_type: String,
+        pub chain_id: u8,
+        pub deposit_count: u64,
+        pub commitment: String,
+        pub amount_tag: String,
+        pub ca_payload_hash: String,
+        pub deposit_nonce: String,
+        pub sequence_number: String,
+        pub tx_version: String,
+        pub event_guid: String,
+        pub previous_deposit_count_observed: u64,
+        pub new_deposit_count_observed: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ObserveDepositResult {
+        pub slot: usize,
+        pub player_id: usize,
+        pub vault_state_path: String,
+        pub vault_state_hash: String,
+        pub worker_transcript_hash: String,
+        pub previous_deposit_count_observed: u64,
+        pub deposit_count_observed: u64,
+        pub vault_sequence: u64,
+        pub observed_at_unix_ms: u128,
+        /// Always `true` on success. Distinguishes a successful observe-call response from
+        /// the worker's other endpoints by introducing a load-bearing literal the coordinator's
+        /// parser asserts on.
+        pub observed: bool,
+    }
+
+    /// Compute the per-worker observe-deposit transcript hash. Byte-identical with the TS
+    /// reconstructor in `deop-protocol::vault_state_v2::vaultStateV2ObserveWorkerTranscriptHash`.
+    pub fn observe_worker_transcript_hash(
+        session_id: &str,
+        request_id: &str,
+        dkg_epoch: &str,
+        sorted_selected_slots: &[usize],
+        self_slot: usize,
+        player_id: usize,
+        vault_ek_transcript_hash: &str,
+        registration_transcript_hash: &str,
+        vault_ek_hex: &str,
+        sender_address_hex: &str,
+        asset_type_hex: &str,
+        chain_id: u8,
+        deposit_count: u64,
+        commitment_hex: &str,
+        amount_tag_hex: &str,
+        ca_payload_hash_hex: &str,
+        deposit_nonce_hex: &str,
+        sequence_number: &str,
+        tx_version: &str,
+        event_guid: &str,
+        previous_deposit_count_observed: u64,
+        new_deposit_count_observed: u64,
+    ) -> String {
+        let joined = sorted_selected_slots
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(OBSERVE_TRANSCRIPT_DOMAIN.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(request_id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(dkg_epoch.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(joined.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(self_slot.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(player_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(registration_transcript_hash.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(vault_ek_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(sender_address_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(asset_type_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(chain_id.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(deposit_count.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(commitment_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(amount_tag_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(ca_payload_hash_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(deposit_nonce_hex.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(sequence_number.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(tx_version.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(event_guid.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(previous_deposit_count_observed.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(new_deposit_count_observed.to_string().as_bytes());
+        sha256_hex(&bytes)
+    }
+
+    /// Worker entrypoint for `/worker/v2/vault_state/observe_deposit`.
+    pub fn observe_deposit_v2(
+        state_dir: &Path,
+        req: &ObserveDepositRequest,
+    ) -> WorkerResult<ObserveDepositResult> {
+        // 1. Identifier safety + range validation. Defense in depth — the coordinator also
+        //    sanitises but the worker is the final fence before the disk.
+        validate_selected_slots(&req.selected_slots)?;
+        assert_slot(req.self_slot)?;
+        if !req.selected_slots.contains(&req.self_slot) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot {} not in selected_slots",
+                req.self_slot
+            )));
+        }
+        if req.player_id >= DEOPERATOR_THRESHOLD {
+            return Err(WorkerError::InvalidRequest(format!(
+                "player_id {} out of range 0..{}",
+                req.player_id, DEOPERATOR_THRESHOLD
+            )));
+        }
+        let sorted = sorted_unique_slots(&req.selected_slots)?;
+        if sorted[req.player_id] != req.self_slot {
+            return Err(WorkerError::InvalidRequest(format!(
+                "self_slot_player_id_mismatch: sorted_slots[{}]={} != self_slot={}",
+                req.player_id, sorted[req.player_id], req.self_slot
+            )));
+        }
+        if req.request_id.is_empty() || !is_safe_id(&req.request_id) {
+            return Err(WorkerError::InvalidRequest(
+                "request_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.session_id.is_empty() || !is_safe_id(&req.session_id) {
+            return Err(WorkerError::InvalidRequest(
+                "session_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
+            ));
+        }
+        if req.dkg_epoch.is_empty() || !req.dkg_epoch.chars().all(|c| c.is_ascii_digit()) {
+            return Err(WorkerError::InvalidRequest(
+                "dkg_epoch must be a non-empty decimal string".to_string(),
+            ));
+        }
+        if req.sequence_number.is_empty()
+            || !req.sequence_number.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(WorkerError::InvalidRequest(
+                "sequence_number must be a non-empty decimal string".to_string(),
+            ));
+        }
+        if req.tx_version.is_empty() || !req.tx_version.chars().all(|c| c.is_ascii_digit()) {
+            return Err(WorkerError::InvalidRequest(
+                "tx_version must be a non-empty decimal string".to_string(),
+            ));
+        }
+        // eventGuid is opaque — we accept any non-empty string but bound its size + reject
+        // newlines / control characters that could corrupt log output.
+        if req.event_guid.is_empty() || req.event_guid.len() > 256 {
+            return Err(WorkerError::InvalidRequest(
+                "event_guid must be a non-empty string up to 256 chars".to_string(),
+            ));
+        }
+        if req
+            .event_guid
+            .chars()
+            .any(|c| c.is_control() || c == '\n' || c == '\r')
+        {
+            return Err(WorkerError::InvalidRequest(
+                "event_guid must not contain control characters".to_string(),
+            ));
+        }
+        if req.deposit_count == 0 {
+            return Err(WorkerError::InvalidRequest(
+                "deposit_count must be >= 1 (depositCount = sequence_number + 1, observer must \
+                 not emit for sequence_number-less-than-zero)"
+                    .to_string(),
+            ));
+        }
+        if req.new_deposit_count_observed != req.deposit_count {
+            return Err(WorkerError::InvalidRequest(format!(
+                "new_deposit_count_observed {} must equal deposit_count {}",
+                req.new_deposit_count_observed, req.deposit_count
+            )));
+        }
+
+        // 2. Normalize hex fields (32-byte hex).
+        let vault_ek_transcript_hash = normalize_hex(&req.vault_ek_transcript_hash, 32)?;
+        let registration_transcript_hash = normalize_hex(&req.registration_transcript_hash, 32)?;
+        let roster_hash = normalize_hex(&req.roster_hash, 32)?;
+        let vault_ek_hex = normalize_hex(&req.vault_ek, 32)?;
+        let sender = normalize_hex(&req.sender_address, 32)?;
+        let asset = normalize_hex(&req.asset_type, 32)?;
+        let commitment = normalize_hex(&req.commitment, 32)?;
+        let amount_tag = normalize_hex(&req.amount_tag, 32)?;
+        let ca_payload_hash = normalize_hex(&req.ca_payload_hash, 32)?;
+        let deposit_nonce = normalize_hex(&req.deposit_nonce, 32)?;
+
+        // 3. Load the persisted state. Missing → fail closed.
+        let existing = load_vault_state_v2(state_dir)?.ok_or_else(|| {
+            WorkerError::InvalidDkgState("missing_vault_state_file".to_string())
+        })?;
+
+        // 4. Provenance gate. Every binding persisted by Milestone 2a's init MUST match the
+        //    observe-deposit request — except cursor counters, which the cursor-monotonicity
+        //    check below handles.
+        let provenance_ok = existing.dkg_epoch == req.dkg_epoch
+            && existing.slot == req.self_slot
+            && existing.player_id == req.player_id
+            && normalize_hex(&existing.vault_ek_transcript_hash, 32)? == vault_ek_transcript_hash
+            && normalize_hex(&existing.registration_transcript_hash, 32)?
+                == registration_transcript_hash
+            && normalize_hex(&existing.roster_hash, 32)? == roster_hash
+            && existing.selected_slots == sorted
+            && normalize_hex(&existing.vault_ek_hex, 32)? == vault_ek_hex
+            && normalize_hex(&existing.sender_address, 32)? == sender
+            && normalize_hex(&existing.asset_type, 32)? == asset
+            && existing.chain_id == req.chain_id;
+        if !provenance_ok {
+            return Err(WorkerError::InvalidDkgState(
+                "vault_state_v2_provenance_mismatch".to_string(),
+            ));
+        }
+
+        // 5. Cursor monotonicity (KILLER). Strict greater-than: req.deposit_count must be
+        //    strictly larger than the existing cursor. Equal is rejected (replay of an
+        //    already-observed event). Less is also rejected (out-of-order observer).
+        if !(req.deposit_count > existing.deposit_count_observed) {
+            return Err(WorkerError::InvalidRequest(format!(
+                "stale_deposit_count: req={} existing={}",
+                req.deposit_count, existing.deposit_count_observed
+            )));
+        }
+        if req.previous_deposit_count_observed != existing.deposit_count_observed {
+            return Err(WorkerError::InvalidRequest(format!(
+                "previous_deposit_count_observed_mismatch: req={} existing={}",
+                req.previous_deposit_count_observed, existing.deposit_count_observed
+            )));
+        }
+
+        // 6. Atomic update: rebuild the on-disk struct with the new cursor and write it via
+        //    the same tmp + create_new + rename helper as init.
+        let previous_cursor = existing.deposit_count_observed;
+        let updated = VaultStateFile {
+            scheme: existing.scheme.clone(),
+            slot: existing.slot,
+            player_id: existing.player_id,
+            dkg_epoch: existing.dkg_epoch.clone(),
+            ca_dkg_transcript_hash: existing.ca_dkg_transcript_hash.clone(),
+            vault_ek_transcript_hash: existing.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: existing.registration_transcript_hash.clone(),
+            roster_hash: existing.roster_hash.clone(),
+            selected_slots: existing.selected_slots.clone(),
+            vault_ek_hex: existing.vault_ek_hex.clone(),
+            sender_address: existing.sender_address.clone(),
+            asset_type: existing.asset_type.clone(),
+            chain_id: existing.chain_id,
+            aggregate_commitment: existing.aggregate_commitment.clone(),
+            aggregate_response: existing.aggregate_response.clone(),
+            challenge: existing.challenge.clone(),
+            vault_sequence: existing.vault_sequence, // untouched by observe
+            deposit_count_observed: req.deposit_count,
+            created_at_unix_ms: existing.created_at_unix_ms,
+        };
+        let bytes = serde_json::to_vec_pretty(&updated)
+            .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;
+        let file_path = vault_state_file_path(state_dir);
+        write_secret_file(&file_path, &bytes)?;
+
+        let vault_state_hash = sha256_hex(&bytes);
+        let worker_transcript_hash = observe_worker_transcript_hash(
+            &req.session_id,
+            &req.request_id,
+            &req.dkg_epoch,
+            &sorted,
+            req.self_slot,
+            req.player_id,
+            &vault_ek_transcript_hash,
+            &registration_transcript_hash,
+            &vault_ek_hex,
+            &sender,
+            &asset,
+            req.chain_id,
+            req.deposit_count,
+            &commitment,
+            &amount_tag,
+            &ca_payload_hash,
+            &deposit_nonce,
+            &req.sequence_number,
+            &req.tx_version,
+            &req.event_guid,
+            previous_cursor,
+            req.deposit_count,
+        );
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        Ok(ObserveDepositResult {
+            slot: req.self_slot,
+            player_id: req.player_id,
+            vault_state_path: file_path.display().to_string(),
+            vault_state_hash,
+            worker_transcript_hash,
+            previous_deposit_count_observed: previous_cursor,
+            deposit_count_observed: req.deposit_count,
+            vault_sequence: existing.vault_sequence,
+            observed_at_unix_ms: observed_at,
+            observed: true,
+        })
     }
 
     fn validate_selected_slots(slots: &[usize]) -> WorkerResult<()> {

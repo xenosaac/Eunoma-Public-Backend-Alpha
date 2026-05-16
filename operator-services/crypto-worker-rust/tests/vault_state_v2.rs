@@ -38,7 +38,8 @@ use eunoma_crypto_worker::{
         run_aggregate_v2, AggregateRequest, Round1Request, Round2Request,
     },
     vault_state_v2::{
-        init_vault_state_v2, init_worker_transcript_hash, load_vault_state_v2, InitRequest,
+        init_vault_state_v2, init_worker_transcript_hash, load_vault_state_v2,
+        observe_deposit_v2, observe_worker_transcript_hash, InitRequest, ObserveDepositRequest,
         VaultStateFile,
     },
     WorkerError,
@@ -605,5 +606,277 @@ fn vault_state_v2_init_rejects_mismatched_challenge() {
     assert!(
         !file_path.exists(),
         "challenge mismatch must not persist vault_state_v2.json"
+    );
+}
+
+// =================================================================================================
+// Milestone 2 sub-milestone 2b — observe_deposit_v2 tests.
+//
+// Build the Milestone 1 fixture, initialise each worker's vault_state_v2.json via 2a, then
+// drive the 2b cursor bump endpoint. Killer test: strict monotonicity — a second call at the
+// SAME deposit_count is rejected `stale_deposit_count`. Other tests cover missing file,
+// mismatched dkg_epoch, provenance mismatch, and worker_transcript_hash reproducibility.
+// =================================================================================================
+
+const VE_TRANSCRIPT_HASH: &str = "aa";
+const REG_TRANSCRIPT_HASH: &str = "bb";
+
+fn run_init_for_slot(
+    fix: &Milestone1Fixture,
+    self_slot: usize,
+    player_id: usize,
+) -> VaultStateFile {
+    let req = build_init_request(fix, self_slot, player_id);
+    init_vault_state_v2(&fix.slot_dirs[self_slot], &req).expect("init for observe fixture");
+    load_vault_state_v2(&fix.slot_dirs[self_slot])
+        .expect("load post-init")
+        .expect("file present post-init")
+}
+
+fn build_observe_request(
+    fix: &Milestone1Fixture,
+    self_slot: usize,
+    player_id: usize,
+    deposit_count: u64,
+    previous_cursor: u64,
+) -> ObserveDepositRequest {
+    ObserveDepositRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: format!("obs-{deposit_count}-{self_slot}"),
+        session_id: format!("obs-sess-{deposit_count}"),
+        vault_ek_transcript_hash: VE_TRANSCRIPT_HASH.repeat(32),
+        registration_transcript_hash: REG_TRANSCRIPT_HASH.repeat(32),
+        roster_hash: fix.roster_hash.clone(),
+        selected_slots: fix.selected_slots.clone(),
+        self_slot,
+        player_id,
+        vault_ek: fix.vault_ek_hex.clone(),
+        sender_address: fix.sender.clone(),
+        asset_type: fix.asset.clone(),
+        chain_id: fix.chain_id,
+        deposit_count,
+        commitment: "0c".repeat(32),
+        amount_tag: "0a".repeat(32),
+        ca_payload_hash: "0d".repeat(32),
+        deposit_nonce: "0e".repeat(32),
+        sequence_number: (deposit_count.saturating_sub(1)).to_string(),
+        tx_version: "1234567".to_string(),
+        event_guid: format!("0:0x{:0>40}", deposit_count),
+        previous_deposit_count_observed: previous_cursor,
+        new_deposit_count_observed: deposit_count,
+    }
+}
+
+#[test]
+fn observe_deposit_v2_increments_cursor_monotonically() {
+    // KILLER test. Phase 1: initialise the worker. Phase 2: observe deposit_count=1; cursor
+    // moves from 0 to 1; file updates atomically. Phase 3: observe deposit_count=2; cursor
+    // moves from 1 to 2. Phase 4 (the actual killer assertion): observe deposit_count=2 again
+    // → rejected `stale_deposit_count`. Phase 5: lower count (deposit_count=1) also rejected.
+    let fix = build_milestone1_fixture("observe-monotonic");
+    let slot = 2_usize;
+    let player_id = 2_usize;
+    let _initial = run_init_for_slot(&fix, slot, player_id);
+
+    // Phase 2: cursor 0 → 1.
+    let req1 = build_observe_request(&fix, slot, player_id, 1, 0);
+    let res1 = observe_deposit_v2(&fix.slot_dirs[slot], &req1).expect("observe 1");
+    assert_eq!(res1.previous_deposit_count_observed, 0);
+    assert_eq!(res1.deposit_count_observed, 1);
+    assert_eq!(res1.vault_sequence, 0, "vault_sequence untouched by observe");
+    assert!(res1.observed);
+    let loaded1 = load_vault_state_v2(&fix.slot_dirs[slot])
+        .expect("load")
+        .expect("file");
+    assert_eq!(loaded1.deposit_count_observed, 1);
+    assert_eq!(loaded1.vault_sequence, 0);
+
+    // Phase 3: cursor 1 → 2.
+    let req2 = build_observe_request(&fix, slot, player_id, 2, 1);
+    let res2 = observe_deposit_v2(&fix.slot_dirs[slot], &req2).expect("observe 2");
+    assert_eq!(res2.previous_deposit_count_observed, 1);
+    assert_eq!(res2.deposit_count_observed, 2);
+
+    // Phase 4 — KILLER: replay at the same cursor is rejected.
+    let req_replay = build_observe_request(&fix, slot, player_id, 2, 2);
+    let err = observe_deposit_v2(&fix.slot_dirs[slot], &req_replay)
+        .expect_err("stale (==cursor) must be rejected");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("stale_deposit_count")),
+        "expected stale_deposit_count, got {err:?}"
+    );
+
+    // Phase 5: lower count rejected.
+    let req_lower = build_observe_request(&fix, slot, player_id, 1, 2);
+    let err = observe_deposit_v2(&fix.slot_dirs[slot], &req_lower)
+        .expect_err("lower deposit_count must be rejected");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("stale_deposit_count")),
+        "expected stale_deposit_count for lower count, got {err:?}"
+    );
+
+    // Persisted cursor unchanged after the rejected replay + lower.
+    let loaded_after = load_vault_state_v2(&fix.slot_dirs[slot])
+        .expect("load")
+        .expect("file");
+    assert_eq!(loaded_after.deposit_count_observed, 2);
+}
+
+#[test]
+fn observe_deposit_v2_rejects_stale_count() {
+    // Cursor at 0; passing deposit_count=0 must fail closed (deposit_count must be >= 1, and
+    // even if it weren't, 0 is not strictly greater than the existing cursor of 0).
+    let fix = build_milestone1_fixture("observe-stale-zero");
+    let slot = 0_usize;
+    run_init_for_slot(&fix, slot, 0);
+
+    let mut req = build_observe_request(&fix, slot, 0, 1, 0);
+    req.deposit_count = 0;
+    req.new_deposit_count_observed = 0;
+    let err = observe_deposit_v2(&fix.slot_dirs[slot], &req)
+        .expect_err("deposit_count=0 must be rejected");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(_)),
+        "expected InvalidRequest for deposit_count=0, got {err:?}"
+    );
+}
+
+#[test]
+fn observe_deposit_v2_rejects_missing_vault_state_file() {
+    // No init has happened. The state_dir exists but has no vault_state_v2.json.
+    let dir = temp_state_dir("observe-missing");
+    let req = ObserveDepositRequest {
+        dkg_epoch: DKG_EPOCH.to_string(),
+        request_id: "obs-missing".to_string(),
+        session_id: "obs-missing".to_string(),
+        vault_ek_transcript_hash: VE_TRANSCRIPT_HASH.repeat(32),
+        registration_transcript_hash: REG_TRANSCRIPT_HASH.repeat(32),
+        roster_hash: "55".repeat(32),
+        selected_slots: vec![0, 1, 2, 3, 4],
+        self_slot: 0,
+        player_id: 0,
+        vault_ek: "01".repeat(32),
+        sender_address: "02".repeat(32),
+        asset_type: "03".repeat(32),
+        chain_id: 2,
+        deposit_count: 1,
+        commitment: "0c".repeat(32),
+        amount_tag: "0a".repeat(32),
+        ca_payload_hash: "0d".repeat(32),
+        deposit_nonce: "0e".repeat(32),
+        sequence_number: "0".to_string(),
+        tx_version: "100".to_string(),
+        event_guid: "0:0xfeed".to_string(),
+        previous_deposit_count_observed: 0,
+        new_deposit_count_observed: 1,
+    };
+    let err = observe_deposit_v2(&dir, &req)
+        .expect_err("missing vault_state_v2.json must be rejected");
+    assert!(
+        matches!(err, WorkerError::InvalidDkgState(ref s) if s == "missing_vault_state_file"),
+        "expected missing_vault_state_file, got {err:?}"
+    );
+}
+
+#[test]
+fn observe_deposit_v2_rejects_mismatched_dkg_epoch() {
+    // Init at DKG_EPOCH=11; observe call claims DKG_EPOCH=12 → provenance mismatch.
+    let fix = build_milestone1_fixture("observe-stale-epoch");
+    let slot = 1_usize;
+    run_init_for_slot(&fix, slot, 1);
+
+    let mut req = build_observe_request(&fix, slot, 1, 1, 0);
+    req.dkg_epoch = "12".to_string();
+    let err = observe_deposit_v2(&fix.slot_dirs[slot], &req)
+        .expect_err("stale dkg_epoch must be rejected");
+    assert!(
+        matches!(err, WorkerError::InvalidDkgState(ref s) if s == "vault_state_v2_provenance_mismatch"),
+        "expected vault_state_v2_provenance_mismatch, got {err:?}"
+    );
+
+    // Cursor on disk unchanged.
+    let loaded = load_vault_state_v2(&fix.slot_dirs[slot])
+        .expect("load")
+        .expect("file");
+    assert_eq!(loaded.deposit_count_observed, 0);
+}
+
+#[test]
+fn observe_deposit_v2_rejects_mismatched_vault_ek() {
+    // Init writes vault_state_v2.json bound to fix.vault_ek_hex; observe call supplies a
+    // different vault_ek → provenance mismatch (load-bearing: prevents a stale observer
+    // from corrupting a worker whose state is bound to a DIFFERENT vault).
+    let fix = build_milestone1_fixture("observe-wrong-vault-ek");
+    let slot = 3_usize;
+    run_init_for_slot(&fix, slot, 3);
+
+    let mut req = build_observe_request(&fix, slot, 3, 1, 0);
+    req.vault_ek = "0f".repeat(32);
+    let err = observe_deposit_v2(&fix.slot_dirs[slot], &req)
+        .expect_err("mismatched vault_ek must be rejected");
+    assert!(
+        matches!(err, WorkerError::InvalidDkgState(ref s) if s == "vault_state_v2_provenance_mismatch"),
+        "expected vault_state_v2_provenance_mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn observe_deposit_v2_rebuilds_transcript_hash() {
+    // The worker's returned worker_transcript_hash must equal the byte-identical Rust-side
+    // reconstruction of the same hash. This is the load-bearing check the coordinator uses
+    // to detect a tampered transcript on the wire.
+    let fix = build_milestone1_fixture("observe-transcript");
+    let slot = 4_usize;
+    run_init_for_slot(&fix, slot, 4);
+
+    let req = build_observe_request(&fix, slot, 4, 5, 0);
+    let result = observe_deposit_v2(&fix.slot_dirs[slot], &req).expect("observe");
+
+    let mut sorted = fix.selected_slots.clone();
+    sorted.sort_unstable();
+    let expected = observe_worker_transcript_hash(
+        &req.session_id,
+        &req.request_id,
+        &req.dkg_epoch,
+        &sorted,
+        slot,
+        4,
+        &VE_TRANSCRIPT_HASH.repeat(32),
+        &REG_TRANSCRIPT_HASH.repeat(32),
+        &fix.vault_ek_hex,
+        &fix.sender,
+        &fix.asset,
+        fix.chain_id,
+        5,
+        &"0c".repeat(32),
+        &"0a".repeat(32),
+        &"0d".repeat(32),
+        &"0e".repeat(32),
+        &req.sequence_number,
+        &req.tx_version,
+        &req.event_guid,
+        0,
+        5,
+    );
+    assert_eq!(result.worker_transcript_hash, expected);
+    assert_eq!(result.previous_deposit_count_observed, 0);
+    assert_eq!(result.deposit_count_observed, 5);
+}
+
+#[test]
+fn observe_deposit_v2_rejects_unsafe_request_id() {
+    // Even though the coordinator sanitises requestId, the worker is the final fence — apply
+    // is_safe_id at the worker boundary too.
+    let fix = build_milestone1_fixture("observe-unsafe-id");
+    let slot = 0_usize;
+    run_init_for_slot(&fix, slot, 0);
+
+    let mut req = build_observe_request(&fix, slot, 0, 1, 0);
+    req.request_id = "../../evil".to_string();
+    let err = observe_deposit_v2(&fix.slot_dirs[slot], &req)
+        .expect_err("unsafe request_id must be rejected");
+    assert!(
+        matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("request_id")),
+        "expected InvalidRequest re: request_id, got {err:?}"
     );
 }

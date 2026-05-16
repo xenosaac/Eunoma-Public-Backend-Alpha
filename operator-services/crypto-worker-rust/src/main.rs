@@ -35,7 +35,9 @@ use eunoma_crypto_worker::ca_registration_v2::{
     Round2Request as CaRegistrationV2Round2Request, VerifyRequest as CaRegistrationV2VerifyRequest,
 };
 use eunoma_crypto_worker::vault_state_v2::{
-    init_vault_state_v2 as run_vault_state_v2_init, InitRequest as VaultStateV2InitRequest,
+    init_vault_state_v2 as run_vault_state_v2_init,
+    observe_deposit_v2 as run_vault_state_v2_observe_deposit, InitRequest as VaultStateV2InitRequest,
+    ObserveDepositRequest as VaultStateV2ObserveDepositRequest,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -160,6 +162,12 @@ async fn main() {
         .route(
             "/worker/v2/vault_state/init",
             post(vault_state_v2_init),
+        )
+        // Milestone 2b — confirmed-deposit observer. Strict cursor monotonicity over the
+        // worker's persisted deposit_count_observed counter. No secret material on the wire.
+        .route(
+            "/worker/v2/vault_state/observe_deposit",
+            post(vault_state_v2_observe_deposit),
         )
         .with_state(app_state);
 
@@ -980,6 +988,23 @@ async fn vault_state_v2_init(
     Json(body): Json<VaultStateV2InitRequest>,
 ) -> (StatusCode, Json<Value>) {
     match run_vault_state_v2_init(&state.state_dir, &body) {
+        Ok(result) => (StatusCode::OK, Json(json!(result))),
+        Err(err) => worker_error_response(err),
+    }
+}
+
+// Milestone 2b — `/worker/v2/vault_state/observe_deposit`. Bumps the per-worker
+// `deposit_count_observed` cursor strictly upward after the coordinator has already cross-
+// referenced the supplied (Phase 2, Milestone 1) provenance against the request body. The
+// worker re-runs the provenance gate against its persisted `vault_state_v2.json` and enforces
+// strict cursor monotonicity (req.deposit_count > existing.deposit_count_observed). A re-call
+// at the same cursor is rejected `stale_deposit_count`; this is the load-bearing security
+// check that prevents an already-observed deposit from being replayed.
+async fn vault_state_v2_observe_deposit(
+    State(state): State<AppState>,
+    Json(body): Json<VaultStateV2ObserveDepositRequest>,
+) -> (StatusCode, Json<Value>) {
+    match run_vault_state_v2_observe_deposit(&state.state_dir, &body) {
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => worker_error_response(err),
     }
