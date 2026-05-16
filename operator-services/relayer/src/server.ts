@@ -165,11 +165,19 @@ export type SpawnAptosFn = (
 
 export interface CreateAptosCliSubmitterOptions {
   /**
-   * Real submit flag. `false` (the default) appends `--simulate` to the CLI
-   * args. Production rollout from M5b/5c/5d will set this `true` only after
-   * explicit operator approval and `RELAYER_SUBMIT_ENABLED=1` in the env.
+   * Real-submit request. When omitted/`false` the submitter appends
+   * `--simulate` to the CLI args. When `true`, the factory ALSO requires the
+   * env (default: `process.env`) to set `RELAYER_SUBMIT_ENABLED=1` — without
+   * that env approval, construction throws so a misconfigured caller cannot
+   * silently bypass the human-approval boundary. There is no per-call
+   * override: the submit/simulate posture is fixed at construction.
    */
   submit?: boolean;
+  /**
+   * Process environment used to gate real-submit construction. Defaults to
+   * `process.env`. Tests inject a deterministic env map.
+   */
+  env?: NodeJS.ProcessEnv;
   /**
    * Override for the spawn implementation. Defaults to `node:child_process`'s
    * `spawn`. Tests inject a deterministic mock that captures the argv vector
@@ -193,9 +201,11 @@ export interface CreateAptosCliSubmitterOptions {
  * with the 27 positional arguments in canonical order. Returns the
  * transaction hash parsed from stdout.
  *
- * Default behavior is --simulate. Set `opts.submit = true` to actually
- * broadcast (which requires `ADMIN_PROFILE` to point at a configured Aptos
- * CLI profile and `RELAYER_SUBMIT_ENABLED=1` in the env).
+ * Default behavior is --simulate. To actually broadcast, the caller must
+ * pass `opts.submit = true` AND the process env must set
+ * `RELAYER_SUBMIT_ENABLED=1` — otherwise construction throws. The
+ * simulate/submit posture is fixed at construction time; there is no
+ * per-call override.
  */
 export function createAptosCliSubmitter(
   bridgePackage: string,
@@ -207,6 +217,16 @@ export function createAptosCliSubmitter(
   }
   const spawnFn = opts.spawnAptos ?? defaultSpawnAptos;
   const aptosBin = opts.aptosBin ?? "aptos";
+  const env = opts.env ?? process.env;
+  // Env approval is a HARD GATE for real-submit construction. A caller that
+  // requests submit:true without RELAYER_SUBMIT_ENABLED=1 in the env hits
+  // this throw at construction — before any HTTP request is ever served — so
+  // a misconfigured deploy cannot silently broadcast real transactions.
+  if (opts.submit === true && env.RELAYER_SUBMIT_ENABLED !== "1") {
+    throw new Error(
+      "createAptosCliSubmitter: submit=true requires RELAYER_SUBMIT_ENABLED=1 in the env",
+    );
+  }
   const simulate = opts.submit !== true;
   const stderrSink = opts.stderrSink ?? defaultStderrSink;
 

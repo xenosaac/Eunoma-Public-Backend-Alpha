@@ -128,6 +128,7 @@ describe("createAptosCliSubmitter — argv encoding", () => {
       "admin",
       {
         submit: true,
+        env: { RELAYER_SUBMIT_ENABLED: "1" }, // env gate satisfied
         spawnAptos: buildMockSpawn({
           stdout: APTOS_CLI_STDOUT_FIXTURE,
           captureArgs: captureSubmit,
@@ -137,6 +138,28 @@ describe("createAptosCliSubmitter — argv encoding", () => {
     );
     await submitterReal(fixtureCallArgs());
     expect(captureSubmit.args).not.toContain("--simulate");
+  });
+
+  it("submit_true_without_env_gate_throws_at_construction_time", () => {
+    // Codex P2 finding: even if a caller passes submit:true, construction
+    // must throw if RELAYER_SUBMIT_ENABLED=1 is absent from the env.
+    expect(() =>
+      createAptosCliSubmitter("0xabc", "admin", {
+        submit: true,
+        env: {}, // env gate NOT satisfied
+      }),
+    ).toThrow(/RELAYER_SUBMIT_ENABLED=1/);
+    expect(() =>
+      createAptosCliSubmitter("0xabc", "admin", {
+        submit: true,
+        env: { RELAYER_SUBMIT_ENABLED: "0" }, // explicit no
+      }),
+    ).toThrow(/RELAYER_SUBMIT_ENABLED=1/);
+    // submit=false or unset MUST NOT require the env gate.
+    expect(() =>
+      createAptosCliSubmitter("0xabc", "admin", { submit: false, env: {} }),
+    ).not.toThrow();
+    expect(() => createAptosCliSubmitter("0xabc", "admin", { env: {} })).not.toThrow();
   });
 
   it("emits the canonical --function-id pointing at withdraw_to_recipient_v2", async () => {
@@ -238,12 +261,13 @@ describe("createAptosCliSubmitter — stdout parsing", () => {
     expect(result.simulated).toBe(true);
   });
 
-  it("returns simulated=false when submit=true", async () => {
+  it("returns simulated=false when submit=true (env gate satisfied)", async () => {
     const submitter = createAptosCliSubmitter(
       "0xabc",
       "admin",
       {
         submit: true,
+        env: { RELAYER_SUBMIT_ENABLED: "1" },
         spawnAptos: buildMockSpawn({
           stdout: APTOS_CLI_STDOUT_FIXTURE,
           captureArgs: {},
