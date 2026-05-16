@@ -3216,6 +3216,46 @@ export function buildCoordinatorServer(
           // with a different error (which means the public binding fence kicked in for that
           // slot and not the others — the orchestrator must surface that).
           if (res.value.statusCode !== 501) {
+            // Codex M3a P1 v4: surface the SPECIFIC, OPERATOR-ACTIONABLE 409 the worker
+            // emits when its persisted `init_transcript_hash` is None — meaning the cluster
+            // is in the legitimate partial-finalize state and the operator should invoke
+            // `/v2/vault_state/init/finalize` (idempotent across already-finalized slots).
+            // Mapping this to a generic 502 round1_unexpected_status loses the recovery
+            // hint; the coordinator's caller needs to know to run finalize, not to
+            // investigate tamper.
+            //
+            // Worker emits body shape (post-v4): `{ "code": "vault_state_v2_not_finalized",
+            // "error": "invalid_dkg_state", "message": "..." }`. We accept either a top-
+            // level `code` field (preferred) or the legacy `message` containing the
+            // sentinel substring (backwards compat with worker builds that predate the
+            // structured `code` field).
+            const body = res.value.body as
+              | Record<string, unknown>
+              | undefined
+              | null;
+            const workerCode =
+              typeof body?.code === "string" ? body.code : undefined;
+            const workerMessage =
+              typeof body?.message === "string" ? body.message : undefined;
+            const notFinalized =
+              workerCode === "vault_state_v2_not_finalized" ||
+              (workerMessage !== undefined &&
+                workerMessage.includes("vault_state_v2_not_finalized"));
+            if (res.value.statusCode === 409 && notFinalized) {
+              return reply.code(503).send({
+                error: "vault_state_v2_not_finalized_invoke_finalize_first",
+                slot: res.slot,
+                requestId,
+                statusCode: res.value.statusCode,
+                workerCode: workerCode ?? "vault_state_v2_not_finalized",
+                message:
+                  "worker rejected MPCCA round1 because its persisted init_transcript_hash " +
+                  "is None — invoke POST /v2/vault_state/init/finalize on the cluster (idempotent " +
+                  "across already-finalized slots) before retrying the withdraw. Do not auto-retry: " +
+                  "the operator must observe finalize converged to a single canonical hash before " +
+                  "the next MPCCA round1 attempt.",
+              });
+            }
             return reply.code(502).send({
               error: "round1_unexpected_status",
               slot: res.slot,

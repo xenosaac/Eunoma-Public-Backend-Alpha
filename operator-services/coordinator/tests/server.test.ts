@@ -3864,6 +3864,172 @@ describe("coordinator", () => {
     expect(res.json().error).toBe("worker_transcript_hash_mismatch");
   });
 
+  // Codex M3a P1 v4: when a worker rejects MPCCA round1 with InvalidDkgState(
+  // "vault_state_v2_not_finalized") — i.e. its persisted vault_state_v2.json has
+  // init_transcript_hash=None (legitimate partial-finalize state) — the coordinator MUST
+  // surface a SPECIFIC, OPERATOR-ACTIONABLE 503 instead of the generic 502
+  // round1_unexpected_status. The operator's action is to invoke /v2/vault_state/init/finalize
+  // (idempotent across already-finalized slots).
+  it("mpcca_withdraw_round1 surfaces 503 vault_state_v2_not_finalized_invoke_finalize_first", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const payload = mpccaWithdrawValidPayload();
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      // Custom forwarder that returns a 409 + worker's structured body shape for slot 0,
+      // simulating an unfinalized worker; the other 4 slots return the normal 501 stub.
+      singleNodeForwarder: async (path, body, _roster, slot) => {
+        if (path !== "/worker/v2/mpcca/withdraw/round1") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
+        }
+        if (slot === 0) {
+          return {
+            slot,
+            ok: false,
+            statusCode: 409,
+            body: {
+              error: "invalid_dkg_state",
+              code: "vault_state_v2_not_finalized",
+              message: 'InvalidDkgState("vault_state_v2_not_finalized")',
+            },
+          };
+        }
+        // Other slots — return generic 501 just so the loop walks past them (unreachable
+        // since we return early on slot 0, but the Promise.all fans out all 5).
+        return {
+          slot,
+          ok: false,
+          statusCode: 501,
+          body: {
+            slot,
+            playerId: (body as Record<string, unknown>).playerId ?? 0,
+            notImplementedPhase:
+              "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
+          },
+        };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-wdr-not-finalized", ...payload },
+    });
+    expect(res.statusCode).toBe(503);
+    const body = res.json();
+    expect(body.error).toBe("vault_state_v2_not_finalized_invoke_finalize_first");
+    expect(body.workerCode).toBe("vault_state_v2_not_finalized");
+    expect(body.message).toContain("/v2/vault_state/init/finalize");
+    // Distinguishability KILLER: this is NOT the generic round1_unexpected_status — that
+    // mapping would lose the operator-actionable recovery hint.
+    expect(body.error).not.toBe("round1_unexpected_status");
+  });
+
+  // Codex M3a P1 v4: backwards-compat fallback — if the worker body lacks the structured
+  // `code` field but the legacy `message` contains the sentinel, the coordinator still
+  // surfaces the actionable 503. This protects against older worker builds in a heterogeneous
+  // rolling deploy.
+  it(
+    "mpcca_withdraw_round1 surfaces 503 vault_state_v2_not_finalized from legacy worker " +
+      "with only message",
+    async () => {
+      const caDkgV2Roster = dkgRoster();
+      const payload = mpccaWithdrawValidPayload();
+
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster,
+        singleNodeForwarder: async (path, _body, _roster, slot) => {
+          if (path !== "/worker/v2/mpcca/withdraw/round1") {
+            return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
+          }
+          if (slot === 0) {
+            // LEGACY worker: emits ONLY `error` + `message` (no `code` field). Coordinator
+            // must still detect the sentinel substring inside `message`.
+            return {
+              slot,
+              ok: false,
+              statusCode: 409,
+              body: {
+                error: "invalid_dkg_state",
+                message: 'InvalidDkgState("vault_state_v2_not_finalized")',
+              },
+            };
+          }
+          return {
+            slot,
+            ok: false,
+            statusCode: 501,
+            body: {
+              slot,
+              playerId: 0,
+              notImplementedPhase:
+                "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
+            },
+          };
+        },
+      });
+
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/start",
+        payload: { requestId: "mpcca-wdr-not-finalized-legacy", ...payload },
+      });
+      expect(res.statusCode).toBe(503);
+      const body = res.json();
+      expect(body.error).toBe("vault_state_v2_not_finalized_invoke_finalize_first");
+    },
+  );
+
+  // Codex M3a P1 v4: a 409 conflict WITHOUT the vault_state_v2_not_finalized sentinel must
+  // still surface as the generic 502 — we mustn't accidentally surface 503 for unrelated
+  // conflicts (e.g. vault_state_init_transcript_hash_mismatch implies tamper, not partial
+  // finalize, and the operator action differs).
+  it("mpcca_withdraw_round1 still returns 502 for unrelated 409 conflicts", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const payload = mpccaWithdrawValidPayload();
+
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async (path, _body, _roster, slot) => {
+        if (path !== "/worker/v2/mpcca/withdraw/round1") {
+          return { slot, ok: false, statusCode: 500, body: { error: "unexpected_path" } };
+        }
+        if (slot === 0) {
+          // Different InvalidDkgState code: NOT vault_state_v2_not_finalized.
+          return {
+            slot,
+            ok: false,
+            statusCode: 409,
+            body: {
+              error: "invalid_dkg_state",
+              code: "vault_state_init_transcript_hash_mismatch",
+              message: 'InvalidDkgState("vault_state_init_transcript_hash_mismatch")',
+            },
+          };
+        }
+        return {
+          slot,
+          ok: false,
+          statusCode: 501,
+          body: {
+            slot,
+            playerId: 0,
+            notImplementedPhase:
+              "mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4",
+          },
+        };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/withdraw/mpcca/start",
+      payload: { requestId: "mpcca-wdr-other-conflict", ...payload },
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe("round1_unexpected_status");
+  });
+
   it("mpcca_withdraw_round1 returns 502 crypto_stub_phase_divergence when workers disagree on phase", async () => {
     const caDkgV2Roster = dkgRoster();
     const rosterHashHex = caDkgV2RosterHash(caDkgV2Roster);

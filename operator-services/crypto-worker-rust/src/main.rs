@@ -1213,42 +1213,62 @@ fn vault_ek_error_response(
 fn worker_error_response(
     err: eunoma_crypto_worker::WorkerError,
 ) -> (StatusCode, Json<Value>) {
-    let (status, code) = match err {
+    // Codex M3a P1 v4: extract the worker's specific error code (the inner string of
+    // `InvalidDkgState(...)`, `InvalidRequest(...)`, etc.) into a dedicated `code` field on
+    // the response body so the coordinator can pattern-match without parsing the Debug-
+    // formatted `message`. The legacy `error` (broad category) and `message` (Debug repr)
+    // fields are retained for backwards compatibility with any existing log scraper.
+    //
+    // Concrete example: a worker that hits the `vault_state_v2_not_finalized` branch in
+    // MPCCA round1 will now emit:
+    //   { "error": "invalid_dkg_state",
+    //     "code": "vault_state_v2_not_finalized",
+    //     "message": "InvalidDkgState(\"vault_state_v2_not_finalized\")" }
+    // The coordinator's MPCCA round1 fan-out checks `body.code` to surface a specific
+    // 503 retryable-operator-action signal instead of the generic 502.
+    let (status, error, code): (StatusCode, &'static str, String) = match &err {
         eunoma_crypto_worker::WorkerError::BadThreshold { .. } => {
-            (StatusCode::BAD_REQUEST, "bad_threshold")
+            (StatusCode::BAD_REQUEST, "bad_threshold", "bad_threshold".to_string())
         }
         eunoma_crypto_worker::WorkerError::UnderQuorum { .. } => {
-            (StatusCode::BAD_REQUEST, "under_quorum")
+            (StatusCode::BAD_REQUEST, "under_quorum", "under_quorum".to_string())
         }
-        eunoma_crypto_worker::WorkerError::ForbiddenPlaintextField(_) => {
-            (StatusCode::BAD_REQUEST, "forbidden_plaintext_field")
+        eunoma_crypto_worker::WorkerError::ForbiddenPlaintextField(field) => {
+            (StatusCode::BAD_REQUEST, "forbidden_plaintext_field", format!("forbidden_plaintext_field:{field}"))
         }
-        eunoma_crypto_worker::WorkerError::MissingLocalState(_) => {
-            (StatusCode::PRECONDITION_FAILED, "missing_local_state")
+        eunoma_crypto_worker::WorkerError::MissingLocalState(path) => {
+            (StatusCode::PRECONDITION_FAILED, "missing_local_state", format!("missing_local_state:{path}"))
         }
-        eunoma_crypto_worker::WorkerError::InvalidRequest(_) => {
-            (StatusCode::BAD_REQUEST, "invalid_request")
+        eunoma_crypto_worker::WorkerError::InvalidRequest(msg) => {
+            (StatusCode::BAD_REQUEST, "invalid_request", msg.clone())
         }
-        eunoma_crypto_worker::WorkerError::Io(_)
-        | eunoma_crypto_worker::WorkerError::Serde(_)
-        | eunoma_crypto_worker::WorkerError::Crypto(_) => {
-            (StatusCode::BAD_REQUEST, "worker_error")
+        eunoma_crypto_worker::WorkerError::Io(msg) => {
+            (StatusCode::BAD_REQUEST, "worker_error", format!("io:{msg}"))
         }
-        eunoma_crypto_worker::WorkerError::NotImplemented(_) => {
-            (StatusCode::NOT_IMPLEMENTED, "not_implemented")
+        eunoma_crypto_worker::WorkerError::Serde(msg) => {
+            (StatusCode::BAD_REQUEST, "worker_error", format!("serde:{msg}"))
         }
-        eunoma_crypto_worker::WorkerError::InvalidDkgState(_) => {
-            (StatusCode::CONFLICT, "invalid_dkg_state")
+        eunoma_crypto_worker::WorkerError::Crypto(msg) => {
+            (StatusCode::BAD_REQUEST, "worker_error", format!("crypto:{msg}"))
         }
-        eunoma_crypto_worker::WorkerError::Complaint(_) => (StatusCode::CONFLICT, "complaint"),
-        eunoma_crypto_worker::WorkerError::InvalidPathSegment(_) => {
-            (StatusCode::BAD_REQUEST, "invalid_path_segment")
+        eunoma_crypto_worker::WorkerError::NotImplemented(msg) => {
+            (StatusCode::NOT_IMPLEMENTED, "not_implemented", msg.to_string())
+        }
+        eunoma_crypto_worker::WorkerError::InvalidDkgState(msg) => {
+            (StatusCode::CONFLICT, "invalid_dkg_state", msg.clone())
+        }
+        eunoma_crypto_worker::WorkerError::Complaint(msg) => {
+            (StatusCode::CONFLICT, "complaint", msg.clone())
+        }
+        eunoma_crypto_worker::WorkerError::InvalidPathSegment(label) => {
+            (StatusCode::BAD_REQUEST, "invalid_path_segment", format!("invalid_path_segment:{label}"))
         }
     };
     (
         status,
         Json(json!({
-            "error": code,
+            "error": error,
+            "code": code,
             "message": format!("{err:?}")
         })),
     )
