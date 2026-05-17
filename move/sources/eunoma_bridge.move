@@ -818,6 +818,92 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    /// V2 deposit-binding VK rotation. Admin-only. Idempotent over presence of the
+    /// existing resource: if a DepositBindingVK is already published, it is dropped
+    /// FIRST (along with any cached PreparedDepositBindingVK), and the new VK is moved
+    /// in. After this entry runs, the admin MUST call
+    /// `rotate_prepared_deposit_binding_vk_v2` to refresh the cached prepared VK.
+    /// Required when the trusted-setup zkey is regenerated and the on-chain VK no
+    /// longer matches the proving key. Hard invariants unchanged: no plaintext
+    /// witness, no centralized dk/inverse, no 5-of-7 weakening.
+    public entry fun rotate_deposit_binding_vk_v2(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+    ) acquires DepositBindingVK, PreparedDepositBindingVK {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        if (exists<PreparedDepositBindingVK>(@eunoma)) {
+            let PreparedDepositBindingVK {
+                pvk_alpha_g1_beta_g2_fq12: _,
+                pvk_gamma_g2_neg: _,
+                pvk_delta_g2_neg: _,
+                pvk_uvw_gamma_g1: _,
+            } = move_from<PreparedDepositBindingVK>(@eunoma);
+        };
+        if (exists<DepositBindingVK>(@eunoma)) {
+            let DepositBindingVK {
+                alpha_g1: _,
+                beta_g2: _,
+                gamma_g2: _,
+                delta_g2: _,
+                ic: _,
+            } = move_from<DepositBindingVK>(@eunoma);
+        };
+        assert_g1(&alpha_g1, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&beta_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&delta_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_0, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_1, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_3, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_4, E_INVALID_DEPOSIT_BINDING_PROOF);
+        move_to(admin, DepositBindingVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4],
+        });
+    }
+
+    /// V2 prepared deposit-binding VK rotation. Admin-only. Drops any cached
+    /// PreparedDepositBindingVK and re-derives it from the currently-published
+    /// DepositBindingVK. Call this AFTER `rotate_deposit_binding_vk_v2` so
+    /// `assert_valid_deposit_binding_proof` consumes the refreshed pairing cache.
+    public entry fun rotate_prepared_deposit_binding_vk_v2(
+        admin: &signer,
+    ) acquires DepositBindingVK, PreparedDepositBindingVK {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(exists<DepositBindingVK>(@eunoma), E_NOT_INITIALIZED);
+        if (exists<PreparedDepositBindingVK>(@eunoma)) {
+            let PreparedDepositBindingVK {
+                pvk_alpha_g1_beta_g2_fq12: _,
+                pvk_gamma_g2_neg: _,
+                pvk_delta_g2_neg: _,
+                pvk_uvw_gamma_g1: _,
+            } = move_from<PreparedDepositBindingVK>(@eunoma);
+        };
+        let vk = borrow_global<DepositBindingVK>(@eunoma);
+        let alpha_g1 = de_g1(vk.alpha_g1);
+        let beta_g2 = de_g2(vk.beta_g2);
+        let gamma_g2 = de_g2(vk.gamma_g2);
+        let delta_g2 = de_g2(vk.delta_g2);
+        move_to(admin, PreparedDepositBindingVK {
+            pvk_alpha_g1_beta_g2_fq12: pairing_fq12_bytes(&alpha_g1, &beta_g2),
+            pvk_gamma_g2_neg: neg_g2_bytes(&gamma_g2),
+            pvk_delta_g2_neg: neg_g2_bytes(&delta_g2),
+            pvk_uvw_gamma_g1: vk.ic,
+        });
+    }
+
     public entry fun publish_withdraw_proof_vk_v2(
         admin: &signer,
         alpha_g1: vector<u8>,
