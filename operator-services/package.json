@@ -13,7 +13,8 @@
   ],
   "scripts": {
     "build": "npm run -w @eunoma/shared build && npm run -w @eunoma/deop-protocol build && npm run -w @eunoma/crypto-worker-client build && npm run -w @eunoma/deoperator-node build && npm run -w @eunoma/coordinator build && npm run -w @eunoma/relayer build",
-    "test": "npm run build && npm run -w @eunoma/shared test && npm run -w @eunoma/deop-protocol test && npm run -w @eunoma/crypto-worker-client test && npm run -w @eunoma/deoperator-node test && npm run -w @eunoma/coordinator test && npm run -w @eunoma/relayer test",
+    "test": "npm run build && npm run -w @eunoma/shared test && npm run -w @eunoma/deop-protocol test && npm run -w @eunoma/crypto-worker-client test && npm run -w @eunoma/deoperator-node test && npm run -w @eunoma/coordinator test && npm run -w @eunoma/relayer test && npm run test:scripts",
+    "test:scripts": "vitest run --config scripts/vitest.config.ts",
     "tsc": "npm run build",
     "local:cluster:config": "npm run build && node scripts/local_cluster_config.mjs",
     "local:cluster:start": "node scripts/local_cluster_start.mjs",

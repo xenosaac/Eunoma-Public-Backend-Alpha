@@ -62,7 +62,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync, writeFileSync } from "node:fs";
 
-import { runPreflight, buildFinalReport } from "./_lib/testnet_e2e_checks.mjs";
+import {
+  runPreflight,
+  buildFinalReport,
+  validateRequiredEnv,
+} from "./_lib/testnet_e2e_checks.mjs";
 
 const EXIT_SUCCESS = 0;
 const EXIT_GENERIC_FAILURE = 1;
@@ -79,64 +83,20 @@ const env = process.env;
 
 // =============================================================================================
 // Stage 1: env-variable precondition checks (structural; before any chain query).
+//
+// Required env vars and their format constraints are validated by the pure helper
+// `validateRequiredEnv` in _lib/testnet_e2e_checks.mjs, so the same logic is exercised by
+// unit tests.
+//
+// NOTE: EUNOMA_TESTNET_VAULT_INIT_TX_HASH is allowed to be derived from the persisted
+// artifact in the pre-flight stage, so it is not in the required-env list.
+// NOTE: EUNOMA_TESTNET_WITHDRAW_PROOF is special-cased below — it can be auto-generated from
+// EUNOMA_TESTNET_WITHDRAW_WITNESS_JSON via the M6-b wrapper, so it is checked AFTER that
+// auto-generation step.
 // =============================================================================================
 
-const errors = [];
-function requireEnv(key, message) {
-  if (!env[key] || env[key].length === 0) {
-    errors.push({ env: key, message });
-  }
-}
-
-requireEnv(
-  "APTOS_TESTNET_NODE_URL",
-  "Aptos testnet fullnode REST endpoint (e.g. https://fullnode.testnet.aptoslabs.com).",
-);
-requireEnv(
-  "BRIDGE_PACKAGE_ADDRESS",
-  "0x-prefixed address of the published Eunoma bridge package on Aptos testnet.",
-);
-requireEnv("RELAYER_SUBMIT_ENABLED", "Must be set to '1' to enable the relayer's chain-submit path.");
-requireEnv(
-  "ADMIN_PROFILE",
-  "Name of an `aptos` CLI profile with admin rights for the bridge package.",
-);
-requireEnv("RELAYER_BEARER_TOKEN", "Bearer auth token the coordinator uses to authenticate to the relayer.");
-requireEnv("EUNOMA_TESTNET_REQUEST_ID", "Unique requestId for this withdraw flow (ISafeId).");
-requireEnv("EUNOMA_TESTNET_DKG_EPOCH", "dkgEpoch (decimal string) this withdraw binds to.");
-
-// New required for the binding final gate (goal.md Final Acceptance items 1-4 + 8 cross-checks).
-requireEnv(
-  "EUNOMA_TESTNET_VAULT_ADDRESS",
-  "0x-prefixed vault address (DO NOT fall back to BRIDGE_PACKAGE_ADDRESS on real testnet; vaults are resource accounts).",
-);
-requireEnv(
-  "EUNOMA_TESTNET_ASSET_TYPE",
-  "0x-prefixed Aptos Object<Metadata> address for the deposit asset.",
-);
-requireEnv(
-  "EUNOMA_TESTNET_CHAIN_ID",
-  "u8 chain id (2 for Aptos testnet); used by the M3 deposit observer payload.",
-);
-requireEnv(
-  "EUNOMA_TESTNET_SENDER_ADDRESS",
-  "0x-prefixed depositor address (used by the M3 deposit observer payload).",
-);
-requireEnv(
-  "EUNOMA_TESTNET_DEPOSIT_TX_HASH",
-  "0x-prefixed real chain-confirmed deposit tx hash. Submit via `aptos move run ...::deposit_with_commitment_v2 ...` first (see M6_OPERATOR_RUNBOOK.md Step 5).",
-);
-requireEnv(
-  "EUNOMA_TESTNET_DEPOSIT_COUNT",
-  "Chain-authoritative deposit_count (decimal string) from the DepositConfirmedV2 event.",
-);
-requireEnv(
-  "EUNOMA_TESTNET_VAULT_EK",
-  "0x-prefixed compressed-Ristretto vault EK (32 bytes hex) derived from CA DKG V2.",
-);
-
-// EUNOMA_TESTNET_VAULT_INIT_TX_HASH is allowed to be derived from the persisted artifact; the
-// pre-flight stage resolves it. We do NOT add it to requireEnv() here.
+const envValidation = validateRequiredEnv(env);
+const envMissing = envValidation.ok ? [] : envValidation.missing.slice();
 
 // M6-b prover output: prefer hex proof; allow witness JSON to auto-generate via M6-b wrapper.
 if (!env.EUNOMA_TESTNET_WITHDRAW_PROOF) {
@@ -205,24 +165,17 @@ if (!env.EUNOMA_TESTNET_WITHDRAW_PROOF) {
       `▶ M6-b: proof generated (${env.EUNOMA_TESTNET_WITHDRAW_PROOF.length} hex chars)`,
     );
   } else {
-    requireEnv(
-      "EUNOMA_TESTNET_WITHDRAW_PROOF",
-      "User-side Groth16 withdraw proof bytes (hex), OR set EUNOMA_TESTNET_WITHDRAW_WITNESS_JSON to a witness JSON file to auto-generate via M6-b.",
-    );
+    envMissing.push({
+      key: "EUNOMA_TESTNET_WITHDRAW_PROOF",
+      message:
+        "User-side Groth16 withdraw proof bytes (hex), OR set EUNOMA_TESTNET_WITHDRAW_WITNESS_JSON to a witness JSON file to auto-generate via M6-b.",
+      priority: "m6b",
+    });
   }
 }
 
-if (errors.length > 0) {
-  const m6bMissing = errors.find((e) => e.env === "EUNOMA_TESTNET_WITHDRAW_PROOF");
-  const m6dMissing = errors.filter((e) =>
-    [
-      "APTOS_TESTNET_NODE_URL",
-      "BRIDGE_PACKAGE_ADDRESS",
-      "RELAYER_SUBMIT_ENABLED",
-      "ADMIN_PROFILE",
-      "RELAYER_BEARER_TOKEN",
-    ].includes(e.env),
-  );
+if (envMissing.length > 0) {
+  const priorities = new Set(envMissing.map((m) => m.priority));
   console.error(
     JSON.stringify(
       {
@@ -230,15 +183,14 @@ if (errors.length > 0) {
         command: "testnet:e2e",
         error: "preconditions_not_met",
         message:
-          "Real Aptos testnet:e2e requires every env var below. Fix each item; this script will not run the withdraw flow with any missing item. V2 is NOT complete.",
-        missing: errors,
+          "Required env vars missing or malformed. V2 is NOT complete. Fix each item below; the script will not proceed.",
+        missing: envMissing,
       },
       null,
       2,
     ),
   );
-  if (m6bMissing) process.exit(EXIT_M6B_NOT_IMPLEMENTED);
-  if (m6dMissing.length > 0) process.exit(EXIT_M6D_NOT_PROVISIONED);
+  if (priorities.has("m6b")) process.exit(EXIT_M6B_NOT_IMPLEMENTED);
   process.exit(EXIT_USAGE_ERROR);
 }
 

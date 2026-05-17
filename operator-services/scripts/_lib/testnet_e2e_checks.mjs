@@ -13,7 +13,7 @@
 //   - On final-report assembly, ANY artifact missing or malformed produces a hard exit-1
 //     with `final_report_artifacts_missing` — NO completion language is emitted.
 // =============================================================================================
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { resolve, join } from "node:path";
 
@@ -155,6 +155,291 @@ export function safeBigInt(s) {
   } catch {
     return null;
   }
+}
+
+// =============================================================================================
+// validateRequiredEnv — pure helper that checks every required env var (and format-validates
+// the ones with a strict format). Used by testnet_e2e_v2.mjs at the very top, BEFORE any chain
+// query. Returns { ok: true } | { ok: false, missing: Array<{key, message, priority}> }.
+//
+// Format-validated:
+//   - EUNOMA_TESTNET_DEPOSIT_CA_PAYLOAD_HASH must be 32-byte hex (0x optional).
+//
+// All other required vars are checked for non-empty string presence only.
+// =============================================================================================
+
+export function validateRequiredEnv(env) {
+  const missing = [];
+
+  function req(key, message) {
+    const v = env[key];
+    if (typeof v !== "string" || v.length === 0) {
+      missing.push({ key, message, priority: "m6c-env" });
+    }
+  }
+
+  function reqHex64(key, message) {
+    const v = env[key];
+    if (typeof v !== "string" || v.length === 0) {
+      missing.push({ key, message, priority: "m6c-env" });
+      return;
+    }
+    if (!isHex64(v)) {
+      missing.push({
+        key: `${key}_malformed`,
+        message: `${key} must be 32-byte hex (0x prefix optional); got "${v.slice(0, 32)}${v.length > 32 ? "..." : ""}".`,
+        priority: "m6c-env",
+      });
+    }
+  }
+
+  req(
+    "APTOS_TESTNET_NODE_URL",
+    "Aptos testnet fullnode REST endpoint (e.g. https://fullnode.testnet.aptoslabs.com).",
+  );
+  req(
+    "BRIDGE_PACKAGE_ADDRESS",
+    "0x-prefixed address of the published Eunoma bridge package on Aptos testnet.",
+  );
+  req(
+    "RELAYER_SUBMIT_ENABLED",
+    "Must be set to '1' to enable the relayer's chain-submit path.",
+  );
+  req(
+    "ADMIN_PROFILE",
+    "Name of an `aptos` CLI profile with admin rights for the bridge package.",
+  );
+  req(
+    "RELAYER_BEARER_TOKEN",
+    "Bearer auth token the coordinator uses to authenticate to the relayer.",
+  );
+  req(
+    "EUNOMA_TESTNET_REQUEST_ID",
+    "Unique requestId for this withdraw flow (ISafeId).",
+  );
+  req(
+    "EUNOMA_TESTNET_DKG_EPOCH",
+    "dkgEpoch (decimal string) this withdraw binds to.",
+  );
+  req(
+    "EUNOMA_TESTNET_VAULT_ADDRESS",
+    "0x-prefixed vault address (DO NOT fall back to BRIDGE_PACKAGE_ADDRESS on real testnet; vaults are resource accounts).",
+  );
+  req(
+    "EUNOMA_TESTNET_ASSET_TYPE",
+    "0x-prefixed Aptos Object<Metadata> address for the deposit asset.",
+  );
+  req(
+    "EUNOMA_TESTNET_CHAIN_ID",
+    "u8 chain id (2 for Aptos testnet); used by the M3 deposit observer payload.",
+  );
+  req(
+    "EUNOMA_TESTNET_SENDER_ADDRESS",
+    "0x-prefixed depositor address (used by the M3 deposit observer payload).",
+  );
+  req(
+    "EUNOMA_TESTNET_DEPOSIT_TX_HASH",
+    "0x-prefixed real chain-confirmed deposit tx hash. Submit via `aptos move run ...::deposit_with_commitment_v2 ...` first (see M6_OPERATOR_RUNBOOK.md Step 5).",
+  );
+  req(
+    "EUNOMA_TESTNET_DEPOSIT_COUNT",
+    "Chain-authoritative deposit_count (decimal string) from the DepositConfirmedV2 event.",
+  );
+  req(
+    "EUNOMA_TESTNET_VAULT_EK",
+    "0x-prefixed compressed-Ristretto vault EK (32 bytes hex) derived from CA DKG V2.",
+  );
+  reqHex64(
+    "EUNOMA_TESTNET_DEPOSIT_CA_PAYLOAD_HASH",
+    "Fr-safe ca_payload_hash (32-byte hex) you passed to deposit_with_commitment_v2. " +
+      "Pre-compute via `caPayloadHashFrV2(payload)` from @eunoma/deop-protocol — it must equal " +
+      "the value the chain emits in DepositConfirmedV2.",
+  );
+
+  return missing.length === 0 ? { ok: true } : { ok: false, missing };
+}
+
+// =============================================================================================
+// compareObservedDepositArtifact — pure helper that cross-checks a coordinator-side
+// vault_state_v2_observed/<dkgEpoch>__<depositCount>__<requestId>.json artifact against the
+// chain DepositConfirmedV2 event and the operator env.
+//
+// NOTE: the artifact does NOT carry `vault_addr`. vault_addr ↔ env binding is enforced
+// separately at the chain-event check inside runPreflight. The artifact's role is to bind
+// the per-deposit event identity (caPayloadHash, txVersion, sequenceNumber, eventGuid) and
+// the vault EK + chain context fields.
+//
+// Returns { ok: true } | { ok: false, mismatches: Array<{ key, message }> }.
+// =============================================================================================
+
+export function compareObservedDepositArtifact(artifact, chainEvent, env) {
+  const mismatches = [];
+
+  if (!artifact || typeof artifact !== "object") {
+    mismatches.push({
+      key: "vault_state_v2_observed_artifact_invalid",
+      message: "Artifact is not an object",
+    });
+    return { ok: false, mismatches };
+  }
+
+  if (artifact.scheme !== "vault_state_v2_observe_deposit") {
+    mismatches.push({
+      key: "vault_state_v2_observed_scheme_invalid",
+      message: `artifact.scheme=${JSON.stringify(artifact.scheme)} != "vault_state_v2_observe_deposit"`,
+    });
+  }
+
+  // env-bound fields
+  if (env.EUNOMA_TESTNET_DKG_EPOCH && String(artifact.dkgEpoch) !== String(env.EUNOMA_TESTNET_DKG_EPOCH)) {
+    mismatches.push({
+      key: "vault_state_v2_observed_epoch_mismatch",
+      message: `artifact.dkgEpoch=${artifact.dkgEpoch} != env=${env.EUNOMA_TESTNET_DKG_EPOCH}`,
+    });
+  }
+  if (env.EUNOMA_TESTNET_DEPOSIT_COUNT) {
+    const wantCount = safeBigInt(env.EUNOMA_TESTNET_DEPOSIT_COUNT);
+    const haveCount = safeBigInt(artifact.depositCount);
+    if (wantCount === null || haveCount === null || wantCount !== haveCount) {
+      mismatches.push({
+        key: "vault_state_v2_observed_count_mismatch",
+        message: `artifact.depositCount=${artifact.depositCount} != env=${env.EUNOMA_TESTNET_DEPOSIT_COUNT}`,
+      });
+    }
+  }
+  if (
+    env.EUNOMA_TESTNET_SENDER_ADDRESS &&
+    !eqAptosAddress(artifact.senderAddress ?? "", env.EUNOMA_TESTNET_SENDER_ADDRESS)
+  ) {
+    mismatches.push({
+      key: "vault_state_v2_observed_sender_mismatch",
+      message: `artifact.senderAddress=${artifact.senderAddress} != env=${env.EUNOMA_TESTNET_SENDER_ADDRESS}`,
+    });
+  }
+  if (env.EUNOMA_TESTNET_ASSET_TYPE && !eqAptosAddress(artifact.assetType ?? "", env.EUNOMA_TESTNET_ASSET_TYPE)) {
+    mismatches.push({
+      key: "vault_state_v2_observed_asset_mismatch",
+      message: `artifact.assetType=${artifact.assetType} != env=${env.EUNOMA_TESTNET_ASSET_TYPE}`,
+    });
+  }
+  if (env.EUNOMA_TESTNET_CHAIN_ID) {
+    const want = Number(env.EUNOMA_TESTNET_CHAIN_ID);
+    if (!Number.isFinite(want) || Number(artifact.chainId) !== want) {
+      mismatches.push({
+        key: "vault_state_v2_observed_chain_mismatch",
+        message: `artifact.chainId=${artifact.chainId} != env=${env.EUNOMA_TESTNET_CHAIN_ID}`,
+      });
+    }
+  }
+  if (env.EUNOMA_TESTNET_VAULT_EK && !eqHexLoose(artifact.vaultEk ?? "", env.EUNOMA_TESTNET_VAULT_EK)) {
+    mismatches.push({
+      key: "vault_state_v2_observed_vaultek_mismatch",
+      message: `artifact.vaultEk differs from env.EUNOMA_TESTNET_VAULT_EK`,
+    });
+  }
+
+  // chain-event-bound fields
+  if (chainEvent && chainEvent.data) {
+    const chainCaPayloadHash = chainEvent.data.ca_payload_hash;
+    if (chainCaPayloadHash && !eqHexLoose(artifact.caPayloadHash ?? "", chainCaPayloadHash)) {
+      mismatches.push({
+        key: "vault_state_v2_observed_ca_payload_hash_mismatch",
+        message: `artifact.caPayloadHash=${artifact.caPayloadHash} != chain.ca_payload_hash=${chainCaPayloadHash}`,
+      });
+    }
+    const chainSeq = chainEvent.sequence_number;
+    if (chainSeq !== undefined && chainSeq !== null && String(artifact.sequenceNumber) !== String(chainSeq)) {
+      mismatches.push({
+        key: "vault_state_v2_observed_sequence_number_mismatch",
+        message: `artifact.sequenceNumber=${artifact.sequenceNumber} != chain.sequence_number=${chainSeq}`,
+      });
+    }
+    const chainTxVersion = chainEvent.version;
+    if (chainTxVersion !== undefined && chainTxVersion !== null && String(artifact.txVersion) !== String(chainTxVersion)) {
+      mismatches.push({
+        key: "vault_state_v2_observed_tx_version_mismatch",
+        message: `artifact.txVersion=${artifact.txVersion} != chain.version=${chainTxVersion}`,
+      });
+    }
+  }
+
+  // structural fields
+  if (typeof artifact.eventGuid !== "string" || artifact.eventGuid.length === 0) {
+    mismatches.push({
+      key: "vault_state_v2_observed_event_guid_missing",
+      message: `artifact.eventGuid is missing or empty`,
+    });
+  }
+  if (!Array.isArray(artifact.perSlotContributions) || artifact.perSlotContributions.length !== 5) {
+    mismatches.push({
+      key: "vault_state_v2_observed_per_slot_count_mismatch",
+      message: `artifact.perSlotContributions.length=${artifact.perSlotContributions?.length} != 5`,
+    });
+  } else if (Array.isArray(artifact.selectedSlots)) {
+    const slotSet = new Set(artifact.selectedSlots);
+    for (const contrib of artifact.perSlotContributions) {
+      if (contrib && typeof contrib.slot === "number" && !slotSet.has(contrib.slot)) {
+        mismatches.push({
+          key: "vault_state_v2_observed_per_slot_count_mismatch",
+          message: `perSlotContributions includes slot=${contrib.slot} not in selectedSlots=[${[...slotSet].join(",")}]`,
+        });
+        break;
+      }
+    }
+  }
+
+  return mismatches.length === 0 ? { ok: true } : { ok: false, mismatches };
+}
+
+// =============================================================================================
+// selectObservedDepositArtifact — pick the canonical artifact from a list of candidates
+// matching the `<dkgEpoch>__<depositCount>__*.json` filename pattern. Refuses to pick
+// silently when multiple candidates fully match (caller must resolve via requestId).
+//
+// Returns one of:
+//   { ok: true, selected: { path, artifact } }
+//   { ok: false, reason: "ambiguous", matchedPaths: string[] }
+//   { ok: false, reason: "no_match", allMismatches: Array<{ path, mismatches }> }
+//   { ok: false, reason: "no_candidates" }
+// =============================================================================================
+
+export function selectObservedDepositArtifact(candidates, chainEvent, env, requestId) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    return { ok: false, reason: "no_candidates" };
+  }
+
+  const matches = [];
+  const allMismatches = [];
+
+  for (const candidate of candidates) {
+    const cmp = compareObservedDepositArtifact(candidate.artifact, chainEvent, env);
+    if (cmp.ok) {
+      matches.push(candidate);
+    } else {
+      allMismatches.push({ path: candidate.path, mismatches: cmp.mismatches });
+    }
+  }
+
+  if (matches.length === 0) {
+    return { ok: false, reason: "no_match", allMismatches };
+  }
+  if (matches.length === 1) {
+    return { ok: true, selected: matches[0] };
+  }
+
+  // Multiple full matches — try to disambiguate by requestId in the filename.
+  if (typeof requestId === "string" && requestId.length > 0) {
+    const byRequestId = matches.filter((m) => m.path.includes(requestId));
+    if (byRequestId.length === 1) {
+      return { ok: true, selected: byRequestId[0] };
+    }
+  }
+
+  return {
+    ok: false,
+    reason: "ambiguous",
+    matchedPaths: matches.map((m) => m.path),
+  };
 }
 
 // =============================================================================================
@@ -578,6 +863,29 @@ export async function runPreflight(opts) {
             priority: "m6c-env",
           });
         }
+        // ----- ca_payload_hash: operator pre-commit ↔ chain-emitted -----
+        // goal.md item 3 requires the deposit event proof to be "bound to bridge, vault, asset,
+        // deposit_count, payload hash, and chain version". Without this binding, an attacker who
+        // can replace the deposit with a different valid payload (same vault/asset/count) would
+        // pass the gate. The operator pre-computes ca_payload_hash via caPayloadHashFrV2(payload)
+        // BEFORE submitting deposit_with_commitment_v2 and supplies it via env so we can verify
+        // the chain emitted the same value.
+        if (env.EUNOMA_TESTNET_DEPOSIT_CA_PAYLOAD_HASH) {
+          const evCaPayloadHash = ev.data?.ca_payload_hash;
+          if (!eqHexLoose(evCaPayloadHash ?? "", env.EUNOMA_TESTNET_DEPOSIT_CA_PAYLOAD_HASH)) {
+            missing.push({
+              key: "deposit_ca_payload_hash_mismatch",
+              message:
+                `DepositConfirmedV2.ca_payload_hash (${evCaPayloadHash}) != ` +
+                `EUNOMA_TESTNET_DEPOSIT_CA_PAYLOAD_HASH (${env.EUNOMA_TESTNET_DEPOSIT_CA_PAYLOAD_HASH}). ` +
+                `The operator's pre-committed payload hash does not match what the chain emitted.`,
+              remediation:
+                "Re-derive ca_payload_hash via `caPayloadHashFrV2(payload)` against the exact " +
+                "ConfidentialTransferRawPayloadV2 you submitted; re-set EUNOMA_TESTNET_DEPOSIT_CA_PAYLOAD_HASH.",
+              priority: "m6d-chain",
+            });
+          }
+        }
         snapshot.depositTx = {
           hash: depositTxHash,
           version: dtxRes.body.version ?? null,
@@ -775,6 +1083,83 @@ export async function runPreflight(opts) {
     }
   }
 
+  // ----- 14. vault_state_v2_observed coordinator-side aggregate -----
+  // Cursor parity (#13) is necessary but not sufficient: it doesn't prove workers observed THIS
+  // exact deposit event. The coordinator persists per-deposit observation aggregates at
+  // <stateRoot>/coordinator/vault_state_v2_observed/<dkgEpoch>__<depositCount>__<requestId>.json
+  // carrying caPayloadHash, txVersion, sequenceNumber, eventGuid, vaultEk, senderAddress,
+  // assetType, chainId, dkgEpoch, depositCount, plus a transcriptHash. We require an aggregate
+  // that fully agrees with the chain event AND the env to exist.
+  if (dkgEpoch && env.EUNOMA_TESTNET_DEPOSIT_COUNT && serviceRoot && snapshot.depositEvent) {
+    const observedDir = stateRootJoin(
+      serviceRoot,
+      stateRoot,
+      "coordinator",
+      "vault_state_v2_observed",
+    );
+    const candidates = [];
+    try {
+      if (existsSync(observedDir)) {
+        const entries = readdirSync(observedDir);
+        const prefix = `${dkgEpoch}__${env.EUNOMA_TESTNET_DEPOSIT_COUNT}__`;
+        for (const f of entries) {
+          if (!f.startsWith(prefix) || !f.endsWith(".json")) continue;
+          const abs = resolve(observedDir, f);
+          const art = readJsonIfExists(abs);
+          if (art !== null) candidates.push({ path: abs, artifact: art });
+        }
+      }
+    } catch (_) {
+      // fall through to no_candidates
+    }
+
+    const selection = selectObservedDepositArtifact(
+      candidates,
+      snapshot.depositEvent,
+      env,
+      env.EUNOMA_TESTNET_REQUEST_ID,
+    );
+
+    if (!selection.ok) {
+      if (selection.reason === "no_candidates") {
+        missing.push({
+          key: "vault_state_v2_observed_artifact_missing",
+          message:
+            `No vault_state_v2_observed artifact at ${observedDir}/${dkgEpoch}__${env.EUNOMA_TESTNET_DEPOSIT_COUNT}__*.json. ` +
+            `Workers may have advanced their cursor but the coordinator has not persisted the per-deposit observation transcript.`,
+          remediation:
+            "Run `npm run local:vault-state:observe-deposit -- --bridge-address $BRIDGE_PACKAGE_ADDRESS --aptos-node-url $APTOS_TESTNET_NODE_URL --dkg-epoch $EUNOMA_TESTNET_DKG_EPOCH --vault-ek $EUNOMA_TESTNET_VAULT_EK --sender-address $EUNOMA_TESTNET_SENDER_ADDRESS --asset-type $EUNOMA_TESTNET_ASSET_TYPE --chain-id $EUNOMA_TESTNET_CHAIN_ID --ca-dkg-transcript-hash $EUNOMA_TESTNET_CA_DKG_TRANSCRIPT_HASH` — this writes the coordinator-side aggregate.",
+          priority: "m6d-artifact",
+        });
+      } else if (selection.reason === "ambiguous") {
+        missing.push({
+          key: "vault_state_v2_observed_ambiguous_candidates",
+          message:
+            `Multiple vault_state_v2_observed artifacts fully match chain event + env for dkgEpoch=${dkgEpoch}, depositCount=${env.EUNOMA_TESTNET_DEPOSIT_COUNT}: ${selection.matchedPaths.join(", ")}. ` +
+            `The gate refuses to pick one silently.`,
+          remediation:
+            "Remove stale duplicate aggregate(s) so exactly one canonical artifact remains, OR set EUNOMA_TESTNET_REQUEST_ID to a value contained in the desired filename.",
+          priority: "m6d-artifact",
+        });
+      } else if (selection.reason === "no_match") {
+        for (const candidate of selection.allMismatches) {
+          for (const m of candidate.mismatches) {
+            missing.push({
+              key: m.key,
+              message: `${candidate.path}: ${m.message}`,
+              remediation:
+                "Re-run the deposit observer with the correct env values, OR investigate whether a prior observer run wrote a stale/incorrect aggregate. The coordinator should reject re-observation of the same depositCount if the workers' per-slot state disagrees.",
+              priority: "m6d-artifact",
+            });
+          }
+        }
+      }
+    } else {
+      snapshot.observedDepositArtifactPath = selection.selected.path;
+      snapshot.observedDepositTranscriptHash = selection.selected.artifact.transcriptHash ?? null;
+    }
+  }
+
   if (missing.length > 0) return { ok: false, missing };
   return { ok: true, snapshot };
 }
@@ -841,6 +1226,45 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       path: submitPath,
       reason: `Submit artifact records chainSuccess=${submit.chainSuccess} (expected true). Not a chain-confirmed withdraw.`,
     });
+  }
+
+  // ---- Independent chain re-query of the submit tx hash ----
+  // Defense in depth: a tampered local artifact OR a coordinator bug that records
+  // chainSuccess=true for a failed submit would otherwise pass the gate. Re-query Aptos
+  // directly and require success=true + vm_status="Executed successfully". Only do the
+  // re-query if the on-disk validation above already passed (`submit` exists, txHash is
+  // valid, not simulated, chainSuccess=true) — otherwise we'd waste a network call.
+  let submitTxVersion = null;
+  if (
+    submit &&
+    submit.completed === true &&
+    isTxHash(submit.txHash) &&
+    submit.simulated !== true &&
+    submit.chainSuccess === true
+  ) {
+    const nodeUrl = env.APTOS_TESTNET_NODE_URL;
+    if (nodeUrl) {
+      const txQuery = await getTransactionByHash(nodeUrl, submit.txHash);
+      if (!txQuery.ok || txQuery.body?.success !== true) {
+        missingArtifacts.push({
+          path: `${nodeUrl}/v1/transactions/by_hash/${submit.txHash}`,
+          reason:
+            `Independent on-chain re-query of relayer submit tx failed. ` +
+            `status=${txQuery.status} success=${txQuery.body?.success} ` +
+            `vm_status=${txQuery.body?.vm_status ?? "n/a"}. ` +
+            `Local submit artifact claimed chainSuccess=true but the chain disagrees.`,
+        });
+      } else if (txQuery.body?.vm_status !== "Executed successfully") {
+        missingArtifacts.push({
+          path: `${nodeUrl}/v1/transactions/by_hash/${submit.txHash}`,
+          reason:
+            `Submit tx vm_status is "${txQuery.body?.vm_status ?? "missing"}", ` +
+            `not "Executed successfully". Local artifact may be stale or tampered.`,
+        });
+      } else {
+        submitTxVersion = txQuery.body?.version ?? null;
+      }
+    }
   }
 
   // ---- Finalize transcript (where transcript hashes live) ----
@@ -1013,6 +1437,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     chainVersions: {
       vaultInit: snapshot?.vaultInitTx?.version ?? null,
       deposit: snapshot?.depositTx?.version ?? null,
+      relayerSubmit: submitTxVersion,
     },
     depositEventProof: snapshot?.depositEvent ?? null,
     transcriptHashes: {
@@ -1025,6 +1450,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       vaultStatePerSlot: workerStateTranscripts.map((w) => w.transcriptHash),
       mpcca: mpccaTranscriptHash,
       submit: submitArtifact.transcriptHash ?? null,
+      observedDeposit: snapshot?.observedDepositTranscriptHash ?? null,
     },
     sources: {
       submitArtifactPath: submitPath,
@@ -1033,6 +1459,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       caDkgV2Path: caDkgArtifact?.path ?? null,
       frostDkgV2Path: frostDkgArtifact?.path ?? null,
       workerStatePaths: workerStateTranscripts.map((w) => w.path),
+      observedDepositArtifactPath: snapshot?.observedDepositArtifactPath ?? null,
     },
     invariants: {
       threshold: snapshot?.deoperatorConfig?.threshold ?? null,
@@ -1060,6 +1487,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     ["transcriptHashes.vaultStateInit", report.transcriptHashes.vaultStateInit],
     ["transcriptHashes.mpcca", report.transcriptHashes.mpcca],
     ["transcriptHashes.submit", report.transcriptHashes.submit],
+    ["transcriptHashes.observedDeposit", report.transcriptHashes.observedDeposit],
     ["invariants.chainSuccess", report.invariants.chainSuccess],
   ];
   // Reject null/undefined. Also reject invariants.chainSuccess !== true explicitly
