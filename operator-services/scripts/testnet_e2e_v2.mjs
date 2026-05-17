@@ -39,8 +39,8 @@
 //   EUNOMA_TESTNET_DEPOSIT_TX_HASH    required — chain-confirmed deposit tx.
 //   EUNOMA_TESTNET_DEPOSIT_COUNT      required — chain-authoritative deposit_count from event.
 //   EUNOMA_TESTNET_VAULT_EK           required — 0x-prefixed compressed-Ristretto hex.
-//   EUNOMA_TESTNET_AUTO_OBSERVE_DEPOSIT  optional — "1" enables auto-invocation of M3 observer.
-//   EUNOMA_TESTNET_CA_DKG_TRANSCRIPT_HASH required only when AUTO_OBSERVE_DEPOSIT=1.
+//   EUNOMA_TESTNET_CA_DKG_TRANSCRIPT_HASH  optional — when set, cross-checked against each
+//                                          slot's vault_state_v2.ca_dkg_transcript_hash.
 //   EUNOMA_TESTNET_REPORT_OUT         optional — file path to also write the final report JSON.
 //   EUNOMA_TESTNET_OPERATOR_SET_VERSION  optional — defaults "1".
 //   EUNOMA_TESTNET_FROST_GROUP_PUBKEY    optional — defaults zero-bytes.
@@ -230,7 +230,7 @@ if (errors.length > 0) {
         command: "testnet:e2e",
         error: "preconditions_not_met",
         message:
-          "Real Aptos testnet:e2e requires every env var below. Fix each item; this script will not run the withdraw flow with any missing item.",
+          "Real Aptos testnet:e2e requires every env var below. Fix each item; this script will not run the withdraw flow with any missing item. V2 is NOT complete.",
         missing: errors,
       },
       null,

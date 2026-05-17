@@ -13,7 +13,7 @@
 //   - On final-report assembly, ANY artifact missing or malformed produces a hard exit-1
 //     with `final_report_artifacts_missing` — NO completion language is emitted.
 // =============================================================================================
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { resolve, join } from "node:path";
 
@@ -129,6 +129,34 @@ export function eqHexLoose(a, b) {
   return strip0x(a).toLowerCase() === strip0x(b).toLowerCase();
 }
 
+// Aptos addresses are 32-byte values. Short forms (`0xabcd`) are equivalent to the
+// 64-hex-char left-zero-padded canonical form (`0x000...0abcd`). REST responses always
+// emit the canonical form; env values from operators often use short forms. Normalize
+// both sides before comparison.
+export function normalizeAptosAddress(s) {
+  if (typeof s !== "string") return s;
+  const stripped = strip0x(s).toLowerCase();
+  if (stripped.length > 64) return `0x${stripped}`; // already long; return as-is + prefix
+  return `0x${stripped.padStart(64, "0")}`;
+}
+
+export function eqAptosAddress(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  return normalizeAptosAddress(a) === normalizeAptosAddress(b);
+}
+
+// Safe BigInt — never throws. Returns null on malformed input.
+export function safeBigInt(s) {
+  if (s === null || s === undefined) return null;
+  const str = String(s).trim();
+  if (!/^[0-9]+$/.test(str)) return null;
+  try {
+    return BigInt(str);
+  } catch {
+    return null;
+  }
+}
+
 // =============================================================================================
 // runPreflight — the binding gate's structural validator
 //
@@ -207,15 +235,25 @@ export async function runPreflight(opts) {
           "0x1::coin::CoinStore<0x1::aptos_coin::AptosCoin>",
         );
         if (coinRes.ok && coinRes.body?.data?.coin?.value !== undefined) {
-          const balance = BigInt(coinRes.body.data.coin.value);
-          snapshot.adminBalanceOctas = balance.toString();
-          if (balance < 10_000_000n) {
+          const balance = safeBigInt(coinRes.body.data.coin.value);
+          if (balance === null) {
             missing.push({
-              key: "admin_account_funded",
-              message: `${adminAddr} balance ${balance} octas < 0.1 APT (10_000_000)`,
-              remediation: `aptos account fund-with-faucet --account ${adminProfile} --amount 100000000`,
+              key: "admin_balance_unparseable",
+              message: `${adminAddr} CoinStore.coin.value is not a non-negative integer (got ${coinRes.body.data.coin.value})`,
+              remediation:
+                "Aptos returned an unexpected CoinStore shape. Investigate the admin account manually.",
               priority: "m6d-cli",
             });
+          } else {
+            snapshot.adminBalanceOctas = balance.toString();
+            if (balance < 10_000_000n) {
+              missing.push({
+                key: "admin_account_funded",
+                message: `${adminAddr} balance ${balance} octas < 0.1 APT (10_000_000)`,
+                remediation: `aptos account fund-with-faucet --account ${adminProfile} --amount 100000000`,
+                priority: "m6d-cli",
+              });
+            }
           }
         }
       }
@@ -333,17 +371,25 @@ export async function runPreflight(opts) {
     } else {
       snapshot.bridgeVault = vaultRes.body?.data ?? null;
       // Asset-type cross-check (defense-in-depth — observer also re-checks).
-      if (
-        assetType &&
-        vaultRes.body?.data?.asset_type?.inner &&
-        !eqHexLoose(vaultRes.body.data.asset_type.inner, assetType)
-      ) {
+      // Aptos returns asset_type either as { inner: hex } or as a plain hex string.
+      const vaultAssetType =
+        typeof vaultRes.body?.data?.asset_type === "string"
+          ? vaultRes.body.data.asset_type
+          : vaultRes.body?.data?.asset_type?.inner ?? null;
+      if (assetType && vaultAssetType && !eqAptosAddress(vaultAssetType, assetType)) {
         missing.push({
           key: "vault_asset_type_mismatch",
-          message: `BridgeVault.asset_type=${vaultRes.body.data.asset_type.inner} != EUNOMA_TESTNET_ASSET_TYPE=${assetType}`,
+          message: `BridgeVault.asset_type=${vaultAssetType} != EUNOMA_TESTNET_ASSET_TYPE=${assetType}`,
           remediation:
             "Fix EUNOMA_TESTNET_ASSET_TYPE to match the vault's actual asset_type, OR initialize the correct vault.",
           priority: "m6c-env",
+        });
+      } else if (assetType && !vaultAssetType) {
+        missing.push({
+          key: "vault_asset_type_unparseable",
+          message: `BridgeVault.asset_type shape unrecognized (data=${JSON.stringify(vaultRes.body?.data?.asset_type)})`,
+          remediation: "Aptos returned an unexpected BridgeVault.asset_type shape.",
+          priority: "m6d-chain",
         });
       }
     }
@@ -419,15 +465,16 @@ export async function runPreflight(opts) {
       });
     } else {
       // ----- 10. DepositConfirmedV2 event present -----
+      // Match by event-type suffix so short-form bridge addresses (`0xabcd`) still match
+      // chain-canonical padded forms (`0x000...0abcd::eunoma_bridge::DepositConfirmedV2`).
       const events = Array.isArray(dtxRes.body?.events) ? dtxRes.body.events : [];
-      const wantType = bridgeAddress
-        ? `${bridgeAddress}::eunoma_bridge::DepositConfirmedV2`
-        : null;
-      const ev = wantType ? events.find((e) => e?.type === wantType) : null;
+      const ev = events.find(
+        (e) => typeof e?.type === "string" && e.type.endsWith("::eunoma_bridge::DepositConfirmedV2"),
+      );
       if (!ev) {
         missing.push({
           key: "deposit_confirmed_v2_event",
-          message: `Deposit tx ${depositTxHash} has no event of type ${wantType ?? "DepositConfirmedV2"}`,
+          message: `Deposit tx ${depositTxHash} has no event of type ...::eunoma_bridge::DepositConfirmedV2`,
           remediation:
             "Confirm the deposit was made via deposit_with_commitment_v2 (NOT a legacy deposit entry). Re-submit if necessary.",
           priority: "m6d-chain",
@@ -438,22 +485,42 @@ export async function runPreflight(opts) {
         const evAssetType =
           typeof ev.data?.asset_type === "string"
             ? ev.data.asset_type
-            : ev.data?.asset_type?.inner;
+            : ev.data?.asset_type?.inner ?? null;
         const evVaultAddr =
           typeof ev.data?.vault_addr === "string"
             ? ev.data.vault_addr
             : ev.data?.vault_addr?.inner ?? null;
         const evDepositCount = ev.data?.deposit_count;
 
-        if (assetType && evAssetType && !eqHexLoose(evAssetType, assetType)) {
+        // Also cross-check the event type's bridge prefix matches our env.
+        if (bridgeAddress) {
+          const evBridgePrefix = ev.type.split("::")[0];
+          if (evBridgePrefix && !eqAptosAddress(evBridgePrefix, bridgeAddress)) {
+            missing.push({
+              key: "deposit_event_bridge_mismatch",
+              message: `DepositConfirmedV2 emitted by ${evBridgePrefix} != BRIDGE_PACKAGE_ADDRESS=${bridgeAddress}`,
+              remediation: "Use the BRIDGE_PACKAGE_ADDRESS that emitted this event.",
+              priority: "m6c-env",
+            });
+          }
+        }
+        if (assetType && evAssetType && !eqAptosAddress(evAssetType, assetType)) {
           missing.push({
             key: "deposit_event_asset_mismatch",
             message: `DepositConfirmedV2.asset_type=${evAssetType} != EUNOMA_TESTNET_ASSET_TYPE=${assetType}`,
             remediation: "Use the asset_type that the deposit actually targeted.",
             priority: "m6c-env",
           });
+        } else if (assetType && !evAssetType) {
+          missing.push({
+            key: "deposit_event_asset_unparseable",
+            message: `DepositConfirmedV2.asset_type field shape unrecognized (data=${JSON.stringify(ev.data?.asset_type)})`,
+            remediation:
+              "Aptos returned an unexpected asset_type shape. Inspect the deposit tx event payload manually.",
+            priority: "m6d-chain",
+          });
         }
-        if (vaultAddress && evVaultAddr && !eqHexLoose(evVaultAddr, vaultAddress)) {
+        if (vaultAddress && evVaultAddr && !eqAptosAddress(evVaultAddr, vaultAddress)) {
           missing.push({
             key: "deposit_event_vault_mismatch",
             message: `DepositConfirmedV2.vault_addr=${evVaultAddr} != EUNOMA_TESTNET_VAULT_ADDRESS=${vaultAddress}`,
@@ -461,11 +528,29 @@ export async function runPreflight(opts) {
             priority: "m6c-env",
           });
         }
+        // deposit_count cross-check (BigInt-safe).
+        const evCountBI = safeBigInt(evDepositCount);
+        const envCountBI = safeBigInt(env.EUNOMA_TESTNET_DEPOSIT_COUNT);
         if (env.EUNOMA_TESTNET_DEPOSIT_COUNT) {
-          if (String(evDepositCount) !== String(env.EUNOMA_TESTNET_DEPOSIT_COUNT)) {
+          if (evCountBI === null) {
+            missing.push({
+              key: "deposit_event_count_unparseable",
+              message: `DepositConfirmedV2.deposit_count is not a non-negative integer (got ${evDepositCount})`,
+              remediation:
+                "Aptos returned an unexpected deposit_count shape. Inspect the deposit tx event payload manually.",
+              priority: "m6d-chain",
+            });
+          } else if (envCountBI === null) {
+            missing.push({
+              key: "deposit_count_env",
+              message: `EUNOMA_TESTNET_DEPOSIT_COUNT=${env.EUNOMA_TESTNET_DEPOSIT_COUNT} is not a non-negative decimal string`,
+              remediation: `Set EUNOMA_TESTNET_DEPOSIT_COUNT=${evDepositCount} from the on-chain DepositConfirmedV2 event.`,
+              priority: "m6c-env",
+            });
+          } else if (evCountBI !== envCountBI) {
             missing.push({
               key: "deposit_event_count_mismatch",
-              message: `DepositConfirmedV2.deposit_count=${evDepositCount} != EUNOMA_TESTNET_DEPOSIT_COUNT=${env.EUNOMA_TESTNET_DEPOSIT_COUNT}`,
+              message: `DepositConfirmedV2.deposit_count=${evCountBI} != EUNOMA_TESTNET_DEPOSIT_COUNT=${envCountBI}`,
               remediation:
                 "Use the chain-authoritative deposit_count from the DepositConfirmedV2 event.",
               priority: "m6c-env",
@@ -476,6 +561,20 @@ export async function runPreflight(opts) {
             key: "deposit_count_env",
             message: "EUNOMA_TESTNET_DEPOSIT_COUNT is required (chain-authoritative deposit_count)",
             remediation: `Set EUNOMA_TESTNET_DEPOSIT_COUNT=${evDepositCount} from the on-chain DepositConfirmedV2 event.`,
+            priority: "m6c-env",
+          });
+        }
+        // Cross-check the deposit tx's `sender` matches EUNOMA_TESTNET_SENDER_ADDRESS.
+        if (
+          env.EUNOMA_TESTNET_SENDER_ADDRESS &&
+          dtxRes.body?.sender &&
+          !eqAptosAddress(dtxRes.body.sender, env.EUNOMA_TESTNET_SENDER_ADDRESS)
+        ) {
+          missing.push({
+            key: "deposit_tx_sender_mismatch",
+            message: `Deposit tx sender=${dtxRes.body.sender} != EUNOMA_TESTNET_SENDER_ADDRESS=${env.EUNOMA_TESTNET_SENDER_ADDRESS}`,
+            remediation:
+              "Use the depositor address that actually signed the deposit tx. The observer payload depends on this.",
             priority: "m6c-env",
           });
         }
@@ -530,56 +629,149 @@ export async function runPreflight(opts) {
     });
   }
 
-  // ----- 13. Worker state cursor sync -----
-  // Read per-slot vault_state_v2 cursor files; each slot must show
-  // deposit_count_observed >= EUNOMA_TESTNET_DEPOSIT_COUNT.
-  // Cursor files live at .agent-local/eunoma-v2/slot-{N}/vault_state_v2/<dkgEpoch>.json
-  // (this is the cluster layout — slot-0..6 each have their own vault_state_v2 dir).
-  // If any slot lags AND auto-observe is OFF, surface as missing.
+  // ----- 13. Worker state — per-slot binding + cursor sync -----
+  // Each worker slot persists a single `slot-{N}/vault_state_v2.json` that the M3 observer
+  // updates in-place. The file binds the worker's state to the operator's intended
+  // (bridge, vault, asset, sender, chain_id, dkg_epoch, vault_ek, roster_hash,
+  // ca_dkg_transcript_hash) configuration AND records the chain-authoritative
+  // deposit_count_observed.
+  //
+  // Goal.md item 4 requires fail-closed on: wrong hash, replay, stale sequence, wrong
+  // bridge, wrong vault, wrong asset. We enforce this by reading every slot artifact and
+  // confirming each field matches the operator's env + chain-snapshot.
   if (dkgEpoch && env.EUNOMA_TESTNET_DEPOSIT_COUNT && serviceRoot) {
-    const wantCount = BigInt(env.EUNOMA_TESTNET_DEPOSIT_COUNT);
-    const laggingSlots = [];
-    const observedBySlot = {};
-    for (let slot = 0; slot < 7; slot += 1) {
-      const slotDir = resolve(
-        serviceRoot,
-        stateRoot ?? ".agent-local/eunoma-v2",
-        `slot-${slot}`,
-        "vault_state_v2",
-      );
-      let observed = null;
-      if (existsSync(slotDir)) {
-        const entries = readdirSync(slotDir).filter((f) => f.endsWith(".json"));
-        for (const entry of entries) {
-          const a = readJsonIfExists(join(slotDir, entry));
-          if (a && typeof a.depositCountObserved === "number") {
-            const v = BigInt(a.depositCountObserved);
-            if (observed === null || v > observed) observed = v;
-          } else if (a && typeof a.deposit_count_observed === "number") {
-            const v = BigInt(a.deposit_count_observed);
-            if (observed === null || v > observed) observed = v;
+    const wantCount = safeBigInt(env.EUNOMA_TESTNET_DEPOSIT_COUNT);
+    if (wantCount === null) {
+      missing.push({
+        key: "deposit_count_env",
+        message: `EUNOMA_TESTNET_DEPOSIT_COUNT=${env.EUNOMA_TESTNET_DEPOSIT_COUNT} is not a non-negative decimal string`,
+        remediation: "Use the chain-authoritative deposit_count from DepositConfirmedV2 (a decimal integer).",
+        priority: "m6c-env",
+      });
+    } else {
+      const observedBySlot = {};
+      const transcriptHashBySlot = {};
+      const initTranscriptHashBySlot = {};
+      for (let slot = 0; slot < 7; slot += 1) {
+        const slotFile = resolve(
+          serviceRoot,
+          stateRoot ?? ".agent-local/eunoma-v2",
+          `slot-${slot}`,
+          "vault_state_v2.json",
+        );
+        const a = readJsonIfExists(slotFile);
+        if (!a) {
+          missing.push({
+            key: `worker_state_slot_${slot}_missing`,
+            message: `slot-${slot}/vault_state_v2.json not found at ${slotFile}`,
+            remediation:
+              "Run the local cluster + `npm run local:vault-state:init` to materialize the per-slot vault_state_v2 artifacts.",
+            priority: "m6d-artifact",
+          });
+          observedBySlot[slot] = null;
+          continue;
+        }
+        // ---- Bind-checks: every slot artifact must reference the same op intent. ----
+        // dkg_epoch
+        if (String(a.dkg_epoch) !== String(dkgEpoch)) {
+          missing.push({
+            key: `worker_state_slot_${slot}_dkg_epoch`,
+            message: `slot-${slot} vault_state_v2.dkg_epoch=${a.dkg_epoch} != EUNOMA_TESTNET_DKG_EPOCH=${dkgEpoch}`,
+            remediation:
+              "The slot artifact was produced for a different dkg_epoch. Re-init the cluster for the current epoch, or use the matching dkg_epoch.",
+            priority: "m6d-artifact",
+          });
+        }
+        // sender_address
+        if (
+          env.EUNOMA_TESTNET_SENDER_ADDRESS &&
+          !eqAptosAddress(a.sender_address ?? "", env.EUNOMA_TESTNET_SENDER_ADDRESS)
+        ) {
+          missing.push({
+            key: `worker_state_slot_${slot}_sender_address`,
+            message: `slot-${slot} vault_state_v2.sender_address=${a.sender_address} != EUNOMA_TESTNET_SENDER_ADDRESS=${env.EUNOMA_TESTNET_SENDER_ADDRESS}`,
+            remediation:
+              "Re-run `npm run local:vault-state:init` with the correct sender, or update EUNOMA_TESTNET_SENDER_ADDRESS.",
+            priority: "m6d-artifact",
+          });
+        }
+        // asset_type
+        if (assetType && !eqAptosAddress(a.asset_type ?? "", assetType)) {
+          missing.push({
+            key: `worker_state_slot_${slot}_asset_type`,
+            message: `slot-${slot} vault_state_v2.asset_type=${a.asset_type} != EUNOMA_TESTNET_ASSET_TYPE=${assetType}`,
+            remediation:
+              "Re-run `npm run local:vault-state:init` with the correct asset_type, or update EUNOMA_TESTNET_ASSET_TYPE.",
+            priority: "m6d-artifact",
+          });
+        }
+        // chain_id
+        if (env.EUNOMA_TESTNET_CHAIN_ID) {
+          const wantChainId = Number(env.EUNOMA_TESTNET_CHAIN_ID);
+          if (Number(a.chain_id) !== wantChainId) {
+            missing.push({
+              key: `worker_state_slot_${slot}_chain_id`,
+              message: `slot-${slot} vault_state_v2.chain_id=${a.chain_id} != EUNOMA_TESTNET_CHAIN_ID=${wantChainId}`,
+              remediation:
+                "Re-run `npm run local:vault-state:init` with the correct chain_id, or update EUNOMA_TESTNET_CHAIN_ID.",
+              priority: "m6d-artifact",
+            });
           }
         }
+        // vault_ek
+        if (
+          env.EUNOMA_TESTNET_VAULT_EK &&
+          a.vault_ek_hex &&
+          !eqHexLoose(a.vault_ek_hex, env.EUNOMA_TESTNET_VAULT_EK)
+        ) {
+          missing.push({
+            key: `worker_state_slot_${slot}_vault_ek`,
+            message: `slot-${slot} vault_state_v2.vault_ek_hex differs from EUNOMA_TESTNET_VAULT_EK`,
+            remediation:
+              "The slot artifact's vault_ek does not match the operator's expected vault EK. Investigate before retrying.",
+            priority: "m6d-artifact",
+          });
+        }
+        // ca_dkg_transcript_hash — optional cross-check (env may not set it)
+        if (
+          env.EUNOMA_TESTNET_CA_DKG_TRANSCRIPT_HASH &&
+          a.ca_dkg_transcript_hash &&
+          !eqHexLoose(a.ca_dkg_transcript_hash, env.EUNOMA_TESTNET_CA_DKG_TRANSCRIPT_HASH)
+        ) {
+          missing.push({
+            key: `worker_state_slot_${slot}_ca_dkg_transcript_hash`,
+            message: `slot-${slot} vault_state_v2.ca_dkg_transcript_hash differs from env`,
+            remediation:
+              "The slot artifact's CA DKG V2 transcript hash does not match the operator's expected one. Investigate.",
+            priority: "m6d-artifact",
+          });
+        }
+        // ---- Cursor check ----
+        const observed = safeBigInt(a.deposit_count_observed);
+        observedBySlot[slot] = observed === null ? null : observed.toString();
+        if (observed === null) {
+          missing.push({
+            key: `worker_state_slot_${slot}_cursor`,
+            message: `slot-${slot} vault_state_v2.deposit_count_observed is not a non-negative integer (got ${a.deposit_count_observed})`,
+            remediation:
+              "Slot artifact is malformed; investigate before retrying.",
+            priority: "m6d-artifact",
+          });
+        } else if (observed < wantCount) {
+          missing.push({
+            key: `worker_state_slot_${slot}_cursor`,
+            message: `slot-${slot} vault_state_v2.deposit_count_observed=${observed} < EUNOMA_TESTNET_DEPOSIT_COUNT=${wantCount}`,
+            remediation:
+              "Run `npm run local:vault-state:observe-deposit -- --aptos-node-url $APTOS_TESTNET_NODE_URL --bridge-address $BRIDGE_PACKAGE_ADDRESS --dkg-epoch $EUNOMA_TESTNET_DKG_EPOCH --vault-ek $EUNOMA_TESTNET_VAULT_EK --sender-address $EUNOMA_TESTNET_SENDER_ADDRESS --asset-type $EUNOMA_TESTNET_ASSET_TYPE --chain-id $EUNOMA_TESTNET_CHAIN_ID --ca-dkg-transcript-hash $EUNOMA_TESTNET_CA_DKG_TRANSCRIPT_HASH` until every slot's cursor reaches the expected count.",
+            priority: "m6d-artifact",
+          });
+        }
+        transcriptHashBySlot[slot] = a.worker_transcript_hash ?? null;
+        initTranscriptHashBySlot[slot] = a.init_transcript_hash ?? null;
       }
-      observedBySlot[slot] = observed === null ? null : observed.toString();
-      if (observed === null || observed < wantCount) {
-        laggingSlots.push(slot);
-      }
-    }
-    snapshot.workerCursors = observedBySlot;
-    if (laggingSlots.length > 0 && env.EUNOMA_TESTNET_AUTO_OBSERVE_DEPOSIT !== "1") {
-      missing.push({
-        key: "worker_state_cursor",
-        message: `Worker slots ${laggingSlots.join(",")} have deposit_count_observed < ${wantCount} (cursor stale)`,
-        remediation:
-          "Run `npm run local:vault-state:observe-deposit -- --bridge-address $BRIDGE_PACKAGE_ADDRESS " +
-          "--aptos-node-url $APTOS_TESTNET_NODE_URL --dkg-epoch $EUNOMA_TESTNET_DKG_EPOCH " +
-          "--vault-ek $EUNOMA_TESTNET_VAULT_EK --sender-address $EUNOMA_TESTNET_SENDER_ADDRESS " +
-          "--asset-type $EUNOMA_TESTNET_ASSET_TYPE --chain-id $EUNOMA_TESTNET_CHAIN_ID " +
-          "--ca-dkg-transcript-hash $EUNOMA_TESTNET_CA_DKG_TRANSCRIPT_HASH` — OR set " +
-          "EUNOMA_TESTNET_AUTO_OBSERVE_DEPOSIT=1 to let testnet:e2e invoke it for you.",
-        priority: "m6d-artifact",
-      });
+      snapshot.workerCursors = observedBySlot;
+      snapshot.workerTranscriptHashes = transcriptHashBySlot;
+      snapshot.workerInitTranscriptHashes = initTranscriptHashBySlot;
     }
   }
 
@@ -633,6 +825,21 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     missingArtifacts.push({
       path: submitPath,
       reason: `Submit artifact has no valid txHash (${submit.txHash})`,
+    });
+  } else if (submit.simulated === true) {
+    // goal.md item 7 requires "Chain-confirmed withdraw tx hash" — a `--simulate`
+    // pass-through is not a chain-confirmed withdraw. Refuse to declare V2 complete.
+    missingArtifacts.push({
+      path: submitPath,
+      reason:
+        "Submit artifact records simulated=true (relayer ran `aptos --simulate`). goal.md item 7 requires a chain-confirmed withdraw, not a simulation. Re-run after restarting the relayer with RELAYER_SUBMIT_ENABLED=1 so the relayer actually broadcasts.",
+    });
+  } else if (submit.chainSuccess !== true) {
+    // The coordinator's submit route fails-closed on chainSuccess=false; if we see anything
+    // other than true here, the submit was not chain-confirmed.
+    missingArtifacts.push({
+      path: submitPath,
+      reason: `Submit artifact records chainSuccess=${submit.chainSuccess} (expected true). Not a chain-confirmed withdraw.`,
     });
   }
 
@@ -703,39 +910,44 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
   }
 
   // ---- Worker state per-slot transcripts ----
+  // Each slot persists a single `slot-{N}/vault_state_v2.json` with `worker_transcript_hash`
+  // and `init_transcript_hash` fields. The pre-flight snapshot already validated bindings;
+  // here we just confirm each file's transcript hashes are non-empty.
   const workerStateTranscripts = [];
-  if (dkgEpoch && env.EUNOMA_TESTNET_DEPOSIT_COUNT) {
+  const workerInitTranscripts = [];
+  if (dkgEpoch) {
     for (let slot = 0; slot < 7; slot += 1) {
-      const slotDir = resolve(
+      const slotFile = resolve(
         serviceRoot,
         stateRoot ?? ".agent-local/eunoma-v2",
         `slot-${slot}`,
-        "vault_state_v2",
+        "vault_state_v2.json",
       );
-      let chosen = null;
-      if (existsSync(slotDir)) {
-        const entries = readdirSync(slotDir).filter((f) => f.endsWith(".json"));
-        // Prefer files that match the dkgEpoch.
-        const matching = entries.filter((f) => f.includes(`${dkgEpoch}`));
-        for (const e of matching.length > 0 ? matching : entries) {
-          const a = readJsonIfExists(join(slotDir, e));
-          if (a && (a.transcriptHash || a.transcript_hash)) {
-            chosen = { slot, path: join(slotDir, e), data: a };
-            break;
-          }
-        }
-      }
-      if (!chosen) {
+      const a = readJsonIfExists(slotFile);
+      if (!a) {
         missingArtifacts.push({
-          path: `${slotDir}/<dkgEpoch>__*.json`,
-          reason: `Worker slot ${slot} vault_state_v2 transcript not found`,
+          path: slotFile,
+          reason: `Worker slot ${slot} vault_state_v2.json not found`,
+        });
+        continue;
+      }
+      const workerHash = a.worker_transcript_hash ?? null;
+      const initHash = a.init_transcript_hash ?? null;
+      if (!isHex64(workerHash)) {
+        missingArtifacts.push({
+          path: slotFile,
+          reason: `Worker slot ${slot} vault_state_v2.worker_transcript_hash is missing or malformed (${workerHash})`,
         });
       } else {
-        workerStateTranscripts.push({
-          slot: chosen.slot,
-          path: chosen.path,
-          transcriptHash: chosen.data.transcriptHash ?? chosen.data.transcript_hash,
+        workerStateTranscripts.push({ slot, path: slotFile, transcriptHash: workerHash });
+      }
+      if (!isHex64(initHash)) {
+        missingArtifacts.push({
+          path: slotFile,
+          reason: `Worker slot ${slot} vault_state_v2.init_transcript_hash is missing or malformed (${initHash})`,
         });
+      } else {
+        workerInitTranscripts.push({ slot, path: slotFile, initTranscriptHash: initHash });
       }
     }
   }
@@ -775,18 +987,20 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     frostDkgArtifact?.data?.transcript?.rosterHash ??
     null;
 
-  // Vault state init transcript (separate from per-slot post-deposit transcripts) — best-effort.
+  // Vault state init transcript hash — use the per-slot init_transcript_hash. All 7 slots
+  // must agree (the worker code pins init_transcript_hash to the canonical final hash via
+  // vault_state_v2_init_finalize). If they disagree, that's a hard miss.
   let vaultStateInitHash = null;
-  if (dkgEpoch) {
-    const initPath = stateRootJoin(
-      serviceRoot,
-      stateRoot,
-      "coordinator",
-      "vault_state_init",
-      `${dkgEpoch}.json`,
-    );
-    const a = readJsonIfExists(initPath);
-    if (a) vaultStateInitHash = a.transcriptHash ?? a.transcript_hash ?? null;
+  if (workerInitTranscripts.length > 0) {
+    const set = new Set(workerInitTranscripts.map((w) => w.initTranscriptHash));
+    if (set.size !== 1) {
+      missingArtifacts.push({
+        path: "<stateRoot>/slot-*/vault_state_v2.json",
+        reason: `Per-slot init_transcript_hash values disagree across slots: ${[...set].join(", ")}. All 7 workers must agree on the canonical init transcript hash.`,
+      });
+    } else {
+      vaultStateInitHash = [...set][0];
+    }
   }
 
   const report = {
@@ -837,21 +1051,32 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     ["txHashes.deposit", report.txHashes.deposit],
     ["txHashes.relayerSubmit", report.txHashes.relayerSubmit],
     ["txHashes.chainConfirmedWithdraw", report.txHashes.chainConfirmedWithdraw],
+    ["depositEventProof", report.depositEventProof],
     ["transcriptHashes.caPayload", report.transcriptHashes.caPayload],
     ["transcriptHashes.caDkgV2Roster", report.transcriptHashes.caDkgV2Roster],
     ["transcriptHashes.frostDkgV2Roster", report.transcriptHashes.frostDkgV2Roster],
     ["transcriptHashes.deoperatorRoster", report.transcriptHashes.deoperatorRoster],
     ["transcriptHashes.quorum", report.transcriptHashes.quorum],
+    ["transcriptHashes.vaultStateInit", report.transcriptHashes.vaultStateInit],
     ["transcriptHashes.mpcca", report.transcriptHashes.mpcca],
     ["transcriptHashes.submit", report.transcriptHashes.submit],
+    ["invariants.chainSuccess", report.invariants.chainSuccess],
   ];
-  const nullFields = required.filter(([_, v]) => v === null || v === undefined).map(([k]) => k);
-  if (nullFields.length > 0) {
+  // Reject null/undefined. Also reject invariants.chainSuccess !== true explicitly
+  // (false would otherwise sneak through the null-only check).
+  const badFields = required
+    .filter(([k, v]) => {
+      if (v === null || v === undefined) return true;
+      if (k === "invariants.chainSuccess" && v !== true) return true;
+      return false;
+    })
+    .map(([k, v]) => [k, v]);
+  if (badFields.length > 0) {
     return {
       ok: false,
-      missingArtifacts: nullFields.map((k) => ({
+      missingArtifacts: badFields.map(([k, v]) => ({
         path: submitPath,
-        reason: `Report field ${k} is null/undefined — artifact contents incomplete`,
+        reason: `Report field ${k} is ${v === null ? "null" : v === undefined ? "undefined" : String(v)} — required value missing or wrong`,
       })),
     };
   }
