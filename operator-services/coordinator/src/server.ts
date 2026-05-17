@@ -7,6 +7,7 @@ import {
   CaRegistrationV2Error,
   DEOPERATOR_COUNT,
   DEOPERATOR_THRESHOLD,
+  DepositFrostAttestError,
   EUNOMA_MPCCA_WITHDRAW_SUBMIT_V1,
   ForbiddenPlaintextFieldError,
   MpccaWithdrawSubmitError,
@@ -45,7 +46,10 @@ import {
   buildCaPayloadFromFinalizeArtifact,
   caPayloadHashRawToFrV2,
   caPayloadHashRawV2,
+  bcsEncodeDepositAttestationV2,
   bcsEncodeWithdrawAttestationV2,
+  depositAttestationTranscriptHash,
+  parseDepositFrostAttestRequest,
   parseFrostAggregateSignatureResponse,
   parseFrostNonceCommitmentResponse,
   parseFrostPartialSignatureResponse,
@@ -75,6 +79,8 @@ import {
   type CaDkgV2Roster,
   type CaRegistrationV2Contribution,
   type DeoperatorRoster,
+  type DepositFrostAttestArtifact,
+  type DepositFrostAttestRequest,
   type FrostDkgV2Roster,
   type FrostRound1Broadcast,
   type FrostRound2Envelope,
@@ -5552,6 +5558,375 @@ export function buildCoordinatorServer(
       }
       return reply.code(400).send({
         error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // =================================================================================================
+  // V2 deposit FROST attestation orchestrator (goal.md required-work item 2).
+  //
+  // POST /v2/deposit/frost-attest takes a depositor-supplied DepositFrostAttestRequest carrying
+  // (commitment, amount_tag, ca_payload_hash, deposit_nonce, expiry, bridge identity envelope),
+  // BCS-encodes the DepositAttestationV2Message domain-separated `EUNOMA_DEPOSIT_BIND_V2`, runs
+  // the same 3-phase FROST signing fanout used by the withdraw frost-attest route over the
+  // depositor-supplied 5-of-7 selectedSlots, and returns the FROST group signature.
+  //
+  // Differences from withdraw frost-attest:
+  //  - No round2/finalize artifacts to load — deposits have no prior MPCCA ceremony because
+  //    amount + balance stay depositor-side. The depositor commits to commitment + amount_tag
+  //    locally (Poseidon over their private witness) and the deoperator quorum only signs the
+  //    PUBLIC chain envelope. Plaintext amount/blind/secret/nullifier never reach this route
+  //    (forbidden-field guard rejects them in parseDepositFrostAttestRequest).
+  //  - Caller picks selectedSlots directly (no quorum lock-in from round2). Validated for
+  //    length 5, distinctness, range [0, DEOPERATOR_COUNT).
+  //  - No vault-in-flight lock — deposits are independent of other deposits / withdraws and
+  //    multiple can proceed concurrently as long as worker FROST nonce slots aren't exhausted.
+  //
+  // Wire shape:
+  //   1. Forbidden-plaintext-field guard FIRST on raw body.
+  //   2. parseDepositFrostAttestRequest — 15 fields.
+  //   3. isSafeId(requestId).
+  //   4. Roster + epoch validation against opts.caDkgV2Roster.
+  //   5. Build + BCS-encode DepositAttestationV2Message.
+  //   6. Phase A: nonce-commit fan-out (AbortController timeouts, default 30s).
+  //   7. Phase B: partial-sign fan-out (AbortController timeouts).
+  //   8. Phase C: aggregate on selectedSlots[0].
+  //   9. Persist artifact at <stateRoot>/coordinator/deposit_frost_attest/<dkgEpoch>__<requestId>.json.
+  //  10. Return 200 with caPayloadHash + groupSignature + messageBytesHex + assembled
+  //      depositCallArgsFields for the depositor to compose into deposit_with_commitment_v2.
+  // =================================================================================================
+  const depositFrostAttestWorkerTimeoutMs =
+    opts.mpccaWithdrawFinalizeWorkerTimeoutMs ?? 30_000;
+  server.post("/v2/deposit/frost-attest", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      // 1+2. Parse + forbidden-field guard (inside parseDepositFrostAttestRequest).
+      let parsed: DepositFrostAttestRequest;
+      try {
+        parsed = parseDepositFrostAttestRequest(raw);
+      } catch (err) {
+        if (err instanceof ForbiddenPlaintextFieldError) {
+          return reply
+            .code(400)
+            .send({ error: "forbidden_plaintext_field", field: err.path });
+        }
+        if (err instanceof DepositFrostAttestError) {
+          return reply.code(400).send({ error: err.code, message: err.message });
+        }
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: err instanceof Error ? err.message : "unknown",
+        });
+      }
+
+      requestId = parsed.requestId;
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds it into FS paths",
+        });
+      }
+
+      // 4. Roster + epoch validation.
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+      if (parsed.rosterHash !== dkgRosterHash) {
+        return reply.code(400).send({
+          error: "stale_roster_hash",
+          requestId,
+          message: `rosterHash mismatch (request=${parsed.rosterHash}, roster=${dkgRosterHash})`,
+        });
+      }
+      if (parsed.dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          requestId,
+          message: `dkgEpoch mismatch (request=${parsed.dkgEpoch}, roster=${dkgRoster.dkgEpoch})`,
+        });
+      }
+
+      const sortedSelectedSlots = [...parsed.selectedSlots].sort((a, b) => a - b);
+
+      // 5. Build + BCS-encode DepositAttestationV2Message. Identical layout to what Move's
+      //    `assert_deop_attestation_v2` verifies inside deposit_with_commitment_v2.
+      const attestationMessage = {
+        chainId: parsed.chainId,
+        bridge: parsed.bridge,
+        vault: parsed.vault,
+        assetType: parsed.assetType,
+        operatorSetVersion: parsed.operatorSetVersion,
+        dkgEpoch: parsed.dkgEpoch,
+        rosterHash: dkgRosterHash,
+        frostGroupPubkey: parsed.frostGroupPubkey,
+        commitment: parsed.commitment,
+        amountTag: parsed.amountTag,
+        caPayloadHash: parsed.caPayloadHash,
+        depositNonce: parsed.depositNonce,
+        expirySecs: parsed.expirySecs,
+        circuitVersionsHash: parsed.circuitVersionsHash,
+      };
+      const messageBytes = bcsEncodeDepositAttestationV2(attestationMessage);
+      const messageHex = bytesToHex(messageBytes);
+
+      // 6. Phase A — nonce-commit fan-out.
+      const nonceCommitPromises = sortedSelectedSlots.map((slot) => {
+        const controller = new AbortController();
+        const timer = setTimeout(
+          () => controller.abort(),
+          depositFrostAttestWorkerTimeoutMs,
+        );
+        return singleNodeForwarder(
+          "/worker/v2/frost/sign/nonce-commit",
+          { requestId },
+          dkgRoster,
+          slot,
+          controller.signal,
+        )
+          .then(
+            (value) => ({
+              kind: "value" as const,
+              slot,
+              value,
+              aborted: controller.signal.aborted,
+            }),
+            (reason) => ({
+              kind: "rejected" as const,
+              slot,
+              reason,
+              aborted: controller.signal.aborted,
+            }),
+          )
+          .finally(() => clearTimeout(timer));
+      });
+      const nonceResults = await Promise.all(nonceCommitPromises);
+      const commitmentEntries: Array<{ slot: number; commitments: unknown }> = [];
+      const noncePerSlot = new Map<number, { nonceId: string; transcriptHash: string }>();
+      for (const r of nonceResults) {
+        if (r.kind === "rejected") {
+          return reply.code(502).send({
+            error: r.aborted ? "frost_nonce_worker_timeout" : "frost_nonce_forward_rejected",
+            slot: r.slot,
+            requestId,
+            reason: r.reason instanceof Error ? r.reason.message : String(r.reason),
+          });
+        }
+        if (r.aborted) {
+          return reply.code(502).send({
+            error: "frost_nonce_worker_timeout",
+            slot: r.slot,
+            requestId,
+          });
+        }
+        if (r.value.statusCode !== 200) {
+          return reply.code(502).send({
+            error: "frost_nonce_unexpected_status",
+            slot: r.slot,
+            requestId,
+            statusCode: r.value.statusCode,
+            body: r.value.body,
+          });
+        }
+        const parsedRes = parseFrostNonceCommitmentResponse(r.value.body);
+        commitmentEntries.push({ slot: r.slot, commitments: parsedRes.commitments });
+        noncePerSlot.set(r.slot, {
+          nonceId: parsedRes.nonceId,
+          transcriptHash: parsedRes.transcriptHash,
+        });
+      }
+      commitmentEntries.sort((a, b) => a.slot - b.slot);
+
+      // 7. Phase B — partial-sign fan-out.
+      const partialSignPromises = sortedSelectedSlots.map((slot) => {
+        const controller = new AbortController();
+        const timer = setTimeout(
+          () => controller.abort(),
+          depositFrostAttestWorkerTimeoutMs,
+        );
+        const body = {
+          nonceId: noncePerSlot.get(slot)!.nonceId,
+          messageBytes: messageHex,
+          commitments: commitmentEntries,
+        };
+        return singleNodeForwarder(
+          "/worker/v2/frost/sign/partial",
+          body,
+          dkgRoster,
+          slot,
+          controller.signal,
+        )
+          .then(
+            (value) => ({
+              kind: "value" as const,
+              slot,
+              value,
+              aborted: controller.signal.aborted,
+            }),
+            (reason) => ({
+              kind: "rejected" as const,
+              slot,
+              reason,
+              aborted: controller.signal.aborted,
+            }),
+          )
+          .finally(() => clearTimeout(timer));
+      });
+      const partialResults = await Promise.all(partialSignPromises);
+      const signatureShareEntries: Array<{ slot: number; signatureShare: unknown }> = [];
+      const partialPerSlot = new Map<number, { transcriptHash: string }>();
+      for (const r of partialResults) {
+        if (r.kind === "rejected") {
+          return reply.code(502).send({
+            error: r.aborted ? "frost_partial_worker_timeout" : "frost_partial_forward_rejected",
+            slot: r.slot,
+            requestId,
+            reason: r.reason instanceof Error ? r.reason.message : String(r.reason),
+          });
+        }
+        if (r.aborted) {
+          return reply.code(502).send({
+            error: "frost_partial_worker_timeout",
+            slot: r.slot,
+            requestId,
+          });
+        }
+        if (r.value.statusCode !== 200) {
+          return reply.code(502).send({
+            error: "frost_partial_unexpected_status",
+            slot: r.slot,
+            requestId,
+            statusCode: r.value.statusCode,
+            body: r.value.body,
+          });
+        }
+        const parsedRes = parseFrostPartialSignatureResponse(r.value.body);
+        if (parsedRes.nonceId !== noncePerSlot.get(r.slot)!.nonceId) {
+          return reply.code(502).send({
+            error: "frost_partial_nonce_id_drift",
+            slot: r.slot,
+            requestId,
+            expectedNonceId: noncePerSlot.get(r.slot)!.nonceId,
+            actualNonceId: parsedRes.nonceId,
+          });
+        }
+        signatureShareEntries.push({ slot: r.slot, signatureShare: parsedRes.signatureShare });
+        partialPerSlot.set(r.slot, { transcriptHash: parsedRes.transcriptHash });
+      }
+      signatureShareEntries.sort((a, b) => a.slot - b.slot);
+
+      // 8. Phase C — aggregate on first sorted slot.
+      const aggregateBody = {
+        messageBytes: messageHex,
+        commitments: commitmentEntries,
+        signatureShares: signatureShareEntries,
+      };
+      const aggregateSlot = sortedSelectedSlots[0];
+      let aggregateRes;
+      try {
+        aggregateRes = await singleNodeForwarder(
+          "/worker/v2/frost/sign/aggregate",
+          aggregateBody,
+          dkgRoster,
+          aggregateSlot,
+        );
+      } catch (err) {
+        return reply.code(502).send({
+          error: "frost_aggregate_forward_rejected",
+          slot: aggregateSlot,
+          requestId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      if (aggregateRes.statusCode !== 200) {
+        return reply.code(502).send({
+          error: "frost_aggregate_unexpected_status",
+          slot: aggregateSlot,
+          requestId,
+          statusCode: aggregateRes.statusCode,
+          body: aggregateRes.body,
+        });
+      }
+      const aggregateParsed = parseFrostAggregateSignatureResponse(aggregateRes.body);
+      const groupSignature = aggregateParsed.signature;
+
+      const attestationTranscriptHash = depositAttestationTranscriptHash(
+        messageHex,
+        groupSignature,
+      );
+
+      // 9. Persist artifact for audit.
+      if (opts.stateRoot) {
+        const { mkdir: mkdirAsync, writeFile: writeFileAsync, rename: renameAsync, chmod: chmodAsync } =
+          await import("node:fs/promises");
+        const artifactDir = join(opts.stateRoot, "coordinator", "deposit_frost_attest");
+        await mkdirAsync(artifactDir, { recursive: true, mode: 0o700 });
+        const artifactPath = join(artifactDir, `${parsed.dkgEpoch}__${requestId}.json`);
+        const artifact: DepositFrostAttestArtifact = {
+          scheme: "deposit_frost_attest_v2",
+          dkgEpoch: parsed.dkgEpoch,
+          requestId,
+          rosterHash: dkgRosterHash,
+          selectedSlots: sortedSelectedSlots,
+          messageBytesHex: messageHex,
+          groupSignature,
+          perSlotTranscriptHashes: sortedSelectedSlots.map((slot) => ({
+            slot,
+            nonceTranscriptHash: noncePerSlot.get(slot)!.transcriptHash,
+            partialTranscriptHash: partialPerSlot.get(slot)!.transcriptHash,
+          })),
+          attestationTranscriptHash,
+          createdAtUnixMs: Date.now(),
+        };
+        const json = JSON.stringify(artifact, null, 2) + "\n";
+        const tmpPath = `${artifactPath}.tmp.${process.pid}.${Date.now()}`;
+        await writeFileAsync(tmpPath, json, { mode: 0o600 });
+        await chmodAsync(tmpPath, 0o600);
+        await renameAsync(tmpPath, artifactPath);
+      }
+
+      // 10. Return 200.
+      return reply.code(200).send({
+        accepted: true,
+        requestId,
+        dkgEpoch: parsed.dkgEpoch,
+        rosterHash: dkgRosterHash,
+        selectedSlots: sortedSelectedSlots,
+        caPayloadHash: parsed.caPayloadHash,
+        messageBytesHex: messageHex,
+        groupSignature,
+        attestationTranscriptHash,
+        depositCallArgsFields: {
+          // Caller composes these into the 24-arg deposit_with_commitment_v2 call alongside
+          // their depositor-only Groth16 proof + CA payload bytes.
+          commitment: parsed.commitment,
+          amountTag: parsed.amountTag,
+          caPayloadHash: parsed.caPayloadHash,
+          depositNonce: parsed.depositNonce,
+          expirySecs: parsed.expirySecs,
+          groupSignature,
+          fallbackBitmap: 0,
+          fallbackSignatures: [] as string[],
+        },
+        message:
+          "Deposit FROST attestation complete; group signature ready for deposit_with_commitment_v2.",
+      });
+    } catch (err) {
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply
+          .code(400)
+          .send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof DepositFrostAttestError) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(500).send({
+        error: "internal_error",
+        requestId,
         message: err instanceof Error ? err.message : "unknown",
       });
     }
