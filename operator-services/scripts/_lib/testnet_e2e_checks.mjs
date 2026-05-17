@@ -641,26 +641,55 @@ export async function runPreflight(opts) {
     }
   }
 
-  // ----- 7. BridgeVault resource at EUNOMA_TESTNET_VAULT_ADDRESS -----
-  if (nodeUrl && bridgeAddress && vaultAddress) {
+  // ----- 7. BridgeVault resource lives under BRIDGE_PACKAGE_ADDRESS -----
+  // goal.md fix: previous revision queried at EUNOMA_TESTNET_VAULT_ADDRESS (a resource
+  // account that only carries 0x1::account::Account). The bridge keeps BridgeVault under
+  // its package address (@eunoma); the vault address is a *value* inside that resource.
+  // We now query at bridgeAddress and cross-check BridgeVault.vault_addr === vaultAddress.
+  if (nodeUrl && bridgeAddress) {
     const vaultType = `${bridgeAddress}::eunoma_bridge::BridgeVault`;
-    const vaultRes = await getResource(nodeUrl, vaultAddress, vaultType);
+    const vaultRes = await getResource(nodeUrl, bridgeAddress, vaultType);
     if (!vaultRes.ok) {
       missing.push({
         key: "bridge_vault_resource",
-        message: `${vaultType} not present at ${vaultAddress} (status=${vaultRes.status})`,
+        message: `${vaultType} not present at ${bridgeAddress} (status=${vaultRes.status})`,
         remediation:
-          "Run `npm run testnet:vault:init -- --submit ...` to publish the BridgeVault resource.",
+          "Run `npm run testnet:vault:init -- --submit ...` to publish the BridgeVault resource under the bridge package address.",
         priority: "m6d-chain",
       });
     } else {
       snapshot.bridgeVault = vaultRes.body?.data ?? null;
-      // Asset-type cross-check (defense-in-depth — observer also re-checks).
-      // Aptos returns asset_type either as { inner: hex } or as a plain hex string.
+      // Aptos returns these address-shaped fields either as plain hex or as { inner: hex }.
       const vaultAssetType =
         typeof vaultRes.body?.data?.asset_type === "string"
           ? vaultRes.body.data.asset_type
           : vaultRes.body?.data?.asset_type?.inner ?? null;
+      const vaultAddrOnChain =
+        typeof vaultRes.body?.data?.vault_addr === "string"
+          ? vaultRes.body.data.vault_addr
+          : vaultRes.body?.data?.vault_addr?.inner ?? null;
+
+      // Cross-check vault_addr inside the on-chain resource against env.
+      if (vaultAddress) {
+        if (vaultAddrOnChain && !eqAptosAddress(vaultAddrOnChain, vaultAddress)) {
+          missing.push({
+            key: "bridge_vault_addr_mismatch",
+            message: `BridgeVault.vault_addr=${vaultAddrOnChain} != EUNOMA_TESTNET_VAULT_ADDRESS=${vaultAddress}`,
+            remediation:
+              "Set EUNOMA_TESTNET_VAULT_ADDRESS to BridgeVault.vault_addr emitted by VaultInitializedV2.",
+            priority: "m6c-env",
+          });
+        } else if (!vaultAddrOnChain) {
+          missing.push({
+            key: "bridge_vault_addr_unparseable",
+            message: `BridgeVault.vault_addr shape unrecognized (data=${JSON.stringify(vaultRes.body?.data?.vault_addr)})`,
+            remediation: "Aptos returned an unexpected BridgeVault.vault_addr shape.",
+            priority: "m6d-chain",
+          });
+        }
+      }
+
+      // Asset-type cross-check (defense-in-depth — observer also re-checks).
       if (assetType && vaultAssetType && !eqAptosAddress(vaultAssetType, assetType)) {
         missing.push({
           key: "vault_asset_type_mismatch",
@@ -680,16 +709,16 @@ export async function runPreflight(opts) {
     }
   }
 
-  // ----- 8. DeoperatorConfigV2 resource matches per-run roster -----
-  if (nodeUrl && bridgeAddress && vaultAddress) {
+  // ----- 8. DeoperatorConfigV2 resource also lives under BRIDGE_PACKAGE_ADDRESS -----
+  if (nodeUrl && bridgeAddress) {
     const cfgType = `${bridgeAddress}::eunoma_bridge::DeoperatorConfigV2`;
-    const cfgRes = await getResource(nodeUrl, vaultAddress, cfgType);
+    const cfgRes = await getResource(nodeUrl, bridgeAddress, cfgType);
     if (!cfgRes.ok) {
       missing.push({
         key: "deoperator_config_v2",
-        message: `${cfgType} not present at ${vaultAddress} (status=${cfgRes.status})`,
+        message: `${cfgType} not present at ${bridgeAddress} (status=${cfgRes.status})`,
         remediation:
-          "Run `npm run testnet:vault:init -- --submit ...` — DeoperatorConfigV2 is published as part of vault init.",
+          "Run `npm run testnet:vault:init -- --submit ...` — DeoperatorConfigV2 is published as part of vault init under the bridge package address.",
         priority: "m6d-chain",
       });
     } else {

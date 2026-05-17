@@ -14,6 +14,7 @@ import {
   compareObservedDepositArtifact,
   selectObservedDepositArtifact,
   buildFinalReport,
+  runPreflight,
   isHex64,
   isTxHash,
 } from "../_lib/testnet_e2e_checks.mjs";
@@ -494,6 +495,142 @@ describe("buildFinalReport — independent chain re-query", () => {
     const result = await buildFinalReport({}, env, "/", stateRoot);
     expect(result.ok).toBe(false);
     expect(result.missingArtifacts.some((m) => /vm_status is "Out of gas"/.test(m.reason))).toBe(true);
+  });
+});
+
+// =============================================================================================
+// runPreflight — BridgeVault / DeoperatorConfigV2 are queried at BRIDGE_PACKAGE_ADDRESS,
+// NOT at EUNOMA_TESTNET_VAULT_ADDRESS. Vault is a value inside BridgeVault, not its location.
+// =============================================================================================
+
+function fetchUrlCapturingStub(routeMap) {
+  const calls = [];
+  return [
+    calls,
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      calls.push(String(url));
+      const entry = Object.entries(routeMap).find(([pattern]) => String(url).includes(pattern));
+      if (!entry) {
+        return { status: 404, ok: false, text: async () => "" };
+      }
+      const [, value] = entry;
+      const status = value.status ?? 200;
+      const body = value.body ?? null;
+      return {
+        status,
+        ok: status >= 200 && status < 300,
+        text: async () => (body === null ? "" : JSON.stringify(body)),
+      };
+    }),
+  ];
+}
+
+describe("runPreflight — BridgeVault/DeoperatorConfigV2 query target", () => {
+  it("queries BridgeVault at BRIDGE_PACKAGE_ADDRESS, not at vault address", async () => {
+    const env = fullEnvFixture();
+    const bridge = env.BRIDGE_PACKAGE_ADDRESS;
+    const [calls] = fetchUrlCapturingStub({
+      // The /modules endpoint must return an eunoma_bridge entry so the bridge_modules check
+      // passes (this is checked before BridgeVault).
+      "/modules": { body: [{ abi: { name: "eunoma_bridge" } }] },
+      // BridgeVault must be queryable at bridge address — return a healthy resource.
+      "BridgeVault": {
+        body: {
+          data: {
+            vault_addr: env.EUNOMA_TESTNET_VAULT_ADDRESS,
+            asset_type: env.EUNOMA_TESTNET_ASSET_TYPE,
+          },
+        },
+      },
+      "DeoperatorConfigV2": {
+        body: {
+          data: { dkg_epoch: env.EUNOMA_TESTNET_DKG_EPOCH, threshold: 5 },
+        },
+      },
+    });
+
+    await runPreflight({ env, serviceRoot: "/", stateRoot: "/tmp" });
+
+    // The BridgeVault query URL must include bridgeAddress, not vaultAddress.
+    const bridgeVaultCalls = calls.filter((u) => u.includes("BridgeVault"));
+    expect(bridgeVaultCalls.length).toBeGreaterThan(0);
+    for (const u of bridgeVaultCalls) {
+      // Find the /v1/accounts/<addr>/ segment.
+      const m = u.match(/\/v1\/accounts\/([^/]+)\/resource\//);
+      expect(m).not.toBeNull();
+      const queriedAddr = m[1].toLowerCase();
+      expect(queriedAddr).toBe(bridge.toLowerCase());
+      expect(queriedAddr).not.toBe(env.EUNOMA_TESTNET_VAULT_ADDRESS.toLowerCase());
+    }
+
+    const cfgCalls = calls.filter((u) => u.includes("DeoperatorConfigV2"));
+    expect(cfgCalls.length).toBeGreaterThan(0);
+    for (const u of cfgCalls) {
+      const m = u.match(/\/v1\/accounts\/([^/]+)\/resource\//);
+      expect(m).not.toBeNull();
+      const queriedAddr = m[1].toLowerCase();
+      expect(queriedAddr).toBe(bridge.toLowerCase());
+    }
+  });
+
+  it("flags bridge_vault_addr_mismatch when BridgeVault.vault_addr disagrees with env", async () => {
+    const env = fullEnvFixture();
+    const wrongVaultAddr = `0x${"9".repeat(64)}`; // intentionally different from env
+    fetchUrlCapturingStub({
+      "/modules": { body: [{ abi: { name: "eunoma_bridge" } }] },
+      "BridgeVault": {
+        body: {
+          data: {
+            vault_addr: wrongVaultAddr,
+            asset_type: env.EUNOMA_TESTNET_ASSET_TYPE,
+          },
+        },
+      },
+      "DeoperatorConfigV2": {
+        body: { data: { dkg_epoch: env.EUNOMA_TESTNET_DKG_EPOCH, threshold: 5 } },
+      },
+    });
+
+    const result = await runPreflight({ env, serviceRoot: "/", stateRoot: "/tmp" });
+
+    expect(result.missing.some((m) => m.key === "bridge_vault_addr_mismatch")).toBe(true);
+  });
+
+  it("passes BridgeVault binding when vault_addr matches env even with { inner } shape", async () => {
+    const env = fullEnvFixture();
+    fetchUrlCapturingStub({
+      "/modules": { body: [{ abi: { name: "eunoma_bridge" } }] },
+      "BridgeVault": {
+        body: {
+          data: {
+            // Aptos sometimes wraps address values as { inner }.
+            vault_addr: { inner: env.EUNOMA_TESTNET_VAULT_ADDRESS },
+            asset_type: { inner: env.EUNOMA_TESTNET_ASSET_TYPE },
+          },
+        },
+      },
+      "DeoperatorConfigV2": {
+        body: { data: { dkg_epoch: env.EUNOMA_TESTNET_DKG_EPOCH, threshold: 5 } },
+      },
+    });
+
+    const result = await runPreflight({ env, serviceRoot: "/", stateRoot: "/tmp" });
+    expect(result.missing.some((m) => m.key === "bridge_vault_addr_mismatch")).toBe(false);
+    expect(result.missing.some((m) => m.key === "bridge_vault_resource")).toBe(false);
+  });
+
+  it("flags bridge_vault_resource when the resource is absent at bridge address", async () => {
+    const env = fullEnvFixture();
+    fetchUrlCapturingStub({
+      "/modules": { body: [{ abi: { name: "eunoma_bridge" } }] },
+      "BridgeVault": { status: 404 },
+      "DeoperatorConfigV2": {
+        body: { data: { dkg_epoch: env.EUNOMA_TESTNET_DKG_EPOCH, threshold: 5 } },
+      },
+    });
+
+    const result = await runPreflight({ env, serviceRoot: "/", stateRoot: "/tmp" });
+    expect(result.missing.some((m) => m.key === "bridge_vault_resource")).toBe(true);
   });
 });
 
