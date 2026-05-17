@@ -27,6 +27,8 @@ export function hexVectorArg(values) {
     }
     return `0x${clean}`;
   });
-  // Aptos CLI accepts vector<vector<u8>> as: "hex:[0x..,0x..,..]"
-  return `hex:[${items.join(",")}]`;
+  // Aptos CLI 9.x accepts vector<vector<u8>> as JSON array literal with QUOTED hex strings:
+  // 'hex:["0x..","0x..",..]'. Older shells require the quotes around the entire arg.
+  const quoted = items.map((it) => `"${it}"`).join(",");
+  return `hex:[${quoted}]`;
 }

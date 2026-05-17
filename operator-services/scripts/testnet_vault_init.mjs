@@ -217,12 +217,16 @@ if (!proofOk) {
 console.log("pre-flight: Aptos SDK verifyRegistration accepted the assembled proof");
 
 // Pre-flight 6: chain state — refuse to re-init an existing vault.
-console.log(`view: ${bridgePackage}::eunoma_bridge::get_bridge_vault (existence probe)`);
+// Use get_vault_address_v2 (a public fun acquiring BridgeVault). If the resource
+// doesn't exist, the call aborts with a MISSING_DATA-style error; if the function
+// itself isn't on chain (e.g., wrong bridge address), invalid_input is also a
+// safe "no vault" signal here because no vault could exist there either.
+console.log(`view: ${bridgePackage}::eunoma_bridge::get_vault_address_v2 (existence probe)`);
 let vaultExists = false;
 try {
   const view = await aptosView(
     aptosNodeUrl,
-    `${bridgePackage}::eunoma_bridge::get_bridge_vault`,
+    `${bridgePackage}::eunoma_bridge::get_vault_address_v2`,
     [],
     [],
   );
@@ -230,10 +234,10 @@ try {
     vaultExists = true;
   }
 } catch (err) {
-  // "Resource not found" or similar — vault doesn't exist yet, which is what we want.
+  // "Resource not found", "function not found", or "missing data" all mean no vault.
   const msg = err instanceof Error ? err.message : String(err);
   if (
-    !/RESOURCE_NOT_FOUND|MissingData|object_not_found|missing_data/i.test(msg)
+    !/RESOURCE_NOT_FOUND|MissingData|object_not_found|missing_data|could not find view function|invalid_input/i.test(msg)
   ) {
     console.error(`pre-flight chain view failed unexpectedly: ${msg}`);
     process.exit(EXIT_USAGE);

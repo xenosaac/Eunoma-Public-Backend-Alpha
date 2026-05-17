@@ -21,11 +21,13 @@ chmodSync(clusterDir, 0o700);
 const frost = runFrostInit();
 const ca = runCaInit();
 const hpke = runCaDkgV2HpkeInit();
+const caDkgScheme = process.env.EUNOMA_CA_DKG_SCHEME ?? "ca_local";
 const plan = buildLocalClusterPlan({
   stateRoot,
   vaultEk: ca.vault_ek,
   aptosNodeUrl: process.env.APTOS_NODE_URL,
   dkgEpoch: ca.dkg_epoch,
+  caDkgScheme,
   frost: {
     groupPublicKey: frost.group_public_key,
     verifyingShares: frost.verifying_shares.map((share) => ({
@@ -50,6 +52,12 @@ if (plan.caDkgV2Roster) {
   writePublicJson(resolve(clusterDir, "ca-dkg-v2-roster.json"), {
     ...plan.caDkgV2Roster,
     caDkgV2RosterHash: plan.caDkgV2RosterHash,
+  });
+}
+if (plan.frostDkgV2Roster) {
+  writePublicJson(resolve(clusterDir, "frost-dkg-v2-roster.json"), {
+    ...plan.frostDkgV2Roster,
+    frostDkgV2RosterHash: plan.frostDkgV2RosterHash,
   });
 }
 renderEnvFiles(plan, clusterDir);
