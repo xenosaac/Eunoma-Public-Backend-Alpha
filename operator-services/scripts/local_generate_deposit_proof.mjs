@@ -217,24 +217,30 @@ if (!verified) {
 // (pi_a[2], pi_b[2][2], pi_c[2]) tuple — 8 BN254 field elements × 32 bytes each = 256 bytes.
 // BN254 G2 uses (c1, c0) order; pi_b[i] = (c0, c1) from snarkjs, so we swap.
 function fr32(decString) {
+  // Aptos's FormatG1Uncompr / FormatG2Uncompr / FormatFrLsb all use LITTLE-ENDIAN byte
+  // order (least-significant byte first). snarkjs returns proof field elements as decimal
+  // BigInts, so we encode LSB at buf[0] and MSB at buf[31].
   let n = BigInt(decString);
   const buf = new Uint8Array(32);
-  for (let i = 31; i >= 0; i -= 1) {
+  for (let i = 0; i < 32; i += 1) {
     buf[i] = Number(n & 0xffn);
     n >>= 8n;
   }
   return buf;
 }
 const proofBytes = new Uint8Array(8 * 32);
+// G2 uncompressed byte order matches the VK extractor in circuits/scripts/extract_deposit_binding_vk.js:
+//   x_c0 || x_c1 || y_c0 || y_c1, each as 32-byte LE.
+// (Both sides MUST use the same convention or pairings won't match the on-chain VK.)
 const proofParts = [
-  proof.pi_a[0],
-  proof.pi_a[1],
-  proof.pi_b[0][1],
-  proof.pi_b[0][0],
-  proof.pi_b[1][1],
-  proof.pi_b[1][0],
-  proof.pi_c[0],
-  proof.pi_c[1],
+  proof.pi_a[0],     // pi_a.x (G1)
+  proof.pi_a[1],     // pi_a.y (G1)
+  proof.pi_b[0][0],  // pi_b.x.c0 (G2)
+  proof.pi_b[0][1],  // pi_b.x.c1
+  proof.pi_b[1][0],  // pi_b.y.c0
+  proof.pi_b[1][1],  // pi_b.y.c1
+  proof.pi_c[0],     // pi_c.x (G1)
+  proof.pi_c[1],     // pi_c.y (G1)
 ];
 for (let i = 0; i < 8; i += 1) {
   proofBytes.set(fr32(proofParts[i]), i * 32);

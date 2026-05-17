@@ -229,22 +229,27 @@ if (!verified) {
 // Move's assert_valid_withdraw_proof takes proof: vector<u8>, which is the BCS-encoded
 // (pi_a[2], pi_b[2][2], pi_c[2]) tuple — 8 BN254 field elements × 32 bytes each = 256 bytes.
 function fr32(decString) {
+  // Aptos's FormatG1Uncompr / FormatG2Uncompr / FormatFrLsb all use LITTLE-ENDIAN byte
+  // order (least-significant byte first). snarkjs returns proof field elements as decimal
+  // BigInts, so we encode LSB at buf[0] and MSB at buf[31].
   let n = BigInt(decString);
   const buf = new Uint8Array(32);
-  for (let i = 31; i >= 0; i -= 1) {
+  for (let i = 0; i < 32; i += 1) {
     buf[i] = Number(n & 0xffn);
     n >>= 8n;
   }
   return buf;
 }
 const proofBytes = new Uint8Array(8 * 32);
+// G2 uncompressed byte order matches the VK extractor in circuits/scripts/extract_withdraw_vk.js:
+//   x_c0 || x_c1 || y_c0 || y_c1, each as 32-byte LE.
 const proofParts = [
   proof.pi_a[0],
   proof.pi_a[1],
-  proof.pi_b[0][1], // BN254 G2 uses (c1, c0) order
-  proof.pi_b[0][0],
-  proof.pi_b[1][1],
-  proof.pi_b[1][0],
+  proof.pi_b[0][0],  // x.c0
+  proof.pi_b[0][1],  // x.c1
+  proof.pi_b[1][0],  // y.c0
+  proof.pi_b[1][1],  // y.c1
   proof.pi_c[0],
   proof.pi_c[1],
 ];

@@ -152,15 +152,9 @@ async function getResource(addr, type) {
 }
 
 async function getMotherAccount() {
-  const showRes = spawnSync(
-    "aptos",
-    ["config", "show-profiles", "--profile", MOTHER_PROFILE],
-    { encoding: "utf8" },
-  );
-  if (showRes.status !== 0) {
-    throw new Error(`aptos config show-profiles ${MOTHER_PROFILE}: ${showRes.stderr}`);
-  }
-  // Mother's private key isn't in the JSON output (has_private_key only). Read from the YAML.
+  // The aptos CLI is unhelpful here — `aptos config show-profiles` only reports `has_private_key`,
+  // not the key itself. Read the YAML directly. Try the repo-root .aptos/config.yaml first (which
+  // is where this project's profiles live), then $HOME/.aptos/config.yaml as a fallback.
   const homeAptos = `${process.env.HOME}/.aptos/config.yaml`;
   const eunomaAptos = resolve(repoRoot, ".aptos/config.yaml");
   for (const path of [eunomaAptos, homeAptos]) {
@@ -245,17 +239,12 @@ async function bootstrapDepositor(aptos, ca) {
   });
   if (!registered) {
     logStep(`registering CA for asset=${ASSET_TYPE_ADDR}`);
-    const regTx = await ca.registerBalance({
-      sender: depositorAccount.accountAddress,
+    const regCommitted = await ca.registerBalance({
+      signer: depositorAccount,
       tokenAddress: ASSET_TYPE_ADDR,
-      publicKey: userDk.publicKey(),
+      decryptionKey: userDk,
+      options: { maxGasAmount: 200000, gasUnitPrice: 100 },
     });
-    const regAuth = aptos.transaction.sign({ signer: depositorAccount, transaction: regTx });
-    const regPending = await aptos.transaction.submit.simple({
-      transaction: regTx,
-      senderAuthenticator: regAuth,
-    });
-    const regCommitted = await aptos.waitForTransaction({ transactionHash: regPending.hash });
     if (!regCommitted.success) {
       throw new Error(`ca.registerBalance failed: ${regCommitted.vm_status}`);
     }
@@ -356,17 +345,35 @@ async function main() {
   const frostGroupPubkey = `0x${bufToHex(hexToBytes(cfg.frost_group_pubkey))}`;
   const rosterHashOnChain = `0x${bufToHex(hexToBytes(cfg.roster_hash))}`;
 
-  // Compute circuit_versions_hash from DeoperatorConfigV2 contents — Move emits a
-  // keccak over (deposit_circuit_version || withdraw_circuit_version || ca_payload_circuit_version).
-  const circuitVersionsHash = `0x${bytesToHex(
-    keccak256(
-      new Uint8Array([
-        ...hexToBytes(cfg.deposit_circuit_version),
-        ...hexToBytes(cfg.withdraw_circuit_version),
-        ...hexToBytes(cfg.ca_payload_circuit_version),
-      ]),
-    ),
-  )}`;
+  // Compute circuit_versions_hash from DeoperatorConfigV2 contents. Move recipe:
+  //   keccak256(bcs::to_bytes(CircuitVersionsForHash {
+  //     deposit_circuit_version,
+  //     withdraw_circuit_version,
+  //     ca_payload_circuit_version,
+  //   }))
+  // BCS encodes each vector<u8> with a ULEB128 length prefix followed by the bytes,
+  // so we MUST replicate that — naive concat skips the prefix and produces a different hash.
+  function bcsVectorU8(hex) {
+    const bytes = hexToBytes(hex);
+    if (bytes.length > 0x7f) {
+      throw new Error("BCS length > 0x7f needs multibyte ULEB128 — extend this helper.");
+    }
+    const out = new Uint8Array(1 + bytes.length);
+    out[0] = bytes.length & 0xff;
+    out.set(bytes, 1);
+    return out;
+  }
+  const circuitVersionsBcs = (() => {
+    const a = bcsVectorU8(cfg.deposit_circuit_version);
+    const b = bcsVectorU8(cfg.withdraw_circuit_version);
+    const c = bcsVectorU8(cfg.ca_payload_circuit_version);
+    const out = new Uint8Array(a.length + b.length + c.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    out.set(c, a.length + b.length);
+    return out;
+  })();
+  const circuitVersionsHash = `0x${bytesToHex(keccak256(circuitVersionsBcs))}`;
   logStep(`dkgEpoch=${dkgEpoch}, opSetVersion=${operatorSetVersion}, circuitVersionsHash=${circuitVersionsHash}`);
 
   const vaultPubRes = await getResource(
@@ -378,7 +385,10 @@ async function main() {
   logStep(`asset_id=${assetIdHex.slice(0, 18)}..., vault_addr_hash=${vaultAddrHashHex.slice(0, 18)}...`);
 
   const caDkgRoster = JSON.parse(readFileSync(CA_DKG_V2_ROSTER_JSON_PATH, "utf8"));
-  const selectedSlots = caDkgRoster.slots.slice(0, 5).map((s) => Number(s.slot));
+  const selectedSlots = caDkgRoster.nodes
+    .map((n) => Number(n.slot))
+    .sort((a, b) => a - b)
+    .slice(0, 5);
   logStep(`selectedSlots=${JSON.stringify(selectedSlots)}`);
 
   // 5. Build CA confidential_transfer payload.
@@ -431,11 +441,15 @@ async function main() {
   const sigmaProtoResp = sigmaProof.response;
   const memo = new Uint8Array(0);
 
+  // Pad short Aptos address forms (e.g. "0xa") to canonical 32-byte hex.
+  const assetTypeHex = `0x${bufToHex(addr32Bytes(ASSET_TYPE_ADDR))}`;
+  const vaultAddrHex = `0x${bufToHex(addr32Bytes(vaultAddr))}`;
+
   // 6. Compute Fr-safe caPayloadHash. Build the payload object matching
   // ConfidentialTransferRawPayloadV2 (hex-string fields).
   const caPayloadObj = {
-    assetType: ASSET_TYPE_ADDR.startsWith("0x") ? ASSET_TYPE_ADDR : `0x${ASSET_TYPE_ADDR}`,
-    to: vaultAddr.startsWith("0x") ? vaultAddr : `0x${vaultAddr}`,
+    assetType: assetTypeHex,
+    to: vaultAddrHex,
     newBalanceP: newBalanceP.map((b) => `0x${bufToHex(b)}`),
     newBalanceR: newBalanceR.map((b) => `0x${bufToHex(b)}`),
     newBalanceREffAud: newBalanceREffAud.map((b) => `0x${bufToHex(b)}`),
@@ -508,9 +522,9 @@ async function main() {
     dkgEpoch,
     rosterHash: rosterHashOnChain,
     selectedSlots,
-    bridge: bridgeAddr.startsWith("0x") ? bridgeAddr : `0x${bridgeAddr}`,
-    vault: vaultAddr.startsWith("0x") ? vaultAddr : `0x${vaultAddr}`,
-    assetType: ASSET_TYPE_ADDR.startsWith("0x") ? ASSET_TYPE_ADDR : `0x${ASSET_TYPE_ADDR}`,
+    bridge: `0x${bufToHex(addr32Bytes(bridgeAddr))}`,
+    vault: vaultAddrHex,
+    assetType: assetTypeHex,
     chainId: 2,
     operatorSetVersion,
     frostGroupPubkey,
@@ -593,7 +607,9 @@ async function main() {
         memo,
       ],
     },
-    options: { maxGasAmount: 2_000_000, gasUnitPrice: 100 },
+    // 0.05 APT cap (500k * 100 = 50_000_000 octas) — enough for the CA verification + Groth16
+    // pairing on chain (~50k-100k gas), well below the depositor's 0.2 APT funding.
+    options: { maxGasAmount: 500_000, gasUnitPrice: 100 },
   });
   const txAuth = aptos.transaction.sign({ signer: depositorAccount, transaction: tx });
   const pending = await aptos.transaction.submit.simple({

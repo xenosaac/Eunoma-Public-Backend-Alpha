@@ -287,7 +287,10 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/mpcca/withdraw/round1"
       | "/worker/v2/mpcca/withdraw/round2"
       | "/worker/v2/mpcca/withdraw/prove"
-      | "/worker/v2/mpcca/withdraw/finalize",
+      | "/worker/v2/mpcca/withdraw/finalize"
+      | "/worker/v2/frost/sign/nonce-commit"
+      | "/worker/v2/frost/sign/partial"
+      | "/worker/v2/frost/sign/aggregate",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -596,6 +599,42 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/worker/v2/mpcca/withdraw/finalize", req.body, reply);
+  });
+
+  // FROST signing passthroughs for the coordinator's withdraw and deposit attest fanouts.
+  // The Rust crypto-worker exposes /worker/v2/frost/sign/{nonce-commit,partial,aggregate}
+  // (crypto-worker-rust/src/main.rs:142-146). The bodies are message-agnostic: the worker
+  // signs whatever messageBytes the coordinator provides. They do NOT carry rosterHash or
+  // selfSlot — the per-slot binding is implicit in the routing (each slot's deop-node has
+  // its own crypto-worker). Forbidden-field guard applies; nothing else.
+  server.post("/worker/v2/frost/sign/nonce-commit", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/frost/sign/nonce-commit", req.body, reply);
+  });
+
+  server.post("/worker/v2/frost/sign/partial", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/frost/sign/partial", req.body, reply);
+  });
+
+  server.post("/worker/v2/frost/sign/aggregate", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/frost/sign/aggregate", req.body, reply);
   });
 
   return { server, store };

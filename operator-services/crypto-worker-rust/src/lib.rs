@@ -278,6 +278,7 @@ pub mod local_state {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct FrostNonceCommitmentResult {
         pub nonce_id: String,
         pub commitment_hash: String,
@@ -286,6 +287,7 @@ pub mod local_state {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct FrostPartialSignatureResult {
         pub nonce_id: String,
         pub signature_share_hash: String,
@@ -294,6 +296,7 @@ pub mod local_state {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct FrostAggregateSignatureResult {
         pub signature: String,
         pub signature_hash: String,
