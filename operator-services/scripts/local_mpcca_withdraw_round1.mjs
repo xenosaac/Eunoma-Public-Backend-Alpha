@@ -4,34 +4,42 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // =============================================================================================
-// Milestone 3 sub-milestone 3a — MPCCA withdraw round1 fan-out driver.
+// MPCCA withdraw round1 fan-out driver.
 //
 // Drives POST /v2/withdraw/mpcca/start against a coordinator that has already run Phase 2
 // (vault_ek derive), Milestone 1 (CA registration sigma), Milestone 2a (vault_state_v2 init),
 // and Milestone 2b (deposit observer for the targeted depositCount). All 5 selected workers
-// run their round1 public-binding work and surface the milestone 3a NotImplemented stub
-// (`mpcca_withdraw_v2_round1_nonce_generation_pending_milestone4`). Round 2 / prove / finalize
-// are wired but not exercised by this driver — milestone 4 will fill the crypto in.
+// run their round1 ingress crypto (HPKE-decrypt α_share + Pedersen verify + seal at rest)
+// and the coordinator persists the round1 transcript at
+// `<stateRoot>/coordinator/mpcca_withdraw/<dkgEpoch>__<requestId>__round1.json`.
+//
+// Status: M1 round1 ingress is LIVE (Rust worker `run_round1_v2` at lib.rs:8800). This driver
+// is now a single-round audit/debug tool — the umbrella orchestrator `local_v2_withdraw_submit.mjs`
+// drives the full round1 → round2 → finalize → frost-attest → submit pipeline.
+//
+// REQUIRED ingress fields (caller-supplied — these are cryptographic outputs that the umbrella
+// orchestrator generates client-side):
+//   --amount-commitment HEX
+//   --per-share-commitments HEX,HEX,HEX,HEX,HEX
+//   --ingress-envelopes-json PATH   (JSON: HpkeEnvelope[5])
 //
 // Exit codes — operator runbook contract:
 //
-//   0   success — printed body is whatever the coordinator returned (200 OK or a documented error).
-//   1   generic request/parse failure (network, malformed JSON, coordinator 5xx other than 502
-//       stub-divergence).
-//   2   usage error.
-//  23   stub-acceptable 501 — the milestone 3a NotImplemented stub returned as expected. Auditor
-//       should review the printed transcript path + per-slot contributions before re-running.
-//  24   vault_state_init_provenance_unknown — Milestone 2a prereq missing. Operator action:
-//       re-run `npm run local:vault-state:init`.
-//  25   crypto_stub_phase_divergence — workers returned divergent notImplementedPhase strings.
-//       Operator action: investigate per-slot crypto-worker logs.
+//   0    success — coordinator returned 200 with round1 transcript.
+//   1    generic request/parse failure (network, malformed JSON, coordinator 5xx).
+//   2    usage error.
+//  24    vault_state_init_provenance_unknown — Milestone 2a prereq missing. Operator action:
+//        re-run `npm run local:vault-state:init`.
+//  25    crypto_stub_phase_divergence — workers returned divergent phase responses.
+//  26    round1_unexpected_stub — REGRESSION: worker returned the M3a NotImplemented stub. M1
+//        retired the stub; if it returns now, investigate the worker build (cargo rebuild?).
 // =============================================================================================
 const EXIT_SUCCESS = 0;
 const EXIT_GENERIC_FAILURE = 1;
 const EXIT_USAGE_ERROR = 2;
-const EXIT_STUB_OK = 23;
 const EXIT_INIT_PROVENANCE = 24;
 const EXIT_PHASE_DIVERGENCE = 25;
+const EXIT_UNEXPECTED_STUB = 26;
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -55,6 +63,9 @@ let expirySecs;
 let requestHash;
 let requestId;
 let bearerToken;
+let amountCommitment;
+let perShareCommitmentsCsv;
+let ingressEnvelopesJsonPath;
 
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i];
@@ -113,6 +124,15 @@ for (let i = 0; i < args.length; i += 1) {
     case "--bearer-token":
       bearerToken = args[++i];
       break;
+    case "--amount-commitment":
+      amountCommitment = args[++i];
+      break;
+    case "--per-share-commitments":
+      perShareCommitmentsCsv = args[++i];
+      break;
+    case "--ingress-envelopes-json":
+      ingressEnvelopesJsonPath = args[++i];
+      break;
     case "--help":
     case "-h":
       console.log(
@@ -123,19 +143,21 @@ for (let i = 0; i < args.length; i += 1) {
           "                                   --recipient HEX --recipient-hash HEX --amount-tag HEX\n" +
           "                                   --deposit-count N --vault-sequence N --expiry-secs N\n" +
           "                                   --request-hash HEX\n" +
+          "                                   --amount-commitment HEX\n" +
+          "                                   --per-share-commitments HEX,HEX,HEX,HEX,HEX\n" +
+          "                                   --ingress-envelopes-json PATH\n" +
           "                                   [--request-id ID] [--bearer-token TOKEN]\n" +
           "\n" +
-          "Drives POST /v2/withdraw/mpcca/start. Milestone 3a fans out round1 to 5 workers; each\n" +
-          "worker does FULL public binding + persists session state + returns 501 NotImplemented.\n" +
-          "round2/prove/finalize wired but deferred to milestone 4.\n" +
+          "Drives POST /v2/withdraw/mpcca/start. M1 round1 ingress is LIVE — workers HPKE-decrypt\n" +
+          "α_share + Pedersen-verify + seal at rest + return ingress_transcript_hash.\n" +
           "\n" +
           "Exit codes:\n" +
-          `  ${EXIT_SUCCESS}   success — coordinator returned 200 (not expected under milestone 3a)\n` +
+          `  ${EXIT_SUCCESS}   success — coordinator returned 200 OK with round1 transcript\n` +
           `  ${EXIT_GENERIC_FAILURE}   generic request/parse failure\n` +
           `  ${EXIT_USAGE_ERROR}   usage error\n` +
-          `  ${EXIT_STUB_OK}  milestone 3a stub returned 501 NotImplemented as expected — review transcript artifact\n` +
           `  ${EXIT_INIT_PROVENANCE}  vault_state_init_provenance_unknown — re-run local:vault-state:init\n` +
-          `  ${EXIT_PHASE_DIVERGENCE}  crypto_stub_phase_divergence — workers returned divergent phases\n`,
+          `  ${EXIT_PHASE_DIVERGENCE}  crypto_stub_phase_divergence — workers returned divergent phases\n` +
+          `  ${EXIT_UNEXPECTED_STUB}  round1_unexpected_stub REGRESSION — M3a stub returned despite M1 landing\n`,
       );
       process.exit(EXIT_SUCCESS);
     default:
@@ -190,6 +212,33 @@ if (!Number.isInteger(expirySecsNum) || expirySecsNum < 0) {
   process.exit(EXIT_USAGE_ERROR);
 }
 require_arg("--request-hash", requestHash);
+require_arg("--amount-commitment", amountCommitment);
+require_arg("--per-share-commitments", perShareCommitmentsCsv);
+require_arg("--ingress-envelopes-json", ingressEnvelopesJsonPath);
+
+const perShareCommitments = perShareCommitmentsCsv
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s.length > 0);
+if (perShareCommitments.length !== 5) {
+  console.error(
+    `--per-share-commitments must be exactly 5 hex strings (got ${perShareCommitments.length})`,
+  );
+  process.exit(EXIT_USAGE_ERROR);
+}
+let ingressEnvelopes;
+try {
+  ingressEnvelopes = JSON.parse(readFileSync(ingressEnvelopesJsonPath, "utf8"));
+} catch (err) {
+  console.error(
+    `--ingress-envelopes-json read failed: ${err?.message ?? err}`,
+  );
+  process.exit(EXIT_USAGE_ERROR);
+}
+if (!Array.isArray(ingressEnvelopes) || ingressEnvelopes.length !== 5) {
+  console.error("--ingress-envelopes-json must contain a 5-element array of HpkeEnvelope");
+  process.exit(EXIT_USAGE_ERROR);
+}
 
 // Pull cluster plan defaults (when running against local:cluster:start).
 const planPath = resolve(
@@ -224,6 +273,9 @@ const payload = {
   expirySecs: expirySecsNum,
   requestHash,
   depositCount: depositCountNum,
+  amountCommitment,
+  perShareCommitments,
+  ingressEnvelopes,
 };
 if (requestId) payload.requestId = requestId;
 
@@ -264,16 +316,24 @@ if (res.status === 502 && body?.error === "crypto_stub_phase_divergence") {
   process.exit(EXIT_PHASE_DIVERGENCE);
 }
 
+// REGRESSION GUARD: M1 retired the round1 stub. If 501 + the M3a phase string returns now,
+// the worker build is stale (recompile + reinstall) or a regression slipped past CI.
 if (res.status === 501) {
-  // Milestone 3a expected stub outcome: round1 public binding succeeded; crypto deferred.
+  const phase = body?.notImplementedPhase ?? body?.phase ?? null;
+  console.error(
+    "round1_unexpected_stub: M1 retired this stub; the worker is returning 501 NotImplemented. " +
+      "Investigate: (1) `cargo build --release` rebuilt, (2) `local:cluster:start` restarted, " +
+      "(3) the request shape carries amountCommitment/perShareCommitments/ingressEnvelopes.",
+  );
+  if (phase) console.error(`  worker phase: ${phase}`);
   process.stdout.write(`${JSON.stringify(body, null, 2)}\n`);
-  process.exit(EXIT_STUB_OK);
+  process.exit(EXIT_UNEXPECTED_STUB);
 }
 if (!res.ok) {
   console.error(`coordinator returned ${res.status}`);
   process.stdout.write(`${JSON.stringify(body, null, 2)}\n`);
   process.exit(EXIT_GENERIC_FAILURE);
 }
-// 200 OK — milestone 3a stub should not return 200; if we got here, milestone 4 has landed.
+// 200 OK — round1 ingress completed; transcript persisted.
 process.stdout.write(`${JSON.stringify(body, null, 2)}\n`);
 process.exit(EXIT_SUCCESS);
