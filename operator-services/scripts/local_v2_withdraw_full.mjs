@@ -543,9 +543,19 @@ const proofObj = JSON.parse(readFileSync(proofOutPath, "utf8"));
 const proofHex = proofObj.proofHex;
 console.error(`[m8-real] Groth16 proof generated (${proofHex.length} hex chars)`);
 
+// ---- 4.5) Override requestHash with the REAL value (derived from final ca_payload_hash) --
+// The round1/round2/finalize bodies carried a PLACEHOLDER requestHash (since the real
+// value depends on ca_payload_hash which is only known after MPCCA finalize). The
+// frost-attest BCS-encoded message + chain call arg must use the REAL value matching the
+// Groth16 proof's public input. Otherwise: E_INVALID_WITHDRAW_PROOF on chain.
+const witnessJsonFinal = JSON.parse(readFileSync(witnessOutPath, "utf8"));
+const realRequestHashHex = `0x${bytesToHex(bigToLE32(BigInt(witnessJsonFinal.request_hash)))}`;
+console.error(`[m8-real] real request_hash = ${realRequestHashHex.slice(0, 16)}... (replacing round1 placeholder)`);
+
 // ---- 5) frost-attest ----------------------------------------------------------------------
 const frostAttestBody = {
   ...finalizeBody,
+  requestHash: normalizeHex(realRequestHashHex),
   attestationConfig: {
     bridge: process.env.BRIDGE_PACKAGE_ADDRESS,
     vault: vaultAddress,

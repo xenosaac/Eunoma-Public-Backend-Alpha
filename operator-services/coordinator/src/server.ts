@@ -5176,10 +5176,14 @@ export function buildCoordinatorServer(
       // Re-uses the M4-c4 compareFinalizeIdentityWithRound2 helper which walks 18 identity
       // fields + selectedSlots + observedDepositTranscriptHashes + statementInputs +
       // userProofArtifacts.
+      // At frost-attest: requestHash legitimately differs from round2 (placeholder vs the
+      // real ca_payload_hash-derived value). Skip that single field; all other identity
+      // bindings remain enforced.
       const identityMismatch = compareFinalizeIdentityWithRound2(
         parsed,
         round2Artifact,
         sortedSelectedSlots,
+        { allowRequestHashUpdate: true },
       );
       if (identityMismatch) {
         return reply.code(400).send({
@@ -7477,6 +7481,7 @@ function compareFinalizeIdentityWithRound2(
   request: MpccaWithdrawFinalizeOrchestrateRequest,
   round2: Record<string, unknown>,
   sortedSelectedSlots: number[],
+  options: { allowRequestHashUpdate?: boolean } = {},
 ):
   | { field: string; round2Value: unknown; requestValue: unknown }
   | undefined {
@@ -7525,7 +7530,16 @@ function compareFinalizeIdentityWithRound2(
     ["amountTag", lowerHex(round2.amountTag), lowerHex(request.amountTag)],
     ["vaultSequence", round2.vaultSequence, request.vaultSequence],
     ["expirySecs", round2.expirySecs, request.expirySecs],
-    ["requestHash", lowerHex(round2.requestHash), lowerHex(request.requestHash)],
+    // requestHash is intentionally OPTIONAL here. By protocol design, request_hash =
+    // Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id, vault_sequence,
+    // CHAIN_ID). ca_payload_hash depends on post-finalize σ aggregation, so request_hash
+    // CANNOT be pre-computed at round1. The user supplies a placeholder requestHash at
+    // round1/round2/finalize and the REAL value at frost-attest (which the chain verifies
+    // via the FROST-signed message + Groth16 proof). At frost-attest the check is skipped;
+    // at finalize it remains enforced (finalize doesn't update ca_payload_hash).
+    ...(options.allowRequestHashUpdate
+      ? []
+      : ([["requestHash", lowerHex(round2.requestHash), lowerHex(request.requestHash)]] as Array<[string, unknown, unknown]>)),
     ["depositCount", round2.depositCount, request.depositCount],
   ];
   for (const [field, a, b] of checks) {
