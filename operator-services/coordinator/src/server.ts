@@ -4686,7 +4686,12 @@ export function buildCoordinatorServer(
           transferAmountC: statementInputs.transferAmountC,
           transferAmountDSender: statementInputs.transferAmountDSender,
           transferAmountDRecipient: statementInputs.transferAmountDRecipient,
-          aggregatedSigmaCommitmentsHex,
+          // The Rust FinalizeRequest struct (crypto-worker-rust::mpcca_withdraw_v2)
+          // uses serde(rename_all = "camelCase") on fields aggregated_sigma_commitments
+          // and challenge_hex, which serialize to aggregatedSigmaCommitments and
+          // challengeHex. The coordinator was previously sending
+          // aggregatedSigmaCommitmentsHex which fails Axum body extraction (422).
+          aggregatedSigmaCommitments: aggregatedSigmaCommitmentsHex,
           challengeHex,
         }));
 
