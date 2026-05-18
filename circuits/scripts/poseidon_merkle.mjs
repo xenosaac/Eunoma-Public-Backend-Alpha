@@ -14,6 +14,12 @@
 // Convention: leaf is always at the LEFT child of each level (path_index = 0 throughout).
 // This is the only leaf-0 / empty-otherwise-tree shape the alpha needs; partial-batch trees
 // will require a different helper.
+//
+// M9 NOTE: `computeMerkleRootAndPathSingleLeaf` is the M8 single-leaf-only helper.
+// M9 testnet paths use `commitment_tree_v2.mjs` (multi-leaf append-only). This file's
+// single-leaf helper is retained as a local fixture for unit tests + the `--leaf-hex` CLI
+// and is rejected by testnet entry points (see `local_record_known_root_v2.mjs` and
+// `compute_withdraw_witness.mjs --testnet`).
 // =============================================================================================
 import { buildPoseidon } from "circomlibjs";
 
