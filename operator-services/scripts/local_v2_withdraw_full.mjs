@@ -466,6 +466,11 @@ const userSigmaCommitmentsHex = sigmaProof.commitment.slice(1, 30).map((c, i) =>
 });
 const userSigmaResponseSharesHex = sigmaProof.response.slice(1, 25).map((r) => bytesToHex(r));
 console.error(`[m8-real] subtracted α[0]·Σbᵢ·old_R[i] from user_commitment[17] (BASE_DK_SET={0,17} shared-index correction)`);
+console.error(`[m8-real-diag] proveTransfer.commitment[0]  = ${bytesToHex(sigmaProof.commitment[0])}`);
+console.error(`[m8-real-diag] proveTransfer.commitment[17] = ${bytesToHex(sigmaProof.commitment[17])}`);
+console.error(`[m8-real-diag] α[0]·dk_base_at_17           = ${bytesToHex(dkContributionAt17.toRawBytes())}`);
+console.error(`[m8-real-diag] user_commitment[17] (subtracted) = ${bytesToHex(userCommitment17.toRawBytes())}`);
+console.error(`[m8-real-diag] α[0]·ek_sid (expected agg[0])  = ${bytesToHex(vaultEkPub.toUint8Array().constructor === Uint8Array ? RistrettoPoint.fromHex(vaultEkPub.toUint8Array()).multiply(modN(alphaZero)).toRawBytes() : new Uint8Array(32))}`);
 const perChunkCommitmentsAmountHex = rangeAmount.comms.map((c) => bytesToHex(c));
 const perChunkCommitmentsNewBalanceHex = rangeNewBalance.comms.map((c) => bytesToHex(c));
 
