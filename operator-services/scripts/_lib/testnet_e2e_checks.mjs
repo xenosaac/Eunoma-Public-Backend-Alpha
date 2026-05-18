@@ -1485,13 +1485,25 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
 
   const caPayloadHash =
     finalizeArtifact?.callArgs?.caPayloadHash ??
+    finalizeArtifact?.withdrawV2CallArgsFields?.caPayloadHash ??
+    finalizeArtifact?.caPayloadHashFr ??
     finalizeArtifact?.ca_payload_hash ??
     finalizeArtifact?.caPayloadHash ??
     null;
   const rosterHash =
-    finalizeArtifact?.rosterHash ?? finalizeArtifact?.roster_hash ?? null;
+    finalizeArtifact?.rosterHash ??
+    finalizeArtifact?.roster_hash ??
+    finalizeArtifact?.attestationConfig?.rosterHash ??
+    finalizeArtifact?.attestationConfig?.caDkgV2RosterHash ??
+    caDkgArtifact?.data?.caDkgV2RosterHash ??
+    null;
+  // Transcript hash on the withdraw finalize artifact itself is the canonical
+  // quorum-binding hash post M5-c1 FROST attest (the artifact's `transcriptHash`).
   const quorumTranscriptHash =
-    finalizeArtifact?.quorumTranscriptHash ?? finalizeArtifact?.quorum_transcript_hash ?? null;
+    finalizeArtifact?.quorumTranscriptHash ??
+    finalizeArtifact?.quorum_transcript_hash ??
+    finalizeArtifact?.transcriptHash ??
+    null;
   const mpccaTranscriptHash =
     finalizeArtifact?.mpccaWithdrawFinalTranscriptHash ??
     finalizeArtifact?.transcriptHash ??

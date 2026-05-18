@@ -245,41 +245,57 @@ if (!existsSync(finalizeArtifactPath)) {
   process.exit(EXIT_FINALIZE_FAILED);
 }
 const finalizePreFrost = JSON.parse(readFileSync(finalizeArtifactPath, "utf8"));
-if (
-  finalizePreFrost.notImplementedPhase !== "m4_pending_frost_signature_assembly" ||
-  !finalizePreFrost.mpccaWithdrawFinalizeArtifact
-) {
-  console.error(
-    "__finalize.json shape regression pre-frost-attest: expected " +
-      "notImplementedPhase = 'm4_pending_frost_signature_assembly' + " +
-      "mpccaWithdrawFinalizeArtifact populated.",
-  );
-  process.exit(EXIT_FINALIZE_SHAPE_REGRESSION);
+// M8: post-frost-attest artifact has no `notImplementedPhase` and carries
+// `withdrawV2CallArgsFields`. The smoke is idempotent — if the harness sees a
+// frost-attested artifact for the same (dkgEpoch, requestId), it short-circuits
+// without re-driving frost-attest (the artifact is already final). Otherwise
+// require the M4 pre-frost shape.
+const alreadyFrostAttested =
+  finalizePreFrost.notImplementedPhase === undefined &&
+  finalizePreFrost.withdrawV2CallArgsFields !== undefined &&
+  finalizePreFrost.mpccaWithdrawFinalizeArtifact !== undefined;
+if (!alreadyFrostAttested) {
+  if (
+    finalizePreFrost.notImplementedPhase !== "m4_pending_frost_signature_assembly" ||
+    !finalizePreFrost.mpccaWithdrawFinalizeArtifact
+  ) {
+    console.error(
+      "__finalize.json shape regression pre-frost-attest: expected " +
+        "notImplementedPhase = 'm4_pending_frost_signature_assembly' + " +
+        "mpccaWithdrawFinalizeArtifact populated, OR a fully frost-attested " +
+        "artifact carrying withdrawV2CallArgsFields.",
+    );
+    process.exit(EXIT_FINALIZE_SHAPE_REGRESSION);
+  }
 }
 
-// Drive frost-attest.
-const frostExit = runDriver(
-  "M5-c1 frost-attest",
-  resolve(scriptDir, "local_mpcca_frost_attest.mjs"),
-  [
-    ...sharedArgs,
-    "--bridge",
-    bridge,
-    "--vault",
-    vault,
-    "--operator-set-version",
-    operatorSetVersion,
-    "--frost-group-pubkey",
-    frostGroupPubkey,
-    "--circuit-versions-hash",
-    circuitVersionsHash,
-    "--withdraw-proof-hex",
-    withdrawProofHex,
-    ...(memoHex !== undefined ? ["--memo-hex", memoHex] : []),
-  ],
-);
-if (frostExit !== EXIT_SUCCESS) {
-  process.exit(EXIT_FROST_ATTEST_FAILED);
+// Drive frost-attest (skip if artifact is already frost-attested).
+if (alreadyFrostAttested) {
+  console.log("▶ M5-c1 frost-attest — already attested for this (dkgEpoch, requestId), skipping");
+} else {
+  const frostExit = runDriver(
+    "M5-c1 frost-attest",
+    resolve(scriptDir, "local_mpcca_frost_attest.mjs"),
+    [
+      ...sharedArgs,
+      "--bridge",
+      bridge,
+      "--vault",
+      vault,
+      "--operator-set-version",
+      operatorSetVersion,
+      "--frost-group-pubkey",
+      frostGroupPubkey,
+      "--circuit-versions-hash",
+      circuitVersionsHash,
+      "--withdraw-proof-hex",
+      withdrawProofHex,
+      ...(memoHex !== undefined ? ["--memo-hex", memoHex] : []),
+    ],
+  );
+  if (frostExit !== EXIT_SUCCESS) {
+    process.exit(EXIT_FROST_ATTEST_FAILED);
+  }
 }
 
 // Post-frost-attest shape verification: __finalize.json must now carry full 27-field
