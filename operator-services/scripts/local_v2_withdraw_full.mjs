@@ -433,8 +433,39 @@ if (r.status !== 200) {
 }
 
 // ---- 2) round2 ----------------------------------------------------------------------------
-const userSigmaCommitmentsHex = sigmaProof.commitment.slice(1, 30).map((c) => bytesToHex(c));
+// User-side σ commitments occupy positions [1..29]; user[i-1] = full commitment[i] except
+// at position 17 (a SHARED dk-index per BASE_DK_SET = {0, 17}; see
+// transfer_sigma_reference::psi_transfer + coordinator/server.ts:4520-4604). At position 17 the
+// coordinator SUMS user_part + worker_aggregate, so user must subtract the dk-component before
+// transmitting to avoid a double-count.
+//
+//   psi_transfer position 17 (balance equation) =
+//       α[0] · Σ_i (b_pow_ell[i] · old_R[i])   ← dk part, worker-aggregated
+//     + Σ_i (G · α_new_a[i] · b_pow_ell[i])    ← user part
+//     + Σ_j (G · α_v[j] · b_pow_n[j])          ← user part
+//
+// So user_commitment[17] = proveTransfer_commitment[17] − α[0]_user · Σ_i b_pow_ell[i]·old_R[i].
+// b = 2^16 (matches compute_b_powers in transfer_sigma_reference.rs:216-224).
+const B_BASE = 1n << 16n;
+const bPowEll = [];
+{
+  let acc = 1n;
+  for (let i = 0; i < ell; i += 1) { bPowEll.push(modN(acc)); acc = modN(acc * B_BASE); }
+}
+let dkBaseAt17 = oldBalanceCt.D[0].multiply(bPowEll[0]);
+for (let i = 1; i < ell; i += 1) {
+  dkBaseAt17 = dkBaseAt17.add(oldBalanceCt.D[i].multiply(bPowEll[i]));
+}
+const sigmaCommitment17Full = RistrettoPoint.fromHex(sigmaProof.commitment[17]);
+const dkContributionAt17 = dkBaseAt17.multiply(modN(alphaZero));
+const userCommitment17 = sigmaCommitment17Full.subtract(dkContributionAt17);
+const userSigmaCommitmentsHex = sigmaProof.commitment.slice(1, 30).map((c, i) => {
+  // i ∈ [0..28] maps to commitment index i+1 ∈ [1..29].
+  if (i + 1 === 17) return bytesToHex(userCommitment17.toRawBytes());
+  return bytesToHex(c);
+});
 const userSigmaResponseSharesHex = sigmaProof.response.slice(1, 25).map((r) => bytesToHex(r));
+console.error(`[m8-real] subtracted α[0]·Σbᵢ·old_R[i] from user_commitment[17] (BASE_DK_SET={0,17} shared-index correction)`);
 const perChunkCommitmentsAmountHex = rangeAmount.comms.map((c) => bytesToHex(c));
 const perChunkCommitmentsNewBalanceHex = rangeNewBalance.comms.map((c) => bytesToHex(c));
 
