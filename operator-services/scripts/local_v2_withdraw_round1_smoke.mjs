@@ -401,6 +401,18 @@ if (!caDkgTranscriptHash) {
 const body = {
   dkgEpoch: roster.dkgEpoch,
   caDkgTranscriptHash: normalizeHex(caDkgTranscriptHash),
+  // The cursor array MUST be [1, 2, ..., depositCount] (strict monotonic from 1) — the
+  // worker round1 currently accepts the field as a default-empty serde at round1 but
+  // round2 enforces length-matches-depositCount. Supplying it at round1 binds it into
+  // the round1 transcript so round2 sees consistent state.
+  observedDepositCursors: Array.from({ length: depositCount }, (_, i) => i + 1),
+  // Vault EK ingress transcript hash (from coordinator state)
+  vaultEkTranscriptHash: process.env.EUNOMA_TESTNET_VAULT_EK_TRANSCRIPT_HASH ?? null,
+  registrationTranscriptHash: process.env.EUNOMA_TESTNET_REGISTRATION_TRANSCRIPT_HASH ?? null,
+  vaultStateInitTranscriptHash: process.env.EUNOMA_TESTNET_VAULT_STATE_INIT_TRANSCRIPT_HASH ?? null,
+  observedDepositTranscriptHashes: process.env.EUNOMA_TESTNET_OBSERVED_DEPOSIT_TRANSCRIPT_HASHES
+    ? process.env.EUNOMA_TESTNET_OBSERVED_DEPOSIT_TRANSCRIPT_HASHES.split(",").map(normalizeHex)
+    : [],
   vaultEk: normalizeHex(vaultEk),
   senderAddress: normalizeHex(addr32Pad(vaultAddress)), // CA sender = bridge vault
   assetType: normalizeHex(addr32Pad(depositWitness.assetType)),

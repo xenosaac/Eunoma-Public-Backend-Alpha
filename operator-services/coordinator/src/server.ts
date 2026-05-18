@@ -3927,6 +3927,13 @@ export function buildCoordinatorServer(
           registrationTranscriptHash: parsed.registrationTranscriptHash,
           vaultStateInitTranscriptHash: parsed.vaultStateInitTranscriptHash,
           observedDepositTranscriptHashes: parsed.observedDepositTranscriptHashes,
+          // Parallel cursor mapping for the worker's strict-monotonic-ordering enforcement.
+          // The worker rejects `observed_deposit_cursors length 0 does not match deposit_count`
+          // when this is absent. Must be [1, 2, …, depositCount] in cursor order.
+          observedDepositCursors:
+            parsed.observedDepositCursors && parsed.observedDepositCursors.length > 0
+              ? parsed.observedDepositCursors
+              : Array.from({ length: parsed.depositCount }, (_, i) => i + 1),
           rosterHash: dkgRosterHash,
           selectedSlots: sortedSelectedSlots,
           selfSlot: slot,
@@ -4628,6 +4635,13 @@ export function buildCoordinatorServer(
           registrationTranscriptHash: parsed.registrationTranscriptHash,
           vaultStateInitTranscriptHash: parsed.vaultStateInitTranscriptHash,
           observedDepositTranscriptHashes: parsed.observedDepositTranscriptHashes,
+          // Parallel cursor mapping for the worker's strict-monotonic-ordering enforcement.
+          // The worker rejects `observed_deposit_cursors length 0 does not match deposit_count`
+          // when this is absent. Must be [1, 2, …, depositCount] in cursor order.
+          observedDepositCursors:
+            parsed.observedDepositCursors && parsed.observedDepositCursors.length > 0
+              ? parsed.observedDepositCursors
+              : Array.from({ length: parsed.depositCount }, (_, i) => i + 1),
           rosterHash: dkgRosterHash,
           selectedSlots: sortedSelectedSlots,
           selfSlot: slot,
