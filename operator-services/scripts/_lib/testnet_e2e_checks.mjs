@@ -81,15 +81,47 @@ export function checkAptosCli() {
   return { ok: true, version: (r.stdout || "").trim() };
 }
 
+/**
+ * Find the nearest ancestor directory containing a .aptos/config.yaml. Returns null if not
+ * found. We need this because the aptos CLI reads profiles from `${cwd}/.aptos/config.yaml`,
+ * and the testnet:e2e script may run from operator-services/ while the .aptos lives at the
+ * repo root.
+ */
+function findAptosConfigDir(startDir) {
+  let dir = startDir;
+  for (let i = 0; i < 8; i += 1) {
+    if (existsSync(resolve(dir, ".aptos", "config.yaml"))) return dir;
+    const parent = resolve(dir, "..");
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return null;
+}
+
 export function listProfiles() {
-  const r = spawnSync("aptos", ["config", "show-profiles"], { encoding: "utf8" });
+  // The aptos CLI reads profiles from `${cwd}/.aptos/config.yaml`. In this repo the .aptos
+  // lives at the repo root, NOT under operator-services/. Search ancestors for the config.
+  const configDir = findAptosConfigDir(process.cwd()) ?? process.cwd();
+  const r = spawnSync("aptos", ["config", "show-profiles"], {
+    encoding: "utf8",
+    cwd: configDir,
+  });
   if (r.status !== 0 || r.error) {
     return { ok: false, profiles: [], error: r.stderr || r.error?.message || "" };
   }
-  const profiles = [];
-  for (const line of (r.stdout || "").split("\n")) {
-    const m = line.match(/^\s*([A-Za-z0-9_.-]+):\s*$/);
-    if (m) profiles.push(m[1]);
+  // Aptos CLI emits JSON when stdout is captured (Result envelope). Try JSON first.
+  let profiles = [];
+  try {
+    const parsed = JSON.parse(r.stdout || "");
+    if (parsed?.Result && typeof parsed.Result === "object") {
+      profiles = Object.keys(parsed.Result);
+    }
+  } catch {
+    // Fall back to the old line-by-line YAML-ish parser.
+    for (const line of (r.stdout || "").split("\n")) {
+      const m = line.match(/^\s*([A-Za-z0-9_.-]+):\s*$/);
+      if (m) profiles.push(m[1]);
+    }
   }
   return { ok: true, profiles };
 }
@@ -307,13 +339,19 @@ export function compareObservedDepositArtifact(artifact, chainEvent, env) {
       });
     }
   }
+  // The observed-deposit artifact's senderAddress is the CA-side SENDER of the vault
+  // operation — i.e. the bridge vault resource address (the entity whose CA dk is
+  // threshold-shared and that *signs* the on-chain confidential_transfer_raw). It is
+  // NOT the depositor who submitted deposit_with_commitment_v2 (that's a separate
+  // identity captured in DepositConfirmedV2.sender + EUNOMA_TESTNET_SENDER_ADDRESS).
+  // Cross-check against EUNOMA_TESTNET_VAULT_ADDRESS, the canonical bridge vault address.
   if (
-    env.EUNOMA_TESTNET_SENDER_ADDRESS &&
-    !eqAptosAddress(artifact.senderAddress ?? "", env.EUNOMA_TESTNET_SENDER_ADDRESS)
+    env.EUNOMA_TESTNET_VAULT_ADDRESS &&
+    !eqAptosAddress(artifact.senderAddress ?? "", env.EUNOMA_TESTNET_VAULT_ADDRESS)
   ) {
     mismatches.push({
       key: "vault_state_v2_observed_sender_mismatch",
-      message: `artifact.senderAddress=${artifact.senderAddress} != env=${env.EUNOMA_TESTNET_SENDER_ADDRESS}`,
+      message: `artifact.senderAddress=${artifact.senderAddress} != EUNOMA_TESTNET_VAULT_ADDRESS=${env.EUNOMA_TESTNET_VAULT_ADDRESS} (vault is the CA-side sender of all vault-managed transfers; depositor identity lives in DepositConfirmedV2.sender)`,
     });
   }
   if (env.EUNOMA_TESTNET_ASSET_TYPE && !eqAptosAddress(artifact.assetType ?? "", env.EUNOMA_TESTNET_ASSET_TYPE)) {
@@ -989,7 +1027,16 @@ export async function runPreflight(opts) {
       const observedBySlot = {};
       const transcriptHashBySlot = {};
       const initTranscriptHashBySlot = {};
-      for (let slot = 0; slot < 7; slot += 1) {
+      // Threshold-aware: V2's CA DKG + vault_state_v2 init protocol is strict 5-of-7. Any
+      // given init/observe run picks selectedSlots[5]; the other (7 - 5 = 2) slots never
+      // receive vault_state_v2.json. The hardening must require AT LEAST THRESHOLD (5)
+      // slots be present-and-consistent, NOT all 7 — over-strict gates would fail closed
+      // on the actual deployed protocol.
+      const DEOPERATOR_COUNT = 7;
+      const DEOPERATOR_THRESHOLD = 5;
+      const presentSlotsForBindChecks = [];
+      const missingSlots = [];
+      for (let slot = 0; slot < DEOPERATOR_COUNT; slot += 1) {
         const slotFile = resolve(
           serviceRoot,
           stateRoot ?? ".agent-local/eunoma-v2",
@@ -998,16 +1045,25 @@ export async function runPreflight(opts) {
         );
         const a = readJsonIfExists(slotFile);
         if (!a) {
-          missing.push({
-            key: `worker_state_slot_${slot}_missing`,
-            message: `slot-${slot}/vault_state_v2.json not found at ${slotFile}`,
-            remediation:
-              "Run the local cluster + `npm run local:vault-state:init` to materialize the per-slot vault_state_v2 artifacts.",
-            priority: "m6d-artifact",
-          });
+          missingSlots.push({ slot, path: slotFile });
           observedBySlot[slot] = null;
           continue;
         }
+        presentSlotsForBindChecks.push({ slot, artifact: a, path: slotFile });
+      }
+      if (presentSlotsForBindChecks.length < DEOPERATOR_THRESHOLD) {
+        // Fail closed: under-quorum is a hard miss because no 5-of-7 op can run.
+        for (const m of missingSlots) {
+          missing.push({
+            key: `worker_state_slot_${m.slot}_missing`,
+            message: `slot-${m.slot}/vault_state_v2.json not found at ${m.path}; only ${presentSlotsForBindChecks.length}/${DEOPERATOR_COUNT} slots initialized (need ≥${DEOPERATOR_THRESHOLD} for 5-of-7 quorum)`,
+            remediation:
+              "Run the local cluster + `npm run local:vault-state:init` to materialize per-slot vault_state_v2 artifacts. The CA DKG V2 init protocol initializes 5 selected slots per call; re-running with different selectedSlots can cover the remaining ones if a future op needs ≥6 slots populated for audit.",
+            priority: "m6d-artifact",
+          });
+        }
+      }
+      for (const { slot, artifact: a } of presentSlotsForBindChecks) {
         // ---- Bind-checks: every slot artifact must reference the same op intent. ----
         // dkg_epoch
         if (String(a.dkg_epoch) !== String(dkgEpoch)) {
@@ -1019,16 +1075,19 @@ export async function runPreflight(opts) {
             priority: "m6d-artifact",
           });
         }
-        // sender_address
+        // sender_address — the worker's vault_state.sender_address is the CA SENDER of
+        // the vault operation = the bridge vault resource address. NOT the depositor.
+        // Compare against EUNOMA_TESTNET_VAULT_ADDRESS (the bridge vault), not
+        // EUNOMA_TESTNET_SENDER_ADDRESS (the depositor address).
         if (
-          env.EUNOMA_TESTNET_SENDER_ADDRESS &&
-          !eqAptosAddress(a.sender_address ?? "", env.EUNOMA_TESTNET_SENDER_ADDRESS)
+          env.EUNOMA_TESTNET_VAULT_ADDRESS &&
+          !eqAptosAddress(a.sender_address ?? "", env.EUNOMA_TESTNET_VAULT_ADDRESS)
         ) {
           missing.push({
             key: `worker_state_slot_${slot}_sender_address`,
-            message: `slot-${slot} vault_state_v2.sender_address=${a.sender_address} != EUNOMA_TESTNET_SENDER_ADDRESS=${env.EUNOMA_TESTNET_SENDER_ADDRESS}`,
+            message: `slot-${slot} vault_state_v2.sender_address=${a.sender_address} != EUNOMA_TESTNET_VAULT_ADDRESS=${env.EUNOMA_TESTNET_VAULT_ADDRESS} (vault is the CA-side sender; depositor identity lives elsewhere)`,
             remediation:
-              "Re-run `npm run local:vault-state:init` with the correct sender, or update EUNOMA_TESTNET_SENDER_ADDRESS.",
+              "Re-run `npm run local:vault-state:init` keyed to the bridge vault address (the CA-side sender), not the depositor address.",
             priority: "m6d-artifact",
           });
         }
@@ -1194,12 +1253,22 @@ export async function runPreflight(opts) {
 }
 
 function resolveProfileAddress(profileName) {
-  // Best-effort: aptos config show-profiles emits YAML-ish blocks. We don't need the address
-  // for correctness — only for the optional admin-balance check. Return null on any failure.
+  // Search ancestors for .aptos/config.yaml (the operator-services dir may not contain one;
+  // the repo root does).
+  const configDir = findAptosConfigDir(process.cwd()) ?? process.cwd();
   const r = spawnSync("aptos", ["config", "show-profiles", "--profile", profileName], {
     encoding: "utf8",
+    cwd: configDir,
   });
   if (r.status !== 0 || r.error) return null;
+  // Aptos CLI emits JSON Result envelope; try JSON first.
+  try {
+    const parsed = JSON.parse(r.stdout || "");
+    const acct = parsed?.Result?.[profileName]?.account;
+    if (typeof acct === "string" && acct.length > 0) return add0x(acct);
+  } catch {
+    /* fall through */
+  }
   const m = (r.stdout || "").match(/account:\s*(?:")?(0x?[0-9a-fA-F]+)(?:")?/);
   if (!m) return null;
   return add0x(m[1]);
