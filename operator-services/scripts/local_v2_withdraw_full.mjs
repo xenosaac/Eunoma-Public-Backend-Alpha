@@ -146,11 +146,31 @@ const rosterHash = caDkgRoster.caDkgV2RosterHash;
 const selectedSlots = [0, 1, 2, 3, 4];
 
 // ---- Recipient + transfer amount ----------------------------------------------------------
-const recipientDkSeed = randomBytes(32);
-const recipientDk = new TwistedEd25519PrivateKey(`0x${bytesToHex(recipientDkSeed)}`);
-const recipientEk = recipientDk.publicKey();
-const recipientEkHex = bytesToHex(recipientEk.toUint8Array());
+// M8-q: recipient_ek MUST be the recipient's chain-registered CA ek. The chain framework reads
+// the recipient's ConfidentialStore.ek for the σ-proof verifier; providing a freshly-generated
+// ek causes lhs[26..29] = chain_ek · y[j] to mismatch our commitment[26..29] (built against the
+// fresh ek) and triggers E_INVALID_TRANSFER_PROOF.
 const recipientAddress = recipientArg ?? depositWitness.depositorAddress;
+async function fetchRecipientEk() {
+  const res = await fetch(`${APTOS_NODE_URL}/v1/view`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      function: "0x1::confidential_asset::get_encryption_key",
+      type_arguments: [],
+      arguments: [addr32(recipientAddress), addr32(assetType)],
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`get_encryption_key(${recipientAddress}, ${assetType}): ${res.status} ${body}`);
+  }
+  const j = await res.json();
+  return j[0].data;
+}
+const recipientEkHex = normalizeHex(await fetchRecipientEk());
+const recipientEk = new TwistedEd25519PublicKey(`0x${recipientEkHex}`);
+console.error(`[m8-q] recipient_ek (chain) = 0x${recipientEkHex}`);
 const senderAddressBytes = hexToBytes(addr32(vaultAddress));
 const recipientAddressBytes = hexToBytes(addr32(recipientAddress));
 const tokenAddressBytes = hexToBytes(addr32(assetType));
@@ -588,6 +608,31 @@ const witnessJsonFinal = JSON.parse(readFileSync(witnessOutPath, "utf8"));
 const realRequestHashHex = `0x${bytesToHex(bigToLE32(BigInt(witnessJsonFinal.request_hash)))}`;
 console.error(`[m8-real] real request_hash = ${realRequestHashHex.slice(0, 16)}... (replacing round1 placeholder)`);
 
+// M8-r: derive circuit_versions_hash from chain DeoperatorConfigV2 (keccak256(BCS(CircuitVersionsForHash{deposit,withdraw,ca_payload}))).
+// Falling back to an env var leaves frost-attest message diverged from chain and triggers E_INVALID_DEOP_SIGNATURE.
+async function fetchCircuitVersionsHash() {
+  const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
+  const resourceType = `${bridgePkg}::eunoma_bridge::DeoperatorConfigV2`;
+  const url = `${APTOS_NODE_URL}/v1/accounts/${bridgePkg}/resource/${resourceType}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`fetch DeoperatorConfigV2: ${res.status} ${await res.text()}`);
+  const json = await res.json();
+  const dep = hexToBytes(normalizeHex(json.data.deposit_circuit_version));
+  const wid = hexToBytes(normalizeHex(json.data.withdraw_circuit_version));
+  const cap = hexToBytes(normalizeHex(json.data.ca_payload_circuit_version));
+  function uleb(n) {
+    const out = [];
+    while (n >= 0x80) { out.push((n & 0x7f) | 0x80); n = n >>> 7; }
+    out.push(n);
+    return new Uint8Array(out);
+  }
+  const bcs = Buffer.concat([uleb(dep.length), dep, uleb(wid.length), wid, uleb(cap.length), cap]);
+  const { keccak_256 } = await import("@noble/hashes/sha3");
+  return `0x${Buffer.from(keccak_256(bcs)).toString("hex")}`;
+}
+const derivedCircuitVersionsHash = await fetchCircuitVersionsHash();
+console.error(`[m8-r] circuit_versions_hash (chain-derived) = ${derivedCircuitVersionsHash}`);
+
 // ---- 5) frost-attest ----------------------------------------------------------------------
 const frostAttestBody = {
   ...finalizeBody,
@@ -597,7 +642,7 @@ const frostAttestBody = {
     vault: vaultAddress,
     operatorSetVersion: caDkgRoster.operatorSetVersion,
     frostGroupPubkey: frostRoster.frostGroupPubkey,
-    circuitVersionsHash: process.env.EUNOMA_TESTNET_CIRCUIT_VERSIONS_HASH ?? "0x0000000000000000000000000000000000000000000000000000000000000001",
+    circuitVersionsHash: process.env.EUNOMA_TESTNET_CIRCUIT_VERSIONS_HASH ?? derivedCircuitVersionsHash,
   },
   withdrawProofHex: proofHex,
   memoHex: "",

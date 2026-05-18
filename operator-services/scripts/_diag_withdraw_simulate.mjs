@@ -43,7 +43,7 @@ const cliArgs = [
   "--function-id", `${BRIDGE}::eunoma_bridge::withdraw_to_recipient_v2`,
   "--profile", PROFILE,
   "--assume-yes",
-  ...(SIMULATE ? ["--simulate"] : []),
+  ...(SIMULATE ? ["--local"] : []),
   "--args",
   ...positional,
 ];
