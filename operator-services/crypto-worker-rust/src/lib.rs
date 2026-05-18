@@ -9088,9 +9088,54 @@ pub mod mpcca_withdraw_v2 {
             ));
         }
 
-        // 8. Generate α_share_j[0] via CSPRNG; zero-reject.
-        let mut rng = OsRng;
-        let mut alpha_share = generate_nonzero_scalar(&mut rng);
+        // 8. Load α_share_j[0] from the M1-ingressed at-rest envelope (NOT fresh CSPRNG).
+        //
+        // M8-o: replacing the previous `generate_nonzero_scalar(&mut rng)` so that
+        // aggregated commitment[0] = (Σ α_share_j) · ek_sid is predictable by the user
+        // (= the canonical α[0] extracted from proveTransfer). Without this, e_chain
+        // computed over aggregated commitments ≠ e_proveTransfer, and the user's
+        // response[1..24] (computed against e_proveTransfer) fails Aptos CA TransferV1
+        // Σ-verification with E_INVALID_TRANSFER_PROOF(0x10005).
+        //
+        // The M1 ingress at-rest envelope was sealed by run_round1_v2 (line 8870) using
+        // HPKE_INFO_INGRESS_AT_REST + at_rest_aad over `a || b` (each 32 bytes). Round1
+        // already Pedersen-validated (a, b) against the user-supplied amount commitment,
+        // so reading it here inherits that binding.
+        let ingress_state = load_ingress_state_file(&binding.session_dir)?.ok_or_else(|| {
+            WorkerError::InvalidDkgState("round2_missing_ingress_state_file".to_string())
+        })?;
+        let keypair_for_ingress = load_hpke_keypair_for_slot(state_dir, req.base.self_slot)?;
+        let ingress_aad = at_rest_aad(&req.base.session_id, &req.base.request_id, req.base.self_slot);
+        let mut ingress_plaintext = hpke_aead::open(
+            &keypair_for_ingress.private_key,
+            HPKE_INFO_INGRESS_AT_REST,
+            &ingress_aad,
+            &ingress_state.encrypted_share_envelope,
+        )
+        .map_err(|_| WorkerError::Crypto("round2_ingress_envelope_open_failed".to_string()))?;
+        if ingress_plaintext.len() != 64 {
+            ingress_plaintext.zeroize();
+            return Err(WorkerError::Crypto(
+                "round2_ingress_plaintext_wrong_length".to_string(),
+            ));
+        }
+        let mut alpha_share_bytes = [0_u8; 32];
+        alpha_share_bytes.copy_from_slice(&ingress_plaintext[..32]);
+        ingress_plaintext.zeroize();
+        let alpha_share_opt = Scalar::from_canonical_bytes(alpha_share_bytes);
+        alpha_share_bytes.zeroize();
+        if alpha_share_opt.is_none().into() {
+            return Err(WorkerError::Crypto(
+                "round2_ingress_alpha_share_non_canonical".to_string(),
+            ));
+        }
+        let mut alpha_share = alpha_share_opt.unwrap();
+        if alpha_share == Scalar::ZERO {
+            alpha_share.zeroize();
+            return Err(WorkerError::Crypto(
+                "round2_ingress_alpha_share_zero_rejected".to_string(),
+            ));
+        }
 
         // 9. Compute partial dk-base commitments: α_share_j[0] · base for each (idx, base).
         let mut partial_dk_commitments: Vec<Round2DkPartial> = Vec::with_capacity(dk_bases.len());
