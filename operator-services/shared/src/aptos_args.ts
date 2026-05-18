@@ -64,9 +64,12 @@ export function hexVectorArg(values: HexInput[]): string {
   if (!Array.isArray(values)) {
     throw new Error(`hex vector arg requires an array, got ${typeof values}`);
   }
+  // Aptos CLI 9.x requires JSON-quoted hex strings inside vector<vector<u8>>
+  // literals: `hex:["0x..","0x.."]`. The older bare form `hex:[0x..,0x..]`
+  // is rejected at args parsing ("expected `,` or `]` at line 1 column 3").
   const items = values.map((v, idx) => {
     try {
-      return `0x${normalizeHex(v)}`;
+      return `"0x${normalizeHex(v)}"`;
     } catch (err) {
       throw new Error(
         `hex vector entry [${idx}] invalid: ${err instanceof Error ? err.message : String(err)}`,
@@ -93,9 +96,12 @@ export function hexVector3Arg(values: HexInput[][]): string {
     if (!Array.isArray(inner)) {
       throw new Error(`hex vector3 entry [${outerIdx}] must be an array, got ${typeof inner}`);
     }
+    // Aptos CLI 9.x requires JSON-quoted hex strings inside the inner array
+    // too (see hexVectorArg). Both bare 0x and unquoted forms are rejected
+    // by the args parser.
     const innerItems = inner.map((v, innerIdx) => {
       try {
-        return `0x${normalizeHex(v)}`;
+        return `"0x${normalizeHex(v)}"`;
       } catch (err) {
         throw new Error(
           `hex vector3 entry [${outerIdx}][${innerIdx}] invalid: ${

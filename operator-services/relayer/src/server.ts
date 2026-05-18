@@ -272,6 +272,13 @@ export function createAptosCliSubmitter(
 
     const txHash = parseTxHashFromAptosCliStdout(stdoutText);
     if (!txHash) {
+      // Diagnostic: log BOTH stdout + stderr LOCALLY (process.stderr) so the
+      // operator can see why the CLI returned 0 without emitting a
+      // transaction_hash. The HTTP response still carries only the opaque
+      // error code — raw output never leaves the relayer process.
+      stderrSink.write(
+        `[relayer] aptos cli exit=0 but no transaction_hash; stdout=\n${stdoutText}\n---stderr=\n${stderrText}\n---\n`,
+      );
       throw new RelayerSubmitterError(
         "aptos_cli_missing_tx_hash",
         `aptos cli stdout missing transaction_hash (simulate=${simulate})`,
