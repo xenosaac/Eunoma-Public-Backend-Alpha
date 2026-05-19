@@ -1547,19 +1547,105 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
   }
 
   // ---- M9-b/e: commitment tree artifact ----
+  // M10-h (codex P1 fix): do not trust the raw JSON. CommitmentTreeV2.deserialize() re-derives
+  // the root from leaves and re-computes the transcriptHash binding over
+  // (scheme || depth || leafCount || rootLE || per-leaf{leafLE, depositCount, commitmentHex,
+  //  sender, depositTxHash, txVersion, sequenceNumber}). It throws on root or transcript
+  // mismatch, so a tampered tree file cannot silently pass the privacy gate.
   const commitmentTreePath = resolve(
     serviceRoot,
     stateRoot ?? ".agent-local/eunoma-v2",
     "coordinator",
     "commitment_tree_v2.json",
   );
-  const commitmentTreeJson = readJsonIfExists(commitmentTreePath);
-  if (!commitmentTreeJson) {
+  let commitmentTreeJson = null;
+  let commitmentTreeVerified = null; // CommitmentTreeV2 instance after deserialize+verify
+  let commitmentTreeDerivedRootHex = null;
+  let commitmentTreeDerivedTranscriptHash = null;
+  if (!existsSync(commitmentTreePath)) {
     missingArtifacts.push({
       path: commitmentTreePath,
       reason:
         "M9 commitment_tree_v2.json not found — run local_build_commitment_tree.mjs first to build the multi-leaf tree.",
     });
+  } else {
+    // Parse the JSON ourselves so we can distinguish parse-failure from
+    // deserialize/integrity-failure error paths. We never trust treeJson values until
+    // CommitmentTreeV2.deserialize() succeeds (which re-derives root + transcript).
+    let parsedTreeJson;
+    try {
+      parsedTreeJson = JSON.parse(readFileSync(commitmentTreePath, "utf8"));
+    } catch (e) {
+      return {
+        ok: false,
+        missingArtifacts: [
+          { path: commitmentTreePath, reason: `tree_deserialize_failed:${e?.message ?? String(e)}` },
+        ],
+      };
+    }
+    const { CommitmentTreeV2, le32ToHex: _le32ToHex, bigToLE32: _bigToLE32 } =
+      await getCommitmentTreeHelpers();
+    try {
+      commitmentTreeVerified = await CommitmentTreeV2.deserialize(parsedTreeJson);
+    } catch (e) {
+      const msg = String(e?.message ?? e);
+      // CommitmentTreeV2.deserialize() throws strings starting with these tags on integrity
+      // failure. Translate to the M10-h integrityFailure contract.
+      if (/^root_mismatch/.test(msg)) {
+        return {
+          ok: false,
+          missingArtifacts: [],
+          integrityFailure: "tree_root_mismatch",
+          claimedRootHex: parsedTreeJson?.latestRootHex ?? null,
+          errorMessage: msg,
+        };
+      }
+      if (/^transcript_hash_mismatch/.test(msg)) {
+        return {
+          ok: false,
+          missingArtifacts: [],
+          integrityFailure: "tree_transcript_mismatch",
+          claimedTranscriptHash: parsedTreeJson?.transcriptHash ?? null,
+          errorMessage: msg,
+        };
+      }
+      return {
+        ok: false,
+        missingArtifacts: [
+          { path: commitmentTreePath, reason: `tree_deserialize_failed:${msg}` },
+        ],
+      };
+    }
+    // deserialize() succeeded — root and transcript are guaranteed to match the file's claim.
+    // Re-derive locally so we can surface them on the report and to defensively assert the
+    // contract one more time (cheap; consistent with the plan's explicit checks).
+    const rootBig = await commitmentTreeVerified.root();
+    commitmentTreeDerivedRootHex = _le32ToHex(_bigToLE32(rootBig));
+    commitmentTreeDerivedTranscriptHash = commitmentTreeVerified._computeTranscriptHash(rootBig);
+    if (
+      String(commitmentTreeDerivedRootHex).toLowerCase() !==
+      String(parsedTreeJson.latestRootHex ?? "").toLowerCase()
+    ) {
+      return {
+        ok: false,
+        missingArtifacts: [],
+        integrityFailure: "tree_root_mismatch",
+        derivedRootHex: commitmentTreeDerivedRootHex,
+        claimedRootHex: parsedTreeJson.latestRootHex ?? null,
+      };
+    }
+    if (commitmentTreeDerivedTranscriptHash !== parsedTreeJson.transcriptHash) {
+      return {
+        ok: false,
+        missingArtifacts: [],
+        integrityFailure: "tree_transcript_mismatch",
+        derivedTranscriptHash: commitmentTreeDerivedTranscriptHash,
+        claimedTranscriptHash: parsedTreeJson.transcriptHash,
+      };
+    }
+    // All integrity checks pass. The JSON now mirrors a verified tree; downstream code may
+    // safely read leafCount / latestRootHex / leaves / depositMeta from it.
+    commitmentTreeJson = parsedTreeJson;
   }
 
   // ---- M9-d/e: public withdraw_tree_context side-car for this requestId ----
@@ -1698,11 +1784,15 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
   };
 
   // ---- M9-e: privacy block ----
+  // M10-h (codex P1 fix): leafIndex and commitmentHex are intentionally omitted from
+  // report.privacy because they directly de-anonymize the spent leaf in the multi-leaf
+  // anonymity set. Use anonymitySetSize / distinctDepositSenders / rootHex / treeTranscriptHash
+  // for verifier evidence. The M10-f side-car producer no longer publishes either field;
+  // the consumer here mirrors that contract so the final report cannot leak them.
   const minAnonymitySet = Number(env.EUNOMA_MIN_ANONYMITY_SET ?? "8");
   const privacyFailures = [];
   let singleLeafRootRejected = null;
   let distinctDepositSenders = null;
-  let leafIndexUsed = null;
   let treeRootHex = null;
   let usedRootHex = null;
   let treeTranscriptHash = null;
@@ -1711,7 +1801,6 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     anonymitySetSize = commitmentTreeJson.leafCount ?? 0;
     treeRootHex = commitmentTreeJson.latestRootHex ?? null;
     treeTranscriptHash = commitmentTreeJson.transcriptHash ?? null;
-    leafIndexUsed = withdrawTreeContext.leafIndex ?? null;
 
     const senderSet = new Set();
     for (const m of commitmentTreeJson.depositMeta ?? []) {
@@ -1758,11 +1847,24 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       privacyFailures.push("root_mismatch");
     }
     if (singleLeafRootRejected !== true) privacyFailures.push("single_leaf_root_match");
-    if (typeof leafIndexUsed !== "number" || leafIndexUsed < 0) {
-      privacyFailures.push("leaf_index_missing");
-    }
+    // M10-h: leafIndex no longer present in side-car; do not check it. The privacy
+    // claim is multi-leaf unlinkability — the verifier proves they spent SOME leaf
+    // in the set, not which leaf. Demanding leafIndex on the report would force a
+    // de-anonymization leak.
     if (distinctDepositSenders < 2) privacyFailures.push("distinct_depositor_senders_below_minimum");
   }
+
+  // M10-h: balanceWitnessIntegrity — hard-pass iff the submit tx returned success and
+  // vm_status == "Executed successfully" on chain. The submit-stage chain re-query above
+  // already enforces this gate (any failure pushes to missingArtifacts and we return
+  // before reaching here). So if execution reaches this point, the on-chain submit tx
+  // is verified to have succeeded; surfacing the flag on report.privacy makes the
+  // invariant explicit for downstream auditors.
+  // Defense-in-depth: re-check the locally-recorded submit artifact's chainSuccess flag.
+  // The pre-flight independent re-query (above) hard-fails if the chain disagrees with
+  // the local flag, so both being true after the missing-artifact gate is the strongest
+  // statement we can make from the helper module's vantage point.
+  const balanceWitnessIntegrity = submitArtifact?.chainSuccess === true;
 
   report.privacy = {
     amountHidden: true,
@@ -1773,7 +1875,9 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     minAnonymitySet,
     rootDepositCount: anonymitySetSize,
     leafIndexPublic: false,
-    leafIndexUsed,
+    // M10-h (codex P1 fix): leafIndexUsed and commitmentHex are intentionally omitted —
+    // both directly de-anonymize the spent leaf. The side-car producer (local_v2_withdraw_full.mjs)
+    // and this consumer mirror the contract.
     recipientPrivacy: false,
     singleLeafRootRejected,
     treeRootHex,
@@ -1781,6 +1885,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     treeTranscriptHash,
     distinctDepositSenders,
     distinctDepositSendersMin: 2,
+    balanceWitnessIntegrity,
     failures: privacyFailures,
   };
   report.sources.commitmentTreePath = commitmentTreeJson ? commitmentTreePath : null;

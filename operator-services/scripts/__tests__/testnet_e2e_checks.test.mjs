@@ -20,6 +20,11 @@ import {
   vaultStateContentSignature,
   findSlotContentCollisions,
 } from "../_lib/testnet_e2e_checks.mjs";
+import { CommitmentTreeV2 } from "../../../circuits/scripts/commitment_tree_v2.mjs";
+import {
+  bigToLE32,
+  le32ToHex,
+} from "../../../circuits/scripts/poseidon_merkle.mjs";
 
 // ---------------------------------------------------------------------------------------------
 // Fixture builders
@@ -704,5 +709,286 @@ describe("findSlotContentCollisions (M9-f)", () => {
     expect(flat.has(0)).toBe(true);
     expect(flat.has(5)).toBe(true);
     expect(flat.has(6)).toBe(true);
+  });
+});
+
+// =============================================================================================
+// M10-h — buildFinalReport truthfulness via CommitmentTreeV2.deserialize + drop leafIndex
+//
+// Codex P1 finding: buildFinalReport read commitment_tree_v2.json as raw JSON without re-running
+// CommitmentTreeV2.deserialize() — a tampered tree could pass the privacy gate. M10-h forces
+// deserialize() and drops leafIndex/commitmentHex from report.privacy to preserve multi-leaf
+// unlinkability.
+// =============================================================================================
+
+const FR_MOD =
+  21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+function frFromSeed(seed) {
+  let v = 0n;
+  for (let i = 0; i < seed.length; i++) {
+    v = (v * 1099511628211n + BigInt(seed.charCodeAt(i) + i)) & ((1n << 254n) - 1n);
+  }
+  return v % FR_MOD;
+}
+
+function senderHexN(n) {
+  return ("0x" + n.toString(16).padStart(64, "f")).toLowerCase();
+}
+
+/**
+ * Build a real CommitmentTreeV2 snapshot with `leafCount` distinct depositMeta entries,
+ * each with a distinct sender (so distinctDepositSenders >= 2 for the privacy gate),
+ * then serialize() to produce the canonical JSON contract that the report consumer expects.
+ *
+ * Returns { snapshot, rootHex } so callers can wire `usedRootHex` to the same value.
+ */
+async function buildRealTreeSnapshot(leafCount = 8) {
+  const t = new CommitmentTreeV2(20);
+  for (let i = 1; i <= leafCount; i++) {
+    const big = frFromSeed(`m10h-leaf-${i}`);
+    const commitmentHex = le32ToHex(bigToLE32(big));
+    t.append(big, {
+      depositCount: i,
+      depositTxHash: "0x" + i.toString(16).padStart(64, "0"),
+      txVersion: String(2000 + i),
+      sequenceNumber: String(i),
+      sender: senderHexN(i),
+      commitmentHex,
+    });
+  }
+  const snapshot = await t.serialize();
+  return { snapshot, rootHex: snapshot.latestRootHex };
+}
+
+/**
+ * Write every artifact buildFinalReport needs to reach the happy-path return, parameterized
+ * over the commitment tree snapshot (so callers can tamper post-write) and the slot lineup.
+ *
+ * Mirrors the schema each production component emits on a successful run. NOT a fixture of the
+ * real online flow — just enough fields to satisfy each null/exists check in buildFinalReport.
+ */
+async function writeHappyFixture(stateRoot, env, treeSnapshot, opts = {}) {
+  const dkgEpoch = env.EUNOMA_TESTNET_DKG_EPOCH;
+  const requestId = env.EUNOMA_TESTNET_REQUEST_ID;
+  const usedRootHex = treeSnapshot.latestRootHex;
+  const transcriptHash = treeSnapshot.transcriptHash;
+  const selectedSlots = opts.selectedSlots ?? [0, 1, 2, 3, 4];
+  const initTranscriptHash = opts.initTranscriptHash ?? ("0x" + "e".repeat(64));
+  const chainSuccess = opts.chainSuccess ?? true;
+
+  // 1. Submit artifact
+  writeSubmitArtifact(stateRoot, dkgEpoch, requestId, submitArtifactFixture({
+    chainSuccess,
+    transcriptHash: "0x" + "c".repeat(64),
+    finalizeTranscriptHash: "0x" + "a".repeat(64),
+  }));
+
+  // 2. Finalize transcript — provides selectedSlots + rosterHash + ca_payload_hash + root.
+  const finalizeDir = join(stateRoot, "coordinator", "mpcca_withdraw");
+  mkdirSync(finalizeDir, { recursive: true });
+  writeFileSync(
+    join(finalizeDir, `${dkgEpoch}__${requestId}__finalize.json`),
+    JSON.stringify({
+      schema: "mpcca_withdraw_finalize_v2",
+      selectedSlots,
+      quorumTranscriptHash: "0x" + "1".repeat(64),
+      transcriptHash: "0x" + "1".repeat(64),
+      mpccaWithdrawFinalTranscriptHash: "0x" + "1".repeat(64),
+      rosterHash: "0x" + "2".repeat(64),
+      withdrawV2CallArgsFields: {
+        caPayloadHash: "0x" + "3".repeat(64),
+        root: usedRootHex,
+        selectedSlots,
+      },
+    }),
+  );
+
+  // 3. CA DKG V2 phase-2
+  const caDir = join(stateRoot, "coordinator", "ca_dkg_v2");
+  mkdirSync(caDir, { recursive: true });
+  writeFileSync(
+    join(caDir, `${dkgEpoch}__phase2.json`),
+    JSON.stringify({
+      schema: "ca_dkg_v2_phase2",
+      rosterHash: "0x" + "4".repeat(64),
+      caDkgV2RosterHash: "0x" + "4".repeat(64),
+    }),
+  );
+
+  // 4. FROST DKG V2
+  const frostDir = join(stateRoot, "coordinator", "frost_dkg_v2");
+  mkdirSync(frostDir, { recursive: true });
+  writeFileSync(
+    join(frostDir, `${dkgEpoch}.json`),
+    JSON.stringify({
+      schema: "frost_dkg_v2",
+      rosterHash: "0x" + "5".repeat(64),
+      frostDkgV2RosterHash: "0x" + "5".repeat(64),
+    }),
+  );
+
+  // 5. Per-slot vault_state_v2 — must agree on init_transcript_hash and have DISTINCT
+  //    worker_transcript_hash (M9-f collision detector).
+  for (const slot of selectedSlots) {
+    const slotDir = join(stateRoot, `slot-${slot}`);
+    mkdirSync(slotDir, { recursive: true });
+    writeFileSync(
+      join(slotDir, "vault_state_v2.json"),
+      JSON.stringify({
+        schema: "vault_state_v2",
+        slot,
+        player_id: slot,
+        worker_transcript_hash: "0x" + (slot.toString(16).padStart(64, "a")),
+        init_transcript_hash: initTranscriptHash,
+        deposit_count_observed: 1,
+      }),
+    );
+  }
+
+  // 6. Commitment tree
+  const coordDir = join(stateRoot, "coordinator");
+  mkdirSync(coordDir, { recursive: true });
+  writeFileSync(
+    join(coordDir, "commitment_tree_v2.json"),
+    JSON.stringify(treeSnapshot, null, 2),
+  );
+
+  // 7. Withdraw tree context (M10-f schema: no leafIndex, no commitmentHex)
+  writeFileSync(
+    join(coordDir, `withdraw_tree_context_${requestId.replace(/[^A-Za-z0-9_-]/g, "_")}.json`),
+    JSON.stringify({
+      schema: "withdraw_tree_context_v2",
+      requestId,
+      rootHex: usedRootHex,
+      treeTranscriptHash: transcriptHash,
+      anonymitySetSize: treeSnapshot.leafCount,
+      distinctDepositSenders: new Set(treeSnapshot.depositMeta.map((m) => m.sender)).size,
+      mode: "real-balance",
+      depositorWitnessSchemaVersion: "v2_depositor_witness_v1",
+      createdAtUnixMs: Date.now(),
+    }),
+  );
+
+  return { usedRootHex, transcriptHash, selectedSlots };
+}
+
+/**
+ * Snapshot fixture for the snapshot argument buildFinalReport(snapshot, ...) consumes — only
+ * the fields it actually reads (`vaultInitTx`, `depositTx`, `depositEvent`,
+ * `observedDepositTranscriptHash`, `deoperatorConfig`, etc).
+ */
+function happySnapshotArg(env) {
+  return {
+    vaultInitTx: { hash: env.EUNOMA_TESTNET_DEPOSIT_TX_HASH, version: "100" },
+    depositTx: { hash: env.EUNOMA_TESTNET_DEPOSIT_TX_HASH, version: "100" },
+    depositEvent: { commitment: "0x" + "b".repeat(64), version: "100" },
+    observedDepositTranscriptHash: "0x" + "f".repeat(64),
+    deoperatorConfig: { threshold: 5, operator_set_version: 1, dkg_epoch: env.EUNOMA_TESTNET_DKG_EPOCH },
+    vaultInitArtifactPath: "/tmp/vault_init.json",
+    observedDepositArtifactPath: "/tmp/observed_deposit.json",
+  };
+}
+
+function mockChainReQueryOk() {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({ success: true, vm_status: "Executed successfully", version: "1234" }),
+  });
+}
+
+describe("buildFinalReport — M10-h tree integrity + privacy field discipline", () => {
+  it("tampered tree JSON (depositMeta sender swapped) → integrityFailure=tree_transcript_mismatch", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture();
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    // Tamper with one leaf's sender — this invalidates the transcriptHash binding but leaves
+    // the leaf bytes themselves untouched, so the root still matches the tampered file's
+    // claim. CommitmentTreeV2.deserialize() re-runs the transcript hash over the tampered
+    // depositMeta and gets a different result vs. the file's claimed `transcriptHash`.
+    const tamperedSnapshot = JSON.parse(JSON.stringify(snapshot));
+    tamperedSnapshot.depositMeta[3].sender = "0x" + "9".repeat(64);
+    await writeHappyFixture(stateRoot, env, tamperedSnapshot);
+    mockChainReQueryOk();
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    expect(result.ok).toBe(false);
+    expect(result.integrityFailure).toBe("tree_transcript_mismatch");
+  });
+
+  it("tampered tree JSON (latestRootHex flipped) → integrityFailure=tree_root_mismatch", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture();
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    // Tamper with the claimed root hex; leaves+depositMeta unchanged. CommitmentTreeV2.deserialize()
+    // re-derives the root from leaves and detects the mismatch BEFORE computing the transcript.
+    const tamperedSnapshot = JSON.parse(JSON.stringify(snapshot));
+    tamperedSnapshot.latestRootHex = "0x" + "0".repeat(64);
+    await writeHappyFixture(stateRoot, env, tamperedSnapshot);
+    mockChainReQueryOk();
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    expect(result.ok).toBe(false);
+    expect(result.integrityFailure).toBe("tree_root_mismatch");
+  });
+
+  it("leafIndex and commitmentHex are absent from report.privacy on the happy path", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture();
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    await writeHappyFixture(stateRoot, env, snapshot);
+    mockChainReQueryOk();
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    if (!result.ok) {
+      // Surface the precise reason if the fixture is incomplete so future maintainers
+      // don't chase phantom regressions.
+      throw new Error(
+        `expected ok=true for happy fixture, got: ${JSON.stringify(result, null, 2)}`,
+      );
+    }
+    expect(result.report.privacy).toBeDefined();
+    expect(result.report.privacy.leafIndexUsed).toBeUndefined();
+    expect(result.report.privacy.commitmentHex).toBeUndefined();
+    // The legitimate anonymity-set aggregates must still be present.
+    expect(result.report.privacy.anonymitySetSize).toBe(8);
+    expect(result.report.privacy.distinctDepositSenders).toBe(8);
+    expect(typeof result.report.privacy.treeRootHex).toBe("string");
+    expect(typeof result.report.privacy.treeTranscriptHash).toBe("string");
+  });
+
+  it("balanceWitnessIntegrity is true iff the submit tx chainSuccess is true", async () => {
+    // Case A: chainSuccess=true → flag is true.
+    {
+      const stateRoot = makeTmpStateRoot();
+      const env = fullEnvFixture();
+      const { snapshot } = await buildRealTreeSnapshot(8);
+      await writeHappyFixture(stateRoot, env, snapshot, { chainSuccess: true });
+      mockChainReQueryOk();
+      const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+      if (!result.ok) {
+        throw new Error(
+          `case A (chainSuccess=true) expected ok=true, got: ${JSON.stringify(result, null, 2)}`,
+        );
+      }
+      expect(result.report.privacy.balanceWitnessIntegrity).toBe(true);
+    }
+    // Reset fetch mock between cases so each test gets its own isolation.
+    vi.restoreAllMocks();
+    // Case B: chainSuccess=false → submit-stage gate already rejects (ok=false). The whole
+    // function never reaches the privacy block, so balanceWitnessIntegrity isn't emitted.
+    // This is the desired semantics: a failed on-chain submit hard-fails the report; the
+    // flag only becomes meaningful on the happy path.
+    {
+      const stateRoot = makeTmpStateRoot();
+      const env = fullEnvFixture();
+      const { snapshot } = await buildRealTreeSnapshot(8);
+      await writeHappyFixture(stateRoot, env, snapshot, { chainSuccess: false });
+      mockChainReQueryOk();
+      const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+      expect(result.ok).toBe(false);
+      expect(result.missingArtifacts.some((m) => /chainSuccess=false/.test(m.reason))).toBe(true);
+    }
   });
 });
