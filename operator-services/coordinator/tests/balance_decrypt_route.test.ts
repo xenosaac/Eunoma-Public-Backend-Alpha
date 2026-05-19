@@ -93,10 +93,17 @@ interface BodyShape {
   requestId: string;
 }
 
+// M10-l iter-6 P1-13: the route now requires the request's vaultAddress +
+// assetType to match the coordinator-configured bridge values. We use valid
+// hex throughout (the old "0xv...a" prefix is no longer a valid Aptos addr
+// once normalization rejects non-hex characters).
+const TEST_BRIDGE_VAULT_ADDRESS = "0x" + "a".repeat(64);
+const TEST_BRIDGE_ASSET_TYPE = "0x1::aptos_coin::AptosCoin";
+
 const baseBody = (overrides: Partial<BodyShape> = {}): BodyShape => ({
   dkgEpoch: "1",
-  vaultAddress: "0xv".padEnd(66, "a"),
-  assetType: "0x1::aptos_coin::AptosCoin",
+  vaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+  assetType: TEST_BRIDGE_ASSET_TYPE,
   oldBalanceDHex: Array.from({ length: 8 }, (_, k) =>
     ((k * 11 + 1) & 0xff).toString(16).padStart(2, "0").repeat(32),
   ),
@@ -166,6 +173,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
       singleNodeForwarder: makeForwarder({ recordCalls: calls }),
     });
     const res = await server.inject({
@@ -209,6 +218,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
       singleNodeForwarder: makeForwarder({
         perSlot: {
           2: async (slot) => ({
@@ -239,6 +250,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
       // Forwarder MUST NOT be reached — the inbound guard fires first.
       singleNodeForwarder: async () => ({
         slot: -1,
@@ -300,6 +313,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
       singleNodeForwarder: makeForwarder({
         perSlot: {
           // Slot 3 returns a valid-looking response, but we flip a byte in
@@ -334,6 +349,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
       singleNodeForwarder: makeForwarder(),
     });
     const res = await server.inject({
@@ -371,6 +388,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
       // Forwarder MUST NOT be reached — parseRequest fails before fan-out.
       singleNodeForwarder: async () => ({
         slot: -1,
@@ -397,6 +416,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
       singleNodeForwarder: async () => ({
         slot: -1,
         ok: false,

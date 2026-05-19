@@ -321,6 +321,8 @@ fn compressed_hex(point: &RistrettoPoint) -> String {
 pub async fn handle(
     state_dir: &Path,
     trusted_aptos_node_url: &str,
+    trusted_bridge_vault_address: &str,
+    trusted_bridge_asset_type: &str,
     req: BalanceDecryptPartialRequest,
     chain_d_override: Option<Vec<RistrettoPoint>>,
 ) -> Result<BalanceDecryptPartialResponse, BalanceDecryptError> {
@@ -355,6 +357,56 @@ pub async fn handle(
     if trusted_aptos_node_url.is_empty() && chain_d_override.is_none() {
         return Err(BalanceDecryptError::Internal(
             "worker_missing_aptos_node_url_config".to_string(),
+        ));
+    }
+    // M10-l (codex iter-6 P1-13): bind to the trusted (vault, asset) pair.
+    // Even with `aptos_node_url` config-trusted, a caller could otherwise
+    // ask `dk_share · D` for any other confidential balance the same CA DKG
+    // signs over (e.g. a different vault on the same chain). Reject early —
+    // before reading the share file.
+    if trusted_bridge_vault_address.is_empty() || trusted_bridge_asset_type.is_empty() {
+        return Err(BalanceDecryptError::Internal(
+            "worker_missing_bridge_vault_or_asset_config".to_string(),
+        ));
+    }
+    let normalize_aptos_addr = |raw: &str| -> Option<String> {
+        let stripped = raw.trim_start_matches("0x").trim_start_matches("0X");
+        if stripped.is_empty() || stripped.len() > 64 {
+            return None;
+        }
+        if !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let lower = stripped.to_ascii_lowercase();
+        // Left-pad with zeros to 64 hex chars (32-byte canonical).
+        Some(format!("{:0>64}", lower))
+    };
+    let cfg_vault_norm = normalize_aptos_addr(trusted_bridge_vault_address);
+    let req_vault_norm = normalize_aptos_addr(&req.vault_address);
+    if cfg_vault_norm.is_none() || req_vault_norm.is_none() || cfg_vault_norm != req_vault_norm {
+        return Err(BalanceDecryptError::BadRequest(
+            "vault_address_does_not_match_configured_bridge_vault".to_string(),
+        ));
+    }
+    // Asset types may be address-shaped OR Move struct-tag shaped. Try
+    // address normalization first; if both sides fail, fall back to a
+    // strict case-insensitive string compare with leading-`0x` stripped.
+    let cfg_asset_norm = normalize_aptos_addr(trusted_bridge_asset_type);
+    let req_asset_norm = normalize_aptos_addr(&req.asset_type);
+    let asset_matches = match (cfg_asset_norm.as_ref(), req_asset_norm.as_ref()) {
+        (Some(cfg), Some(reqv)) => cfg == reqv,
+        _ => {
+            let strip = |s: &str| -> String {
+                s.trim_start_matches("0x")
+                    .trim_start_matches("0X")
+                    .to_ascii_lowercase()
+            };
+            strip(trusted_bridge_asset_type) == strip(&req.asset_type)
+        }
+    };
+    if !asset_matches {
+        return Err(BalanceDecryptError::BadRequest(
+            "asset_type_does_not_match_configured_bridge_asset".to_string(),
         ));
     }
     if req.old_balance_d_hex.is_empty() {
@@ -503,7 +555,9 @@ pub async fn handle_http<S: AppStateForBalanceDecrypt + Send + Sync>(
 ) -> impl IntoResponse {
     let state_dir = state.state_dir().to_path_buf();
     let trusted_url = state.aptos_node_url().to_string();
-    match handle(&state_dir, &trusted_url, req, None).await {
+    let trusted_vault = state.bridge_vault_address().to_string();
+    let trusted_asset = state.bridge_asset_type().to_string();
+    match handle(&state_dir, &trusted_url, &trusted_vault, &trusted_asset, req, None).await {
         Ok(resp) => (StatusCode::OK, Json(json!(resp))).into_response(),
         Err(err) => {
             let status = err.http_status();
@@ -516,16 +570,22 @@ pub async fn handle_http<S: AppStateForBalanceDecrypt + Send + Sync>(
     }
 }
 
-/// Read-only view of the worker's per-slot state directory and the trusted
-/// chain URL. Implemented by `main.rs`'s `AppState`.
+/// Read-only view of the worker's per-slot state directory, the trusted
+/// chain URL, and the trusted (vault, asset) bridge binding. Implemented by
+/// `main.rs`'s `AppState`.
 ///
-/// `aptos_node_url` is sourced from the worker's `APTOS_NODE_URL` env var
-/// at startup (see `main.rs`). The balance-decrypt handler uses this for
-/// the defense-in-depth chain re-fetch — the value in the request body is
-/// rejected at the coordinator (M10-l codex P1).
+/// `aptos_node_url`, `bridge_vault_address`, and `bridge_asset_type` are all
+/// sourced from the worker's env at startup (`APTOS_NODE_URL`,
+/// `BRIDGE_VAULT_ADDRESS`, `BRIDGE_ASSET_TYPE`). The balance-decrypt handler
+/// rejects any request whose `vault_address` / `asset_type` don't match the
+/// configured trusted pair — without this gate, a caller with a valid bearer
+/// could ask the threshold-decrypt to operate on any confidential balance
+/// under the same CA DKG (M10-l codex iter-6 P1-13).
 pub trait AppStateForBalanceDecrypt: Clone + 'static {
     fn state_dir(&self) -> &Path;
     fn aptos_node_url(&self) -> &str;
+    fn bridge_vault_address(&self) -> &str;
+    fn bridge_asset_type(&self) -> &str;
 }
 
 #[cfg(test)]

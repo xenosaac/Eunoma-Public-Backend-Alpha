@@ -242,6 +242,19 @@ export interface CoordinatorServerOptions {
   mpccaWithdrawRound2WorkerTimeoutMs?: number;
   /** M4 commit 4 — per-worker AbortController timeout for the finalize fan-out. Default 30s. */
   mpccaWithdrawFinalizeWorkerTimeoutMs?: number;
+  /**
+   * M10-l (codex iter-6 P1-13): bridge vault address. `/v2/balance/decrypt`
+   * rejects requests whose `vaultAddress` doesn't match this configured value.
+   * Without this gate, a caller with the coordinator bearer can target any
+   * confidential balance under the same DKG.
+   */
+  bridgeVaultAddress?: string;
+  /**
+   * M10-l (codex iter-6 P1-13): bridge confidential-asset type tag. Same
+   * rationale as `bridgeVaultAddress` — narrows the threshold-decrypt surface
+   * to a single (vault, asset) pair.
+   */
+  bridgeAssetType?: string;
 }
 
 export function buildCoordinatorServer(
@@ -6920,8 +6933,13 @@ export function buildCoordinatorServer(
 
   // M10-c — POST /v2/balance/decrypt. Fan-out + SHA-256 transcript verification.
   // Uses the same `singleNodeForwarder` and `caDkgV2Roster` already wired above.
+  // M10-l (codex iter-6 P1-13): bridgeVaultAddress + bridgeAssetType come from
+  // env (BRIDGE_VAULT_ADDRESS / BRIDGE_ASSET_TYPE) via CoordinatorConfig; the
+  // route rejects any request whose vaultAddress/assetType don't match.
   registerBalanceDecryptRoute(server, {
     getDefaultRoster: () => opts.caDkgV2Roster,
+    getBridgeVaultAddress: () => opts.bridgeVaultAddress,
+    getBridgeAssetType: () => opts.bridgeAssetType,
     forwarder: singleNodeForwarder,
   });
 

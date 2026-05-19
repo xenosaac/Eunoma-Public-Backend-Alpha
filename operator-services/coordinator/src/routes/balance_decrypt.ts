@@ -270,6 +270,21 @@ export interface RegisterBalanceDecryptOptions {
    * decrypt).
    */
   getDefaultRoster: () => CaDkgV2Roster | undefined;
+  /**
+   * M10-l (codex iter-6 P1-13): coordinator-configured bridge vault address.
+   * Sourced from `BRIDGE_VAULT_ADDRESS` env. The route rejects requests
+   * whose `vaultAddress` doesn't match — preventing a caller with a valid
+   * coordinator bearer from asking the threshold to decrypt any non-bridge
+   * confidential balance under the same DKG.
+   */
+  getBridgeVaultAddress: () => string | undefined;
+  /**
+   * M10-l (codex iter-6 P1-13): coordinator-configured bridge asset type.
+   * Sourced from `BRIDGE_ASSET_TYPE` env. Same rationale as
+   * `getBridgeVaultAddress` — narrows the threshold-decrypt surface to a
+   * single configured (vault, asset) pair.
+   */
+  getBridgeAssetType: () => string | undefined;
   /** Per-worker fan-out forwarder. */
   forwarder: BalanceDecryptForwarder;
   /** Optional override for the per-worker timeout (default 30_000ms). */
@@ -316,7 +331,53 @@ export function registerBalanceDecryptRoute(
         });
       }
 
-      // 3. Roster + slot selection — coordinator-configured only.
+      // 3a. M10-l (codex iter-6 P1-13): require the request's `vaultAddress`
+      //     and `assetType` to match the coordinator-configured bridge values.
+      //     Without this gate, a caller with a valid coordinator bearer can
+      //     point the threshold-decrypt fan-out at any chain confidential
+      //     balance under the same DKG and recover its plaintext.
+      const normalizeAptosAddr = (raw: string | undefined): string | null => {
+        if (typeof raw !== "string" || raw.length === 0) return null;
+        const stripped = raw.toLowerCase().replace(/^0x/, "");
+        if (!/^[0-9a-f]{1,64}$/.test(stripped)) return null;
+        return stripped.padStart(64, "0");
+      };
+      const configuredVault = opts.getBridgeVaultAddress();
+      const configuredAsset = opts.getBridgeAssetType();
+      if (!configuredVault || !configuredAsset) {
+        return reply.code(500).send({
+          error: "internal_error",
+          message:
+            "coordinator missing BRIDGE_VAULT_ADDRESS or BRIDGE_ASSET_TYPE config — refusing to fan out threshold-decrypt",
+        });
+      }
+      const cfgVaultNorm = normalizeAptosAddr(configuredVault);
+      const reqVaultNorm = normalizeAptosAddr(parsed.vaultAddress);
+      if (!cfgVaultNorm || !reqVaultNorm || cfgVaultNorm !== reqVaultNorm) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "vaultAddress does not match the configured bridge vault",
+        });
+      }
+      // Asset types are not always 32-byte addresses (e.g. Move struct tags
+      // like `0x1::aptos_coin::AptosCoin`). Try address-normalization first;
+      // if either side fails to parse as an address, fall back to a strict
+      // case-insensitive string equality (still leading-0x stripped).
+      const stripPrefix = (s: string): string => s.toLowerCase().replace(/^0x/, "");
+      const cfgAssetNorm = normalizeAptosAddr(configuredAsset);
+      const reqAssetNorm = normalizeAptosAddr(parsed.assetType);
+      const assetMatches =
+        cfgAssetNorm && reqAssetNorm
+          ? cfgAssetNorm === reqAssetNorm
+          : stripPrefix(configuredAsset) === stripPrefix(parsed.assetType);
+      if (!assetMatches) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "assetType does not match the configured bridge asset",
+        });
+      }
+
+      // 3b. Roster + slot selection — coordinator-configured only.
       // M10-l (codex P1): the request body MUST NOT supply caDkgV2Roster (the
       // parseRequest step above already rejected it). Trust comes from the
       // coordinator's configured roster (`getDefaultRoster`), whose hash is

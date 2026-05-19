@@ -814,6 +814,12 @@ async function writeHappyFixture(stateRoot, env, treeSnapshot, opts = {}) {
       withdrawV2CallArgsFields: {
         caPayloadHash: "0x" + "3".repeat(64),
         root: usedRootHex,
+        // M10-l iter-6 P1-14: finalize must carry the chain-binding security
+        // fields (nullifierHash + recipientHash) so the chain re-query event
+        // verification can byte-compare against them. mockChainReQueryOk
+        // uses the same fixture values below.
+        nullifierHash: "0x" + "9".repeat(64),
+        recipientHash: "0x" + "f".repeat(64),
         selectedSlots,
       },
     }),
@@ -909,16 +915,24 @@ function happySnapshotArg(env) {
 // WithdrawEventV2 event in the re-query response (M10-l iter-4 P1-10).
 let lastFixtureUsedRoot = null;
 
-function mockChainReQueryOk({ withdrawEventRoot, eventType } = {}) {
+function mockChainReQueryOk({ withdrawEventRoot, eventType, eventData } = {}) {
   const root = withdrawEventRoot ?? lastFixtureUsedRoot;
   // The fullEnvFixture's BRIDGE_PACKAGE_ADDRESS is 0x77…77 (64 hex chars).
   // Match that by default so the iter-5 P1-11 package-prefix check passes.
   const defaultEventType = `0x${"7".repeat(64)}::eunoma_bridge::WithdrawEventV2`;
+  // M10-l iter-6 P1-14: include nullifier_hash + recipient_hash matching
+  // the finalize fixture defaults so the new full-binding check passes on
+  // the happy-path tests. Negative-case tests can override via `eventData`.
+  const defaultEventData = {
+    root,
+    nullifier_hash: "0x" + "9".repeat(64),
+    recipient_hash: "0x" + "f".repeat(64),
+  };
   const events = root
     ? [
         {
           type: eventType ?? defaultEventType,
-          data: { root },
+          data: eventData ?? defaultEventData,
         },
       ]
     : [];

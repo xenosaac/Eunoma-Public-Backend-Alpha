@@ -1530,29 +1530,48 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
             `Refusing to bind chainConfirmedWithdraw to this tx.`,
         });
       } else {
-        const expectedRoot = normHex(finalize.withdrawV2CallArgsFields.root);
-        const eventRoot = normHex(withdrawEvent.data?.root);
-        if (expectedRoot && expectedRoot !== eventRoot) {
+        // M10-l (codex iter-6 P1-14): require ALL three security fields
+        // (root, nullifierHash, recipientHash) to be PRESENT in the finalize
+        // artifact AND match the on-chain event. The iter-5 check skipped any
+        // field whose finalize value was missing — a tampered/stale artifact
+        // could include only `root` and bypass nullifier+recipient binding,
+        // letting any bridge tx with the same root pass.
+        const isHex64 = (h) => typeof h === "string" && /^[0-9a-fA-F]{64}$/.test(h.replace(/^0x/, ""));
+        const expectedRoot = finalize.withdrawV2CallArgsFields.root;
+        const expectedNullifier = finalize.withdrawV2CallArgsFields.nullifierHash;
+        const expectedRecipientHash = finalize.withdrawV2CallArgsFields.recipientHash;
+        if (!isHex64(expectedRoot) || !isHex64(expectedNullifier) || !isHex64(expectedRecipientHash)) {
           missingArtifacts.push({
-            path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
-            reason: `WithdrawEventV2.root mismatch: chain=${eventRoot} != finalize.callArgs.root=${expectedRoot}`,
+            path: finalizePath,
+            reason:
+              `Finalize artifact withdrawV2CallArgsFields is missing one or more required ` +
+              `chain-binding fields (root/nullifierHash/recipientHash must each be 64-hex). ` +
+              `Got root=${typeof expectedRoot} nullifierHash=${typeof expectedNullifier} ` +
+              `recipientHash=${typeof expectedRecipientHash}. Refusing to bind ` +
+              `chainConfirmedWithdraw to a partially-defined withdraw call.`,
           });
-        }
-        const expectedNullifier = normHex(finalize.withdrawV2CallArgsFields.nullifierHash);
-        const eventNullifier = normHex(withdrawEvent.data?.nullifier_hash);
-        if (expectedNullifier && expectedNullifier !== eventNullifier) {
-          missingArtifacts.push({
-            path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
-            reason: `WithdrawEventV2.nullifier_hash mismatch: chain=${eventNullifier} != finalize.callArgs.nullifierHash=${expectedNullifier}`,
-          });
-        }
-        const expectedRecipientHash = normHex(finalize.withdrawV2CallArgsFields.recipientHash);
-        const eventRecipientHash = normHex(withdrawEvent.data?.recipient_hash);
-        if (expectedRecipientHash && expectedRecipientHash !== eventRecipientHash) {
-          missingArtifacts.push({
-            path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
-            reason: `WithdrawEventV2.recipient_hash mismatch: chain=${eventRecipientHash} != finalize.callArgs.recipientHash=${expectedRecipientHash}`,
-          });
+        } else {
+          const eventRoot = normHex(withdrawEvent.data?.root);
+          const eventNullifier = normHex(withdrawEvent.data?.nullifier_hash);
+          const eventRecipientHash = normHex(withdrawEvent.data?.recipient_hash);
+          if (normHex(expectedRoot) !== eventRoot) {
+            missingArtifacts.push({
+              path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+              reason: `WithdrawEventV2.root mismatch: chain=${eventRoot} != finalize.callArgs.root=${normHex(expectedRoot)}`,
+            });
+          }
+          if (normHex(expectedNullifier) !== eventNullifier) {
+            missingArtifacts.push({
+              path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+              reason: `WithdrawEventV2.nullifier_hash mismatch: chain=${eventNullifier} != finalize.callArgs.nullifierHash=${normHex(expectedNullifier)}`,
+            });
+          }
+          if (normHex(expectedRecipientHash) !== eventRecipientHash) {
+            missingArtifacts.push({
+              path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+              reason: `WithdrawEventV2.recipient_hash mismatch: chain=${eventRecipientHash} != finalize.callArgs.recipientHash=${normHex(expectedRecipientHash)}`,
+            });
+          }
         }
       }
     }

@@ -216,7 +216,7 @@ async fn happy_path_partial_decrypt() {
         slot,
     };
 
-    let resp = handle(&slot_dir, "", req, Some(chain_d.clone()))
+    let resp = handle(&slot_dir, "", VAULT_ADDR, ASSET_TYPE, req, Some(chain_d.clone()))
         .await
         .expect("happy-path partial decrypt");
 
@@ -272,7 +272,7 @@ async fn chain_d_mismatch_rejects() {
         slot,
     };
 
-    let err = handle(&slot_dir, "", req, Some(chain_d))
+    let err = handle(&slot_dir, "", VAULT_ADDR, ASSET_TYPE, req, Some(chain_d))
         .await
         .expect_err("forged D must be rejected");
     let code = err.to_string();
@@ -313,7 +313,7 @@ async fn wrong_dkg_epoch_rejects() {
         slot,
     };
 
-    let err = handle(&slot_dir, "", req, Some(chain_d))
+    let err = handle(&slot_dir, "", VAULT_ADDR, ASSET_TYPE, req, Some(chain_d))
         .await
         .expect_err("mismatched dkgEpoch must be rejected");
     let code = err.to_string();
@@ -352,7 +352,7 @@ async fn ell_mismatch_rejects() {
         slot,
     };
 
-    let err = handle(&slot_dir, "", req, Some(chain_d))
+    let err = handle(&slot_dir, "", VAULT_ADDR, ASSET_TYPE, req, Some(chain_d))
         .await
         .expect_err("ell mismatch must be rejected");
     let code = err.to_string();
@@ -397,7 +397,7 @@ async fn signature_verifies() {
         slot,
     };
 
-    let resp = handle(&slot_dir, "", req, Some(chain_d))
+    let resp = handle(&slot_dir, "", VAULT_ADDR, ASSET_TYPE, req, Some(chain_d))
         .await
         .expect("happy-path for signature test");
 

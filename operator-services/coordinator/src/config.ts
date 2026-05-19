@@ -46,6 +46,20 @@ export interface CoordinatorConfig {
    * Sourced from `APTOS_CHAIN_CONFIRMATION_TIMEOUT_MS` (decimal string).
    */
   chainConfirmationTimeoutMs?: number;
+  /**
+   * M10-l (codex iter-6 P1-13): the bridge's vault address on Aptos (0x-prefixed
+   * hex). Sourced from `BRIDGE_VAULT_ADDRESS`. Required by `/v2/balance/decrypt`
+   * — the route rejects requests whose `vaultAddress` doesn't match this
+   * configured value, preventing a caller from asking the threshold to decrypt
+   * any non-bridge confidential balance that happens to share the same CA DKG.
+   */
+  bridgeVaultAddress?: string;
+  /**
+   * M10-l (codex iter-6 P1-13): the bridge's confidential-asset type tag
+   * (e.g. `0x1::aptos_coin::AptosCoin`). Sourced from `BRIDGE_ASSET_TYPE`.
+   * Required by `/v2/balance/decrypt` for the same chosen-balance-target reason.
+   */
+  bridgeAssetType?: string;
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): CoordinatorConfig {
@@ -91,6 +105,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Coordinator
     relayerBearerToken: env.RELAYER_BEARER_TOKEN || undefined,
     chainNodeUrl: env.APTOS_NODE_URL || undefined,
     ...(chainConfirmationTimeoutMs !== undefined ? { chainConfirmationTimeoutMs } : {}),
+    bridgeVaultAddress: env.BRIDGE_VAULT_ADDRESS || undefined,
+    bridgeAssetType: env.BRIDGE_ASSET_TYPE || undefined,
   };
 }
 

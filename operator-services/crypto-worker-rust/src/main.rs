@@ -68,16 +68,32 @@ struct AppState {
     /// closure: never read from the request body — a request-controlled URL
     /// becomes a chosen-D threshold decryption oracle.
     aptos_node_url: String,
+    /// M10-l (codex iter-6 P1-13): trusted bridge vault address. Sourced from
+    /// the worker's `BRIDGE_VAULT_ADDRESS` env at startup. The balance-decrypt
+    /// handler rejects requests whose `vaultAddress` doesn't match — even
+    /// with the chain URL fixed, a caller could otherwise target any
+    /// confidential balance under the same DKG.
+    bridge_vault_address: String,
+    /// M10-l (codex iter-6 P1-13): trusted bridge asset type tag. Sourced
+    /// from `BRIDGE_ASSET_TYPE` env. Same rationale as `bridge_vault_address`.
+    bridge_asset_type: String,
 }
 
 // M10-b: opt AppState in to the balance_decrypt handler's read-only view of
-// the per-slot state directory + trusted chain URL (M10-l).
+// the per-slot state directory + trusted chain URL (M10-l) + trusted vault/
+// asset config (M10-l iter-6).
 impl eunoma_crypto_worker::balance_decrypt::AppStateForBalanceDecrypt for AppState {
     fn state_dir(&self) -> &std::path::Path {
         &self.state_dir
     }
     fn aptos_node_url(&self) -> &str {
         &self.aptos_node_url
+    }
+    fn bridge_vault_address(&self) -> &str {
+        &self.bridge_vault_address
+    }
+    fn bridge_asset_type(&self) -> &str {
+        &self.bridge_asset_type
     }
 }
 
@@ -119,6 +135,12 @@ async fn main() {
     // on the first request if it's missing. (Other worker routes — DKG,
     // mpcca/withdraw — don't fetch from chain, so they're unaffected.)
     let aptos_node_url = std::env::var("APTOS_NODE_URL").unwrap_or_default();
+    // M10-l (codex iter-6 P1-13): the trusted (vault, asset) pair narrows the
+    // balance-decrypt surface to the bridge's own confidential balance. Same
+    // semantics as `APTOS_NODE_URL` — empty allowed at startup, fail closed
+    // at first balance-decrypt request if missing.
+    let bridge_vault_address = std::env::var("BRIDGE_VAULT_ADDRESS").unwrap_or_default();
+    let bridge_asset_type = std::env::var("BRIDGE_ASSET_TYPE").unwrap_or_default();
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .expect("valid CRYPTO_WORKER_HOST/CRYPTO_WORKER_PORT");
@@ -127,6 +149,8 @@ async fn main() {
         slot,
         state_dir,
         aptos_node_url,
+        bridge_vault_address,
+        bridge_asset_type,
     };
 
     let app = Router::new()
