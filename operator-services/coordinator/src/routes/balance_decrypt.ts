@@ -361,8 +361,8 @@ export function registerBalanceDecryptRoute(
             // M10-l (codex P1): no `aptosNodeUrl` in the worker body. The
             // worker uses its own configured APTOS_NODE_URL for the chain
             // re-fetch. Request-supplied URLs would let a caller point the
-            // worker at an attacker-controlled `/v1/view` and turn
-            // `dk_share · D` into an oracle for chosen D.
+            // worker at an attacker-hosted Aptos REST view endpoint and
+            // turn `dk_share · D` into an oracle for chosen D.
             const workerBody = {
               dkgEpoch: parsed.dkgEpoch,
               vaultAddress: parsed.vaultAddress,

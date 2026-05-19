@@ -384,7 +384,7 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
       url: "/v2/balance/decrypt",
       payload: {
         ...baseBody(),
-        aptosNodeUrl: "http://evil.example/v1/view",
+        aptosNodeUrl: "http://evil.example",
       },
     });
     expect(res.statusCode).toBe(400);
