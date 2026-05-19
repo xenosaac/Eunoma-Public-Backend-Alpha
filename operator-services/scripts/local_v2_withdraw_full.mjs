@@ -310,11 +310,25 @@ const { chunks: balanceChunks } = recoverBalanceChunks({
   lagrangeCoeffs,
   chunkBits: CHUNK_BITS,
 });
-console.error(`[m10-d] recovered balance chunks: ${balanceChunks.map((c) => c.toString()).join(",")}`);
+// M10-l (codex iter-3 P1): plaintext chunks/sums on stderr or in error
+// messages violate the "no plaintext amount in artifacts/logs" discipline.
+// CI/operator log capture treats stderr as an artifact surface. Default
+// emits only the chunk-count shape; full plaintext is gated behind
+// `EUNOMA_LOCAL_DEBUG_BALANCE=1` (interactive operator diagnostics only).
+const debugBalance = process.env.EUNOMA_LOCAL_DEBUG_BALANCE === "1";
+if (debugBalance) {
+  console.error(`[m10-d] recovered balance chunks: ${balanceChunks.map((c) => c.toString()).join(",")}`);
+} else {
+  console.error(`[m10-d] recovered balance: chunkCount=${balanceChunks.length} (plaintext gated; set EUNOMA_LOCAL_DEBUG_BALANCE=1 to log)`);
+}
 
 const transferChunksPadded = padToEll(transferAmountChunks, ell);
 const newBalanceChunks = chunkSubtract(balanceChunks, transferChunksPadded);
-console.error(`[m10-d] new_a chunks: ${newBalanceChunks.map((c) => c.toString()).join(",")}`);
+if (debugBalance) {
+  console.error(`[m10-d] new_a chunks: ${newBalanceChunks.map((c) => c.toString()).join(",")}`);
+} else {
+  console.error(`[m10-d] new_a: chunkCount=${newBalanceChunks.length} (plaintext gated)`);
+}
 
 // Sanity assertion (defense in depth — chunkSubtract already throws on underflow):
 const balanceSum = balanceChunks.reduce(
@@ -330,21 +344,26 @@ const newBalanceSum = newBalanceChunks.reduce(
   0n,
 );
 if (newBalanceSum + transferSum !== balanceSum) {
-  throw new Error(
-    `balance_witness_check_failed: ${newBalanceSum}+${transferSum}!=${balanceSum}`,
-  );
+  // M10-l (codex iter-3 P1): never embed plaintext sums in the thrown
+  // Error message — error strings get logged by process supervisors,
+  // shell wrappers, and CI capture. Reference the gating env for
+  // operator debugging.
+  const detail = debugBalance
+    ? `: ${newBalanceSum}+${transferSum}!=${balanceSum}`
+    : ` (set EUNOMA_LOCAL_DEBUG_BALANCE=1 for plaintext detail)`;
+  throw new Error(`balance_witness_check_failed${detail}`);
 }
 
 if (process.argv.includes("--check-balance-only")) {
-  // M10-l (codex iter-2 P2): plaintext `balanceChunks`/`newBalanceChunks`/
-  // chunk sums printed to stdout violate the "no plaintext amount in
-  // artifacts/logs" discipline — CI / operator log capture would persist
-  // them. Default emits only the boolean integrity verdict + a transcript
-  // hash binding the (private) chunk vectors so downstream tooling can
-  // still detect drift across runs. The plaintext detail is gated behind
-  // `EUNOMA_LOCAL_DEBUG_BALANCE=1`, intended only for an operator running
-  // the orchestrator interactively for diagnostics — never for CI.
-  const debugBalance = process.env.EUNOMA_LOCAL_DEBUG_BALANCE === "1";
+  // M10-l (codex iter-2 P2 + iter-3 P1): plaintext `balanceChunks`/
+  // `newBalanceChunks`/sums printed to stdout (here) OR stderr (above)
+  // OR thrown Error messages (above) all violate the "no plaintext
+  // amount in artifacts/logs" discipline. Default emits only the
+  // boolean integrity verdict + a transcript hash binding the (private)
+  // chunk vectors so downstream tooling can still detect drift across
+  // runs. The plaintext detail is gated behind the same
+  // `EUNOMA_LOCAL_DEBUG_BALANCE=1` env var the stderr/Error gating uses
+  // above — interactive operator diagnostics only, never for CI.
   const balanceVectorHash = createHash("sha256")
     .update(
       [
