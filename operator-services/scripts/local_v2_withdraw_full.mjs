@@ -493,6 +493,12 @@ const bPowEll = [];
   let acc = 1n;
   for (let i = 0; i < ell; i += 1) { bPowEll.push(modN(acc)); acc = modN(acc * B_BASE); }
 }
+// Position 17 dk-base: empirically verified to require .D (the H·r randomness component) at
+// chunk-balance scale where ≤1 deposit accumulated; M9 testing with .C broke 29/30 positions.
+// At multi-deposit scale, σ position 17 still fails — root cause is deeper in the SDK
+// proveTransfer fake-dk cross-term handling (see M9_FINAL_STATUS.md "M9-j Live Iteration Log"
+// + memory `eunoma-m9-sigma-position-17`). Genuine MPCCA-sigma SDK-level investigation needed
+// to resolve; outside M9 plan scope per goal.md "preserve MPCCA sigma".
 let dkBaseAt17 = oldBalanceCt.D[0].multiply(bPowEll[0]);
 for (let i = 1; i < ell; i += 1) {
   dkBaseAt17 = dkBaseAt17.add(oldBalanceCt.D[i].multiply(bPowEll[i]));
