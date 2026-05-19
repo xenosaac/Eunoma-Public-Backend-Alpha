@@ -43,6 +43,29 @@
 //! to use it directly here. The orchestrator re-derives the SAME canonical
 //! bytes and compares hashes. This is documented as the M10-b "transcript
 //! signature" deviation.
+//!
+//! ### M10-l known limitation (codex iter-2 P1, deferred)
+//!
+//! A SHA-256 of public fields is NOT a per-slot signature. Anyone with
+//! response-path access (a MITM between coordinator and worker, a compromised
+//! deop-node passthrough, or any actor that can intercept the HTTP response)
+//! can forge an arbitrary `partialHex` and recompute the matching
+//! `signature` — the coordinator's verification only detects accidental
+//! tampering, not malicious response forgery. Closing this requires either:
+//!   (a) a per-slot signing key bound to the roster's `transcriptPublicKey`
+//!       (workers don't currently carry the matching private key — adding it
+//!       is a new DKG-like state initialization, out of M10-l "no new crypto
+//!       scope" per the milestone contract); OR
+//!   (b) a verifiable partial-decryption NIZK (e.g. Chaum-Pedersen proof of
+//!       `dk_share · D = partial` for known `D`), which is new crypto scope.
+//!
+//! Threat-model impact: this is **DoS-only**, not a privacy or key-material
+//! compromise. Even with a forged partial, the threshold aggregation yields
+//! a wrong `real_dk · D`, which produces a wrong `newBalanceChunks` witness,
+//! which the chain σ-position-17 verifier rejects (`E_INVALID_TRANSFER_PROOF`).
+//! The vault's confidential balance and the workers' `dk_share` material stay
+//! protected by the existing 5-of-7 threshold + chain-D byte-equality check.
+//! Tracked for a future hardening milestone (M11+).
 
 use axum::{
     extract::State,

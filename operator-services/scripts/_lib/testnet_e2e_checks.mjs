@@ -1679,14 +1679,29 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
         "the withdraw orchestrator (local_v2_withdraw_full.mjs) writes it after the final witness build.",
     });
   } else {
-    const FORBIDDEN = /^(amount|secret|nullifier|.*blind|dk|inverse)$/i;
-    for (const k of Object.keys(withdrawTreeContext)) {
-      if (FORBIDDEN.test(k)) {
-        missingArtifacts.push({
-          path: withdrawTreeContextPath,
-          reason: `withdraw_tree_context contains forbidden private field "${k}". This file MUST contain only public chain-derivable values.`,
-        });
-        break;
+    // M10-l (codex iter-2 P1-4 fix): the producer-side regex in
+    // `local_v2_withdraw_full.mjs` rejects commitmentHex/leafIndex/merkle/Path/
+    // sender(without 's'), but the consumer here previously used a SHORTER
+    // regex that didn't reject those keys — a stale or hand-copied
+    // `withdraw_tree_context_<requestId>.json` from before M10-f could pass
+    // through unnoticed. Mirror the producer's M10-f regex AND require the
+    // post-M10-f schema bump to v2, so v1 side-cars are rejected even if
+    // their fields happen to be cleared.
+    if (withdrawTreeContext.schema !== "withdraw_tree_context_v2") {
+      missingArtifacts.push({
+        path: withdrawTreeContextPath,
+        reason: `withdraw_tree_context.schema=${JSON.stringify(withdrawTreeContext.schema)} != "withdraw_tree_context_v2" — M10-f bumped the schema to drop commitmentHex/leafIndex; reject stale v1 side-cars.`,
+      });
+    } else {
+      const FORBIDDEN = /(amount|secret|nullifier|blind|\bdk|inverse|commitmentHex|leafIndex|merkle|Path|sender(?!s))/i;
+      for (const k of Object.keys(withdrawTreeContext)) {
+        if (FORBIDDEN.test(k)) {
+          missingArtifacts.push({
+            path: withdrawTreeContextPath,
+            reason: `withdraw_tree_context contains forbidden private field "${k}". This file MUST contain only public chain-derivable values (M10-f forbidden-key contract).`,
+          });
+          break;
+        }
       }
     }
   }
@@ -1754,19 +1769,33 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     }
   }
 
+  // M10-l (codex iter-2 P1): the previous report embedded
+  //   txHashes.deposit, chainVersions.deposit, depositEventProof
+  // verbatim. All three are deposit-specific identifiers (deposit tx hash,
+  // chain version, commitment, deposit_count, deposit_nonce, amount_tag,
+  // ca_payload_hash) that link the SPECIFIC deposit to the withdraw tx in
+  // the same report file, defeating the multi-leaf-root anonymity claim
+  // (`depositWithdrawUnlinkability: "multi_leaf_root"`).
+  //
+  // The chain has all of this publicly anyway, and a report consumer that
+  // wants to verify the report's binding to a specific deposit can do so
+  // via the on-chain deposit_count enumeration. The report's audit binding
+  // for the OBSERVATION lives in `transcriptHashes.observedDeposit` (a
+  // collision-resistant hash that doesn't expose deposit identity).
+  //
+  // So: drop deposit-linking fields from the report entirely. vault-init
+  // identifiers remain (vault address is bridge-singleton, not depositor-
+  // linking).
   const report = {
     txHashes: {
       vaultInit: snapshot?.vaultInitTx?.hash ?? null,
-      deposit: snapshot?.depositTx?.hash ?? null,
       relayerSubmit: submitArtifact.txHash,
       chainConfirmedWithdraw: submitArtifact.txHash, // same value — chain-confirmed after waitForTx
     },
     chainVersions: {
       vaultInit: snapshot?.vaultInitTx?.version ?? null,
-      deposit: snapshot?.depositTx?.version ?? null,
       relayerSubmit: submitTxVersion,
     },
-    depositEventProof: snapshot?.depositEvent ?? null,
     transcriptHashes: {
       caPayload: caPayloadHash,
       caDkgV2Roster: caDkgV2RosterHash,
@@ -1920,12 +1949,16 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
   // Hard cross-check: if any required hash is null, report it as a missing artifact instead of
   // declaring V2 complete with holes. This catches the "submit succeeded but transcripts are stubs"
   // race.
+  // M10-l (codex iter-2 P1-3 fix): txHashes.deposit and depositEventProof
+  // removed from the required-field set — they linked the specific deposit
+  // to the withdraw in the same report file, defeating multi-leaf-root
+  // unlinkability. The chain has the deposit publicly; the report's binding
+  // for the OBSERVATION lives in transcriptHashes.observedDeposit (still
+  // required below), which doesn't expose deposit identity.
   const required = [
     ["txHashes.vaultInit", report.txHashes.vaultInit],
-    ["txHashes.deposit", report.txHashes.deposit],
     ["txHashes.relayerSubmit", report.txHashes.relayerSubmit],
     ["txHashes.chainConfirmedWithdraw", report.txHashes.chainConfirmedWithdraw],
-    ["depositEventProof", report.depositEventProof],
     ["transcriptHashes.caPayload", report.transcriptHashes.caPayload],
     ["transcriptHashes.caDkgV2Roster", report.transcriptHashes.caDkgV2Roster],
     ["transcriptHashes.frostDkgV2Roster", report.transcriptHashes.frostDkgV2Roster],

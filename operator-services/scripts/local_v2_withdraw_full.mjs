@@ -336,17 +336,40 @@ if (newBalanceSum + transferSum !== balanceSum) {
 }
 
 if (process.argv.includes("--check-balance-only")) {
-  console.log(
-    JSON.stringify({
-      check: "balance",
-      balanceChunks: balanceChunks.map(String),
-      newBalanceChunks: newBalanceChunks.map(String),
-      balanceChunksSum: balanceSum.toString(),
-      transferChunksSum: transferSum.toString(),
-      newBalanceChunksSum: newBalanceSum.toString(),
-      balance_witness_check: "ok",
-    }),
-  );
+  // M10-l (codex iter-2 P2): plaintext `balanceChunks`/`newBalanceChunks`/
+  // chunk sums printed to stdout violate the "no plaintext amount in
+  // artifacts/logs" discipline — CI / operator log capture would persist
+  // them. Default emits only the boolean integrity verdict + a transcript
+  // hash binding the (private) chunk vectors so downstream tooling can
+  // still detect drift across runs. The plaintext detail is gated behind
+  // `EUNOMA_LOCAL_DEBUG_BALANCE=1`, intended only for an operator running
+  // the orchestrator interactively for diagnostics — never for CI.
+  const debugBalance = process.env.EUNOMA_LOCAL_DEBUG_BALANCE === "1";
+  const balanceVectorHash = createHash("sha256")
+    .update(
+      [
+        "EUNOMA_M10L_BALANCE_CHECK_V1",
+        balanceChunks.map(String).join(","),
+        newBalanceChunks.map(String).join(","),
+        balanceSum.toString(),
+        transferSum.toString(),
+        newBalanceSum.toString(),
+      ].join(":"),
+    )
+    .digest("hex");
+  const out = {
+    check: "balance",
+    balance_witness_check: "ok",
+    balanceVectorHash,
+  };
+  if (debugBalance) {
+    out.balanceChunks = balanceChunks.map(String);
+    out.newBalanceChunks = newBalanceChunks.map(String);
+    out.balanceChunksSum = balanceSum.toString();
+    out.transferChunksSum = transferSum.toString();
+    out.newBalanceChunksSum = newBalanceSum.toString();
+  }
+  console.log(JSON.stringify(out));
   process.exit(0);
 }
 

@@ -473,12 +473,21 @@ test("--check-balance-only does not write side-car or σ-proof", async () => {
         `expected exit 0 (balance recovers cleanly); got ${result.status}, stderr=${result.stderr?.slice(0, 1000)}`,
       );
       // Stdout should be a single JSON payload with check=balance.
+      // M10-l: default redacts plaintext chunks/sums; only the integrity
+      // verdict + balanceVectorHash bind the (private) recovered vectors.
       const stdout = (result.stdout ?? "").trim();
       const parsed = JSON.parse(stdout);
       assert.equal(parsed.check, "balance");
       assert.equal(parsed.balance_witness_check, "ok");
-      assert.ok(Array.isArray(parsed.balanceChunks));
-      assert.equal(parsed.balanceChunks.length, AVAILABLE_BALANCE_CHUNK_COUNT);
+      assert.match(parsed.balanceVectorHash, /^[0-9a-f]{64}$/);
+      assert.ok(
+        !("balanceChunks" in parsed),
+        "default mode must NOT leak plaintext balanceChunks to stdout (codex iter-2 P2)",
+      );
+      assert.ok(
+        !("balanceChunksSum" in parsed),
+        "default mode must NOT leak plaintext balanceChunksSum to stdout (codex iter-2 P2)",
+      );
 
       // No new side-car was written.
       const after = snapshotArtifactDir();
