@@ -17,6 +17,8 @@ import {
   runPreflight,
   isHex64,
   isTxHash,
+  vaultStateContentSignature,
+  findSlotContentCollisions,
 } from "../_lib/testnet_e2e_checks.mjs";
 
 // ---------------------------------------------------------------------------------------------
@@ -652,5 +654,55 @@ describe("isHex64 / isTxHash", () => {
   it("isTxHash matches the 64-hex shape", () => {
     expect(isTxHash(`0x${"1".repeat(64)}`)).toBe(true);
     expect(isTxHash("0xnot-a-hash")).toBe(false);
+  });
+});
+
+// =============================================================================================
+// M9 helpers — slot truthfulness + privacy invariants
+// =============================================================================================
+
+describe("vaultStateContentSignature (M9-f)", () => {
+  it("ignores slot + player_id fields when computing signature", () => {
+    const slot0 = { slot: 0, player_id: 0, deposit_count_observed: 1, x: "y" };
+    const slot5_clone = { slot: 5, player_id: 5, deposit_count_observed: 1, x: "y" };
+    expect(vaultStateContentSignature(slot0)).toBe(vaultStateContentSignature(slot5_clone));
+  });
+  it("returns different signatures when content differs", () => {
+    const a = { slot: 0, player_id: 0, content: "A" };
+    const b = { slot: 0, player_id: 0, content: "B" };
+    expect(vaultStateContentSignature(a)).not.toBe(vaultStateContentSignature(b));
+  });
+  it("null on bad input", () => {
+    expect(vaultStateContentSignature(null)).toBe(null);
+    expect(vaultStateContentSignature("not-an-object")).toBe(null);
+  });
+});
+
+describe("findSlotContentCollisions (M9-f)", () => {
+  it("returns [] when all 7 slots have distinct content", () => {
+    const states = Array.from({ length: 7 }, (_, slot) => ({
+      slot,
+      json: { slot, player_id: slot, worker_transcript_hash: `0x${slot}`.padEnd(66, "f") },
+    }));
+    expect(findSlotContentCollisions(states)).toEqual([]);
+  });
+  it("flags slot-5 + slot-6 backfilled from slot-0", () => {
+    const base = { worker_transcript_hash: "0x" + "a".repeat(64), deposit_count_observed: 1 };
+    const states = [
+      { slot: 0, json: { slot: 0, player_id: 0, ...base } },
+      { slot: 1, json: { slot: 1, player_id: 1, worker_transcript_hash: "0x" + "1".repeat(64) } },
+      { slot: 2, json: { slot: 2, player_id: 2, worker_transcript_hash: "0x" + "2".repeat(64) } },
+      { slot: 3, json: { slot: 3, player_id: 3, worker_transcript_hash: "0x" + "3".repeat(64) } },
+      { slot: 4, json: { slot: 4, player_id: 4, worker_transcript_hash: "0x" + "4".repeat(64) } },
+      { slot: 5, json: { slot: 5, player_id: 5, ...base } }, // backfill of slot 0
+      { slot: 6, json: { slot: 6, player_id: 6, ...base } }, // backfill of slot 0
+    ];
+    const dups = findSlotContentCollisions(states);
+    // [0,5], [0,6], [5,6] all collide
+    expect(dups.length).toBe(3);
+    const flat = new Set(dups.flat());
+    expect(flat.has(0)).toBe(true);
+    expect(flat.has(5)).toBe(true);
+    expect(flat.has(6)).toBe(true);
   });
 });

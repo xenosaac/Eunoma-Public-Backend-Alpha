@@ -15,7 +15,21 @@
 // =============================================================================================
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { resolve, join } from "node:path";
+import { resolve, join, dirname } from "node:path";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+
+// M9: lazy-loaded helpers from circuits/scripts. Loaded once per process to avoid the
+// circomlibjs WASM startup cost across each call.
+let _commitmentTreeHelpers;
+async function getCommitmentTreeHelpers() {
+  if (_commitmentTreeHelpers) return _commitmentTreeHelpers;
+  const here = dirname(fileURLToPath(import.meta.url));
+  const tree = await import(`file://${resolve(here, "..", "..", "..", "circuits", "scripts", "commitment_tree_v2.mjs")}`);
+  const poseidon = await import(`file://${resolve(here, "..", "..", "..", "circuits", "scripts", "poseidon_merkle.mjs")}`);
+  _commitmentTreeHelpers = { ...tree, ...poseidon };
+  return _commitmentTreeHelpers;
+}
 
 const HEX64 = /^(0x)?[0-9a-fA-F]{64}$/;
 const TX_HASH_RE = /^(0x)?[0-9a-fA-F]{64}$/;
@@ -1275,6 +1289,38 @@ function resolveProfileAddress(profileName) {
 }
 
 // =============================================================================================
+// =============================================================================================
+// M9 — privacy invariant helpers
+// =============================================================================================
+
+/**
+ * SHA-256 of the vault_state_v2.json content WITHOUT the slot-binding fields. Two slots that
+ * share this signature are byte-identical except for `slot` + `player_id` — i.e. one is a
+ * synthetic backfill of the other. Used to enforce M9 slot-truthfulness.
+ */
+export function vaultStateContentSignature(json) {
+  if (!json || typeof json !== "object") return null;
+  const { slot: _s, player_id: _p, ...rest } = json;
+  const canonical = JSON.stringify(rest, Object.keys(rest).sort());
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * Returns the list of [slotA, slotB] index pairs whose vault_state content signatures collide.
+ * Empty array → all slots are independent. Non-empty → at least one slot is a backfill.
+ */
+export function findSlotContentCollisions(slotStates) {
+  const sigs = slotStates.map((s) => ({ slot: s.slot, sig: vaultStateContentSignature(s.json) }));
+  const dups = [];
+  for (let i = 0; i < sigs.length; i++) {
+    for (let j = i + 1; j < sigs.length; j++) {
+      if (sigs[i].sig && sigs[i].sig === sigs[j].sig) dups.push([sigs[i].slot, sigs[j].slot]);
+    }
+  }
+  return dups;
+}
+
+// =============================================================================================
 // buildFinalReport — reads all required artifacts and assembles the per-run evidence JSON.
 // Returns { ok: true, report } | { ok: false, missingArtifacts: [{path, reason}] }.
 // =============================================================================================
@@ -1437,6 +1483,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
   // here we just confirm each file's transcript hashes are non-empty.
   const workerStateTranscripts = [];
   const workerInitTranscripts = [];
+  const slotStatesForCollisionCheck = []; // M9-f: detect synthetic backfills
   if (dkgEpoch) {
     for (let slot = 0; slot < 7; slot += 1) {
       const slotFile = resolve(
@@ -1453,6 +1500,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
         });
         continue;
       }
+      slotStatesForCollisionCheck.push({ slot, json: a, path: slotFile });
       const workerHash = a.worker_transcript_hash ?? null;
       const initHash = a.init_transcript_hash ?? null;
       if (!isHex64(workerHash)) {
@@ -1470,6 +1518,63 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
         });
       } else {
         workerInitTranscripts.push({ slot, path: slotFile, initTranscriptHash: initHash });
+      }
+    }
+  }
+
+  // ---- M9-f: slot-truthfulness — reject byte-identical (excluding slot/player_id) vault_state ----
+  const slotCollisions = findSlotContentCollisions(slotStatesForCollisionCheck);
+  if (slotCollisions.length > 0) {
+    missingArtifacts.push({
+      path: "<stateRoot>/slot-*/vault_state_v2.json",
+      reason:
+        `Slot truthfulness check failed: ${slotCollisions.length} pair(s) of slots share byte-identical ` +
+        `content excluding slot/player_id fields: ${JSON.stringify(slotCollisions)}. ` +
+        "This indicates a synthetic backfill (e.g. slot-5/6 copied from slot-0). " +
+        "Re-run the observer + cluster so each of the 7 workers produces an independent vault_state.",
+    });
+  }
+
+  // ---- M9-b/e: commitment tree artifact ----
+  const commitmentTreePath = resolve(
+    serviceRoot,
+    stateRoot ?? ".agent-local/eunoma-v2",
+    "coordinator",
+    "commitment_tree_v2.json",
+  );
+  const commitmentTreeJson = readJsonIfExists(commitmentTreePath);
+  if (!commitmentTreeJson) {
+    missingArtifacts.push({
+      path: commitmentTreePath,
+      reason:
+        "M9 commitment_tree_v2.json not found — run local_build_commitment_tree.mjs first to build the multi-leaf tree.",
+    });
+  }
+
+  // ---- M9-d/e: public withdraw_tree_context side-car for this requestId ----
+  const withdrawTreeContextPath = resolve(
+    serviceRoot,
+    stateRoot ?? ".agent-local/eunoma-v2",
+    "coordinator",
+    `withdraw_tree_context_${(requestId ?? "").replace(/[^A-Za-z0-9_-]/g, "_")}.json`,
+  );
+  const withdrawTreeContext = readJsonIfExists(withdrawTreeContextPath);
+  if (!withdrawTreeContext) {
+    missingArtifacts.push({
+      path: withdrawTreeContextPath,
+      reason:
+        "M9 public withdraw_tree_context side-car for this requestId not found — " +
+        "the withdraw orchestrator (local_v2_withdraw_full.mjs) writes it after the final witness build.",
+    });
+  } else {
+    const FORBIDDEN = /^(amount|secret|nullifier|.*blind|dk|inverse)$/i;
+    for (const k of Object.keys(withdrawTreeContext)) {
+      if (FORBIDDEN.test(k)) {
+        missingArtifacts.push({
+          path: withdrawTreeContextPath,
+          reason: `withdraw_tree_context contains forbidden private field "${k}". This file MUST contain only public chain-derivable values.`,
+        });
+        break;
       }
     }
   }
@@ -1577,8 +1682,98 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       dkgEpoch: snapshot?.deoperatorConfig?.dkg_epoch ?? null,
       simulated: submitArtifact.simulated === true,
       chainSuccess: submitArtifact.chainSuccess ?? null,
+      allSlotsIndependent: slotCollisions.length === 0,
     },
   };
+
+  // ---- M9-e: privacy block ----
+  const minAnonymitySet = Number(env.EUNOMA_MIN_ANONYMITY_SET ?? "8");
+  const privacyFailures = [];
+  let singleLeafRootRejected = null;
+  let distinctDepositSenders = null;
+  let leafIndexUsed = null;
+  let treeRootHex = null;
+  let usedRootHex = null;
+  let treeTranscriptHash = null;
+  let anonymitySetSize = null;
+  if (commitmentTreeJson && withdrawTreeContext) {
+    anonymitySetSize = commitmentTreeJson.leafCount ?? 0;
+    treeRootHex = commitmentTreeJson.latestRootHex ?? null;
+    treeTranscriptHash = commitmentTreeJson.transcriptHash ?? null;
+    leafIndexUsed = withdrawTreeContext.leafIndex ?? null;
+
+    const senderSet = new Set();
+    for (const m of commitmentTreeJson.depositMeta ?? []) {
+      if (m.sender) senderSet.add(m.sender.toLowerCase());
+    }
+    distinctDepositSenders = senderSet.size;
+
+    usedRootHex =
+      finalizeArtifact?.withdrawV2CallArgsFields?.root ??
+      finalizeArtifact?.callArgs?.root ??
+      submitArtifact?.callArgs?.root ??
+      submitArtifact?.withdrawV2CallArgsFields?.root ??
+      null;
+
+    if (usedRootHex && commitmentTreeJson.leaves?.length) {
+      try {
+        const { singleLeafRoot, hexToLE32, leBytesToBig, bigToLE32, le32ToHex } = await getCommitmentTreeHelpers();
+        let collide = false;
+        for (const leafHex of commitmentTreeJson.leaves) {
+          const big = leBytesToBig(hexToLE32(leafHex));
+          const sl = await singleLeafRoot(big, commitmentTreeJson.treeDepth ?? 20);
+          const slHex = le32ToHex(bigToLE32(sl));
+          if (slHex.toLowerCase() === usedRootHex.toLowerCase()) {
+            collide = true;
+            break;
+          }
+        }
+        singleLeafRootRejected = !collide;
+      } catch (e) {
+        singleLeafRootRejected = false;
+        privacyFailures.push(`single_leaf_root_check_error:${e?.message ?? String(e)}`);
+      }
+    } else {
+      singleLeafRootRejected = false;
+      privacyFailures.push("single_leaf_root_check_missing_inputs");
+    }
+
+    if (anonymitySetSize < minAnonymitySet) privacyFailures.push("anonymity_set_too_small");
+    if (
+      !usedRootHex ||
+      !treeRootHex ||
+      usedRootHex.toLowerCase() !== treeRootHex.toLowerCase()
+    ) {
+      privacyFailures.push("root_mismatch");
+    }
+    if (singleLeafRootRejected !== true) privacyFailures.push("single_leaf_root_match");
+    if (typeof leafIndexUsed !== "number" || leafIndexUsed < 0) {
+      privacyFailures.push("leaf_index_missing");
+    }
+    if (distinctDepositSenders < 2) privacyFailures.push("distinct_depositor_senders_below_minimum");
+  }
+
+  report.privacy = {
+    amountHidden: true,
+    depositSenderPublic: true,
+    withdrawRecipientPublic: true,
+    depositWithdrawUnlinkability: "multi_leaf_root",
+    anonymitySetSize,
+    minAnonymitySet,
+    rootDepositCount: anonymitySetSize,
+    leafIndexPublic: false,
+    leafIndexUsed,
+    recipientPrivacy: false,
+    singleLeafRootRejected,
+    treeRootHex,
+    usedRootHex,
+    treeTranscriptHash,
+    distinctDepositSenders,
+    distinctDepositSendersMin: 2,
+    failures: privacyFailures,
+  };
+  report.sources.commitmentTreePath = commitmentTreeJson ? commitmentTreePath : null;
+  report.sources.withdrawTreeContextPath = withdrawTreeContext ? withdrawTreeContextPath : null;
 
   // Hard cross-check: if any required hash is null, report it as a missing artifact instead of
   // declaring V2 complete with holes. This catches the "submit succeeded but transcripts are stubs"
@@ -1625,6 +1820,28 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
         {
           path: "<stateRoot>/slot-*/vault_state_v2/*",
           reason: `Expected 7 per-slot transcript hashes, got ${report.transcriptHashes.vaultStatePerSlot.length}`,
+        },
+      ],
+    };
+  }
+
+  // ---- M9-e: privacy + slot-truthfulness gate ----
+  if (privacyFailures.length > 0) {
+    return {
+      ok: false,
+      missingArtifacts: privacyFailures.map((f) => ({
+        path: "<privacy>",
+        reason: `privacy invariant failure: ${f}`,
+      })),
+    };
+  }
+  if (!report.invariants.allSlotsIndependent) {
+    return {
+      ok: false,
+      missingArtifacts: [
+        {
+          path: "<slot-truthfulness>",
+          reason: "invariants.allSlotsIndependent is false — at least two slot vault_state files are byte-identical excluding slot/player_id fields",
         },
       ],
     };
