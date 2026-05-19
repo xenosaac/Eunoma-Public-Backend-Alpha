@@ -648,6 +648,110 @@ pub fn verify_transfer_single_party(
 }
 
 // =============================================================================
+// M10-g: per-position parity verifier (test-only API)
+//
+// `verify_transfer_single_party` above returns a single boolean — useful for
+// production but it loses the per-position resolution needed to cross-check
+// against the JS reference verifier in
+// `operator-services/scripts/sigma_reference_verifier.mjs`. The M10-g rust
+// parity test (`tests/sigma_position_17_parity.rs`) needs a 30-entry mask so
+// it can assert that the rust and JS verifiers agree on EXACTLY which σ
+// positions verify and which fail.
+//
+// This entry point is therefore a minimal `pub fn` shaped specifically for
+// that parity test — same arithmetic as `verify_transfer_single_party`, but
+// returning `Vec<bool>` with one entry per position (true = position
+// verifies, false = position fails). Marked test-only via the `for_parity_tests`
+// suffix and documented as such; not wired into any production caller.
+//
+// File:line references match the production verifier above so any future
+// change to ψ/f propagates here too.
+// =============================================================================
+
+/// Per-position verifier used exclusively by the M10-g parity integration test
+/// (`tests/sigma_position_17_parity.rs`). Returns one boolean per σ
+/// commitment position: `true` means the position's verification identity
+/// `ψ(σ)[i] == A[i] + e · f(stmt)[i]` holds, `false` means it fails.
+///
+/// This entry point exists so the rust parity test can diff per-position
+/// against the JS reference verifier (`operator-services/scripts/
+/// sigma_reference_verifier.mjs`) which returns the equivalent
+/// `failsByPosition[]` array. Not a production API: for the production
+/// boolean answer, callers MUST use `verify_transfer_single_party`.
+pub fn verify_transfer_per_position_for_parity_tests(
+    proof: &SigmaProtocolProof,
+    statement: &Statement,
+    dst: &DomainSeparator,
+    ell: usize,
+    n: usize,
+    has_effective_auditor: bool,
+    num_voluntary_auditors: usize,
+) -> WorkerResult<Vec<bool>> {
+    if has_effective_auditor || num_voluntary_auditors > 0 {
+        return Err(WorkerError::InvalidRequest(
+            "auditor branches are not supported by the single-party reference port"
+                .to_string(),
+        ));
+    }
+    if proof.commitment.is_empty() {
+        return Err(WorkerError::InvalidRequest(
+            "verify_transfer_per_position_for_parity_tests: empty commitment vector".to_string(),
+        ));
+    }
+    let k = proof.response.len() as u64;
+
+    let sigma: Vec<Scalar> = proof
+        .response
+        .iter()
+        .map(|bytes| Scalar::from_bytes_mod_order(*bytes))
+        .collect();
+
+    let bcs = bcs_fiat_shamir_inputs(
+        dst,
+        TYPE_NAME,
+        k,
+        &statement.compressed_points,
+        &statement.scalars,
+        &proof.commitment,
+    );
+    let (e, _beta) = sigma_fiat_shamir_seed(&bcs);
+
+    let psi_sigma = psi_transfer(
+        statement,
+        &sigma,
+        ell,
+        n,
+        has_effective_auditor,
+        num_voluntary_auditors,
+    )?;
+    let f_stmt = f_transfer(
+        statement,
+        ell,
+        n,
+        has_effective_auditor,
+        num_voluntary_auditors,
+    )?;
+
+    if psi_sigma.len() != proof.commitment.len() || f_stmt.len() != proof.commitment.len() {
+        return Err(WorkerError::InvalidRequest(format!(
+            "verify_transfer_per_position_for_parity_tests: shape mismatch \
+             psi_sigma.len()={} f_stmt.len()={} commitment.len()={}",
+            psi_sigma.len(),
+            f_stmt.len(),
+            proof.commitment.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(proof.commitment.len());
+    for i in 0..proof.commitment.len() {
+        let a_i = decompress(&proof.commitment[i], "commitment")?;
+        let rhs = a_i + f_stmt[i] * e;
+        out.push(psi_sigma[i] == rhs);
+    }
+    Ok(out)
+}
+
+// =============================================================================
 // Deterministic PRNG mirror (used by the byte-parity test to reconstruct alpha)
 // =============================================================================
 
