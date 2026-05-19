@@ -123,6 +123,7 @@ import {
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
+import { registerBalanceDecryptRoute } from "./routes/balance_decrypt.js";
 
 /**
  * Codex M2a P2 #3: safe-id sanitiser for caller-supplied identifiers that the coordinator
@@ -6915,6 +6916,13 @@ export function buildCoordinatorServer(
         message: err instanceof Error ? err.message : "unknown",
       });
     }
+  });
+
+  // M10-c — POST /v2/balance/decrypt. Fan-out + SHA-256 transcript verification.
+  // Uses the same `singleNodeForwarder` and `caDkgV2Roster` already wired above.
+  registerBalanceDecryptRoute(server, {
+    getDefaultRoster: () => opts.caDkgV2Roster,
+    forwarder: singleNodeForwarder,
   });
 
   return { server, store };

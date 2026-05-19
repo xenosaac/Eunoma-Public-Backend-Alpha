@@ -1,4 +1,6 @@
 export * from "./aptos_args.js";
+export * from "./balance_decrypt_payload.js";
+export * from "./forbidden_fields.js";
 export * from "./hex.js";
 export * from "./hash.js";
 export * from "./http.js";
