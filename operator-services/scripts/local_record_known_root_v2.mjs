@@ -9,12 +9,24 @@
 //   chain (Move dedups on Table::contains); we additionally short-circuit if the root is already
 //   recorded to save a tx fee.
 //
-// Inputs:
-//   --deposit-witness-path PATH      required — depositor witness JSON (carries commitmentHex)
+// Inputs (M9: prefer --commitment-tree for testnet; --deposit-witness-path is local-fixture only):
+//   --commitment-tree PATH           M9 PRIMARY — reads multi-leaf tree artifact (commitment_tree_v2.json)
+//                                    and records the latestRootHex it contains. Enforces
+//                                    leafCount >= --min-anonymity-set.
+//   --deposit-witness-path PATH      LEGACY (single-leaf, M8) — only honored under EUNOMA_LOCAL_SMOKE=1
+//                                    + --allow-local-smoke-anonymity. Computes a single-leaf root for
+//                                    one depositor commitment with all-zero siblings. Rejected on
+//                                    testnet paths.
 //   --bridge-package-address HEX     required
 //   --admin-profile NAME             default: testnet-admin
 //   --aptos-node-url URL             default: https://fullnode.testnet.aptoslabs.com/v1
 //   --depth N                        default: 20 (must match withdrawal_proof.circom TREE_DEPTH)
+//   --min-anonymity-set N            M9 anonymity gate. Defaults to env EUNOMA_MIN_ANONYMITY_SET or 8.
+//                                    With --commitment-tree, reject if leafCount < min.
+//   --allow-local-smoke-anonymity    Bypass the anonymity gate / accept single-leaf fixture path,
+//                                    only when env EUNOMA_LOCAL_SMOKE=1. Local-only.
+//   --state-dir PATH                 default: operator-services/.agent-local/eunoma-v2/coordinator
+//                                    side-car artifact written here on success.
 //   --dry-run                        compute root + exit 0 without submitting
 //   --root-override HEX              override computed root (negative tests only)
 //
@@ -26,12 +38,14 @@
 //   0    success (recorded, already_recorded, or dry_run).
 //   1    generic failure.
 //   2    usage / required-arg error.
+//   3    anonymity_set_too_small (M9 gate; leafCount < --min-anonymity-set without local smoke flag).
+//   4    legacy_single_leaf_rejected_on_testnet (M9 gate; --deposit-witness-path without local smoke).
 //  30    chain confirmation failed (tx reverted on chain).
 //  31    aptos CLI spawn or non-zero exit.
 //  32    fullnode unreachable / 5xx after retries.
 //  33    chain returned tx without RootRecordedV2 event (mismatch).
 // =============================================================================================
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -39,6 +53,8 @@ import { spawnSync } from "node:child_process";
 const EXIT_SUCCESS = 0;
 const EXIT_GENERIC_FAILURE = 1;
 const EXIT_USAGE = 2;
+const EXIT_ANONYMITY_SET_TOO_SMALL = 3;
+const EXIT_LEGACY_SINGLE_LEAF_REJECTED = 4;
 const EXIT_CHAIN_REVERTED = 30;
 const EXIT_APTOS_SPAWN = 31;
 const EXIT_FULLNODE_UNREACHABLE = 32;
@@ -50,16 +66,24 @@ const repoRoot = resolve(serviceRoot, "..");
 
 const args = process.argv.slice(2);
 let depositWitnessPath;
+let commitmentTreePath;
 let bridgePackageAddress;
 let adminProfile = "testnet-admin";
 let aptosNodeUrl = "https://fullnode.testnet.aptoslabs.com/v1";
 let depthStr = "20";
 let dryRun = false;
 let rootOverride;
+let minAnonymitySetStr =
+  process.env.EUNOMA_MIN_ANONYMITY_SET ?? "8";
+let allowLocalSmokeAnonymity = false;
+let stateDir = join(serviceRoot, ".agent-local", "eunoma-v2", "coordinator");
 
 for (let i = 0; i < args.length; ++i) {
   const a = args[i];
   switch (a) {
+    case "--commitment-tree":
+      commitmentTreePath = args[++i];
+      break;
     case "--deposit-witness-path":
       depositWitnessPath = args[++i];
       break;
@@ -75,6 +99,15 @@ for (let i = 0; i < args.length; ++i) {
     case "--depth":
       depthStr = args[++i];
       break;
+    case "--min-anonymity-set":
+      minAnonymitySetStr = args[++i];
+      break;
+    case "--allow-local-smoke-anonymity":
+      allowLocalSmokeAnonymity = true;
+      break;
+    case "--state-dir":
+      stateDir = args[++i];
+      break;
     case "--dry-run":
       dryRun = true;
       break;
@@ -84,10 +117,14 @@ for (let i = 0; i < args.length; ++i) {
     case "--help":
     case "-h":
       console.log(
-        "usage: local_record_known_root_v2 --deposit-witness-path PATH \\\n" +
+        "usage: local_record_known_root_v2 --commitment-tree PATH (M9 testnet) \\\n" +
+          "                                | --deposit-witness-path PATH (legacy local fixture)\n" +
           "                                  --bridge-package-address HEX \\\n" +
           "                                  [--admin-profile NAME=testnet-admin] \\\n" +
           "                                  [--aptos-node-url URL] [--depth N=20] \\\n" +
+          "                                  [--min-anonymity-set N=$EUNOMA_MIN_ANONYMITY_SET|8] \\\n" +
+          "                                  [--allow-local-smoke-anonymity (needs EUNOMA_LOCAL_SMOKE=1)] \\\n" +
+          "                                  [--state-dir PATH] \\\n" +
           "                                  [--dry-run] [--root-override HEX]",
       );
       process.exit(EXIT_SUCCESS);
@@ -103,8 +140,28 @@ function requireArg(name, value) {
     process.exit(EXIT_USAGE);
   }
 }
-requireArg("--deposit-witness-path", depositWitnessPath);
 requireArg("--bridge-package-address", bridgePackageAddress);
+
+const minAnonymitySet = Number.parseInt(minAnonymitySetStr, 10);
+if (!Number.isInteger(minAnonymitySet) || minAnonymitySet < 1) {
+  console.error(`--min-anonymity-set must be positive integer, got ${minAnonymitySetStr}`);
+  process.exit(EXIT_USAGE);
+}
+const localSmokeAllowed =
+  allowLocalSmokeAnonymity && process.env.EUNOMA_LOCAL_SMOKE === "1";
+
+if (!commitmentTreePath && !depositWitnessPath) {
+  console.error(
+    "supply --commitment-tree PATH (M9 testnet path) or --deposit-witness-path PATH (legacy local fixture)",
+  );
+  process.exit(EXIT_USAGE);
+}
+if (commitmentTreePath && depositWitnessPath) {
+  console.error(
+    "cannot pass both --commitment-tree and --deposit-witness-path; pick one",
+  );
+  process.exit(EXIT_USAGE);
+}
 const depth = Number.parseInt(depthStr, 10);
 if (!Number.isInteger(depth) || depth < 1 || depth > 40) {
   console.error("--depth must be an integer in [1, 40]");
@@ -115,28 +172,9 @@ if (!/^0x[0-9a-fA-F]{1,64}$/.test(bridgePackageAddress)) {
   process.exit(EXIT_USAGE);
 }
 
-// Load depositor witness.
-let witness;
-try {
-  witness = JSON.parse(readFileSync(depositWitnessPath, "utf8"));
-} catch (err) {
-  console.error(`failed to read --deposit-witness-path ${depositWitnessPath}: ${err?.message ?? err}`);
-  process.exit(EXIT_USAGE);
-}
-if (witness?.schema !== "v2_depositor_witness_v1") {
-  console.error(
-    `unexpected depositor witness schema: ${witness?.schema} (expected v2_depositor_witness_v1)`,
-  );
-  process.exit(EXIT_USAGE);
-}
-const commitmentHex = witness.commitmentHex;
-if (!/^0x[0-9a-fA-F]{64}$/.test(commitmentHex)) {
-  console.error(`commitmentHex malformed in depositor witness: ${commitmentHex}`);
-  process.exit(EXIT_USAGE);
-}
-
-// Resolve circuits-side Merkle helper.
+// Resolve circuits-side Merkle helpers.
 const merkleHelperPath = resolve(repoRoot, "circuits/scripts/poseidon_merkle.mjs");
+const treeHelperPath = resolve(repoRoot, "circuits/scripts/commitment_tree_v2.mjs");
 if (!existsSync(merkleHelperPath)) {
   console.error(`circuits/scripts/poseidon_merkle.mjs not found at ${merkleHelperPath}`);
   process.exit(EXIT_GENERIC_FAILURE);
@@ -144,26 +182,118 @@ if (!existsSync(merkleHelperPath)) {
 const { hexToLE32, leBytesToBig, le32ToHex, computeMerkleRootAndPathSingleLeaf } = await import(
   `file://${merkleHelperPath}`
 );
+let CommitmentTreeV2;
+if (existsSync(treeHelperPath)) {
+  ({ CommitmentTreeV2 } = await import(`file://${treeHelperPath}`));
+}
 
-// Compute Merkle root.
+// Compute Merkle root. Branch: M9 multi-leaf (commitmentTreePath) vs. M8 legacy single-leaf.
 let rootHex;
-let depositCommitment = commitmentHex;
+let depositCommitment = null;
+let mode;
+let leafCount = null;
+let treeTranscriptHash = null;
+let depositTxHashes = null;
+
 if (rootOverride) {
   if (!/^0x[0-9a-fA-F]{64}$/.test(rootOverride)) {
     console.error("--root-override must be 0x-prefixed 32-byte hex");
     process.exit(EXIT_USAGE);
   }
   rootHex = rootOverride;
+  mode = "root_override";
   console.error(
-    `[warn] using --root-override ${rootHex} — for negative tests only; chain will reject if unrelated to the deposit commitment ${depositCommitment}`,
+    `[warn] using --root-override ${rootHex} — for negative tests only; chain will reject if unrelated to any recorded leaf`,
+  );
+} else if (commitmentTreePath) {
+  // M9 PRIMARY — multi-leaf commitment tree path.
+  if (!CommitmentTreeV2) {
+    console.error(`commitment_tree_v2.mjs not found at ${treeHelperPath}; required for --commitment-tree`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  let snapshot;
+  try {
+    snapshot = JSON.parse(readFileSync(commitmentTreePath, "utf8"));
+  } catch (err) {
+    console.error(`failed to read --commitment-tree ${commitmentTreePath}: ${err?.message ?? err}`);
+    process.exit(EXIT_USAGE);
+  }
+  let tree;
+  try {
+    tree = await CommitmentTreeV2.deserialize(snapshot);
+  } catch (err) {
+    console.error(`commitment_tree deserialize failed: ${err?.message ?? err}`);
+    process.exit(EXIT_USAGE);
+  }
+  leafCount = tree.leaves.length;
+  if (snapshot.treeDepth !== depth) {
+    console.error(
+      `tree depth mismatch: artifact treeDepth=${snapshot.treeDepth}, --depth=${depth}`,
+    );
+    process.exit(EXIT_USAGE);
+  }
+  if (leafCount < minAnonymitySet) {
+    if (!localSmokeAllowed) {
+      console.error(
+        JSON.stringify({
+          error: "anonymity_set_too_small",
+          leafCount,
+          minAnonymitySet,
+          hint: "for local smoke set EUNOMA_LOCAL_SMOKE=1 and pass --allow-local-smoke-anonymity",
+        }),
+      );
+      process.exit(EXIT_ANONYMITY_SET_TOO_SMALL);
+    }
+    console.error(
+      `[local-smoke] leafCount=${leafCount} below minAnonymitySet=${minAnonymitySet}; allowed by EUNOMA_LOCAL_SMOKE=1`,
+    );
+  }
+  rootHex = snapshot.latestRootHex;
+  treeTranscriptHash = snapshot.transcriptHash;
+  depositTxHashes = snapshot.depositMeta.map((m) => m.depositTxHash);
+  mode = "multi_leaf";
+  console.error(
+    `M9 multi-leaf root (depth=${depth}, leafCount=${leafCount}, transcriptHash=${treeTranscriptHash}): ${rootHex}`,
   );
 } else {
+  // LEGACY single-leaf path — only allowed under EUNOMA_LOCAL_SMOKE=1 + --allow-local-smoke-anonymity.
+  if (!localSmokeAllowed) {
+    console.error(
+      JSON.stringify({
+        error: "legacy_single_leaf_rejected_on_testnet",
+        hint: "use --commitment-tree PATH; --deposit-witness-path is fixture-only and requires EUNOMA_LOCAL_SMOKE=1 + --allow-local-smoke-anonymity",
+      }),
+    );
+    process.exit(EXIT_LEGACY_SINGLE_LEAF_REJECTED);
+  }
+  let witness;
+  try {
+    witness = JSON.parse(readFileSync(depositWitnessPath, "utf8"));
+  } catch (err) {
+    console.error(`failed to read --deposit-witness-path ${depositWitnessPath}: ${err?.message ?? err}`);
+    process.exit(EXIT_USAGE);
+  }
+  if (witness?.schema !== "v2_depositor_witness_v1") {
+    console.error(
+      `unexpected depositor witness schema: ${witness?.schema} (expected v2_depositor_witness_v1)`,
+    );
+    process.exit(EXIT_USAGE);
+  }
+  const commitmentHex = witness.commitmentHex;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(commitmentHex)) {
+    console.error(`commitmentHex malformed in depositor witness: ${commitmentHex}`);
+    process.exit(EXIT_USAGE);
+  }
+  depositCommitment = commitmentHex;
   const leafLE = hexToLE32(commitmentHex);
   const leafBig = leBytesToBig(leafLE);
   const { rootLE32 } = await computeMerkleRootAndPathSingleLeaf(leafBig, depth);
   rootHex = le32ToHex(rootLE32);
+  mode = "legacy_single_leaf";
+  console.error(
+    `[local-smoke] legacy single-leaf root (depth=${depth}, leaf=0, zero-siblings): ${rootHex}`,
+  );
 }
-console.error(`computed Merkle root (depth=${depth}, leaf=0, zero-siblings): ${rootHex}`);
 
 if (dryRun) {
   process.stdout.write(
@@ -171,8 +301,12 @@ if (dryRun) {
       {
         ok: true,
         root: rootHex,
+        mode,
+        leafCount,
+        treeTranscriptHash,
         depositCommitment,
         depth,
+        minAnonymitySet,
         status: "dry_run",
       },
       null,
@@ -233,11 +367,23 @@ if (knownRootsHandle) {
       // Table item returned — root is already recorded.
       const body = await res.json();
       console.error(`root already on chain (table item = ${JSON.stringify(body)})`);
+      writeKnownRootSidecar({
+        rootHex,
+        leafCount,
+        depositTxHashes,
+        treeTranscriptHash,
+        txHash: null,
+        status: "already_recorded",
+        mode,
+      });
       process.stdout.write(
         `${JSON.stringify(
           {
             ok: true,
             root: rootHex,
+            mode,
+            leafCount,
+            treeTranscriptHash,
             depositCommitment,
             depth,
             status: "already_recorded",
@@ -392,11 +538,24 @@ if (eventRootNormalized?.toLowerCase() !== rootHexNormalized) {
   process.exit(EXIT_EVENT_MISSING);
 }
 
+writeKnownRootSidecar({
+  rootHex,
+  leafCount,
+  depositTxHashes,
+  treeTranscriptHash,
+  txHash,
+  status: "recorded",
+  mode,
+});
+
 process.stdout.write(
   `${JSON.stringify(
     {
       ok: true,
       root: rootHex,
+      mode,
+      leafCount,
+      treeTranscriptHash,
       depositCommitment,
       depth,
       txHash,
@@ -410,3 +569,32 @@ process.stdout.write(
   )}\n`,
 );
 process.exit(EXIT_SUCCESS);
+
+function writeKnownRootSidecar({ rootHex, leafCount, depositTxHashes, treeTranscriptHash, txHash, status, mode }) {
+  try {
+    mkdirSync(stateDir, { recursive: true });
+  } catch {
+    // best-effort; if mkdir fails, the write will surface the real error
+  }
+  const sidecar = {
+    scheme: "known_root_v2_sidecar_v1",
+    rootHex,
+    leafCount,
+    depositTxHashes,
+    treeTranscriptHash,
+    txHash,
+    status,
+    mode,
+    recordedAtUnixMs: Date.now(),
+  };
+  const fname = `known_root_v2_${rootHex.replace(/^0x/, "").slice(0, 8)}.json`;
+  const full = join(stateDir, fname);
+  const tmp = full + ".tmp";
+  try {
+    writeFileSync(tmp, JSON.stringify(sidecar, null, 2) + "\n", { mode: 0o644 });
+    renameSync(tmp, full);
+    console.error(`wrote known-root side-car: ${full}`);
+  } catch (e) {
+    console.error(`[warn] failed to write known-root side-car at ${full}: ${e?.message ?? e}`);
+  }
+}

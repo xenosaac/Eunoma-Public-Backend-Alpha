@@ -1,0 +1,257 @@
+// Tests for scripts/local_record_known_root_v2.mjs.
+//
+// Strategy: drive the CLI as a subprocess in --dry-run mode so we never call
+// `aptos move run` or hit real network. We exercise the M9 anonymity gate + the
+// legacy single-leaf rejection paths via stdout/exitCode.
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { CommitmentTreeV2 } from "../../../circuits/scripts/commitment_tree_v2.mjs";
+import {
+  bigToLE32,
+  le32ToHex,
+} from "../../../circuits/scripts/poseidon_merkle.mjs";
+
+const SCRIPT_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "local_record_known_root_v2.mjs",
+);
+const BRIDGE = "0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1";
+
+const FR_MOD =
+  21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+function frFromSeed(seed) {
+  let v = 0n;
+  for (let i = 0; i < seed.length; i++) {
+    v = (v * 1099511628211n + BigInt(seed.charCodeAt(i) + i)) & ((1n << 254n) - 1n);
+  }
+  return v % FR_MOD;
+}
+
+async function makeTreeFixture(stateDir, leafCount) {
+  const t = new CommitmentTreeV2(20);
+  for (let i = 1; i <= leafCount; i++) {
+    const big = frFromSeed("rec-fix-" + i);
+    const commitmentHex = le32ToHex(bigToLE32(big));
+    t.append(big, {
+      depositCount: i,
+      depositTxHash: "0x" + i.toString(16).padStart(64, "0"),
+      txVersion: String(2000 + i),
+      sequenceNumber: String(i),
+      sender: "0x" + i.toString(16).padStart(64, "f"),
+      commitmentHex,
+    });
+  }
+  const snapshot = await t.serialize();
+  const p = join(stateDir, "commitment_tree_v2.json");
+  writeFileSync(p, JSON.stringify(snapshot, null, 2));
+  return { path: p, snapshot };
+}
+
+function makeLegacyWitness(witnessPath, commitmentHex) {
+  writeFileSync(
+    witnessPath,
+    JSON.stringify(
+      {
+        schema: "v2_depositor_witness_v1",
+        commitmentHex,
+        depositTxHash: "0x" + "1".repeat(64),
+        depositCount: "1",
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function runCli(args, env = {}) {
+  return spawnSync("node", [SCRIPT_PATH, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+}
+
+function parseStdoutJson(stdout) {
+  // Last JSON-shaped block at end of stdout.
+  const m = stdout.match(/\{[\s\S]*\}\s*$/);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[0]);
+  } catch {
+    return null;
+  }
+}
+
+let tmpRoot;
+let stateDir;
+let witnessPath;
+beforeEach(() => {
+  tmpRoot = mkdtempSync(join(tmpdir(), "m9c-record-"));
+  stateDir = join(tmpRoot, "coordinator");
+  mkdirSync(stateDir, { recursive: true });
+  witnessPath = join(tmpRoot, "withdraw_witness.json");
+});
+afterEach(() => {
+  if (tmpRoot) rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+describe("local_record_known_root_v2 — usage gates", () => {
+  it("missing source: --commitment-tree and --deposit-witness-path both absent → exit 2", () => {
+    const r = runCli(["--bridge-package-address", BRIDGE, "--dry-run"]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/supply --commitment-tree/);
+  });
+
+  it("both --commitment-tree and --deposit-witness-path supplied → exit 2", async () => {
+    const { path } = await makeTreeFixture(stateDir, 8);
+    makeLegacyWitness(witnessPath, "0x" + "a".repeat(64));
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--commitment-tree", path,
+      "--deposit-witness-path", witnessPath,
+      "--dry-run",
+    ]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/cannot pass both/);
+  });
+
+  it("missing --bridge-package-address → exit 2", () => {
+    const r = runCli(["--dry-run", "--commitment-tree", "/nope"]);
+    expect(r.status).toBe(2);
+  });
+
+  it("invalid --min-anonymity-set → exit 2", () => {
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--commitment-tree", "/nope",
+      "--min-anonymity-set", "not-a-number",
+      "--dry-run",
+    ]);
+    expect(r.status).toBe(2);
+  });
+});
+
+describe("local_record_known_root_v2 — M9 multi-leaf anonymity gate", () => {
+  it("leafCount=8 ≥ default min 8 → dry-run succeeds with mode=multi_leaf", async () => {
+    const { path, snapshot } = await makeTreeFixture(stateDir, 8);
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--commitment-tree", path,
+      "--dry-run",
+    ]);
+    expect(r.status).toBe(0);
+    const body = parseStdoutJson(r.stdout);
+    expect(body).toMatchObject({
+      ok: true,
+      mode: "multi_leaf",
+      leafCount: 8,
+      minAnonymitySet: 8,
+      status: "dry_run",
+    });
+    expect(body.root.toLowerCase()).toBe(snapshot.latestRootHex.toLowerCase());
+    expect(body.treeTranscriptHash).toBe(snapshot.transcriptHash);
+  });
+
+  it("leafCount=4 < default min 8 → exit 3 anonymity_set_too_small", async () => {
+    const { path } = await makeTreeFixture(stateDir, 4);
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--commitment-tree", path,
+      "--dry-run",
+    ]);
+    expect(r.status).toBe(3);
+    expect(r.stderr).toMatch(/anonymity_set_too_small/);
+  });
+
+  it("leafCount=4 < min 8 + EUNOMA_LOCAL_SMOKE=1 + --allow-local-smoke-anonymity → dry-run succeeds", async () => {
+    const { path } = await makeTreeFixture(stateDir, 4);
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--commitment-tree", path,
+      "--allow-local-smoke-anonymity",
+      "--dry-run",
+    ], { EUNOMA_LOCAL_SMOKE: "1" });
+    expect(r.status).toBe(0);
+    const body = parseStdoutJson(r.stdout);
+    expect(body.mode).toBe("multi_leaf");
+    expect(body.leafCount).toBe(4);
+  });
+
+  it("leafCount=4 < min 8 + --allow-local-smoke-anonymity but EUNOMA_LOCAL_SMOKE unset → exit 3", async () => {
+    const { path } = await makeTreeFixture(stateDir, 4);
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--commitment-tree", path,
+      "--allow-local-smoke-anonymity",
+      "--dry-run",
+    ], { EUNOMA_LOCAL_SMOKE: "" });
+    expect(r.status).toBe(3);
+  });
+
+  it("EUNOMA_MIN_ANONYMITY_SET env override is honored", async () => {
+    const { path } = await makeTreeFixture(stateDir, 5);
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--commitment-tree", path,
+      "--dry-run",
+    ], { EUNOMA_MIN_ANONYMITY_SET: "4" });
+    expect(r.status).toBe(0);
+    const body = parseStdoutJson(r.stdout);
+    expect(body.minAnonymitySet).toBe(4);
+  });
+
+  it("--commitment-tree pointing at tampered artifact → exit 2", async () => {
+    const { path, snapshot } = await makeTreeFixture(stateDir, 8);
+    const tampered = JSON.parse(JSON.stringify(snapshot));
+    tampered.depositMeta[3].sender = "0x" + "9".repeat(64);
+    writeFileSync(path, JSON.stringify(tampered, null, 2));
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--commitment-tree", path,
+      "--dry-run",
+    ]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/transcript_hash_mismatch|deserialize/);
+  });
+});
+
+describe("local_record_known_root_v2 — legacy single-leaf rejection", () => {
+  it("--deposit-witness-path without local smoke → exit 4 legacy_single_leaf_rejected_on_testnet", () => {
+    const commitmentHex = "0x" + "a".repeat(64);
+    makeLegacyWitness(witnessPath, commitmentHex);
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--deposit-witness-path", witnessPath,
+      "--dry-run",
+    ]);
+    expect(r.status).toBe(4);
+    expect(r.stderr).toMatch(/legacy_single_leaf_rejected_on_testnet/);
+  });
+
+  it("--deposit-witness-path + EUNOMA_LOCAL_SMOKE=1 + --allow-local-smoke-anonymity → dry-run succeeds, mode=legacy_single_leaf", () => {
+    // Fr-safe commitment (we used frFromSeed above; here we just use one matching the depositor witness)
+    const big = frFromSeed("legacy-leaf");
+    const commitmentHex = le32ToHex(bigToLE32(big));
+    makeLegacyWitness(witnessPath, commitmentHex);
+    const r = runCli([
+      "--bridge-package-address", BRIDGE,
+      "--deposit-witness-path", witnessPath,
+      "--allow-local-smoke-anonymity",
+      "--dry-run",
+    ], { EUNOMA_LOCAL_SMOKE: "1" });
+    expect(r.status).toBe(0);
+    const body = parseStdoutJson(r.stdout);
+    expect(body.mode).toBe("legacy_single_leaf");
+    expect(body.depositCommitment).toBe(commitmentHex);
+  });
+});
