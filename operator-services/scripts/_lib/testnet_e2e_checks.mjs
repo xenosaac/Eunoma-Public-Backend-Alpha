@@ -1834,11 +1834,16 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       try {
         const { singleLeafRoot, hexToLE32, leBytesToBig, bigToLE32, le32ToHex } = await getCommitmentTreeHelpers();
         let collide = false;
+        // M10-k: normalize both sides (strip optional 0x prefix). le32ToHex returns 0x-prefixed
+        // hex; finalize artifact persists root without 0x prefix. Without normalization the
+        // collision detector silently never triggers regardless of true equality.
+        const usedRootNorm = String(usedRootHex).toLowerCase().replace(/^0x/, "");
         for (const leafHex of commitmentTreeJson.leaves) {
           const big = leBytesToBig(hexToLE32(leafHex));
           const sl = await singleLeafRoot(big, commitmentTreeJson.treeDepth ?? 20);
           const slHex = le32ToHex(bigToLE32(sl));
-          if (slHex.toLowerCase() === usedRootHex.toLowerCase()) {
+          const slNorm = String(slHex).toLowerCase().replace(/^0x/, "");
+          if (slNorm === usedRootNorm) {
             collide = true;
             break;
           }
@@ -1854,10 +1859,16 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     }
 
     if (anonymitySetSize < minAnonymitySet) privacyFailures.push("anonymity_set_too_small");
+    // M10-k: normalize both roots (strip optional 0x prefix) before byte-comparing. The
+    // finalize artifact persists root without 0x prefix; commitment_tree_v2.json persists
+    // latestRootHex with 0x prefix. Without normalization a byte-equal root_hex pair fails
+    // the equality check on prefix asymmetry alone.
+    const usedRootNorm = String(usedRootHex ?? "").toLowerCase().replace(/^0x/, "");
+    const treeRootNorm = String(treeRootHex ?? "").toLowerCase().replace(/^0x/, "");
     if (
       !usedRootHex ||
       !treeRootHex ||
-      usedRootHex.toLowerCase() !== treeRootHex.toLowerCase()
+      usedRootNorm !== treeRootNorm
     ) {
       privacyFailures.push("root_mismatch");
     }
