@@ -39,11 +39,6 @@ export interface BalanceDecryptRequest {
   oldBalanceDHex: string[];
   /** Caller-supplied correlation id. Bound into every worker's transcript. */
   requestId: string;
-  /**
-   * Aptos REST node URL for the workers' defense-in-depth re-fetch. Must
-   * not be empty (workers reject empty strings).
-   */
-  aptosNodeUrl: string;
 }
 
 /**

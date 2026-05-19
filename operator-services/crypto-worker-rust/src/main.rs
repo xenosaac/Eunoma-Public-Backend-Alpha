@@ -63,13 +63,21 @@ use std::{net::SocketAddr, path::PathBuf};
 struct AppState {
     slot: usize,
     state_dir: PathBuf,
+    /// Trusted Aptos REST node URL for the M10-b chain re-fetch. Sourced from
+    /// the worker's `APTOS_NODE_URL` env var at startup. M10-l (codex P1)
+    /// closure: never read from the request body — a request-controlled URL
+    /// becomes a chosen-D threshold decryption oracle.
+    aptos_node_url: String,
 }
 
 // M10-b: opt AppState in to the balance_decrypt handler's read-only view of
-// the per-slot state directory.
+// the per-slot state directory + trusted chain URL (M10-l).
 impl eunoma_crypto_worker::balance_decrypt::AppStateForBalanceDecrypt for AppState {
     fn state_dir(&self) -> &std::path::Path {
         &self.state_dir
+    }
+    fn aptos_node_url(&self) -> &str {
+        &self.aptos_node_url
     }
 }
 
@@ -105,11 +113,21 @@ async fn main() {
     let state_dir = std::env::var("CRYPTO_WORKER_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_state_dir(slot).expect("valid CRYPTO_WORKER_SLOT"));
+    // M10-l (codex P1 closure): worker reads the chain URL from its own env,
+    // not from the request body. Empty string is allowed at startup — the
+    // balance_decrypt handler fails closed with `worker_missing_aptos_node_url_config`
+    // on the first request if it's missing. (Other worker routes — DKG,
+    // mpcca/withdraw — don't fetch from chain, so they're unaffected.)
+    let aptos_node_url = std::env::var("APTOS_NODE_URL").unwrap_or_default();
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .expect("valid CRYPTO_WORKER_HOST/CRYPTO_WORKER_PORT");
     assert_loopback(&addr);
-    let app_state = AppState { slot, state_dir };
+    let app_state = AppState {
+        slot,
+        state_dir,
+        aptos_node_url,
+    };
 
     let app = Router::new()
         .route("/worker/v2/health", get(health))

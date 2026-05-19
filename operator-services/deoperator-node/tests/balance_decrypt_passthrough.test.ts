@@ -103,7 +103,8 @@ function worker(slot: number): CryptoWorker {
 }
 
 /** Canonical wire body the coordinator's `/v2/balance/decrypt` route emits per
- * selected slot — mirrors `balance_decrypt.ts` `workerBody`. */
+ * selected slot — mirrors `balance_decrypt.ts` `workerBody`. M10-l: no
+ * `aptosNodeUrl` (worker reads it from its own env, never the body). */
 function decryptPartialBody(slot: number, overrides: Record<string, unknown> = {}) {
   return {
     dkgEpoch: "1",
@@ -112,7 +113,6 @@ function decryptPartialBody(slot: number, overrides: Record<string, unknown> = {
     oldBalanceDHex: [h32("1"), h32("2"), h32("3"), h32("4")],
     requestId: "m10-e-fix-test",
     slot,
-    aptosNodeUrl: "https://fullnode.testnet.aptoslabs.com",
     ...overrides,
   };
 }

@@ -644,13 +644,15 @@ export function buildDeoperatorNodeServer(
   // chain coordinator → deop-node → crypto-worker breaks at the deop-node hop.
   //
   // The wire body is `{ dkgEpoch, vaultAddress, assetType, oldBalanceDHex,
-  // requestId, slot, aptosNodeUrl }` — no `rosterHash` (the coordinator selects
-  // slots from its configured CA DKG V2 roster) and `slot` instead of
-  // `selfSlot`. The deop-node's responsibility here is bearer-auth (applied at
-  // the global onRequest hook), forbidden-field guard, slot binding, then a
-  // stateless forward to the local crypto-worker. The worker's own handler
-  // performs the defense-in-depth chain re-fetch of `oldBalanceD` and signs a
-  // SHA-256 transcript that the coordinator re-derives + verifies.
+  // requestId, slot }` — no `rosterHash` (the coordinator selects slots from
+  // its configured CA DKG V2 roster), no `aptosNodeUrl` (M10-l codex P1 — the
+  // worker reads the chain URL from its own APTOS_NODE_URL env to prevent a
+  // chosen-D threshold decryption oracle), and `slot` instead of `selfSlot`.
+  // The deop-node's responsibility here is bearer-auth (applied at the global
+  // onRequest hook), forbidden-field guard, slot binding, then a stateless
+  // forward to the local crypto-worker. The worker's own handler performs the
+  // defense-in-depth chain re-fetch of `oldBalanceD` and signs a SHA-256
+  // transcript that the coordinator re-derives + verifies.
   //
   // Stateless + idempotent: no `store.*` mutation, no cursor advance, no
   // artifact write. Mirrors the FROST signing passthrough posture (forbidden

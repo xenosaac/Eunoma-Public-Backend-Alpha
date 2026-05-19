@@ -16,6 +16,14 @@
 //! `D` points could probe the worker's `dk_share` by observing the output
 //! pattern across many requests.
 //!
+//! M10-l (codex P1): the chain re-fetch URL is sourced from the worker's
+//! own `APTOS_NODE_URL` env var via `AppState.aptos_node_url()` — never the
+//! request body. A request-controlled URL turns the worker into an oracle:
+//! attacker hosts `/v1/view` that returns chosen `D'` matching the request's
+//! `oldBalanceDHex`, byte-equality check passes, worker returns
+//! `dk_share · D'`. Threshold-aggregate 5 such partials and you recover
+//! `real_dk · D'` for attacker-chosen D' — full vault decryption.
+//!
 //! ## Zeroize discipline
 //!
 //! `dk_share` is decoded from the share file and held in a single `Scalar` on
@@ -83,11 +91,6 @@ pub struct BalanceDecryptPartialRequest {
     /// Slot the requester believes this worker holds. Must equal the share
     /// file's slot.
     pub slot: usize,
-    /// Aptos REST node URL (e.g. `https://fullnode.testnet.aptoslabs.com`).
-    /// Passed by the coordinator so the worker isn't forced to encode an
-    /// environment-specific default. The worker only uses this for the
-    /// defense-in-depth re-fetch — never to learn new state.
-    pub aptos_node_url: String,
 }
 
 /// Successful response body.
@@ -294,6 +297,7 @@ fn compressed_hex(point: &RistrettoPoint) -> String {
 /// authoritative chain D. Production callers always pass `None`.
 pub async fn handle(
     state_dir: &Path,
+    trusted_aptos_node_url: &str,
     req: BalanceDecryptPartialRequest,
     chain_d_override: Option<Vec<RistrettoPoint>>,
 ) -> Result<BalanceDecryptPartialResponse, BalanceDecryptError> {
@@ -318,9 +322,16 @@ pub async fn handle(
             "requestId is empty".to_string(),
         ));
     }
-    if req.aptos_node_url.is_empty() && chain_d_override.is_none() {
-        return Err(BalanceDecryptError::BadRequest(
-            "aptosNodeUrl is empty".to_string(),
+    // M10-l (codex P1): the chain URL is config-trusted (from AppState ←
+    // APTOS_NODE_URL env at worker startup). A request-controlled URL
+    // becomes a chosen-D oracle for `dk_share · D'` (attacker points the
+    // worker at `/v1/view` they control, returning D' that matches the
+    // request's `oldBalanceDHex`; worker then signs `dk_share · D'`).
+    // Threshold-aggregate 5 such partials and you recover `real_dk · D'`
+    // for attacker-chosen D' — full vault decryption.
+    if trusted_aptos_node_url.is_empty() && chain_d_override.is_none() {
+        return Err(BalanceDecryptError::Internal(
+            "worker_missing_aptos_node_url_config".to_string(),
         ));
     }
     if req.old_balance_d_hex.is_empty() {
@@ -360,14 +371,15 @@ pub async fn handle(
     //    subsequent return path until step 7.
     let mut dk_share = scalar_from_share_hex(&share.dk_share)?;
 
-    // 5. Re-fetch oldBalanceD from chain (or use injected vector for tests).
+    // 5. Re-fetch oldBalanceD from chain using the worker's TRUSTED URL
+    //    (M10-l codex P1: never the request-supplied URL — see top of handler).
     //    Failure → zeroize dk_share, surface ChainFetch error.
     let chain_d = match chain_d_override {
         Some(v) => v,
         None => match fetch_old_balance_d_from_chain(
             &req.vault_address,
             &req.asset_type,
-            &req.aptos_node_url,
+            trusted_aptos_node_url,
         )
         .await
         {
@@ -467,7 +479,8 @@ pub async fn handle_http<S: AppStateForBalanceDecrypt + Send + Sync>(
     Json(req): Json<BalanceDecryptPartialRequest>,
 ) -> impl IntoResponse {
     let state_dir = state.state_dir().to_path_buf();
-    match handle(&state_dir, req, None).await {
+    let trusted_url = state.aptos_node_url().to_string();
+    match handle(&state_dir, &trusted_url, req, None).await {
         Ok(resp) => (StatusCode::OK, Json(json!(resp))).into_response(),
         Err(err) => {
             let status = err.http_status();
@@ -480,10 +493,16 @@ pub async fn handle_http<S: AppStateForBalanceDecrypt + Send + Sync>(
     }
 }
 
-/// Read-only view of the worker's per-slot state directory. Implemented by
-/// `main.rs`'s `AppState`.
+/// Read-only view of the worker's per-slot state directory and the trusted
+/// chain URL. Implemented by `main.rs`'s `AppState`.
+///
+/// `aptos_node_url` is sourced from the worker's `APTOS_NODE_URL` env var
+/// at startup (see `main.rs`). The balance-decrypt handler uses this for
+/// the defense-in-depth chain re-fetch — the value in the request body is
+/// rejected at the coordinator (M10-l codex P1).
 pub trait AppStateForBalanceDecrypt: Clone + 'static {
     fn state_dir(&self) -> &Path;
+    fn aptos_node_url(&self) -> &str;
 }
 
 #[cfg(test)]

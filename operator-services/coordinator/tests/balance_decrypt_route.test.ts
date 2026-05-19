@@ -91,7 +91,6 @@ interface BodyShape {
   assetType: string;
   oldBalanceDHex: string[];
   requestId: string;
-  aptosNodeUrl: string;
 }
 
 const baseBody = (overrides: Partial<BodyShape> = {}): BodyShape => ({
@@ -102,7 +101,6 @@ const baseBody = (overrides: Partial<BodyShape> = {}): BodyShape => ({
     ((k * 11 + 1) & 0xff).toString(16).padStart(2, "0").repeat(32),
   ),
   requestId: "m10c-test",
-  aptosNodeUrl: "https://fullnode.testnet.aptoslabs.example",
   ...overrides,
 });
 
@@ -362,5 +360,76 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
 
     // The roster's hash is still computable (just smoke-check it didn't drift).
     expect(caDkgV2RosterHash(caDkgV2Roster)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  // M10-l (codex P1): body MUST NOT supply `aptosNodeUrl` or `caDkgV2Roster`.
+  // Both come from coordinator config only. Request-controlled URL = chosen-D
+  // threshold decryption oracle. Request-controlled roster = SSRF + breaks
+  // 5-of-7 quorum invariant.
+
+  it("M10-l: rejects body with aptosNodeUrl (chosen-D oracle defense)", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      // Forwarder MUST NOT be reached — parseRequest fails before fan-out.
+      singleNodeForwarder: async () => ({
+        slot: -1,
+        ok: false,
+        statusCode: 500,
+        error: "should_not_be_called",
+      }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/balance/decrypt",
+      payload: {
+        ...baseBody(),
+        aptosNodeUrl: "http://evil.example/v1/view",
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.error).toBe("invalid_request");
+    expect(body.message).toContain("aptosNodeUrl_not_allowed_in_body");
+  });
+
+  it("M10-l: rejects body with caDkgV2Roster (SSRF + 5-of-7 invariant defense)", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      singleNodeForwarder: async () => ({
+        slot: -1,
+        ok: false,
+        statusCode: 500,
+        error: "should_not_be_called",
+      }),
+    });
+    // Attacker-supplied roster — would have re-routed fan-out to attacker
+    // endpoints if accepted.
+    const attackerRoster = {
+      operatorSetVersion: "1",
+      dkgEpoch: "1",
+      caDkgScheme: "ca_dkg_v2",
+      threshold: 5,
+      nodes: Array.from({ length: 7 }, (_, slot) => ({
+        slot,
+        nodeId: `evil-${slot}`,
+        endpoint: `http://attacker.example/node-${slot}`,
+        hpkePublicKey: h32(String(slot + 1)),
+        transcriptPublicKey: h32("d"),
+      })),
+    };
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/balance/decrypt",
+      payload: {
+        ...baseBody(),
+        caDkgV2Roster: attackerRoster,
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.error).toBe("invalid_request");
+    expect(body.message).toContain("caDkgV2Roster_not_allowed_in_body");
   });
 });

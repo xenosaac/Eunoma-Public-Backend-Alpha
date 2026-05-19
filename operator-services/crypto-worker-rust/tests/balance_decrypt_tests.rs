@@ -214,12 +214,9 @@ async fn happy_path_partial_decrypt() {
         old_balance_d_hex: old_balance_d_hex.clone(),
         request_id: "happy-req-1".to_string(),
         slot,
-        // Ignored when chain_d_override is Some, but must be non-empty per
-        // request validation.
-        aptos_node_url: "http://unused".to_string(),
     };
 
-    let resp = handle(&slot_dir, req, Some(chain_d.clone()))
+    let resp = handle(&slot_dir, "", req, Some(chain_d.clone()))
         .await
         .expect("happy-path partial decrypt");
 
@@ -273,10 +270,9 @@ async fn chain_d_mismatch_rejects() {
         old_balance_d_hex: forged_hex,
         request_id: "mismatch-req".to_string(),
         slot,
-        aptos_node_url: "http://unused".to_string(),
     };
 
-    let err = handle(&slot_dir, req, Some(chain_d))
+    let err = handle(&slot_dir, "", req, Some(chain_d))
         .await
         .expect_err("forged D must be rejected");
     let code = err.to_string();
@@ -315,10 +311,9 @@ async fn wrong_dkg_epoch_rejects() {
         old_balance_d_hex,
         request_id: "wrong-epoch".to_string(),
         slot,
-        aptos_node_url: "http://unused".to_string(),
     };
 
-    let err = handle(&slot_dir, req, Some(chain_d))
+    let err = handle(&slot_dir, "", req, Some(chain_d))
         .await
         .expect_err("mismatched dkgEpoch must be rejected");
     let code = err.to_string();
@@ -355,10 +350,9 @@ async fn ell_mismatch_rejects() {
         old_balance_d_hex: short_hex,
         request_id: "ell-mismatch".to_string(),
         slot,
-        aptos_node_url: "http://unused".to_string(),
     };
 
-    let err = handle(&slot_dir, req, Some(chain_d))
+    let err = handle(&slot_dir, "", req, Some(chain_d))
         .await
         .expect_err("ell mismatch must be rejected");
     let code = err.to_string();
@@ -401,10 +395,9 @@ async fn signature_verifies() {
         old_balance_d_hex: old_balance_d_hex.clone(),
         request_id: "sig-verify-req".to_string(),
         slot,
-        aptos_node_url: "http://unused".to_string(),
     };
 
-    let resp = handle(&slot_dir, req, Some(chain_d))
+    let resp = handle(&slot_dir, "", req, Some(chain_d))
         .await
         .expect("happy-path for signature test");
 

@@ -4,13 +4,18 @@
  * Coordinator fan-out + Lagrange-coefficient helper for the balance-decryption
  * surface. Steps:
  *   1. Parse the orchestrator's request (`dkgEpoch`, `vaultAddress`, `assetType`,
- *      `oldBalanceDHex`, `requestId`, `aptosNodeUrl`).
+ *      `oldBalanceDHex`, `requestId`). The body MUST NOT carry `aptosNodeUrl`
+ *      or `caDkgV2Roster` — both come from coordinator config only (M10-l
+ *      codex P1 — a request-controlled URL becomes a chosen-D oracle for
+ *      `dk_share · D'`, and a request-controlled roster is SSRF that breaks
+ *      the 5-of-7 invariant).
  *   2. Run the forbidden-key regex guard on the inbound body BEFORE any worker
  *      dispatch — any plaintext amount/blind/secret/dk/merkle/sender key fails
  *      400 immediately.
  *   3. Select the lowest-5-of-7 quorum from the CA DKG V2 roster (same
  *      `lowestEligibleSlots` selector used by `/v2/derive/vault_ek/start`
- *      and `/v2/derive/ca_registration/start` MPCCA fan-out).
+ *      and `/v2/derive/ca_registration/start` MPCCA fan-out). Source: the
+ *      coordinator's configured roster via `opts.getDefaultRoster()`.
  *   4. Fan out in parallel to each selected worker's `/v2/balance/decrypt_partial`
  *      endpoint via the injected `SingleNodeForwarder`.
  *   5. For each worker response: re-derive the M10-b canonical bytes from the
@@ -42,11 +47,8 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createHash } from "node:crypto";
 import {
   type CaDkgV2Roster,
-  caDkgV2RosterHash,
   lagrangeCoefficientsAtZero,
   scalarHexFromBigint,
-  validateCaDkgV2Roster,
-  parseCaDkgV2Roster,
   DEOPERATOR_THRESHOLD,
 } from "@eunoma/deop-protocol";
 import {
@@ -120,13 +122,25 @@ function parseRequest(raw: unknown): BalanceDecryptRequest {
     }
     return v.toLowerCase();
   });
+  // M10-l (codex P1): the request MUST NOT carry `aptosNodeUrl` or
+  // `caDkgV2Roster`. Trust for both lives at the coordinator (chainNodeUrl +
+  // configured CA DKG V2 roster) and at the worker (its own APTOS_NODE_URL).
+  // A request-controlled URL is a threshold decryption oracle (worker would
+  // return `dk_share · D'` for attacker-chosen D'); a request-controlled
+  // roster is SSRF + breaks 5-of-7. Reject early, defense-in-depth, before
+  // any forwarder dispatch.
+  if ("aptosNodeUrl" in obj) {
+    throw new Error("invalid_request:aptosNodeUrl_not_allowed_in_body");
+  }
+  if ("caDkgV2Roster" in obj) {
+    throw new Error("invalid_request:caDkgV2Roster_not_allowed_in_body");
+  }
   return {
     dkgEpoch: requireString("dkgEpoch"),
     vaultAddress: requireString("vaultAddress"),
     assetType: requireString("assetType"),
     oldBalanceDHex,
     requestId: requireString("requestId"),
-    aptosNodeUrl: requireString("aptosNodeUrl"),
   };
 }
 
@@ -249,9 +263,11 @@ function verifyWorkerPartial(args: {
 
 export interface RegisterBalanceDecryptOptions {
   /**
-   * Optional caDkgV2Roster to use for slot selection + endpoint resolution.
-   * If absent, the route falls back to the coordinator-configured roster
-   * (passed via `getDefaultRoster`).
+   * Coordinator-configured CA DKG V2 roster (passed via `getDefaultRoster`).
+   * The route uses ONLY this roster — request bodies are rejected if they
+   * carry a `caDkgV2Roster` field (M10-l codex P1 — a request-controlled
+   * roster would allow SSRF and break the 5-of-7 invariant for partial
+   * decrypt).
    */
   getDefaultRoster: () => CaDkgV2Roster | undefined;
   /** Per-worker fan-out forwarder. */
@@ -300,22 +316,13 @@ export function registerBalanceDecryptRoute(
         });
       }
 
-      // 3. Roster + slot selection.
-      let dkgRoster: CaDkgV2Roster | undefined;
-      const rawBody = raw as Record<string, unknown>;
-      if (rawBody.caDkgV2Roster !== undefined) {
-        try {
-          dkgRoster = parseCaDkgV2Roster(rawBody.caDkgV2Roster);
-          validateCaDkgV2Roster(dkgRoster);
-        } catch (err) {
-          return reply.code(400).send({
-            error: "invalid_request",
-            message: err instanceof Error ? err.message : "bad_roster",
-          });
-        }
-      } else {
-        dkgRoster = opts.getDefaultRoster();
-      }
+      // 3. Roster + slot selection — coordinator-configured only.
+      // M10-l (codex P1): the request body MUST NOT supply caDkgV2Roster (the
+      // parseRequest step above already rejected it). Trust comes from the
+      // coordinator's configured roster (`getDefaultRoster`), whose hash is
+      // bound into every downstream call (round1/round2/finalize) at config
+      // load time.
+      const dkgRoster: CaDkgV2Roster | undefined = opts.getDefaultRoster();
       if (!dkgRoster) {
         return reply.code(400).send({
           error: "invalid_request",
@@ -328,7 +335,6 @@ export function registerBalanceDecryptRoute(
           message: `request.dkgEpoch=${parsed.dkgEpoch} roster.dkgEpoch=${dkgRoster.dkgEpoch}`,
         });
       }
-      const rosterHashHex = caDkgV2RosterHash(dkgRoster);
       if (dkgRoster.nodes.length < DEOPERATOR_THRESHOLD) {
         return reply.code(400).send({
           error: "under_quorum",
@@ -352,6 +358,11 @@ export function registerBalanceDecryptRoute(
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), workerTimeoutMs);
           try {
+            // M10-l (codex P1): no `aptosNodeUrl` in the worker body. The
+            // worker uses its own configured APTOS_NODE_URL for the chain
+            // re-fetch. Request-supplied URLs would let a caller point the
+            // worker at an attacker-controlled `/v1/view` and turn
+            // `dk_share · D` into an oracle for chosen D.
             const workerBody = {
               dkgEpoch: parsed.dkgEpoch,
               vaultAddress: parsed.vaultAddress,
@@ -359,7 +370,6 @@ export function registerBalanceDecryptRoute(
               oldBalanceDHex: parsed.oldBalanceDHex,
               requestId: parsed.requestId,
               slot,
-              aptosNodeUrl: parsed.aptosNodeUrl,
             };
             let res: ForwarderResult;
             try {
@@ -469,7 +479,6 @@ export function registerBalanceDecryptRoute(
         });
       }
 
-      void rosterHashHex; // logged-or-future-use; currently informational only
       return reply.code(200).send(resp);
     },
   );

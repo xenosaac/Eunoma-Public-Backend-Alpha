@@ -239,6 +239,11 @@ const transferAmountChunks = ChunkedAmount.createTransferAmount(TRANSFER_AMOUNT_
 // decode each chunk's plaintext integer and compute new_a = balance - transfer
 // with borrow propagation.
 console.error(`[m10-d] requesting balance partial decryption from coordinator quorum...`);
+// M10-l (codex P1): no `aptosNodeUrl` in the body. The coordinator (and
+// each worker) reads its own configured Aptos REST URL from env. A
+// request-controlled URL would let a caller point the workers at an
+// attacker-hosted `/v1/view`, returning chosen D' matching `oldBalanceDHex`,
+// turning each `dk_share_i · D'` into a chosen-D threshold decryption oracle.
 const decryptResp = await fetch(`${COORDINATOR_URL}/v2/balance/decrypt`, {
   method: "POST",
   headers: {
@@ -251,7 +256,6 @@ const decryptResp = await fetch(`${COORDINATOR_URL}/v2/balance/decrypt`, {
     assetType: addr32(assetType),
     oldBalanceDHex: oldBalanceCt.D.map((p) => bytesToHex(p.toRawBytes())),
     requestId,
-    aptosNodeUrl: APTOS_NODE_URL,
   }),
 });
 if (!decryptResp.ok) {
