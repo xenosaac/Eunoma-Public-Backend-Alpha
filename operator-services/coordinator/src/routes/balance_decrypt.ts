@@ -16,7 +16,7 @@
  *   5. For each worker response: re-derive the M10-b canonical bytes from the
  *      coordinator's known inputs + the worker's returned partials and
  *      recompute SHA-256. Reject any slot whose returned `signature` doesn't
- *      match byte-for-byte, OR whose `transcript_domain` is wrong.
+ *      match byte-for-byte, OR whose `transcriptDomain` is wrong.
  *   6. Compute Lagrange coefficients at x=0 over the selected quorum's slot
  *      ids (`lagrangeCoefficientsAtZero` from deop-protocol, encoded with
  *      `scalarHexFromBigint`).
@@ -194,14 +194,16 @@ function verifyWorkerPartial(args: {
   if (typeof b.slot !== "number" || !Number.isInteger(b.slot) || b.slot !== expectedSlot) {
     throw new Error(`worker_slot_mismatch:expected=${expectedSlot}:got=${String(b.slot)}`);
   }
-  if (!Array.isArray(b.partial_hex) || b.partial_hex.length !== expectedEll) {
+  // M10-c-fix: Rust worker emits camelCase JSON (struct has
+  // #[serde(rename_all = "camelCase")]), so reads must be camelCase.
+  if (!Array.isArray(b.partialHex) || b.partialHex.length !== expectedEll) {
     throw new Error(
       `worker_partial_hex_length_mismatch:expected=${expectedEll}:got=${
-        Array.isArray(b.partial_hex) ? b.partial_hex.length : "non_array"
+        Array.isArray(b.partialHex) ? b.partialHex.length : "non_array"
       }`,
     );
   }
-  const partialHex = (b.partial_hex as unknown[]).map((v, i) => {
+  const partialHex = (b.partialHex as unknown[]).map((v, i) => {
     if (typeof v !== "string" || !/^[0-9a-fA-F]{64}$/.test(v)) {
       throw new Error(`worker_partial_hex[${i}]_not_64_hex`);
     }
@@ -210,12 +212,12 @@ function verifyWorkerPartial(args: {
   if (typeof b.signature !== "string" || !/^[0-9a-fA-F]{64}$/.test(b.signature)) {
     throw new Error("worker_signature_not_64_hex");
   }
-  if (typeof b.transcript_domain !== "string") {
+  if (typeof b.transcriptDomain !== "string") {
     throw new Error("worker_transcript_domain_missing");
   }
-  if (b.transcript_domain !== BALANCE_DECRYPT_TRANSCRIPT_DOMAIN) {
+  if (b.transcriptDomain !== BALANCE_DECRYPT_TRANSCRIPT_DOMAIN) {
     throw new Error(
-      `worker_transcript_domain_mismatch:expected=${BALANCE_DECRYPT_TRANSCRIPT_DOMAIN}:got=${b.transcript_domain}`,
+      `worker_transcript_domain_mismatch:expected=${BALANCE_DECRYPT_TRANSCRIPT_DOMAIN}:got=${b.transcriptDomain}`,
     );
   }
   // Re-derive the canonical bytes from the coordinator's known inputs + the

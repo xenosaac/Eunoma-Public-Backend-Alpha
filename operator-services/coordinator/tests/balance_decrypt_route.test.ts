@@ -142,11 +142,14 @@ function makeForwarder(opts: {
       requestId: b.requestId as string,
       partialHex,
     });
+    // M10-c-fix: Rust worker emits camelCase JSON (#[serde(rename_all =
+    // "camelCase")]), so the test mock must produce camelCase to match the
+    // real wire format the coordinator now expects.
     const defaultResponse = {
       slot,
-      partial_hex: partialHex,
+      partialHex,
       signature,
-      transcript_domain: BALANCE_DECRYPT_TRANSCRIPT_DOMAIN,
+      transcriptDomain: BALANCE_DECRYPT_TRANSCRIPT_DOMAIN,
     };
     if (opts.perSlot && opts.perSlot[slot]) {
       return opts.perSlot[slot](slot, b, defaultResponse);
@@ -302,17 +305,17 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
       singleNodeForwarder: makeForwarder({
         perSlot: {
           // Slot 3 returns a valid-looking response, but we flip a byte in
-          // partial_hex[0] without updating the signature. The route must
+          // partialHex[0] without updating the signature. The route must
           // recompute SHA-256 and reject the mismatch.
           3: async (slot, _b, defaultResponse) => {
             const tampered = { ...defaultResponse };
-            const flipped = [...(defaultResponse.partial_hex as string[])];
+            const flipped = [...(defaultResponse.partialHex as string[])];
             const first = flipped[0];
             // Flip the first hex char (00 → 01, 01 → 00, etc.) — produces a
             // valid 64-hex string that no longer matches the worker's signature.
             const swap = (c: string) => (c === "0" ? "1" : "0");
             flipped[0] = swap(first[0]) + first.slice(1);
-            tampered.partial_hex = flipped;
+            tampered.partialHex = flipped;
             return { slot, ok: true, statusCode: 200, body: tampered };
           },
         },
