@@ -1941,16 +1941,25 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       vaultStatePerSlot: workerStateTranscripts.map((w) => w.transcriptHash),
       mpcca: mpccaTranscriptHash,
       submit: submitArtifact.transcriptHash ?? null,
-      observedDeposit: snapshot?.observedDepositTranscriptHash ?? null,
+      // M10-l (codex iter-7 P1-15): `observedDeposit` was a SHA-256 over the
+      // observation transcript, which binds the specific deposit's
+      // `depositCount`, `commitment`, `senderAddress`, `txVersion`,
+      // `sequenceNumber`, and `eventGuid`. Anyone with the on-chain
+      // DepositConfirmedV2 set (publicly enumerable) can recompute the
+      // transcript hash for each candidate deposit and find the one that
+      // matches the published value — same low-cardinality dictionary
+      // attack class as the iter-4 P1-9 `balanceVectorHash`. The audit
+      // binding for the OBSERVATION lives implicitly in the chain itself;
+      // dropping the hash from the public report closes the linker.
     },
-    // M10-l (codex iter-4 P1-7): `sources.observedDepositArtifactPath` was
-    // a path like `<dkgEpoch>__<depositCount>__<observeRequestId>.json` —
-    // the embedded `depositCount` and depositor request id reintroduced a
-    // direct deposit→withdraw linker via the source-path block, defeating
-    // the iter-2 P1-3 redactions on `depositEventProof` + `txHashes.deposit`.
-    // Drop the deposit-linking source path. The observation's audit binding
-    // remains via `transcriptHashes.observedDeposit` (a SHA-256 over the
-    // observed-deposit transcript, no deposit identity).
+    // M10-l (codex iter-4 P1-7 + iter-7 P1-15): both
+    // `sources.observedDepositArtifactPath` (a path with embedded
+    // `depositCount` + depositor request id) and
+    // `transcriptHashes.observedDeposit` (a low-cardinality hash that
+    // dictionary-attacks back to a specific deposit) were
+    // deposit→withdraw linkers that defeated the iter-2 P1-3 redactions.
+    // Both fields are now omitted; the observation's audit binding lives
+    // implicitly in the chain (DepositConfirmedV2 events are public).
     sources: {
       submitArtifactPath: submitPath,
       finalizeTranscriptPath: finalizePath,
@@ -2109,7 +2118,9 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     ["transcriptHashes.vaultStateInit", report.transcriptHashes.vaultStateInit],
     ["transcriptHashes.mpcca", report.transcriptHashes.mpcca],
     ["transcriptHashes.submit", report.transcriptHashes.submit],
-    ["transcriptHashes.observedDeposit", report.transcriptHashes.observedDeposit],
+    // M10-l (codex iter-7 P1-15): observedDeposit transcript hash dropped
+    // from both the report payload AND this required-field gate — it
+    // dictionary-attacks back to a specific deposit on chain.
     ["invariants.chainSuccess", report.invariants.chainSuccess],
   ];
   // Reject null/undefined. Also reject invariants.chainSuccess !== true explicitly

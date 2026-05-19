@@ -53,6 +53,21 @@ export interface LocalClusterPlanOptions {
   dkgEpoch?: string;
   caDkgScheme?: CaDkgScheme;
   aptosNodeUrl?: string;
+  /**
+   * M10-l (codex iter-7 P1-16): bridge vault address. Propagated to both the
+   * coordinator and every worker as `BRIDGE_VAULT_ADDRESS` so the
+   * /v2/balance/decrypt + /v2/balance/decrypt_partial config-trust checks
+   * have the value they need. Without this, the cluster will fail closed
+   * with `coordinator missing BRIDGE_VAULT_ADDRESS` on the first balance-
+   * decrypt call.
+   */
+  bridgeVaultAddress?: string;
+  /**
+   * M10-l (codex iter-7 P1-16): bridge asset type tag. Same rationale as
+   * `bridgeVaultAddress` — propagated as `BRIDGE_ASSET_TYPE` to coordinator
+   * + workers.
+   */
+  bridgeAssetType?: string;
   randomHex?: (bytes: number, label: string) => string;
 }
 
@@ -177,6 +192,12 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         ...(caDkgV2RosterJson ? { CA_DKG_V2_ROSTER_JSON: caDkgV2RosterJson } : {}),
         ...(frostDkgV2RosterJson ? { FROST_DKG_V2_ROSTER_JSON: frostDkgV2RosterJson } : {}),
         DEOPERATOR_NODE_BEARER_TOKENS_JSON: JSON.stringify(nodeBearerTokens),
+        // M10-l (codex iter-7 P1-16): the /v2/balance/decrypt route needs
+        // these envs for the iter-1 (chain URL) + iter-6 (vault, asset) trust
+        // checks. Without them, the route fails closed at first request.
+        APTOS_NODE_URL: opts.aptosNodeUrl ?? "https://fullnode.testnet.aptoslabs.com/v1",
+        ...(opts.bridgeVaultAddress ? { BRIDGE_VAULT_ADDRESS: opts.bridgeVaultAddress } : {}),
+        ...(opts.bridgeAssetType ? { BRIDGE_ASSET_TYPE: opts.bridgeAssetType } : {}),
       },
     },
     relayer: {
@@ -216,6 +237,15 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         CRYPTO_WORKER_PORT: String(workerPortBase + slot),
         CRYPTO_WORKER_STATE_DIR: `${stateRoot}/slot-${slot}`,
         CRYPTO_WORKER_STATE_ROOT: stateRoot,
+        // M10-l (codex iter-7 P1-16): workers do their own chain re-fetch
+        // for the balance-decrypt path (iter-1 P1-1 closure) and enforce
+        // their own (vault, asset) match against the request (iter-6 P1-13
+        // closure). All three envs must be present here or the worker will
+        // fail closed with `worker_missing_aptos_node_url_config` /
+        // `worker_missing_bridge_vault_or_asset_config` at first decrypt.
+        APTOS_NODE_URL: opts.aptosNodeUrl ?? "https://fullnode.testnet.aptoslabs.com/v1",
+        ...(opts.bridgeVaultAddress ? { BRIDGE_VAULT_ADDRESS: opts.bridgeVaultAddress } : {}),
+        ...(opts.bridgeAssetType ? { BRIDGE_ASSET_TYPE: opts.bridgeAssetType } : {}),
       },
     })),
   };
