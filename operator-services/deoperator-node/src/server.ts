@@ -290,7 +290,8 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/mpcca/withdraw/finalize"
       | "/worker/v2/frost/sign/nonce-commit"
       | "/worker/v2/frost/sign/partial"
-      | "/worker/v2/frost/sign/aggregate",
+      | "/worker/v2/frost/sign/aggregate"
+      | "/v2/balance/decrypt_partial",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -635,6 +636,38 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/worker/v2/frost/sign/aggregate", req.body, reply);
+  });
+
+  // M10-e-fix: balance partial-decryption passthrough. The coordinator's
+  // `/v2/balance/decrypt` (M10-c) fans out to each selected slot's deop-node
+  // endpoint at path `/v2/balance/decrypt_partial`; without this route the
+  // chain coordinator → deop-node → crypto-worker breaks at the deop-node hop.
+  //
+  // The wire body is `{ dkgEpoch, vaultAddress, assetType, oldBalanceDHex,
+  // requestId, slot, aptosNodeUrl }` — no `rosterHash` (the coordinator selects
+  // slots from its configured CA DKG V2 roster) and `slot` instead of
+  // `selfSlot`. The deop-node's responsibility here is bearer-auth (applied at
+  // the global onRequest hook), forbidden-field guard, slot binding, then a
+  // stateless forward to the local crypto-worker. The worker's own handler
+  // performs the defense-in-depth chain re-fetch of `oldBalanceD` and signs a
+  // SHA-256 transcript that the coordinator re-derives + verifies.
+  //
+  // Stateless + idempotent: no `store.*` mutation, no cursor advance, no
+  // artifact write. Mirrors the FROST signing passthrough posture (forbidden
+  // guard + forward).
+  server.post("/v2/balance/decrypt_partial", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const slot = body.slot;
+      if (typeof slot !== "number" || !Number.isInteger(slot)) {
+        throw new Error("slot must be an integer");
+      }
+      assertSlot(slot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/v2/balance/decrypt_partial", req.body, reply);
   });
 
   return { server, store };
