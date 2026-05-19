@@ -194,6 +194,13 @@ interface MpccaWithdrawBaseRequest {
   registrationTranscriptHash: HexString;
   vaultStateInitTranscriptHash: HexString;
   observedDepositTranscriptHashes: HexString[];
+  /**
+   * Optional parallel cursor list paired with `observedDepositTranscriptHashes`. When supplied,
+   * the coordinator passes it through to workers' strict-monotonic ordering check; when absent,
+   * the coordinator synthesizes `[1, 2, …, depositCount]`. M9: typed here so server.ts builds
+   * cleanly under tsc (M8 holdover from the M2b ordering bind).
+   */
+  observedDepositCursors?: number[];
   rosterHash: HexString;
   selectedSlots: number[];
   selfSlot: number;
