@@ -59,8 +59,10 @@ fn ristretto_from_hex(hex: &str) -> Result<RistrettoPoint, String> {
 /// `R` (or equivalently `chunks`) — the `R` array is the chunked `D` points
 /// (one per chunk, compressed Ristretto in 0x-prefixed hex).
 ///
-/// Tolerant of two shapes that the Aptos node has emitted historically:
-///   1. `[ { "P": [...], "R": [...] } ]`
+/// Tolerant of three shapes that the Aptos node has emitted historically:
+///   1. `[ { "P": [...], "R": [...] } ]` where each array entry is either a
+///      bare hex string OR an object `{ "data": "0x..." }` (the latter is
+///      what the live testnet `/v1/view` actually returns).
 ///   2. `[ { "chunks": [ { "left": "...", "right": "..." }, ... ] } ]`
 ///
 /// We attempt #1 first (the documented shape), fall back to #2, and return a
@@ -95,10 +97,18 @@ pub fn parse_view_response_d(value: &Value) -> Result<Vec<RistrettoPoint>, Strin
 fn parse_hex_array(arr: &[Value]) -> Result<Vec<RistrettoPoint>, String> {
     let mut out = Vec::with_capacity(arr.len());
     for (idx, v) in arr.iter().enumerate() {
-        let s = v
-            .as_str()
-            .ok_or_else(|| format!("R[{idx}] is not a string"))?;
-        out.push(ristretto_from_hex(s)?);
+        // Accept either bare string OR { "data": "0x..." } shape (what Aptos
+        // /v1/view actually emits for compressed Ristretto entries).
+        let hex_str = if let Some(s) = v.as_str() {
+            s
+        } else if let Some(data) = v.get("data").and_then(|d| d.as_str()) {
+            data
+        } else {
+            return Err(format!(
+                "R[{idx}] is neither string nor {{data:string}}"
+            ));
+        };
+        out.push(ristretto_from_hex(hex_str)?);
     }
     Ok(out)
 }
@@ -230,5 +240,56 @@ mod tests {
         );
         assert_eq!(body["arguments"][0], "0xabc");
         assert_eq!(body["arguments"][1], "0xdef");
+    }
+
+    /// M10-b-fix: live Aptos `/v1/view` emits each Ristretto entry as an
+    /// object `{ "data": "0x..." }` rather than a bare hex string. The
+    /// parser must accept this shape across both `P` and `R` arrays.
+    #[test]
+    fn parse_view_response_d_accepts_object_with_data_field() {
+        let p1 = RISTRETTO_BASEPOINT_POINT * Scalar::from(123u64);
+        let p2 = RISTRETTO_BASEPOINT_POINT * Scalar::from(456u64);
+        let val = json!([{
+            "P": [
+                { "data": format!("0x{}", "00".repeat(32)) },
+                { "data": format!("0x{}", "00".repeat(32)) }
+            ],
+            "R": [
+                { "data": format!("0x{}", compressed_hex(&p1)) },
+                { "data": format!("0x{}", compressed_hex(&p2)) }
+            ]
+        }]);
+        let parsed = parse_view_response_d(&val).expect("object-shape parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].compress(), p1.compress());
+        assert_eq!(parsed[1].compress(), p2.compress());
+    }
+
+    /// Regression: the original bare-string shape must continue to parse.
+    #[test]
+    fn parse_view_response_d_still_accepts_bare_strings() {
+        let p1 = RISTRETTO_BASEPOINT_POINT * Scalar::from(99u64);
+        let val = json!([{
+            "P": ["00".repeat(32)],
+            "R": [compressed_hex(&p1)],
+        }]);
+        let parsed = parse_view_response_d(&val).expect("bare-string parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].compress(), p1.compress());
+    }
+
+    /// `{ "data": <non-string> }` must surface a precise error (not a panic).
+    #[test]
+    fn parse_view_response_d_rejects_non_string_data() {
+        let val = json!([{
+            "P": [],
+            "R": [{ "data": 42 }],
+        }]);
+        let err = parse_view_response_d(&val)
+            .expect_err("non-string data must be rejected");
+        assert!(
+            err.contains("neither string nor {data:string}"),
+            "expected precise parse error, got {err}"
+        );
     }
 }
