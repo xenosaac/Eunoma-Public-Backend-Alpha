@@ -51,13 +51,23 @@
 //   --vault-sequence N             required. u64 from BridgeVault.vault_sequence.
 //   --root HEX                     required. 32-byte LE root from local_record_known_root_v2 output.
 //   --ca-payload-hash HEX          required. 32-byte LE Fr-safe ca_payload_hash (via caPayloadHashFrV2).
+//   --commitment-tree PATH         M9: required when --testnet. Multi-leaf commitment tree artifact.
+//                                  Without it, the legacy single-leaf path (leaf 0 + zero siblings)
+//                                  is used — local-fixture only.
+//   --testnet                      M9: asserts multi-leaf path; --commitment-tree must be present and
+//                                  the depositor's commitment must be found in the tree.
 //   --withdraw-blind-hex HEX       optional. 32-byte LE Fr blinding; auto-generates if omitted.
 //   --output PATH                  optional. Write witness JSON here (0o600); default = stdout.
+//
+// Stdout JSON header (always — even when --output writes the witness to disk):
+//   { ok, witnessPath, leafIndex, treeRootHex, treeTranscriptHash, mode: "multi_leaf"|"legacy_single_leaf",
+//     publics: {...}, withdraw_blind_hex }
 //
 // Privacy:
 //   Witness JSON carries plaintext nullifier + secret + withdraw_blind + amount. Output file is
 //   chmod 0o600 if --output given. This file MUST stay client-side. NEVER POST it to coordinator
-//   or deoperator services.
+//   or deoperator services. leafIndex is public-derivable (depositCount-1) and is included in the
+//   stdout header so the orchestrator can write a PUBLIC withdraw_tree_context side-car artifact.
 // =============================================================================================
 import { writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -84,6 +94,7 @@ if (hasFlag("--help") || hasFlag("-h")) {
   console.log(
     "usage: compute_withdraw_witness --depositor-witness PATH --recipient HEX \\\n" +
       "                               --vault-sequence N --root HEX --ca-payload-hash HEX \\\n" +
+      "                               [--commitment-tree PATH] [--testnet] \\\n" +
       "                               [--withdraw-blind-hex HEX] [--output PATH]",
   );
   process.exit(0);
@@ -94,8 +105,15 @@ const recipientArg = getArg("--recipient");
 const vaultSequenceArg = getArg("--vault-sequence");
 const rootArg = getArg("--root");
 const caPayloadHashArg = getArg("--ca-payload-hash");
+const commitmentTreeArg = getArg("--commitment-tree", false);
+const testnetFlag = hasFlag("--testnet");
 const withdrawBlindArg = getArg("--withdraw-blind-hex", false);
 const outputArg = getArg("--output", false);
+
+if (testnetFlag && !commitmentTreeArg) {
+  console.error(JSON.stringify({ error: "testnet_requires_commitment_tree" }));
+  process.exit(2);
+}
 
 const CHAIN_ID = 2;
 const POOL_ID = 0;
@@ -323,15 +341,67 @@ if (depositorCommitmentHex !== recomputedCommitmentHex) {
   process.exit(2);
 }
 
-// ---- Compute Merkle path + indices (single leaf at index 0, depth 20) ---------------------
+// ---- Compute Merkle path + indices ---------------------------------------------------------
+// M9: if --commitment-tree is supplied, look up the depositor's commitment in the multi-leaf tree
+// and produce its real leaf-index path. Otherwise fall back to the M8 single-leaf helper
+// (rejected when --testnet is set; already gated above).
 const dirHere = dirname(fileURLToPath(import.meta.url));
 const merkleHelperPath = resolve(dirHere, "poseidon_merkle.mjs");
+const treeHelperPath = resolve(dirHere, "commitment_tree_v2.mjs");
 const { computeMerkleRootAndPathSingleLeaf, leBytesToBig, bigToLE32, le32ToHex: le32ToHexHelp } =
   await import(`file://${merkleHelperPath}`);
 
 const commitmentBig = leBytesToBig(commitmentLe);
-const merkleResult = await computeMerkleRootAndPathSingleLeaf(commitmentBig, TREE_DEPTH);
-const recomputedRootLE = merkleResult.rootLE32;
+
+let merklePathBig;
+let merkleIndicesBig;
+let recomputedRootBig;
+let leafIndexResolved = 0;
+let mode = "legacy_single_leaf";
+let treeTranscriptHash = null;
+
+if (commitmentTreeArg) {
+  const { CommitmentTreeV2 } = await import(`file://${treeHelperPath}`);
+  let snapshot;
+  try {
+    snapshot = JSON.parse(readFileSync(commitmentTreeArg, "utf8"));
+  } catch (err) {
+    console.error(`failed to read --commitment-tree ${commitmentTreeArg}: ${err?.message ?? err}`);
+    process.exit(2);
+  }
+  let tree;
+  try {
+    tree = await CommitmentTreeV2.deserialize(snapshot);
+  } catch (err) {
+    console.error(`commitment_tree deserialize failed: ${err?.message ?? err}`);
+    process.exit(2);
+  }
+  if (tree.depth !== TREE_DEPTH) {
+    console.error(`tree depth mismatch: tree=${tree.depth}, circuit=${TREE_DEPTH}`);
+    process.exit(2);
+  }
+  let pathResult;
+  try {
+    pathResult = await tree.pathForCommitment(commitmentBig);
+  } catch (err) {
+    console.error(`pathForCommitment failed: ${err?.message ?? err}`);
+    process.exit(2);
+  }
+  merklePathBig = pathResult.path;
+  merkleIndicesBig = pathResult.indices;
+  leafIndexResolved = pathResult.leafIndex;
+  recomputedRootBig = await tree.root();
+  treeTranscriptHash = snapshot.transcriptHash;
+  mode = "multi_leaf";
+} else {
+  const result = await computeMerkleRootAndPathSingleLeaf(commitmentBig, TREE_DEPTH);
+  merklePathBig = result.merklePathBig;
+  merkleIndicesBig = result.merkleIndicesBig;
+  recomputedRootBig = result.rootBig;
+  leafIndexResolved = 0;
+}
+
+const recomputedRootLE = bigToLE32(recomputedRootBig);
 const recomputedRootHex = Array.from(recomputedRootLE)
   .map((b) => b.toString(16).padStart(2, "0"))
   .join("");
@@ -341,7 +411,9 @@ const rootHexLower = rootHex.toLowerCase();
 if (recomputedRootHex !== rootHexLower) {
   console.error(
     `root mismatch — --root says 0x${rootHexLower} but recomputed 0x${recomputedRootHex}. ` +
-      "Check that --root is the depth-20 Poseidon root for the depositor commitment with leaf=0/zero-siblings.",
+      (mode === "multi_leaf"
+        ? "Check that --root matches the commitment_tree_v2 latestRootHex."
+        : "Check that --root is the depth-20 single-leaf Poseidon root."),
   );
   process.exit(2);
 }
@@ -362,13 +434,17 @@ const witnessJson = {
   secret: le32ToDec(secretLe),
   amount: amountOctas,
   withdraw_blind: le32ToDec(withdrawBlindLe),
-  merkle_path: merkleResult.merklePathBig.map((b) => b.toString()),
-  merkle_indices: merkleResult.merkleIndicesBig.map((b) => b.toString()),
+  merkle_path: merklePathBig.map((b) => b.toString()),
+  merkle_indices: merkleIndicesBig.map((b) => b.toString()),
 };
 
 const summary = {
   ok: true,
   witnessPath: outputArg ?? null,
+  leafIndex: leafIndexResolved,
+  mode,
+  treeRootHex: `0x${rootHexLower}`,
+  treeTranscriptHash,
   publics: {
     root: rootHex,
     nullifier_hash: le32ToHex(nullifierHashLe),

@@ -18,7 +18,7 @@
 // The user's proveTransfer used dk_user (fake), which the coordinator + workers then replace
 // transparently during finalize aggregation. See M4-c5 byte-canonical test for the pattern.
 // =============================================================================================
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -114,6 +114,24 @@ const rootHex = required(flag("--root"), "--root");
 const recipientArg = flag("--recipient"); // optional, defaults to fresh keypair below
 const assetType = required(flag("--asset-type"), "--asset-type");
 const vaultSequenceArg = required(flag("--vault-sequence"), "--vault-sequence");
+
+// M9: commitment_tree_v2.json drives the real leaf-index Merkle path. Default location is the
+// coordinator state dir written by local_build_commitment_tree.mjs. If absent, the orchestrator
+// falls back to the legacy M8 single-leaf path with a warning.
+const commitmentTreePath =
+  flag("--commitment-tree") ??
+  resolve(serviceRoot, ".agent-local/eunoma-v2/coordinator/commitment_tree_v2.json");
+const commitmentTreeExists = existsSync(commitmentTreePath);
+const witnessMode = commitmentTreeExists ? "multi_leaf" : "legacy_single_leaf";
+if (!commitmentTreeExists) {
+  console.error(
+    `[m9] WARNING: commitment_tree_v2.json not found at ${commitmentTreePath}; falling back to ` +
+      "legacy single-leaf witness path (M8 behavior). For real M9 testnet runs, build the tree " +
+      "with local_build_commitment_tree.mjs first.",
+  );
+} else {
+  console.error(`[m9] using commitment_tree_v2.json at ${commitmentTreePath} (multi-leaf path)`);
+}
 
 const COORDINATOR_URL = process.env.COORDINATOR_URL ?? "http://127.0.0.1:4200";
 const COORDINATOR_BEARER_TOKEN = required(
@@ -326,19 +344,22 @@ const amountCommitmentHex = bytesToHex(amountCommitmentPoint.toRawBytes());
 
 // ---- Compute nullifier/recipient_hash/amount_tag via the witness builder ------------------
 const witnessOutPath = `/tmp/m8-${requestId}-witness.json`;
-const witnessTempProc = spawnSync(
-  "node",
-  [
-    resolve(repoRoot, "circuits/scripts/compute_withdraw_witness.mjs"),
-    "--depositor-witness", depositWitnessPath,
-    "--recipient", recipientAddress,
-    "--vault-sequence", vaultSequenceArg,
-    "--root", rootHex,
-    "--ca-payload-hash", `0x${"00".repeat(32)}`, // placeholder for r1
-    "--output", witnessOutPath,
-  ],
-  { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 },
-);
+const witnessBuilderArgs = [
+  resolve(repoRoot, "circuits/scripts/compute_withdraw_witness.mjs"),
+  "--depositor-witness", depositWitnessPath,
+  "--recipient", recipientAddress,
+  "--vault-sequence", vaultSequenceArg,
+  "--root", rootHex,
+  "--ca-payload-hash", `0x${"00".repeat(32)}`, // placeholder for r1
+  "--output", witnessOutPath,
+];
+if (commitmentTreeExists) {
+  witnessBuilderArgs.push("--commitment-tree", commitmentTreePath, "--testnet");
+}
+const witnessTempProc = spawnSync("node", witnessBuilderArgs, {
+  encoding: "utf8",
+  maxBuffer: 10 * 1024 * 1024,
+});
 if (witnessTempProc.status !== 0) {
   console.error(`witness build failed: ${witnessTempProc.stderr || witnessTempProc.stdout}`);
   process.exit(1);
@@ -563,23 +584,87 @@ const caPayloadHashFr = caPayloadHashFrV2(caPayload);
 console.error(`[m8-real] caPayloadHashFr = ${caPayloadHashFr.slice(0, 16)}...`);
 
 // Regenerate witness with the REAL ca_payload_hash + withdraw_blind we already chose.
-const witnessReProc = spawnSync(
-  "node",
-  [
-    resolve(repoRoot, "circuits/scripts/compute_withdraw_witness.mjs"),
-    "--depositor-witness", depositWitnessPath,
-    "--recipient", recipientAddress,
-    "--vault-sequence", vaultSequenceArg,
-    "--root", rootHex,
-    "--ca-payload-hash", caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : "0x" + caPayloadHashFr,
-    "--withdraw-blind-hex", withdrawBlindHex,
-    "--output", witnessOutPath,
-  ],
-  { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 },
-);
+const witnessReArgs = [
+  resolve(repoRoot, "circuits/scripts/compute_withdraw_witness.mjs"),
+  "--depositor-witness", depositWitnessPath,
+  "--recipient", recipientAddress,
+  "--vault-sequence", vaultSequenceArg,
+  "--root", rootHex,
+  "--ca-payload-hash", caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : "0x" + caPayloadHashFr,
+  "--withdraw-blind-hex", withdrawBlindHex,
+  "--output", witnessOutPath,
+];
+if (commitmentTreeExists) {
+  witnessReArgs.push("--commitment-tree", commitmentTreePath, "--testnet");
+}
+const witnessReProc = spawnSync("node", witnessReArgs, {
+  encoding: "utf8",
+  maxBuffer: 10 * 1024 * 1024,
+});
 if (witnessReProc.status !== 0) {
   console.error(`witness re-build failed: ${witnessReProc.stderr || witnessReProc.stdout}`);
   process.exit(33);
+}
+// Parse the witness builder's stdout JSON header to capture leafIndex + treeTranscriptHash
+// for the public side-car artifact below.
+let witnessReSummary = null;
+try {
+  witnessReSummary = JSON.parse(witnessReProc.stdout.trim());
+} catch (e) {
+  console.error(`[m9-d] witness re-build stdout parse failed: ${e?.message ?? e}`);
+}
+
+// ---- Persist PUBLIC withdraw_tree_context side-car for the final-report builder ----------
+// Public artifact — readable at 0o644. Contains commitmentHex, leafIndex, rootHex,
+// treeTranscriptHash, anonymitySetSize. Strictly NO amount/nullifier/secret/blind here.
+{
+  const ctxStateDir = resolve(serviceRoot, ".agent-local/eunoma-v2/coordinator");
+  mkdirSync(ctxStateDir, { recursive: true });
+  let anonymitySetSize = null;
+  let distinctDepositSenders = null;
+  let treeTranscriptHashFromTree = null;
+  if (commitmentTreeExists) {
+    try {
+      const snap = JSON.parse(readFileSync(commitmentTreePath, "utf8"));
+      anonymitySetSize = snap.leafCount;
+      treeTranscriptHashFromTree = snap.transcriptHash;
+      const set = new Set();
+      for (const m of snap.depositMeta ?? []) {
+        if (m.sender) set.add(m.sender.toLowerCase());
+      }
+      distinctDepositSenders = set.size;
+    } catch (e) {
+      console.error(`[m9-d] could not read commitment_tree_v2.json for side-car: ${e?.message ?? e}`);
+    }
+  }
+  const ctx = {
+    schema: "withdraw_tree_context_v1",
+    requestId,
+    commitmentHex: depositWitness.commitmentHex,
+    leafIndex: witnessReSummary?.leafIndex ?? null,
+    rootHex,
+    treeTranscriptHash: witnessReSummary?.treeTranscriptHash ?? treeTranscriptHashFromTree,
+    anonymitySetSize,
+    distinctDepositSenders,
+    mode: witnessReSummary?.mode ?? witnessMode,
+    depositorWitnessSchemaVersion: depositWitness.schema ?? "v2_depositor_witness_v1",
+    createdAtUnixMs: Date.now(),
+  };
+  const FORBIDDEN = /^(amount|secret|nullifier|.*blind|dk|inverse)$/i;
+  for (const k of Object.keys(ctx)) {
+    if (FORBIDDEN.test(k)) {
+      console.error(`[m9-d] FATAL forbidden field in withdraw_tree_context: ${k}`);
+      process.exit(34);
+    }
+  }
+  const fname = `withdraw_tree_context_${requestId.replace(/[^A-Za-z0-9_-]/g, "_")}.json`;
+  const full = resolve(ctxStateDir, fname);
+  const tmp = full + ".tmp";
+  writeFileSync(tmp, JSON.stringify(ctx, null, 2) + "\n", { mode: 0o644 });
+  renameSync(tmp, full);
+  console.error(
+    `[m9-d] wrote withdraw_tree_context side-car: ${full} (leafIndex=${ctx.leafIndex}, anonymitySetSize=${ctx.anonymitySetSize}, distinctDepositSenders=${ctx.distinctDepositSenders})`,
+  );
 }
 const proofOutPath = `/tmp/m8-${requestId}-proof.json`;
 const proofProc = spawnSync(
