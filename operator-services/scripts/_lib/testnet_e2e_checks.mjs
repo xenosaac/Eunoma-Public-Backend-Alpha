@@ -1460,45 +1460,100 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
   // checking that the tx's events array contains a WithdrawEventV2 whose
   // payload matches the finalize artifact's call args (root, nullifier_hash,
   // recipient_hash).
-  if (chainSubmitTxBody && finalize?.withdrawV2CallArgsFields) {
-    const events = Array.isArray(chainSubmitTxBody.events) ? chainSubmitTxBody.events : [];
-    const withdrawEvent = events.find(
-      (e) => typeof e?.type === "string" && /::eunoma_bridge::WithdrawEventV2(?:<[^>]*>)?$/.test(e.type),
-    );
-    const normHex = (h) => String(h ?? "").toLowerCase().replace(/^0x/, "");
-    if (!withdrawEvent) {
+  // M10-l (codex iter-5):
+  //   P1-11: the event-type matcher previously used a SUFFIX regex
+  //          (`::eunoma_bridge::WithdrawEventV2`), accepting an event from
+  //          ANY package whose last two type-name segments matched. An
+  //          attacker-deployed package with a module named `eunoma_bridge`
+  //          could pass the gate. Require the FULL prefix to equal
+  //          `${BRIDGE_PACKAGE_ADDRESS}::eunoma_bridge::WithdrawEventV2`
+  //          (with Aptos's leading-zero normalization applied to both sides).
+  //   P1-12: the verification was skipped entirely if finalize was loaded but
+  //          missing `withdrawV2CallArgsFields`. A tampered or stale finalize
+  //          artifact could omit the field and bypass the gate. Fail closed
+  //          when finalize exists but the call-args block is missing.
+  if (chainSubmitTxBody) {
+    if (!finalize) {
+      // missingArtifacts already includes the "finalize transcript not found"
+      // entry above; we don't double-report here.
+    } else if (!finalize.withdrawV2CallArgsFields) {
       missingArtifacts.push({
-        path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+        path: finalizePath,
         reason:
-          `Chain submit tx success=true and vm_status="Executed successfully" but no ` +
-          `eunoma_bridge::WithdrawEventV2 emitted. The tx may be a successful Move call ` +
-          `against the same address that is not a M10 withdraw. Refusing to bind ` +
-          `chainConfirmedWithdraw to this tx.`,
+          "MPCCA finalize transcript exists but withdrawV2CallArgsFields is missing — " +
+          "the artifact is stale, malformed, or tampered; cannot bind chainConfirmedWithdraw to " +
+          "an expected withdraw call shape. Refusing to verify chain WithdrawEventV2 against an " +
+          "unknown expected payload.",
       });
     } else {
-      const expectedRoot = normHex(finalize.withdrawV2CallArgsFields.root);
-      const eventRoot = normHex(withdrawEvent.data?.root);
-      if (expectedRoot && expectedRoot !== eventRoot) {
+      const events = Array.isArray(chainSubmitTxBody.events) ? chainSubmitTxBody.events : [];
+      // Aptos addresses may appear with leading-zero padding stripped. Normalize
+      // both the env's configured BRIDGE_PACKAGE_ADDRESS and each event's
+      // declared package address to 32-byte canonical form before comparing.
+      const normalizeAptosAddr = (raw) => {
+        if (typeof raw !== "string") return null;
+        const stripped = raw.toLowerCase().replace(/^0x/, "");
+        if (!/^[0-9a-f]{1,64}$/.test(stripped)) return null;
+        return stripped.padStart(64, "0");
+      };
+      const expectedPkg = normalizeAptosAddr(env.BRIDGE_PACKAGE_ADDRESS);
+      const expectedFullType = expectedPkg
+        ? `0x${expectedPkg}::eunoma_bridge::WithdrawEventV2`
+        : null;
+      const eventTypeMatches = (rawType) => {
+        if (typeof rawType !== "string") return false;
+        // Drop generic params `<...>` for comparison.
+        const baseType = rawType.replace(/<[^>]*>$/, "");
+        // Split into pkg::module::name and normalize the pkg.
+        const parts = baseType.split("::");
+        if (parts.length !== 3) return false;
+        if (parts[1] !== "eunoma_bridge" || parts[2] !== "WithdrawEventV2") return false;
+        const eventPkg = normalizeAptosAddr(parts[0]);
+        return eventPkg !== null && expectedPkg !== null && eventPkg === expectedPkg;
+      };
+      const withdrawEvent = events.find((e) => eventTypeMatches(e?.type));
+      const normHex = (h) => String(h ?? "").toLowerCase().replace(/^0x/, "");
+      if (!expectedPkg) {
+        missingArtifacts.push({
+          path: "BRIDGE_PACKAGE_ADDRESS",
+          reason:
+            "BRIDGE_PACKAGE_ADDRESS is missing/invalid — cannot bind WithdrawEventV2 to the " +
+            "real bridge package (codex iter-5 P1-11).",
+        });
+      } else if (!withdrawEvent) {
         missingArtifacts.push({
           path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
-          reason: `WithdrawEventV2.root mismatch: chain=${eventRoot} != finalize.callArgs.root=${expectedRoot}`,
+          reason:
+            `Chain submit tx success=true and vm_status="Executed successfully" but no ` +
+            `${expectedFullType} event emitted. The tx may be a successful Move call (or a ` +
+            `spoofed event from a non-bridge package) that is not a real M10 withdraw. ` +
+            `Refusing to bind chainConfirmedWithdraw to this tx.`,
         });
-      }
-      const expectedNullifier = normHex(finalize.withdrawV2CallArgsFields.nullifierHash);
-      const eventNullifier = normHex(withdrawEvent.data?.nullifier_hash);
-      if (expectedNullifier && expectedNullifier !== eventNullifier) {
-        missingArtifacts.push({
-          path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
-          reason: `WithdrawEventV2.nullifier_hash mismatch: chain=${eventNullifier} != finalize.callArgs.nullifierHash=${expectedNullifier}`,
-        });
-      }
-      const expectedRecipientHash = normHex(finalize.withdrawV2CallArgsFields.recipientHash);
-      const eventRecipientHash = normHex(withdrawEvent.data?.recipient_hash);
-      if (expectedRecipientHash && expectedRecipientHash !== eventRecipientHash) {
-        missingArtifacts.push({
-          path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
-          reason: `WithdrawEventV2.recipient_hash mismatch: chain=${eventRecipientHash} != finalize.callArgs.recipientHash=${expectedRecipientHash}`,
-        });
+      } else {
+        const expectedRoot = normHex(finalize.withdrawV2CallArgsFields.root);
+        const eventRoot = normHex(withdrawEvent.data?.root);
+        if (expectedRoot && expectedRoot !== eventRoot) {
+          missingArtifacts.push({
+            path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+            reason: `WithdrawEventV2.root mismatch: chain=${eventRoot} != finalize.callArgs.root=${expectedRoot}`,
+          });
+        }
+        const expectedNullifier = normHex(finalize.withdrawV2CallArgsFields.nullifierHash);
+        const eventNullifier = normHex(withdrawEvent.data?.nullifier_hash);
+        if (expectedNullifier && expectedNullifier !== eventNullifier) {
+          missingArtifacts.push({
+            path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+            reason: `WithdrawEventV2.nullifier_hash mismatch: chain=${eventNullifier} != finalize.callArgs.nullifierHash=${expectedNullifier}`,
+          });
+        }
+        const expectedRecipientHash = normHex(finalize.withdrawV2CallArgsFields.recipientHash);
+        const eventRecipientHash = normHex(withdrawEvent.data?.recipient_hash);
+        if (expectedRecipientHash && expectedRecipientHash !== eventRecipientHash) {
+          missingArtifacts.push({
+            path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+            reason: `WithdrawEventV2.recipient_hash mismatch: chain=${eventRecipientHash} != finalize.callArgs.recipientHash=${expectedRecipientHash}`,
+          });
+        }
       }
     }
   }

@@ -909,12 +909,15 @@ function happySnapshotArg(env) {
 // WithdrawEventV2 event in the re-query response (M10-l iter-4 P1-10).
 let lastFixtureUsedRoot = null;
 
-function mockChainReQueryOk({ withdrawEventRoot } = {}) {
+function mockChainReQueryOk({ withdrawEventRoot, eventType } = {}) {
   const root = withdrawEventRoot ?? lastFixtureUsedRoot;
+  // The fullEnvFixture's BRIDGE_PACKAGE_ADDRESS is 0x77…77 (64 hex chars).
+  // Match that by default so the iter-5 P1-11 package-prefix check passes.
+  const defaultEventType = `0x${"7".repeat(64)}::eunoma_bridge::WithdrawEventV2`;
   const events = root
     ? [
         {
-          type: "0xbeef::eunoma_bridge::WithdrawEventV2",
+          type: eventType ?? defaultEventType,
           data: { root },
         },
       ]
