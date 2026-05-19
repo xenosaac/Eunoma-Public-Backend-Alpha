@@ -777,8 +777,9 @@ try {
 }
 
 // ---- Persist PUBLIC withdraw_tree_context side-car for the final-report builder ----------
-// Public artifact — readable at 0o644. Contains commitmentHex, leafIndex, rootHex,
-// treeTranscriptHash, anonymitySetSize. Strictly NO amount/nullifier/secret/blind here.
+// Public artifact — readable at 0o644. Contains rootHex, treeTranscriptHash,
+// anonymitySetSize, distinctDepositSenders. Strictly NO amount/nullifier/secret/blind here,
+// AND (M10-f) no commitmentHex/leafIndex either — see comment on the ctx literal below.
 {
   const ctxStateDir = resolve(serviceRoot, ".agent-local/eunoma-v2/coordinator");
   mkdirSync(ctxStateDir, { recursive: true });
@@ -799,11 +800,14 @@ try {
       console.error(`[m9-d] could not read commitment_tree_v2.json for side-car: ${e?.message ?? e}`);
     }
   }
+  // M10-f (codex P1 fix): commitmentHex and leafIndex MUST NOT be published. They
+  // directly link the spent leaf in the multi-leaf anonymity set to the withdraw,
+  // defeating the M9 deposit↔withdraw unlinkability guarantee. Side-car carries
+  // only the anonymity-set aggregate (rootHex, anonymitySetSize, distinctDepositSenders,
+  // treeTranscriptHash). Schema bumped to v2.
   const ctx = {
-    schema: "withdraw_tree_context_v1",
+    schema: "withdraw_tree_context_v2",
     requestId,
-    commitmentHex: depositWitness.commitmentHex,
-    leafIndex: witnessReSummary?.leafIndex ?? null,
     rootHex,
     treeTranscriptHash: witnessReSummary?.treeTranscriptHash ?? treeTranscriptHashFromTree,
     anonymitySetSize,
@@ -812,10 +816,15 @@ try {
     depositorWitnessSchemaVersion: depositWitness.schema ?? "v2_depositor_witness_v1",
     createdAtUnixMs: Date.now(),
   };
-  const FORBIDDEN = /^(amount|secret|nullifier|.*blind|dk|inverse)$/i;
+  // Token-substring match (case-insensitive) — rejects suffix/prefix variants
+  // like `depositSender`, `secretSeed`, `dkUser`, `nullifierHash`, `merklepath`.
+  // The `sender(?!s)` lookahead excludes the legitimate plural in our own
+  // `distinctDepositSenders` field (an anonymity-set aggregate, not a leak).
+  // Task M10-f Step f.3 lists every name we must reject.
+  const FORBIDDEN_SIDECAR = /(amount|secret|nullifier|blind|\bdk|inverse|commitmentHex|leafIndex|merkle|Path|sender(?!s))/i;
   for (const k of Object.keys(ctx)) {
-    if (FORBIDDEN.test(k)) {
-      console.error(`[m9-d] FATAL forbidden field in withdraw_tree_context: ${k}`);
+    if (FORBIDDEN_SIDECAR.test(k)) {
+      console.error(`[m10-f] FATAL forbidden field in side-car: ${k}`);
       process.exit(34);
     }
   }
@@ -825,7 +834,7 @@ try {
   writeFileSync(tmp, JSON.stringify(ctx, null, 2) + "\n", { mode: 0o644 });
   renameSync(tmp, full);
   console.error(
-    `[m9-d] wrote withdraw_tree_context side-car: ${full} (leafIndex=${ctx.leafIndex}, anonymitySetSize=${ctx.anonymitySetSize}, distinctDepositSenders=${ctx.distinctDepositSenders})`,
+    `[m10-f] wrote withdraw_tree_context side-car: ${full} (anonymitySetSize=${ctx.anonymitySetSize}, distinctDepositSenders=${ctx.distinctDepositSenders}) [commitmentHex/leafIndex intentionally omitted]`,
   );
 }
 const proofOutPath = `/tmp/m8-${requestId}-proof.json`;
