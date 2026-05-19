@@ -50,6 +50,12 @@ import {
   m1IngressAad,
 } from "@eunoma/deop-protocol";
 
+// M10-d: orchestrator-side threshold-decrypt of chain old_balance + truthful
+// newAmountChunks witness derivation. See plan task M10-d for the rationale
+// (sigma-position-17 verifies iff balance == <B, new_a> + <B, v>).
+import { recoverBalanceChunks } from "../../circuits/scripts/recover_balance_chunks.mjs";
+import { chunkSubtract, padToEll } from "./_lib/chunk_arithmetic.mjs";
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
 const repoRoot = resolve(serviceRoot, "..");
@@ -219,12 +225,126 @@ async function fetchAvailable() {
 const oldBalanceCt = await fetchAvailable();
 console.error(`[m8-real] fetched chain oldBalance: ${oldBalanceCt.C.length} chunks`);
 
-// ---- Construct new_balance + transfer_amount chunks + randomness -------------------------
-// The bridge vault holds 100 octas in chunk 0. After full withdrawal:
-//   new_balance = 0 (all chunks 0)
-//   transfer_amount = 100 (chunk 0 = 100, rest 0)
-const newBalanceChunks = new Array(ell).fill(0n);
+// ---- Construct transfer_amount chunks + randomness ---------------------------------------
 const transferAmountChunks = ChunkedAmount.createTransferAmount(TRANSFER_AMOUNT_OCTAS).amountChunks;
+
+// ---- M10-d: threshold-decrypt chain old_balance to derive a TRUTHFUL newAmountChunks ------
+// M9's `new Array(ell).fill(0n)` was the bug — sigma-position-17 verifies iff
+//     balance == <B, new_a> + <B, v>  (mod q)
+// (see M10-a sigma_reference_verifier.mjs:202 and the regression-guard test
+// in operator-services/scripts/__tests__/sigma_position_17_parity.test.mjs).
+// We POST to coordinator /v2/balance/decrypt, Lagrange-aggregate the 5 worker
+// partial decryptions in the exponent to recover real_dk * oldBalanceD[k] per
+// chunk, subtract from oldBalanceC[k] to get balance_chunk[k] * G, then BSGS-
+// decode each chunk's plaintext integer and compute new_a = balance - transfer
+// with borrow propagation.
+console.error(`[m10-d] requesting balance partial decryption from coordinator quorum...`);
+const decryptResp = await fetch(`${COORDINATOR_URL}/v2/balance/decrypt`, {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+    authorization: `Bearer ${COORDINATOR_BEARER_TOKEN}`,
+  },
+  body: JSON.stringify({
+    dkgEpoch: String(caDkgRoster.dkgEpoch),
+    vaultAddress: addr32(vaultAddress),
+    assetType: addr32(assetType),
+    oldBalanceDHex: oldBalanceCt.D.map((p) => bytesToHex(p.toRawBytes())),
+    requestId,
+    aptosNodeUrl: APTOS_NODE_URL,
+  }),
+});
+if (!decryptResp.ok) {
+  const errBody = await decryptResp.text();
+  throw new Error(`balance_decrypt_failed: ${decryptResp.status} ${errBody}`);
+}
+const decryptJson = await decryptResp.json();
+
+// M10-c outbound forbidden-key guard is server-side; defense in depth here so
+// the orchestrator doesn't silently accept a key the coordinator might emit
+// in a future protocol revision.
+const FORBIDDEN_DECRYPT_RESPONSE = /^(amount|secret|nullifier|.*blind|dk|inverse|commitmentHex|leafIndex|merkle.*|.*Path|sender|amountChunks)$/i;
+function assertNoForbiddenDecrypt(obj, pathPrefix = "") {
+  if (obj === null || typeof obj !== "object") return;
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) assertNoForbiddenDecrypt(obj[i], `${pathPrefix}[${i}]`);
+    return;
+  }
+  for (const k of Object.keys(obj)) {
+    if (FORBIDDEN_DECRYPT_RESPONSE.test(k)) {
+      throw new Error(`forbidden_field_in_decrypt_response: ${pathPrefix}${pathPrefix ? "." : ""}${k}`);
+    }
+    assertNoForbiddenDecrypt(obj[k], `${pathPrefix}${pathPrefix ? "." : ""}${k}`);
+  }
+}
+assertNoForbiddenDecrypt(decryptJson);
+
+if (!Array.isArray(decryptJson.slots) || !Array.isArray(decryptJson.lagrangeCoeffs)) {
+  throw new Error(
+    `balance_decrypt_response_shape: slots=${Array.isArray(decryptJson.slots)} lagrangeCoeffs=${Array.isArray(decryptJson.lagrangeCoeffs)}`,
+  );
+}
+if (decryptJson.slots.length !== decryptJson.lagrangeCoeffs.length) {
+  throw new Error(
+    `balance_decrypt_quorum_lagrange_mismatch: slots=${decryptJson.slots.length} lagrange=${decryptJson.lagrangeCoeffs.length}`,
+  );
+}
+const partialsFromSlots = decryptJson.slots.map((s) => ({
+  slot: s.slot,
+  partials: s.partial_hex.map((h) => RistrettoPoint.fromHex(hexToBytes(h))),
+}));
+// M10-c encodes scalars via `scalarHexFromBigint`, which produces 32-byte
+// LITTLE-endian hex (see operator-services/deop-protocol/src/vault_ek_derivation.ts:448).
+// `BigInt("0x" + h)` would parse it as BIG-endian — reading exactly the wrong
+// scalar. Use bytesToBigLE on the decoded bytes to round-trip correctly.
+const lagrangeCoeffs = decryptJson.lagrangeCoeffs.map((h) => bytesToBigLE(hexToBytes(h)));
+
+const { chunks: balanceChunks } = recoverBalanceChunks({
+  oldBalanceC: oldBalanceCt.C,
+  oldBalanceD: oldBalanceCt.D,
+  partialsFromSlots,
+  lagrangeCoeffs,
+  chunkBits: CHUNK_BITS,
+});
+console.error(`[m10-d] recovered balance chunks: ${balanceChunks.map((c) => c.toString()).join(",")}`);
+
+const transferChunksPadded = padToEll(transferAmountChunks, ell);
+const newBalanceChunks = chunkSubtract(balanceChunks, transferChunksPadded);
+console.error(`[m10-d] new_a chunks: ${newBalanceChunks.map((c) => c.toString()).join(",")}`);
+
+// Sanity assertion (defense in depth — chunkSubtract already throws on underflow):
+const balanceSum = balanceChunks.reduce(
+  (a, c, i) => a + c * (1n << BigInt(CHUNK_BITS * i)),
+  0n,
+);
+const transferSum = transferAmountChunks.reduce(
+  (a, c, i) => a + c * (1n << BigInt(CHUNK_BITS * i)),
+  0n,
+);
+const newBalanceSum = newBalanceChunks.reduce(
+  (a, c, i) => a + c * (1n << BigInt(CHUNK_BITS * i)),
+  0n,
+);
+if (newBalanceSum + transferSum !== balanceSum) {
+  throw new Error(
+    `balance_witness_check_failed: ${newBalanceSum}+${transferSum}!=${balanceSum}`,
+  );
+}
+
+if (process.argv.includes("--check-balance-only")) {
+  console.log(
+    JSON.stringify({
+      check: "balance",
+      balanceChunks: balanceChunks.map(String),
+      newBalanceChunks: newBalanceChunks.map(String),
+      balanceChunksSum: balanceSum.toString(),
+      transferChunksSum: transferSum.toString(),
+      newBalanceChunksSum: newBalanceSum.toString(),
+      balance_witness_check: "ok",
+    }),
+  );
+  process.exit(0);
+}
 
 const newBalanceRandomness = Array.from({ length: ell }, () => randScalar());
 const transferAmountRandomness = Array.from({ length: n }, () => randScalar());
@@ -285,6 +405,42 @@ const sigmaProof = proveTransfer({
   hasEffectiveAuditor: false,
 });
 console.error(`[m8-real] σ proof: commitment[${sigmaProof.commitment.length}] + response[${sigmaProof.response.length}]`);
+
+// M10-d / M10-e: dry-run σ verification. Exits after proveTransfer is done but
+// BEFORE the witness builder writes /tmp/m8-*.json, round1 POST, or any
+// finalize-side artifact. Runs the M10-a JS reference verifier locally so a
+// pre-flight check can confirm that position 17 verifies with the truthful
+// new_a (and refutes — or pins — any remaining sigma-position-17 regression
+// before consuming a live cluster slot).
+if (process.argv.includes("--check-sigma-only")) {
+  const { runReferenceVerifier } = await import("./sigma_reference_verifier.mjs");
+  const oldBalanceCtPairs = oldBalanceCt.C.map((c, i) => ({ C: c, D: oldBalanceCt.D[i] }));
+  const newBalanceCtPairs = newBalanceCt.map((x) => ({ C: x.C, D: x.D }));
+  const transferSenderCtPairs = transferSenderCt.map((x) => ({ C: x.C, D: x.D }));
+  const transferRecipientCtPairs = transferRecipientCt.map((x) => ({ C: x.C, D: x.D }));
+  const result = runReferenceVerifier({
+    proof: sigmaProof,
+    oldBalanceCt: oldBalanceCtPairs,
+    newBalanceCt: newBalanceCtPairs,
+    transferSenderCt: transferSenderCtPairs,
+    transferRecipientCt: transferRecipientCtPairs,
+    ekSender: vaultEkPub,
+    ekRecipient: recipientEk,
+    chainId: CHAIN_ID,
+    senderAddress: senderAddressBytes,
+    recipientAddress: recipientAddressBytes,
+    tokenAddress: tokenAddressBytes,
+  });
+  console.log(
+    JSON.stringify({
+      check: "sigma",
+      failsByPosition: result.failsByPosition,
+      allPass: result.allPass,
+      challengeHex: result.challengeHex,
+    }),
+  );
+  process.exit(0);
+}
 
 // Recompute Fiat-Shamir e to extract α[0].
 const PROTOCOL_ID_BYTES = new TextEncoder().encode("AptosConfidentialAsset/TransferV1");
