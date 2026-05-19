@@ -1410,7 +1410,21 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     submit.chainSuccess === true
   ) {
     const nodeUrl = env.APTOS_TESTNET_NODE_URL;
-    if (nodeUrl) {
+    if (!nodeUrl) {
+      // M10-l (codex iter-8 P2-1 closure): make the helper fail-closed on
+      // missing APTOS_TESTNET_NODE_URL even when the orchestrator-side env
+      // preflight has been bypassed (e.g. a direct buildFinalReport caller).
+      // Without the node URL we can't fetch the tx body, can't verify
+      // success/vm_status, and can't run the WithdrawEventV2 event-payload
+      // check — refusing to bind `chainConfirmedWithdraw` is the safe move.
+      missingArtifacts.push({
+        path: "APTOS_TESTNET_NODE_URL",
+        reason:
+          "APTOS_TESTNET_NODE_URL is required for the independent chain re-query + " +
+          "WithdrawEventV2 event-payload verification. Refusing to bind chainConfirmedWithdraw " +
+          "to an unverified local submit artifact.",
+      });
+    } else {
       const txQuery = await getTransactionByHash(nodeUrl, submit.txHash);
       if (!txQuery.ok || txQuery.body?.success !== true) {
         missingArtifacts.push({
