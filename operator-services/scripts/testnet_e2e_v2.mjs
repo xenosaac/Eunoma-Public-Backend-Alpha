@@ -240,15 +240,19 @@ const preflightSnapshot = preflight.snapshot;
 
 {
   const stateRootForGuard = env.EUNOMA_LOCAL_STATE_ROOT ?? ".agent-local/eunoma-v2";
-  const finalizePath = resolve(
+  // The presence of a submit artifact (mpcca_withdraw_submit/<epoch>__<id>.json) means a chain
+  // submit has ALREADY happened for this requestId — that's the unambiguous replay signal.
+  // Finalize artifacts are created legitimately by local_v2_withdraw_full.mjs before testnet:e2e
+  // runs, so we cannot use those as the replay marker.
+  const submitArtifactPath = resolve(
     serviceRoot,
     stateRootForGuard,
     "coordinator",
-    "mpcca_withdraw",
-    `${env.EUNOMA_TESTNET_DKG_EPOCH}__${env.EUNOMA_TESTNET_REQUEST_ID}__finalize.json`,
+    "mpcca_withdraw_submit",
+    `${env.EUNOMA_TESTNET_DKG_EPOCH}__${env.EUNOMA_TESTNET_REQUEST_ID}.json`,
   );
-  const finalizeArtifactExists = existsSync(finalizePath);
-  if (finalizeArtifactExists && env.EUNOMA_TESTNET_ALLOW_REPLAY !== "1") {
+  const submitArtifactExists = existsSync(submitArtifactPath);
+  if (submitArtifactExists && env.EUNOMA_TESTNET_ALLOW_REPLAY !== "1") {
     console.error(
       JSON.stringify(
         {
@@ -256,13 +260,13 @@ const preflightSnapshot = preflight.snapshot;
           command: "testnet:e2e",
           error: "m9_replay_blocked",
           message:
-            "MPCCA finalize artifact for this requestId already exists on disk. " +
-            "M9 acceptance requires a FRESH withdraw against the multi-leaf root — replay of " +
-            "M8/earlier artifacts is not acceptable. To override (local debug only) set " +
-            "EUNOMA_TESTNET_ALLOW_REPLAY=1.",
+            "Submit artifact for this requestId already exists on disk — a chain submit already " +
+            "happened for this exact (dkgEpoch, requestId). M9 acceptance requires a FRESH " +
+            "withdraw against the multi-leaf root. Use a new EUNOMA_TESTNET_REQUEST_ID for " +
+            "each run. To override (local debug only) set EUNOMA_TESTNET_ALLOW_REPLAY=1.",
           requestId: env.EUNOMA_TESTNET_REQUEST_ID,
           dkgEpoch: env.EUNOMA_TESTNET_DKG_EPOCH,
-          finalizeArtifactPath: finalizePath,
+          submitArtifactPath,
         },
         null,
         2,
@@ -271,7 +275,7 @@ const preflightSnapshot = preflight.snapshot;
     process.exit(EXIT_USAGE_ERROR);
   }
   console.log(
-    `▶ M9 requestId=${env.EUNOMA_TESTNET_REQUEST_ID} mode=${finalizeArtifactExists ? "replay (allowed by EUNOMA_TESTNET_ALLOW_REPLAY=1)" : "fresh"}`,
+    `▶ M9 requestId=${env.EUNOMA_TESTNET_REQUEST_ID} mode=${submitArtifactExists ? "replay (allowed by EUNOMA_TESTNET_ALLOW_REPLAY=1)" : "fresh"}`,
   );
 
   // Build / refresh commitment_tree_v2.json. Idempotent; uses --refresh to merge with any
