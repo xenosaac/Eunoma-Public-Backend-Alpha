@@ -1481,11 +1481,22 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
   // Each slot persists a single `slot-{N}/vault_state_v2.json` with `worker_transcript_hash`
   // and `init_transcript_hash` fields. The pre-flight snapshot already validated bindings;
   // here we just confirm each file's transcript hashes are non-empty.
+  // M9-f: scope vault_state checks to the SELECTED 5-of-7 active quorum, not all 7. The 2
+  // unselected slots are part of the 5-of-7 threshold reserve and do not participate in init
+  // or observe_deposit fan-out — they legitimately have no vault_state_v2.json. The slot-
+  // collision detector enforces that the 5 selected slots have INDEPENDENT vault_state.
+  const finalizeSelectedSlots = Array.isArray(finalize?.selectedSlots)
+    ? finalize.selectedSlots
+    : Array.isArray(finalize?.withdrawV2CallArgsFields?.selectedSlots)
+      ? finalize.withdrawV2CallArgsFields.selectedSlots
+      : null;
+  const slotsToCheck = finalizeSelectedSlots ?? [0, 1, 2, 3, 4]; // sensible default; may be overridden
+
   const workerStateTranscripts = [];
   const workerInitTranscripts = [];
-  const slotStatesForCollisionCheck = []; // M9-f: detect synthetic backfills
+  const slotStatesForCollisionCheck = []; // M9-f: detect synthetic backfills within selected quorum
   if (dkgEpoch) {
-    for (let slot = 0; slot < 7; slot += 1) {
+    for (const slot of slotsToCheck) {
       const slotFile = resolve(
         serviceRoot,
         stateRoot ?? ".agent-local/eunoma-v2",
@@ -1496,7 +1507,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       if (!a) {
         missingArtifacts.push({
           path: slotFile,
-          reason: `Worker slot ${slot} vault_state_v2.json not found`,
+          reason: `Worker slot ${slot} (in selected quorum) vault_state_v2.json not found`,
         });
         continue;
       }
@@ -1813,13 +1824,16 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       })),
     };
   }
-  if (report.transcriptHashes.vaultStatePerSlot.length !== 7) {
+  // M9-f: vault_state truthfulness is scoped to the selected 5-of-7 active quorum.
+  // Unselected slots do not run init/observe_deposit and have no vault_state_v2.json by design.
+  const expectedSlotsLen = slotsToCheck.length;
+  if (report.transcriptHashes.vaultStatePerSlot.length !== expectedSlotsLen) {
     return {
       ok: false,
       missingArtifacts: [
         {
           path: "<stateRoot>/slot-*/vault_state_v2/*",
-          reason: `Expected 7 per-slot transcript hashes, got ${report.transcriptHashes.vaultStatePerSlot.length}`,
+          reason: `Expected ${expectedSlotsLen} per-selected-slot transcript hashes (matching finalize.selectedSlots), got ${report.transcriptHashes.vaultStatePerSlot.length}`,
         },
       ],
     };
