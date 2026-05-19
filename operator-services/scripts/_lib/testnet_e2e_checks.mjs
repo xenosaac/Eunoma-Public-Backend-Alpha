@@ -13,7 +13,7 @@
 //   - On final-report assembly, ANY artifact missing or malformed produces a hard exit-1
 //     with `final_report_artifacts_missing` — NO completion language is emitted.
 // =============================================================================================
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { resolve, join, dirname } from "node:path";
 import { createHash } from "node:crypto";
@@ -33,6 +33,21 @@ async function getCommitmentTreeHelpers() {
 
 const HEX64 = /^(0x)?[0-9a-fA-F]{64}$/;
 const TX_HASH_RE = /^(0x)?[0-9a-fA-F]{64}$/;
+
+// =============================================================================================
+// M10-i: env-gate helpers — pure functions so the two-gate decision is unit-testable. The
+// orchestrator (testnet_e2e_v2.mjs) imports these and refuses to bypass replay or skip the
+// tree rebuild unless BOTH the local-smoke marker AND the *_LOCAL-suffixed flag are set.
+// CI never sets EUNOMA_LOCAL_SMOKE=1, so both helpers return false in CI by construction.
+// =============================================================================================
+
+export function evaluateReplayBypass(env) {
+  return env?.EUNOMA_LOCAL_SMOKE === "1" && env?.EUNOMA_TESTNET_ALLOW_REPLAY_LOCAL === "1";
+}
+
+export function evaluateSkipTreeBuild(env) {
+  return env?.EUNOMA_LOCAL_SMOKE === "1" && env?.EUNOMA_TESTNET_SKIP_TREE_BUILD_LOCAL === "1";
+}
 
 // =============================================================================================
 // Low-level fetch + REST helpers
@@ -1963,6 +1978,70 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
           reason: "invariants.allSlotsIndependent is false — at least two slot vault_state files are byte-identical excluding slot/player_id fields",
         },
       ],
+    };
+  }
+
+  // ---- M10-i: tx freshness check ----
+  // Codex P1: the chain re-query at the submit-stage only verifies that the surfaced tx
+  // succeeded; it does not assert the tx is FRESH for this run. A replay could present an
+  // old withdraw tx (e.g. M8's 0xeb55af02...) and have it accepted by every prior invariant.
+  // Reject any chain-confirmed withdraw whose tx hash appears in the project's historical
+  // withdraw set. The historical file is appended ONLY after the rest of the report is OK
+  // (so a failed run never pollutes the set).
+  const historicalWithdrawTxsPath = resolve(
+    serviceRoot,
+    stateRoot ?? ".agent-local/eunoma-v2",
+    "historical_withdraw_txs.json",
+  );
+  let historical = { txs: [] };
+  if (existsSync(historicalWithdrawTxsPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(historicalWithdrawTxsPath, "utf8"));
+      if (parsed && Array.isArray(parsed.txs)) {
+        historical = { txs: parsed.txs, ...(parsed.note ? { note: parsed.note } : {}) };
+      }
+    } catch (_e) {
+      // Malformed historical file is treated as empty rather than crashing the gate; if a
+      // human edited it badly, the next successful run will overwrite with a clean shape.
+      historical = { txs: [] };
+    }
+  }
+  const chainConfirmedWithdraw = report.txHashes.chainConfirmedWithdraw;
+  const chainTxLower = String(chainConfirmedWithdraw).toLowerCase();
+  const historicalLower = historical.txs.map((t) => String(t).toLowerCase());
+  if (historicalLower.includes(chainTxLower)) {
+    return {
+      ok: false,
+      missingArtifacts: [],
+      integrityFailure: "tx_freshness_failed",
+      txReplayed: chainConfirmedWithdraw,
+      historicalWithdrawTxsPath,
+    };
+  }
+
+  // ---- M10-i: append to historical set (atomic .tmp → rename) ----
+  // Write happens only after EVERY prior invariant has passed, so a failed run leaves the
+  // historical set untouched. Atomic rename guarantees the on-disk file is never partially
+  // written even if the process is killed mid-write.
+  const updated = {
+    txs: [...historical.txs, chainConfirmedWithdraw],
+    ...(historical.note ? { note: historical.note } : {}),
+    updatedAtUnixMs: Date.now(),
+  };
+  try {
+    mkdirSync(dirname(historicalWithdrawTxsPath), { recursive: true });
+    const tmpPath = `${historicalWithdrawTxsPath}.tmp`;
+    writeFileSync(tmpPath, JSON.stringify(updated, null, 2) + "\n", { mode: 0o644 });
+    renameSync(tmpPath, historicalWithdrawTxsPath);
+  } catch (e) {
+    // A write failure here means the historical file is stale; surface it as an integrity
+    // failure rather than silently letting the next run replay this tx.
+    return {
+      ok: false,
+      missingArtifacts: [],
+      integrityFailure: "tx_freshness_write_failed",
+      errorMessage: e?.message ?? String(e),
+      historicalWithdrawTxsPath,
     };
   }
 

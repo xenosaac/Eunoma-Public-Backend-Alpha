@@ -66,6 +66,8 @@ import {
   runPreflight,
   buildFinalReport,
   validateRequiredEnv,
+  evaluateReplayBypass,
+  evaluateSkipTreeBuild,
 } from "./_lib/testnet_e2e_checks.mjs";
 
 const EXIT_SUCCESS = 0;
@@ -252,7 +254,13 @@ const preflightSnapshot = preflight.snapshot;
     `${env.EUNOMA_TESTNET_DKG_EPOCH}__${env.EUNOMA_TESTNET_REQUEST_ID}.json`,
   );
   const submitArtifactExists = existsSync(submitArtifactPath);
-  if (submitArtifactExists && env.EUNOMA_TESTNET_ALLOW_REPLAY !== "1") {
+  // M10-i (codex P1 fix): require BOTH gates to allow artifact replay.
+  // CI never sets EUNOMA_LOCAL_SMOKE=1, so this is hard-fail in CI. The previous single-env
+  // check (EUNOMA_TESTNET_ALLOW_REPLAY=1) could be flipped by any caller; the *_LOCAL suffix
+  // makes the local-debug-only intent explicit. Logic lives in evaluateReplayBypass so the
+  // two-gate decision can be unit-tested in isolation from the orchestrator.
+  const allowReplay = evaluateReplayBypass(env);
+  if (submitArtifactExists && !allowReplay) {
     console.error(
       JSON.stringify(
         {
@@ -263,7 +271,8 @@ const preflightSnapshot = preflight.snapshot;
             "Submit artifact for this requestId already exists on disk — a chain submit already " +
             "happened for this exact (dkgEpoch, requestId). M9 acceptance requires a FRESH " +
             "withdraw against the multi-leaf root. Use a new EUNOMA_TESTNET_REQUEST_ID for " +
-            "each run. To override (local debug only) set EUNOMA_TESTNET_ALLOW_REPLAY=1.",
+            "each run. To override (local debug only) set BOTH EUNOMA_LOCAL_SMOKE=1 AND " +
+            "EUNOMA_TESTNET_ALLOW_REPLAY_LOCAL=1.",
           requestId: env.EUNOMA_TESTNET_REQUEST_ID,
           dkgEpoch: env.EUNOMA_TESTNET_DKG_EPOCH,
           submitArtifactPath,
@@ -275,7 +284,7 @@ const preflightSnapshot = preflight.snapshot;
     process.exit(EXIT_USAGE_ERROR);
   }
   console.log(
-    `▶ M9 requestId=${env.EUNOMA_TESTNET_REQUEST_ID} mode=${submitArtifactExists ? "replay (allowed by EUNOMA_TESTNET_ALLOW_REPLAY=1)" : "fresh"}`,
+    `▶ M9 requestId=${env.EUNOMA_TESTNET_REQUEST_ID} mode=${submitArtifactExists ? "replay (allowed by EUNOMA_LOCAL_SMOKE=1 + EUNOMA_TESTNET_ALLOW_REPLAY_LOCAL=1)" : "fresh"}`,
   );
 
   // Build / refresh commitment_tree_v2.json. Idempotent; uses --refresh to merge with any
@@ -286,7 +295,12 @@ const preflightSnapshot = preflight.snapshot;
     "coordinator",
     "commitment_tree_v2.json",
   );
-  if (env.EUNOMA_TESTNET_SKIP_TREE_BUILD !== "1") {
+  // M10-i (codex P1 fix): also two-gate the tree-build skip. The previous single-env check
+  // (EUNOMA_TESTNET_SKIP_TREE_BUILD=1) was bypassable by any caller; require BOTH the
+  // local-smoke marker and the *_LOCAL-suffixed flag so CI cannot skip the rebuild. Logic
+  // lives in evaluateSkipTreeBuild for unit-test isolation.
+  const skipTreeBuild = evaluateSkipTreeBuild(env);
+  if (!skipTreeBuild) {
     console.log("▶ M9 commitment tree refresh: local_build_commitment_tree.mjs");
     const treeArgs = [
       "scripts/local_build_commitment_tree.mjs",
@@ -323,7 +337,9 @@ const preflightSnapshot = preflight.snapshot;
       process.exit(EXIT_USAGE_ERROR);
     }
   } else {
-    console.log("▶ M9 EUNOMA_TESTNET_SKIP_TREE_BUILD=1 — using existing commitment_tree_v2.json");
+    console.log(
+      "▶ M9 EUNOMA_LOCAL_SMOKE=1 + EUNOMA_TESTNET_SKIP_TREE_BUILD_LOCAL=1 — using existing commitment_tree_v2.json",
+    );
   }
 }
 

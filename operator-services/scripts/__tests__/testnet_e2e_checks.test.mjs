@@ -5,9 +5,17 @@
 // to `aptos` and must NOT touch real network endpoints.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   validateRequiredEnv,
@@ -19,6 +27,8 @@ import {
   isTxHash,
   vaultStateContentSignature,
   findSlotContentCollisions,
+  evaluateReplayBypass,
+  evaluateSkipTreeBuild,
 } from "../_lib/testnet_e2e_checks.mjs";
 import { CommitmentTreeV2 } from "../../../circuits/scripts/commitment_tree_v2.mjs";
 import {
@@ -990,5 +1000,256 @@ describe("buildFinalReport — M10-h tree integrity + privacy field discipline",
       expect(result.ok).toBe(false);
       expect(result.missingArtifacts.some((m) => /chainSuccess=false/.test(m.reason))).toBe(true);
     }
+  });
+});
+
+// =============================================================================================
+// M10-i — tx freshness check + two-gate env bypass
+//
+// Codex P1 finding: the chain re-query at the submit stage only verifies that the surfaced tx
+// succeeded; it does not assert the tx is FRESH for the current run. A replay could present an
+// old withdraw tx (e.g. M8's 0xeb55af02...) and pass every prior invariant. M10-i adds a
+// historical-set check + two-gate env bypass for the replay/skip-tree-build flags.
+// =============================================================================================
+
+describe("buildFinalReport — M10-i tx freshness check", () => {
+  it("chain tx hash in historical set → integrityFailure=tx_freshness_failed", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture();
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    await writeHappyFixture(stateRoot, env, snapshot);
+    mockChainReQueryOk();
+
+    // Seed the historical file with the submit tx hash. The submitArtifactFixture uses
+    // TX_HASH_OK = 0x${"1".repeat(64)}; pre-populating it forces the freshness gate to fail.
+    writeFileSync(
+      join(stateRoot, "historical_withdraw_txs.json"),
+      JSON.stringify(
+        {
+          txs: [TX_HASH_OK],
+          note: "fixture: pretend M8's withdraw was already on chain",
+          updatedAtUnixMs: 1716000000000,
+        },
+        null,
+        2,
+      ),
+    );
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    expect(result.ok).toBe(false);
+    expect(result.integrityFailure).toBe("tx_freshness_failed");
+    expect(result.txReplayed?.toLowerCase()).toBe(TX_HASH_OK.toLowerCase());
+  });
+
+  it("chain tx hash in historical set with different casing → still detected", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture();
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    await writeHappyFixture(stateRoot, env, snapshot);
+    mockChainReQueryOk();
+
+    // Uppercase the historical entry; case-insensitive match should still trip the gate.
+    writeFileSync(
+      join(stateRoot, "historical_withdraw_txs.json"),
+      JSON.stringify({ txs: [TX_HASH_OK.toUpperCase()] }, null, 2),
+    );
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    expect(result.ok).toBe(false);
+    expect(result.integrityFailure).toBe("tx_freshness_failed");
+  });
+
+  it("happy path with no prior history → tx is appended atomically (.tmp not left over)", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture();
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    await writeHappyFixture(stateRoot, env, snapshot);
+    mockChainReQueryOk();
+
+    const historicalPath = join(stateRoot, "historical_withdraw_txs.json");
+    const tmpPath = `${historicalPath}.tmp`;
+    expect(existsSync(historicalPath)).toBe(false);
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    if (!result.ok) {
+      throw new Error(
+        `expected ok=true for happy fixture, got: ${JSON.stringify(result, null, 2)}`,
+      );
+    }
+
+    expect(existsSync(historicalPath)).toBe(true);
+    expect(existsSync(tmpPath)).toBe(false); // atomic rename removes the .tmp
+    const written = JSON.parse(readFileSync(historicalPath, "utf8"));
+    expect(written.txs).toEqual([TX_HASH_OK]);
+    expect(typeof written.updatedAtUnixMs).toBe("number");
+  });
+
+  it("write happens only on full success — failed run does not pollute the historical set", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture();
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    // chainSuccess=false makes the submit-stage gate fail BEFORE the freshness write runs.
+    await writeHappyFixture(stateRoot, env, snapshot, { chainSuccess: false });
+    mockChainReQueryOk();
+
+    const historicalPath = join(stateRoot, "historical_withdraw_txs.json");
+    expect(existsSync(historicalPath)).toBe(false);
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    expect(result.ok).toBe(false);
+    // Critical: even though chainConfirmedWithdraw was a real-looking tx, the write must NOT
+    // have happened because the broader report failed. Otherwise a botched run would seed the
+    // history and block a later legitimate retry of the same tx hash.
+    expect(existsSync(historicalPath)).toBe(false);
+  });
+
+  it("malformed historical file is treated as empty rather than crashing the gate", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture();
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    await writeHappyFixture(stateRoot, env, snapshot);
+    mockChainReQueryOk();
+
+    writeFileSync(join(stateRoot, "historical_withdraw_txs.json"), "not valid json {{{");
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    if (!result.ok) {
+      throw new Error(
+        `expected ok=true with malformed historical (fallback to empty), got: ${JSON.stringify(result, null, 2)}`,
+      );
+    }
+    // The malformed file should have been overwritten with a clean shape.
+    const written = JSON.parse(readFileSync(join(stateRoot, "historical_withdraw_txs.json"), "utf8"));
+    expect(Array.isArray(written.txs)).toBe(true);
+    expect(written.txs).toEqual([TX_HASH_OK]);
+  });
+});
+
+// =============================================================================================
+// M10-i — two-gate env bypass helpers
+//
+// The orchestrator delegates the two-gate decision to evaluateReplayBypass and
+// evaluateSkipTreeBuild so the logic is unit-testable in isolation from the rest of
+// testnet_e2e_v2.mjs (which can't run in CI without the aptos CLI, profiles, and chain
+// reachability). These helpers are pure: env → boolean.
+// =============================================================================================
+
+describe("evaluateReplayBypass (M10-i two-gate replay)", () => {
+  it("ALLOW_REPLAY_LOCAL=1 without LOCAL_SMOKE → false (replay blocked)", () => {
+    expect(evaluateReplayBypass({ EUNOMA_TESTNET_ALLOW_REPLAY_LOCAL: "1" })).toBe(false);
+  });
+
+  it("LOCAL_SMOKE=1 without ALLOW_REPLAY_LOCAL → false (replay blocked)", () => {
+    expect(evaluateReplayBypass({ EUNOMA_LOCAL_SMOKE: "1" })).toBe(false);
+  });
+
+  it("legacy EUNOMA_TESTNET_ALLOW_REPLAY=1 alone has NO effect → false", () => {
+    // Critical: the old single-env flag must be DEAD. Any caller relying on it has to set the
+    // new *_LOCAL flag + the local-smoke marker.
+    expect(evaluateReplayBypass({ EUNOMA_TESTNET_ALLOW_REPLAY: "1" })).toBe(false);
+    expect(
+      evaluateReplayBypass({
+        EUNOMA_TESTNET_ALLOW_REPLAY: "1",
+        EUNOMA_TESTNET_ALLOW_REPLAY_LOCAL: "1",
+        // LOCAL_SMOKE missing — should STILL be blocked.
+      }),
+    ).toBe(false);
+  });
+
+  it("both gates set (LOCAL_SMOKE=1 + ALLOW_REPLAY_LOCAL=1) → true (replay allowed)", () => {
+    expect(
+      evaluateReplayBypass({
+        EUNOMA_LOCAL_SMOKE: "1",
+        EUNOMA_TESTNET_ALLOW_REPLAY_LOCAL: "1",
+      }),
+    ).toBe(true);
+  });
+
+  it("non-'1' values do not satisfy the gate (e.g. 'true', 'yes', 'TRUE')", () => {
+    expect(
+      evaluateReplayBypass({
+        EUNOMA_LOCAL_SMOKE: "true",
+        EUNOMA_TESTNET_ALLOW_REPLAY_LOCAL: "1",
+      }),
+    ).toBe(false);
+    expect(
+      evaluateReplayBypass({
+        EUNOMA_LOCAL_SMOKE: "1",
+        EUNOMA_TESTNET_ALLOW_REPLAY_LOCAL: "yes",
+      }),
+    ).toBe(false);
+  });
+
+  it("empty env → false", () => {
+    expect(evaluateReplayBypass({})).toBe(false);
+    expect(evaluateReplayBypass(null)).toBe(false);
+    expect(evaluateReplayBypass(undefined)).toBe(false);
+  });
+});
+
+describe("evaluateSkipTreeBuild (M10-i two-gate skip-tree-build)", () => {
+  it("SKIP_TREE_BUILD_LOCAL=1 without LOCAL_SMOKE → false (must rebuild)", () => {
+    expect(evaluateSkipTreeBuild({ EUNOMA_TESTNET_SKIP_TREE_BUILD_LOCAL: "1" })).toBe(false);
+  });
+
+  it("LOCAL_SMOKE=1 without SKIP_TREE_BUILD_LOCAL → false (must rebuild)", () => {
+    expect(evaluateSkipTreeBuild({ EUNOMA_LOCAL_SMOKE: "1" })).toBe(false);
+  });
+
+  it("legacy EUNOMA_TESTNET_SKIP_TREE_BUILD=1 alone has NO effect → false", () => {
+    expect(evaluateSkipTreeBuild({ EUNOMA_TESTNET_SKIP_TREE_BUILD: "1" })).toBe(false);
+  });
+
+  it("both gates set (LOCAL_SMOKE=1 + SKIP_TREE_BUILD_LOCAL=1) → true (skip allowed)", () => {
+    expect(
+      evaluateSkipTreeBuild({
+        EUNOMA_LOCAL_SMOKE: "1",
+        EUNOMA_TESTNET_SKIP_TREE_BUILD_LOCAL: "1",
+      }),
+    ).toBe(true);
+  });
+
+  it("empty env → false", () => {
+    expect(evaluateSkipTreeBuild({})).toBe(false);
+    expect(evaluateSkipTreeBuild(null)).toBe(false);
+  });
+});
+
+// =============================================================================================
+// M10-i — orchestrator wiring smoke check
+//
+// Reads testnet_e2e_v2.mjs source and asserts it routes its replay/skip-tree-build decisions
+// through the unit-tested helpers. This is the structural pin that prevents a future refactor
+// from re-introducing the single-env bypass. Source-level pinning beats spawning the script
+// because the orchestrator's preflight needs the `aptos` CLI + a funded testnet profile, which
+// cannot be assumed in CI.
+// =============================================================================================
+
+const TESTNET_E2E_V2_SRC = readFileSync(
+  resolve(dirname(fileURLToPath(import.meta.url)), "..", "testnet_e2e_v2.mjs"),
+  "utf8",
+);
+
+describe("testnet_e2e_v2.mjs — M10-i wiring", () => {
+  it("imports the two-gate env helpers from _lib/testnet_e2e_checks.mjs", () => {
+    expect(TESTNET_E2E_V2_SRC).toMatch(/evaluateReplayBypass/);
+    expect(TESTNET_E2E_V2_SRC).toMatch(/evaluateSkipTreeBuild/);
+  });
+
+  it("uses evaluateReplayBypass(env) for the replay decision", () => {
+    expect(TESTNET_E2E_V2_SRC).toMatch(/const\s+allowReplay\s*=\s*evaluateReplayBypass\(env\)/);
+  });
+
+  it("uses evaluateSkipTreeBuild(env) for the skip-tree-build decision", () => {
+    expect(TESTNET_E2E_V2_SRC).toMatch(/const\s+skipTreeBuild\s*=\s*evaluateSkipTreeBuild\(env\)/);
+  });
+
+  it("no longer references the single-env legacy flags as decision gates", () => {
+    // Comments still mention the legacy names (historical context); decision-bearing code
+    // must NOT compare them with === "1". We assert no assignment uses the old single flag.
+    expect(TESTNET_E2E_V2_SRC).not.toMatch(/env\.EUNOMA_TESTNET_ALLOW_REPLAY\s*!==\s*"1"/);
+    expect(TESTNET_E2E_V2_SRC).not.toMatch(/env\.EUNOMA_TESTNET_SKIP_TREE_BUILD\s*!==\s*"1"/);
+    expect(TESTNET_E2E_V2_SRC).not.toMatch(/env\.EUNOMA_TESTNET_ALLOW_REPLAY\s*===\s*"1"/);
+    expect(TESTNET_E2E_V2_SRC).not.toMatch(/env\.EUNOMA_TESTNET_SKIP_TREE_BUILD\s*===\s*"1"/);
   });
 });
