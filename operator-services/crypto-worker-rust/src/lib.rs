@@ -3117,6 +3117,13 @@ pub mod bulletproof_reference;
 
 pub mod twisted_elgamal_reference;
 
+// M10-b: chain re-fetch helper + partial-decrypt handler. Worker-side of the
+// threshold balance-decrypt protocol that backs the orchestrator's truthful
+// `newBalanceChunks = oldBalanceChunks − transferAmountChunks` witness.
+pub mod chain_fetch;
+
+pub mod balance_decrypt;
+
 // =================================================================================================
 // Codex M3a P2 #2: atomic write helper applied uniformly across V2 production sites.
 //

@@ -65,6 +65,14 @@ struct AppState {
     state_dir: PathBuf,
 }
 
+// M10-b: opt AppState in to the balance_decrypt handler's read-only view of
+// the per-slot state directory.
+impl eunoma_crypto_worker::balance_decrypt::AppStateForBalanceDecrypt for AppState {
+    fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -219,6 +227,20 @@ async fn main() {
         .route(
             "/worker/v2/mpcca/withdraw/finalize",
             post(mpcca_withdraw_finalize),
+        )
+        // M10-b: worker partial-decryption endpoint. Computes
+        // `dk_share_i · oldBalanceD[k]` per chunk after re-fetching oldBalanceD
+        // from chain (defense-in-depth vs chosen-D oracle). Registered under
+        // both the canonical /worker/v2 prefix (matches all other worker
+        // routes) and the plan's literal /v2 path so the coordinator can pick
+        // either.
+        .route(
+            "/worker/v2/balance/decrypt_partial",
+            post(eunoma_crypto_worker::balance_decrypt::handle_http::<AppState>),
+        )
+        .route(
+            "/v2/balance/decrypt_partial",
+            post(eunoma_crypto_worker::balance_decrypt::handle_http::<AppState>),
         )
         .with_state(app_state);
 
