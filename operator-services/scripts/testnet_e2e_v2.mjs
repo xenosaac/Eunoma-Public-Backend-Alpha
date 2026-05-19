@@ -60,7 +60,7 @@
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 
 import {
   runPreflight,
@@ -228,6 +228,100 @@ if (!preflight.ok) {
   process.exit(EXIT_USAGE_ERROR);
 }
 const preflightSnapshot = preflight.snapshot;
+
+// =============================================================================================
+// Stage 2.5: M9 fresh-requestId guard + commitment-tree refresh.
+//
+// M9 acceptance requires a FRESH withdraw against a multi-leaf root, not an idempotent replay of
+// M8 artifacts. Detect existing MPCCA artifacts for this requestId and bail unless explicitly
+// allowed (local debugging only). Also ensure commitment_tree_v2.json exists; if absent, build it
+// from confirmed depositor witness tx hashes.
+// =============================================================================================
+
+{
+  const stateRootForGuard = env.EUNOMA_LOCAL_STATE_ROOT ?? ".agent-local/eunoma-v2";
+  const finalizePath = resolve(
+    serviceRoot,
+    stateRootForGuard,
+    "coordinator",
+    "mpcca_withdraw",
+    `${env.EUNOMA_TESTNET_DKG_EPOCH}__${env.EUNOMA_TESTNET_REQUEST_ID}__finalize.json`,
+  );
+  const finalizeArtifactExists = existsSync(finalizePath);
+  if (finalizeArtifactExists && env.EUNOMA_TESTNET_ALLOW_REPLAY !== "1") {
+    console.error(
+      JSON.stringify(
+        {
+          ok: false,
+          command: "testnet:e2e",
+          error: "m9_replay_blocked",
+          message:
+            "MPCCA finalize artifact for this requestId already exists on disk. " +
+            "M9 acceptance requires a FRESH withdraw against the multi-leaf root — replay of " +
+            "M8/earlier artifacts is not acceptable. To override (local debug only) set " +
+            "EUNOMA_TESTNET_ALLOW_REPLAY=1.",
+          requestId: env.EUNOMA_TESTNET_REQUEST_ID,
+          dkgEpoch: env.EUNOMA_TESTNET_DKG_EPOCH,
+          finalizeArtifactPath: finalizePath,
+        },
+        null,
+        2,
+      ),
+    );
+    process.exit(EXIT_USAGE_ERROR);
+  }
+  console.log(
+    `▶ M9 requestId=${env.EUNOMA_TESTNET_REQUEST_ID} mode=${finalizeArtifactExists ? "replay (allowed by EUNOMA_TESTNET_ALLOW_REPLAY=1)" : "fresh"}`,
+  );
+
+  // Build / refresh commitment_tree_v2.json. Idempotent; uses --refresh to merge with any
+  // existing snapshot rather than rebuilding from scratch.
+  const treePath = resolve(
+    serviceRoot,
+    stateRootForGuard,
+    "coordinator",
+    "commitment_tree_v2.json",
+  );
+  if (env.EUNOMA_TESTNET_SKIP_TREE_BUILD !== "1") {
+    console.log("▶ M9 commitment tree refresh: local_build_commitment_tree.mjs");
+    const treeArgs = [
+      "scripts/local_build_commitment_tree.mjs",
+      "--bridge-package-address",
+      env.BRIDGE_PACKAGE_ADDRESS,
+      "--vault-address",
+      env.EUNOMA_TESTNET_VAULT_ADDRESS,
+      "--asset-type",
+      env.EUNOMA_TESTNET_ASSET_TYPE,
+      "--aptos-node-url",
+      env.APTOS_TESTNET_NODE_URL,
+      "--state-dir",
+      resolve(serviceRoot, stateRootForGuard, "coordinator"),
+    ];
+    if (existsSync(treePath)) treeArgs.push("--refresh");
+    const tree = spawnSync("node", treeArgs, { stdio: "inherit", cwd: serviceRoot });
+    if (tree.status !== EXIT_SUCCESS) {
+      console.error(
+        JSON.stringify(
+          {
+            ok: false,
+            command: "testnet:e2e",
+            error: "m9_tree_build_failed",
+            message:
+              "M9 commitment tree builder failed. Investigate: (a) Aptos REST rate limits, " +
+              "(b) bridge/vault/asset address mismatch, (c) depositor witness tx-hash list. " +
+              "V2 is NOT complete.",
+            treeExitCode: tree.status,
+          },
+          null,
+          2,
+        ),
+      );
+      process.exit(EXIT_USAGE_ERROR);
+    }
+  } else {
+    console.log("▶ M9 EUNOMA_TESTNET_SKIP_TREE_BUILD=1 — using existing commitment_tree_v2.json");
+  }
+}
 
 // =============================================================================================
 // Stage 3: M6-a local smoke prerequisite (round1 → round2 → finalize → frost-attest).
