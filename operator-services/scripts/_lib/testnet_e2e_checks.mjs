@@ -1393,7 +1393,15 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
   // directly and require success=true + vm_status="Executed successfully". Only do the
   // re-query if the on-disk validation above already passed (`submit` exists, txHash is
   // valid, not simulated, chainSuccess=true) — otherwise we'd waste a network call.
+  //
+  // M10-l (codex iter-4 P1-10): preserve the full tx body for the post-finalize
+  // WithdrawEventV2 verification step. `success: true` + `vm_status: "Executed
+  // successfully"` only proves the tx executed without aborting; an attacker
+  // could otherwise feed a different successful tx (any non-aborting Move call
+  // on the same address) and pass this gate. The chain event payload is what
+  // binds the tx to THIS withdraw's root/nullifier_hash/recipient.
   let submitTxVersion = null;
+  let chainSubmitTxBody = null;
   if (
     submit &&
     submit.completed === true &&
@@ -1422,6 +1430,7 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
         });
       } else {
         submitTxVersion = txQuery.body?.version ?? null;
+        chainSubmitTxBody = txQuery.body;
       }
     }
   }
@@ -1440,6 +1449,58 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       path: finalizePath,
       reason: "MPCCA finalize transcript not found on disk",
     });
+  }
+
+  // ---- M10-l (codex iter-4 P1-10): verify the chain tx actually emitted
+  //      WithdrawEventV2 with the expected root/nullifier/recipient. ----
+  //
+  // `success: true` + `vm_status: "Executed successfully"` only proves the tx
+  // executed without aborting; any non-aborting Move call on the same address
+  // would pass that check. Binding the chain tx to THIS withdraw requires
+  // checking that the tx's events array contains a WithdrawEventV2 whose
+  // payload matches the finalize artifact's call args (root, nullifier_hash,
+  // recipient_hash).
+  if (chainSubmitTxBody && finalize?.withdrawV2CallArgsFields) {
+    const events = Array.isArray(chainSubmitTxBody.events) ? chainSubmitTxBody.events : [];
+    const withdrawEvent = events.find(
+      (e) => typeof e?.type === "string" && /::eunoma_bridge::WithdrawEventV2(?:<[^>]*>)?$/.test(e.type),
+    );
+    const normHex = (h) => String(h ?? "").toLowerCase().replace(/^0x/, "");
+    if (!withdrawEvent) {
+      missingArtifacts.push({
+        path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+        reason:
+          `Chain submit tx success=true and vm_status="Executed successfully" but no ` +
+          `eunoma_bridge::WithdrawEventV2 emitted. The tx may be a successful Move call ` +
+          `against the same address that is not a M10 withdraw. Refusing to bind ` +
+          `chainConfirmedWithdraw to this tx.`,
+      });
+    } else {
+      const expectedRoot = normHex(finalize.withdrawV2CallArgsFields.root);
+      const eventRoot = normHex(withdrawEvent.data?.root);
+      if (expectedRoot && expectedRoot !== eventRoot) {
+        missingArtifacts.push({
+          path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+          reason: `WithdrawEventV2.root mismatch: chain=${eventRoot} != finalize.callArgs.root=${expectedRoot}`,
+        });
+      }
+      const expectedNullifier = normHex(finalize.withdrawV2CallArgsFields.nullifierHash);
+      const eventNullifier = normHex(withdrawEvent.data?.nullifier_hash);
+      if (expectedNullifier && expectedNullifier !== eventNullifier) {
+        missingArtifacts.push({
+          path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+          reason: `WithdrawEventV2.nullifier_hash mismatch: chain=${eventNullifier} != finalize.callArgs.nullifierHash=${expectedNullifier}`,
+        });
+      }
+      const expectedRecipientHash = normHex(finalize.withdrawV2CallArgsFields.recipientHash);
+      const eventRecipientHash = normHex(withdrawEvent.data?.recipient_hash);
+      if (expectedRecipientHash && expectedRecipientHash !== eventRecipientHash) {
+        missingArtifacts.push({
+          path: `${env.APTOS_TESTNET_NODE_URL}/v1/transactions/by_hash/${submit.txHash}`,
+          reason: `WithdrawEventV2.recipient_hash mismatch: chain=${eventRecipientHash} != finalize.callArgs.recipientHash=${expectedRecipientHash}`,
+        });
+      }
+    }
   }
 
   // ---- CA DKG V2 transcript ----
@@ -1808,6 +1869,14 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       submit: submitArtifact.transcriptHash ?? null,
       observedDeposit: snapshot?.observedDepositTranscriptHash ?? null,
     },
+    // M10-l (codex iter-4 P1-7): `sources.observedDepositArtifactPath` was
+    // a path like `<dkgEpoch>__<depositCount>__<observeRequestId>.json` —
+    // the embedded `depositCount` and depositor request id reintroduced a
+    // direct deposit→withdraw linker via the source-path block, defeating
+    // the iter-2 P1-3 redactions on `depositEventProof` + `txHashes.deposit`.
+    // Drop the deposit-linking source path. The observation's audit binding
+    // remains via `transcriptHashes.observedDeposit` (a SHA-256 over the
+    // observed-deposit transcript, no deposit identity).
     sources: {
       submitArtifactPath: submitPath,
       finalizeTranscriptPath: finalizePath,
@@ -1815,7 +1884,6 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
       caDkgV2Path: caDkgArtifact?.path ?? null,
       frostDkgV2Path: frostDkgArtifact?.path ?? null,
       workerStatePaths: workerStateTranscripts.map((w) => w.path),
-      observedDepositArtifactPath: snapshot?.observedDepositArtifactPath ?? null,
     },
     invariants: {
       threshold: snapshot?.deoperatorConfig?.threshold ?? null,
@@ -2038,17 +2106,33 @@ export async function buildFinalReport(snapshot, env, serviceRoot, stateRoot) {
     "historical_withdraw_txs.json",
   );
   let historical = { txs: [] };
+  let historicalCorrupt = false;
   if (existsSync(historicalWithdrawTxsPath)) {
     try {
       const parsed = JSON.parse(readFileSync(historicalWithdrawTxsPath, "utf8"));
       if (parsed && Array.isArray(parsed.txs)) {
         historical = { txs: parsed.txs, ...(parsed.note ? { note: parsed.note } : {}) };
+      } else {
+        historicalCorrupt = true;
       }
     } catch (_e) {
-      // Malformed historical file is treated as empty rather than crashing the gate; if a
-      // human edited it badly, the next successful run will overwrite with a clean shape.
-      historical = { txs: [] };
+      historicalCorrupt = true;
     }
+  }
+  // M10-l (codex iter-4 P1-10): malformed history was previously treated as
+  // empty — an operator-friendly fallback that doubled as a freshness-gate
+  // bypass for an attacker who can write to the state dir. Fail closed by
+  // default; allow the empty-fallback only under EUNOMA_LOCAL_SMOKE=1
+  // (interactive local debug where the state may be hand-edited). The chain-
+  // event verification above (WithdrawEventV2 root/nullifier_hash match) is
+  // the primary defense; this history file is the secondary replay denylist.
+  if (historicalCorrupt && env.EUNOMA_LOCAL_SMOKE !== "1") {
+    return {
+      ok: false,
+      missingArtifacts: [],
+      integrityFailure: "historical_withdraw_txs_corrupt",
+      historicalWithdrawTxsPath,
+    };
   }
   const chainConfirmedWithdraw = report.txHashes.chainConfirmedWithdraw;
   const chainTxLower = String(chainConfirmedWithdraw).toLowerCase();

@@ -473,13 +473,19 @@ test("--check-balance-only does not write side-car or σ-proof", async () => {
         `expected exit 0 (balance recovers cleanly); got ${result.status}, stderr=${result.stderr?.slice(0, 1000)}`,
       );
       // Stdout should be a single JSON payload with check=balance.
-      // M10-l: default redacts plaintext chunks/sums; only the integrity
-      // verdict + balanceVectorHash bind the (private) recovered vectors.
+      // M10-l (iter-4 P1-9): default redacts plaintext chunks/sums AND the
+      // public balanceVectorHash (offline-bruteforceable on low-entropy
+      // balances). Only the integrity verdict + chunk-count shape (non-
+      // revealing) survive.
       const stdout = (result.stdout ?? "").trim();
       const parsed = JSON.parse(stdout);
       assert.equal(parsed.check, "balance");
       assert.equal(parsed.balance_witness_check, "ok");
-      assert.match(parsed.balanceVectorHash, /^[0-9a-f]{64}$/);
+      assert.equal(parsed.chunkCount, AVAILABLE_BALANCE_CHUNK_COUNT);
+      assert.ok(
+        !("balanceVectorHash" in parsed),
+        "default mode must NOT publish a public hash of low-entropy balance vectors (codex iter-4 P1-9)",
+      );
       assert.ok(
         !("balanceChunks" in parsed),
         "default mode must NOT leak plaintext balanceChunks to stdout (codex iter-2 P2)",

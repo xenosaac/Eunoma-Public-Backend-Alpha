@@ -173,6 +173,7 @@ afterEach(() => {
     tmpRoot = undefined;
   }
   vi.restoreAllMocks();
+  lastFixtureUsedRoot = null;
 });
 
 // =============================================================================================
@@ -783,6 +784,10 @@ async function writeHappyFixture(stateRoot, env, treeSnapshot, opts = {}) {
   const requestId = env.EUNOMA_TESTNET_REQUEST_ID;
   const usedRootHex = treeSnapshot.latestRootHex;
   const transcriptHash = treeSnapshot.transcriptHash;
+  // M10-l iter-4 P1-10: hand the root to the mockChainReQueryOk helper so the
+  // mocked chain re-query response includes a WithdrawEventV2 whose root
+  // matches the finalize artifact's withdrawV2CallArgsFields.root.
+  lastFixtureUsedRoot = usedRootHex;
   const selectedSlots = opts.selectedSlots ?? [0, 1, 2, 3, 4];
   const initTranscriptHash = opts.initTranscriptHash ?? ("0x" + "e".repeat(64));
   const chainSuccess = opts.chainSuccess ?? true;
@@ -900,11 +905,30 @@ function happySnapshotArg(env) {
   };
 }
 
-function mockChainReQueryOk() {
+// Set by writeHappyFixture so mockChainReQueryOk can include a matching
+// WithdrawEventV2 event in the re-query response (M10-l iter-4 P1-10).
+let lastFixtureUsedRoot = null;
+
+function mockChainReQueryOk({ withdrawEventRoot } = {}) {
+  const root = withdrawEventRoot ?? lastFixtureUsedRoot;
+  const events = root
+    ? [
+        {
+          type: "0xbeef::eunoma_bridge::WithdrawEventV2",
+          data: { root },
+        },
+      ]
+    : [];
   vi.spyOn(globalThis, "fetch").mockResolvedValue({
     status: 200,
     ok: true,
-    text: async () => JSON.stringify({ success: true, vm_status: "Executed successfully", version: "1234" }),
+    text: async () =>
+      JSON.stringify({
+        success: true,
+        vm_status: "Executed successfully",
+        version: "1234",
+        events,
+      }),
   });
 }
 
@@ -1103,7 +1127,7 @@ describe("buildFinalReport — M10-i tx freshness check", () => {
     expect(existsSync(historicalPath)).toBe(false);
   });
 
-  it("malformed historical file is treated as empty rather than crashing the gate", async () => {
+  it("malformed historical file fails closed in non-smoke (codex iter-4 P1-10)", async () => {
     const stateRoot = makeTmpStateRoot();
     const env = fullEnvFixture();
     const { snapshot } = await buildRealTreeSnapshot(8);
@@ -1113,9 +1137,27 @@ describe("buildFinalReport — M10-i tx freshness check", () => {
     writeFileSync(join(stateRoot, "historical_withdraw_txs.json"), "not valid json {{{");
 
     const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
+    expect(result.ok).toBe(false);
+    expect(result.integrityFailure).toBe("historical_withdraw_txs_corrupt");
+    // Malformed file was NOT overwritten — fail-closed path doesn't append.
+    expect(readFileSync(join(stateRoot, "historical_withdraw_txs.json"), "utf8")).toBe(
+      "not valid json {{{",
+    );
+  });
+
+  it("malformed historical file falls back to empty under EUNOMA_LOCAL_SMOKE (operator-friendly local debug)", async () => {
+    const stateRoot = makeTmpStateRoot();
+    const env = fullEnvFixture({ EUNOMA_LOCAL_SMOKE: "1" });
+    const { snapshot } = await buildRealTreeSnapshot(8);
+    await writeHappyFixture(stateRoot, env, snapshot);
+    mockChainReQueryOk();
+
+    writeFileSync(join(stateRoot, "historical_withdraw_txs.json"), "not valid json {{{");
+
+    const result = await buildFinalReport(happySnapshotArg(env), env, "/", stateRoot);
     if (!result.ok) {
       throw new Error(
-        `expected ok=true with malformed historical (fallback to empty), got: ${JSON.stringify(result, null, 2)}`,
+        `expected ok=true under EUNOMA_LOCAL_SMOKE=1 (fallback to empty), got: ${JSON.stringify(result, null, 2)}`,
       );
     }
     // The malformed file should have been overwritten with a clean shape.

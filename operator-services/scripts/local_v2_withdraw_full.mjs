@@ -355,31 +355,25 @@ if (newBalanceSum + transferSum !== balanceSum) {
 }
 
 if (process.argv.includes("--check-balance-only")) {
-  // M10-l (codex iter-2 P2 + iter-3 P1): plaintext `balanceChunks`/
-  // `newBalanceChunks`/sums printed to stdout (here) OR stderr (above)
-  // OR thrown Error messages (above) all violate the "no plaintext
-  // amount in artifacts/logs" discipline. Default emits only the
-  // boolean integrity verdict + a transcript hash binding the (private)
-  // chunk vectors so downstream tooling can still detect drift across
-  // runs. The plaintext detail is gated behind the same
-  // `EUNOMA_LOCAL_DEBUG_BALANCE=1` env var the stderr/Error gating uses
-  // above — interactive operator diagnostics only, never for CI.
-  const balanceVectorHash = createHash("sha256")
-    .update(
-      [
-        "EUNOMA_M10L_BALANCE_CHECK_V1",
-        balanceChunks.map(String).join(","),
-        newBalanceChunks.map(String).join(","),
-        balanceSum.toString(),
-        transferSum.toString(),
-        newBalanceSum.toString(),
-      ].join(":"),
-    )
-    .digest("hex");
+  // M10-l (codex iter-2 P2 + iter-3 P1 + iter-4 P1-9): plaintext
+  // `balanceChunks`/`newBalanceChunks`/sums on stdout/stderr/Error messages
+  // all violate the "no plaintext amount in artifacts/logs" discipline.
+  //
+  // Iter-2 introduced a `balanceVectorHash = SHA-256(<vectors>)` thinking
+  // it would bind the private vectors for drift-detection. Iter-4 codex
+  // pointed out that's an offline-bruteforceable dictionary leak: balances
+  // are low-entropy (small integers, typically < 2^64), so an attacker
+  // with the public hash can enumerate plausible balance values and
+  // recover them in milliseconds. A public hash is NOT a privacy-
+  // preserving binding for low-entropy data. Drop the hash from default
+  // output entirely; only emit under EUNOMA_LOCAL_DEBUG_BALANCE=1, which
+  // is for interactive operator diagnostics where plaintext is acceptable
+  // anyway. Default keeps only the boolean integrity verdict + the chunk-
+  // count shape (non-revealing).
   const out = {
     check: "balance",
     balance_witness_check: "ok",
-    balanceVectorHash,
+    chunkCount: balanceChunks.length,
   };
   if (debugBalance) {
     out.balanceChunks = balanceChunks.map(String);
@@ -387,6 +381,18 @@ if (process.argv.includes("--check-balance-only")) {
     out.balanceChunksSum = balanceSum.toString();
     out.transferChunksSum = transferSum.toString();
     out.newBalanceChunksSum = newBalanceSum.toString();
+    out.balanceVectorHash = createHash("sha256")
+      .update(
+        [
+          "EUNOMA_M10L_BALANCE_CHECK_V1",
+          balanceChunks.map(String).join(","),
+          newBalanceChunks.map(String).join(","),
+          balanceSum.toString(),
+          transferSum.toString(),
+          newBalanceSum.toString(),
+        ].join(":"),
+      )
+      .digest("hex");
   }
   console.log(JSON.stringify(out));
   process.exit(0);
@@ -961,14 +967,27 @@ if (r.status !== 200) {
 console.error(`[m8-real] POST /v2/withdraw/mpcca/submit`);
 r = await post("/v2/withdraw/mpcca/submit", { dkgEpoch: dkgEpochStr, requestId });
 console.error(`[m8-real] submit → HTTP ${r.status}`);
-process.stdout.write(JSON.stringify({
+// M10-l (codex iter-4 P1-8): the final submit summary previously emitted
+// `amountOctas` unconditionally — the iter-2/3 plaintext gating only
+// covered the --check-balance-only path. CI / process supervisors capture
+// stdout, so a non-interactive operator run would persist the plaintext
+// withdrawal amount. Gate plaintext fields behind the same
+// EUNOMA_LOCAL_DEBUG_BALANCE=1 env. Default emits the binding identifiers
+// (requestId, recipientAddress, caPayloadHashFr — all already public on
+// chain via the withdraw tx) and the proof hex (a Groth16 SNARK that
+// reveals nothing about the witness).
+const debugBalanceSubmit = process.env.EUNOMA_LOCAL_DEBUG_BALANCE === "1";
+const submitSummary = {
   ok: r.status >= 200 && r.status < 300,
   httpStatus: r.status,
   requestId,
   recipientAddress,
-  amountOctas: TRANSFER_AMOUNT_OCTAS.toString(),
   caPayloadHashFr,
   proofHex,
   responseBody: r.body,
-}, null, 2) + "\n");
+};
+if (debugBalanceSubmit) {
+  submitSummary.amountOctas = TRANSFER_AMOUNT_OCTAS.toString();
+}
+process.stdout.write(JSON.stringify(submitSummary, null, 2) + "\n");
 process.exit(r.status >= 200 && r.status < 300 ? 0 : 35);
