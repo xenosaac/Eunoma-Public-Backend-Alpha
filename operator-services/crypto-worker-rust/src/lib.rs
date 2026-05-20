@@ -5622,6 +5622,17 @@ pub mod vault_state_v2 {
         /// `vault_state_v2_finalize_already_pinned_with_different_value`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub init_transcript_hash: Option<String>,
+        /// M11: the chain tx hash that the `/v2/vault/resync` handler last verified +
+        /// bound when advancing `vault_sequence`. `None` until the first resync (or for
+        /// legacy/pre-M11 files). Used for idempotent-replay detection (`existing ==
+        /// expected_next AND last_bound_tx_hash == req.tx_hash`) and the legacy-state
+        /// guard. Excluded from `compute_vault_state_hash_canonical` (mutable metadata).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_bound_tx_hash: Option<String>,
+        /// M11: unix-ms timestamp of the last resync write. Observability only;
+        /// excluded from the canonical hash.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_resync_at: Option<u64>,
     }
 
     fn vault_state_file_path(state_dir: &Path) -> PathBuf {
@@ -6190,6 +6201,9 @@ pub mod vault_state_v2 {
             // from a hash mismatch — so coordinators can distinguish "needs finalize" from
             // "tampered request".
             init_transcript_hash: None,
+            // M11: never resynced at init time.
+            last_bound_tx_hash: None,
+            last_resync_at: None,
         };
         // pretty-print so the file is human-auditable. Codex M3a P1 v4: the `vault_state_hash`
         // returned to the caller is NO LONGER the SHA-256 of the on-disk byte buffer (that
@@ -6520,6 +6534,9 @@ pub mod vault_state_v2 {
             created_at_unix_ms: existing.created_at_unix_ms,
             worker_transcript_hash: existing.worker_transcript_hash.clone(),
             init_transcript_hash: Some(claimed_final.to_lowercase()),
+            // M11: finalize preserves any prior resync binding verbatim.
+            last_bound_tx_hash: existing.last_bound_tx_hash.clone(),
+            last_resync_at: existing.last_resync_at,
         };
         let bytes = serde_json::to_vec_pretty(&updated)
             .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;
@@ -6540,6 +6557,345 @@ pub mod vault_state_v2 {
             vault_state_hash,
             init_transcript_hash: claimed_final.to_lowercase(),
             finalized: true,
+        })
+    }
+
+    // ── M11: vault-state resync ────────────────────────────────────────────
+    //
+    // After a chain-confirmed `WithdrawEventV2`, the on-chain `BridgeVault.
+    // vault_sequence` advances but the per-worker `vault_state_v2.json` does not
+    // (no post-submit observe step existed pre-M11). The next withdraw round1
+    // then trips `stale_vault_sequence`. This endpoint advances the worker's
+    // persisted `vault_sequence` by re-fetching the withdraw tx, verifying the
+    // emitted event binds to the trusted (package, vault) + the claimed
+    // sequence, then writing the bump atomically.
+    //
+    // Sequence semantics (verified vs move/sources/eunoma_bridge.move): the
+    // withdraw asserts `vault.vault_sequence == param` (pre-increment), bumps
+    // `+= 1`, then emits `WithdrawEventV2.vault_sequence = param`. So the event
+    // carries the PRE-increment value; the new chain value is `event_seq + 1`.
+    // The request binds both; a fresh advance requires `existing == event_seq`
+    // and moves the worker to `event_seq + 1`.
+    //
+    // Trust model: the node URL + bridge package/vault/asset are read from the
+    // worker's env (passed in as `trusted_*`), NEVER the request body. The
+    // request's package/vault/asset are cross-checked against the trusted config
+    // and the event type is built from the trusted package — closing the same
+    // chosen-target class as the M10-l balance-decrypt closures.
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VaultResyncRequest {
+        pub dkg_epoch: String,
+        pub request_id: String,
+        pub tx_hash: String,
+        /// Cross-checked vs trusted package; the event type is built from the
+        /// trusted package, NOT this field.
+        pub bridge_package: String,
+        /// Cross-checked vs trusted `BRIDGE_VAULT_ADDRESS` (NOT `sender_address`).
+        pub vault: String,
+        /// Cross-checked vs trusted `BRIDGE_ASSET_TYPE`.
+        pub asset_type: String,
+        pub root: String,
+        pub nullifier_hash: String,
+        pub recipient_hash: String,
+        pub request_hash: String,
+        /// `event.data.vault_sequence` (pre-increment).
+        pub event_vault_sequence: u64,
+        /// MUST equal `event_vault_sequence + 1`.
+        pub expected_next_sequence: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VaultResyncResponse {
+        pub vault_sequence: u64,
+        pub updated_at_ms: u64,
+        pub idempotent: bool,
+        /// true ONLY for the legacy-idempotent migration (worker already at the
+        /// target sequence but `last_bound_tx_hash` was None; tx verified +
+        /// backfilled without changing the sequence).
+        pub legacy_backfill: bool,
+    }
+
+    /// Transport-agnostic error for the resync handler. `status_u16()` maps to
+    /// the HTTP status the worker should return; `code()` is the stable machine
+    /// code surfaced to the coordinator. Mirrors `BalanceDecryptError`'s split
+    /// (400 / 404 / 502 / 503 / 500) without importing axum into this module.
+    #[derive(Debug)]
+    pub enum VaultResyncError {
+        /// 400 — caller/binding fault (wrong_package, wrong_vault, wrong_asset,
+        /// sequence_binding_invalid, rollback_rejected, sequence_mismatch,
+        /// sequence_step_too_large, binding_conflict, binding_mismatch:<field>,
+        /// event_sequence_mismatch, tx_not_successful, wrong_event,
+        /// legacy_state_bound_tx_verification_failed).
+        BadRequest(String),
+        /// 404 — uninitialized slot (no vault_state_v2.json).
+        NotFound(String),
+        /// 503 — worker missing trusted bridge config at request time.
+        Config(String),
+        /// 502 — chain re-fetch failed (network/timeout/bad_status/bad_json/parse).
+        ChainFetch(String),
+        /// 500 — internal (state load / encode / write).
+        Internal(String),
+    }
+
+    impl VaultResyncError {
+        pub fn status_u16(&self) -> u16 {
+            match self {
+                VaultResyncError::BadRequest(_) => 400,
+                VaultResyncError::NotFound(_) => 404,
+                VaultResyncError::ChainFetch(_) => 502,
+                VaultResyncError::Config(_) => 503,
+                VaultResyncError::Internal(_) => 500,
+            }
+        }
+        pub fn code(&self) -> &str {
+            match self {
+                VaultResyncError::BadRequest(s)
+                | VaultResyncError::NotFound(s)
+                | VaultResyncError::Config(s)
+                | VaultResyncError::ChainFetch(s)
+                | VaultResyncError::Internal(s) => s.as_str(),
+            }
+        }
+    }
+
+    /// Normalize an Aptos address to 64-hex lowercase (no 0x), left-padded.
+    fn vault_resync_norm_addr(raw: &str) -> Option<String> {
+        let s = raw
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
+        if s.is_empty() || s.len() > 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(format!("{:0>64}", s.to_ascii_lowercase()))
+    }
+
+    /// Lowercase + strip 0x for value comparison (no length enforcement).
+    fn vault_resync_norm_hex(raw: &str) -> String {
+        raw.trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .to_ascii_lowercase()
+    }
+
+    fn vault_resync_now_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Core resync logic. `fetch_override` injects the parsed event for tests:
+    /// `None` performs the real chain fetch+parse; `Some(Ok(ev))` uses `ev`;
+    /// `Some(Err(e))` simulates a chain-fetch failure (→ 502).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_vault_resync_v2(
+        state_dir: &Path,
+        trusted_aptos_node_url: &str,
+        trusted_bridge_package: &str,
+        trusted_bridge_vault: &str,
+        trusted_bridge_asset: &str,
+        req: &VaultResyncRequest,
+        fetch_override: Option<Result<crate::chain_fetch::TxWithdrawEventV2, String>>,
+    ) -> Result<VaultResyncResponse, VaultResyncError> {
+        use VaultResyncError as E;
+
+        // 1. Field well-formedness + the request-internal sequence relationship.
+        if req.dkg_epoch.is_empty() || req.request_id.is_empty() {
+            return Err(E::BadRequest("dkg_epoch_and_request_id_required".to_string()));
+        }
+        if req.tx_hash.is_empty() {
+            return Err(E::BadRequest("tx_hash_required".to_string()));
+        }
+        let expected_from_event = req
+            .event_vault_sequence
+            .checked_add(1)
+            .ok_or_else(|| E::BadRequest("sequence_overflow".to_string()))?;
+        if req.expected_next_sequence != expected_from_event {
+            return Err(E::BadRequest("sequence_binding_invalid".to_string()));
+        }
+
+        // 2. Trusted-config preconditions (BEFORE any chain fetch). Never trust
+        //    request-supplied identifiers; cross-check them against worker env.
+        if trusted_aptos_node_url.is_empty()
+            || trusted_bridge_package.is_empty()
+            || trusted_bridge_vault.is_empty()
+            || trusted_bridge_asset.is_empty()
+        {
+            return Err(E::Config("worker_missing_bridge_config".to_string()));
+        }
+        let want_pkg = vault_resync_norm_addr(trusted_bridge_package)
+            .ok_or_else(|| E::Config("worker_bridge_package_config_invalid".to_string()))?;
+        if vault_resync_norm_addr(&req.bridge_package).as_deref() != Some(want_pkg.as_str()) {
+            return Err(E::BadRequest("wrong_package".to_string()));
+        }
+        let want_vault = vault_resync_norm_addr(trusted_bridge_vault)
+            .ok_or_else(|| E::Config("worker_bridge_vault_config_invalid".to_string()))?;
+        if vault_resync_norm_addr(&req.vault).as_deref() != Some(want_vault.as_str()) {
+            return Err(E::BadRequest("wrong_vault".to_string()));
+        }
+        // Asset may be address- or struct-tag-shaped (same fallback as balance_decrypt).
+        let asset_ok = match (
+            vault_resync_norm_addr(trusted_bridge_asset),
+            vault_resync_norm_addr(&req.asset_type),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => vault_resync_norm_hex(trusted_bridge_asset) == vault_resync_norm_hex(&req.asset_type),
+        };
+        if !asset_ok {
+            return Err(E::BadRequest("wrong_asset".to_string()));
+        }
+
+        // 3. Load persisted vault state. Missing → uninitialized (non-quorum) slot.
+        let existing = load_vault_state_v2(state_dir)
+            .map_err(|e| E::Internal(format!("load_vault_state:{e:?}")))?
+            .ok_or_else(|| E::NotFound("vault_state_not_found".to_string()))?;
+        let existing_seq = existing.vault_sequence;
+
+        // 4. Sequence state machine. `is_legacy_backfill` is assigned on every
+        //    non-returning path below.
+        let is_legacy_backfill;
+        if existing_seq == req.expected_next_sequence {
+            match existing.last_bound_tx_hash.as_deref() {
+                Some(bound)
+                    if vault_resync_norm_hex(bound) == vault_resync_norm_hex(&req.tx_hash) =>
+                {
+                    // Idempotent replay: same tx already bound this sequence.
+                    return Ok(VaultResyncResponse {
+                        vault_sequence: existing_seq,
+                        updated_at_ms: vault_resync_now_ms(),
+                        idempotent: true,
+                        legacy_backfill: false,
+                    });
+                }
+                Some(_other) => {
+                    // A DIFFERENT tx already claims this sequence.
+                    return Err(E::BadRequest("binding_conflict".to_string()));
+                }
+                None => {
+                    // Legacy/manual state: do NOT silently accept. Verify the
+                    // supplied tx (which must be the one that advanced chain to
+                    // `existing_seq`) and backfill the binding, or fail closed.
+                    is_legacy_backfill = true;
+                }
+            }
+        } else if req.expected_next_sequence < existing_seq {
+            return Err(E::BadRequest("rollback_rejected".to_string()));
+        } else {
+            // expected_next_sequence > existing_seq: fresh advance, single step,
+            // worker positioned exactly at the event's pre-increment value.
+            if req.expected_next_sequence != existing_seq + 1 {
+                return Err(E::BadRequest("sequence_step_too_large".to_string()));
+            }
+            if existing_seq != req.event_vault_sequence {
+                return Err(E::BadRequest("sequence_mismatch".to_string()));
+            }
+            is_legacy_backfill = false;
+        }
+
+        // 5. Chain re-fetch (TRUSTED node URL) + parse, or injected override.
+        let event = match fetch_override {
+            Some(Ok(ev)) => ev,
+            Some(Err(e)) => return Err(E::ChainFetch(format!("chain_fetch_failed:{e}"))),
+            None => {
+                let tx_value =
+                    crate::chain_fetch::fetch_tx_by_hash(trusted_aptos_node_url, &req.tx_hash)
+                        .await
+                        .map_err(|e| E::ChainFetch(format!("chain_fetch_failed:{e}")))?;
+                crate::chain_fetch::parse_tx_withdraw_event_v2(&tx_value, trusted_bridge_package)
+                    .map_err(|e| {
+                        if e.contains("not found") {
+                            E::BadRequest("wrong_event".to_string())
+                        } else {
+                            E::BadRequest(format!("event_parse_failed:{e}"))
+                        }
+                    })?
+            }
+        };
+
+        // 6. Tx must have executed successfully.
+        if !event.success {
+            return Err(E::BadRequest("tx_not_successful".to_string()));
+        }
+
+        // 7. Full event binding. On the legacy path ANY failure here is the
+        //    fail-closed `legacy_state_bound_tx_verification_failed`.
+        let bind_err = |field: &str| -> VaultResyncError {
+            if is_legacy_backfill {
+                E::BadRequest("legacy_state_bound_tx_verification_failed".to_string())
+            } else {
+                E::BadRequest(format!("binding_mismatch:{field}"))
+            }
+        };
+        if vault_resync_norm_hex(&event.root) != vault_resync_norm_hex(&req.root) {
+            return Err(bind_err("root"));
+        }
+        if vault_resync_norm_hex(&event.nullifier_hash) != vault_resync_norm_hex(&req.nullifier_hash)
+        {
+            return Err(bind_err("nullifier_hash"));
+        }
+        if vault_resync_norm_hex(&event.recipient_hash) != vault_resync_norm_hex(&req.recipient_hash)
+        {
+            return Err(bind_err("recipient_hash"));
+        }
+        if vault_resync_norm_hex(&event.request_hash) != vault_resync_norm_hex(&req.request_hash) {
+            return Err(bind_err("request_hash"));
+        }
+        if event.vault_sequence != req.event_vault_sequence {
+            return Err(if is_legacy_backfill {
+                E::BadRequest("legacy_state_bound_tx_verification_failed".to_string())
+            } else {
+                E::BadRequest("event_sequence_mismatch".to_string())
+            });
+        }
+
+        // 8. Persist. Fresh advance moves to expected_next; legacy backfill keeps
+        //    the sequence and only records the binding.
+        let new_seq = if is_legacy_backfill {
+            existing_seq
+        } else {
+            req.expected_next_sequence
+        };
+        let now = vault_resync_now_ms();
+        let updated = VaultStateFile {
+            vault_sequence: new_seq,
+            last_bound_tx_hash: Some(vault_resync_norm_hex(&req.tx_hash)),
+            last_resync_at: Some(now),
+            scheme: existing.scheme.clone(),
+            slot: existing.slot,
+            player_id: existing.player_id,
+            dkg_epoch: existing.dkg_epoch.clone(),
+            ca_dkg_transcript_hash: existing.ca_dkg_transcript_hash.clone(),
+            vault_ek_transcript_hash: existing.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: existing.registration_transcript_hash.clone(),
+            roster_hash: existing.roster_hash.clone(),
+            selected_slots: existing.selected_slots.clone(),
+            vault_ek_hex: existing.vault_ek_hex.clone(),
+            sender_address: existing.sender_address.clone(),
+            asset_type: existing.asset_type.clone(),
+            chain_id: existing.chain_id,
+            aggregate_commitment: existing.aggregate_commitment.clone(),
+            aggregate_response: existing.aggregate_response.clone(),
+            challenge: existing.challenge.clone(),
+            deposit_count_observed: existing.deposit_count_observed,
+            created_at_unix_ms: existing.created_at_unix_ms,
+            worker_transcript_hash: existing.worker_transcript_hash.clone(),
+            init_transcript_hash: existing.init_transcript_hash.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&updated)
+            .map_err(|e| E::Internal(format!("encode vault_state_v2:{e}")))?;
+        let file_path = vault_state_file_path(state_dir);
+        write_secret_file_replace(&file_path, &bytes)
+            .map_err(|e| E::Internal(format!("write vault_state_v2:{e:?}")))?;
+
+        Ok(VaultResyncResponse {
+            vault_sequence: new_seq,
+            updated_at_ms: now,
+            // Legacy backfill leaves the sequence unchanged → report idempotent.
+            idempotent: is_legacy_backfill,
+            legacy_backfill: is_legacy_backfill,
         })
     }
 
@@ -6959,6 +7315,9 @@ pub mod vault_state_v2 {
             // identity, so both bindings remain valid across cursor bumps.
             worker_transcript_hash: existing.worker_transcript_hash.clone(),
             init_transcript_hash: existing.init_transcript_hash.clone(),
+            // M11: observe-deposit preserves any prior resync binding verbatim.
+            last_bound_tx_hash: existing.last_bound_tx_hash.clone(),
+            last_resync_at: existing.last_resync_at,
         };
         let bytes = serde_json::to_vec_pretty(&updated)
             .map_err(|err| WorkerError::Crypto(format!("encode vault_state_v2 file: {err}")))?;

@@ -38,6 +38,8 @@ use eunoma_crypto_worker::vault_state_v2::{
     finalize_vault_state_v2 as run_vault_state_v2_finalize,
     init_vault_state_v2 as run_vault_state_v2_init,
     observe_deposit_v2 as run_vault_state_v2_observe_deposit,
+    run_vault_resync_v2,
+    VaultResyncRequest,
     FinalizeRequest as VaultStateV2FinalizeRequest,
     InitRequest as VaultStateV2InitRequest,
     ObserveDepositRequest as VaultStateV2ObserveDepositRequest,
@@ -77,6 +79,15 @@ struct AppState {
     /// M10-l (codex iter-6 P1-13): trusted bridge asset type tag. Sourced
     /// from `BRIDGE_ASSET_TYPE` env. Same rationale as `bridge_vault_address`.
     bridge_asset_type: String,
+    /// M11: trusted bridge package address (the `@eunoma` module-publish
+    /// address — distinct from the vault resource account). Sourced from the
+    /// worker's `BRIDGE_PACKAGE_ADDRESS` env at startup. The `/v2/vault/resync`
+    /// handler builds the expected `WithdrawEventV2` event type from THIS value
+    /// — never from the request body — so a caller can't point the worker at a
+    /// chosen package's event (same chosen-target closure as the vault/asset
+    /// binding above). Empty allowed at boot; resync fails closed with
+    /// `worker_missing_bridge_config` on the first request if missing.
+    bridge_package_address: String,
 }
 
 // M10-b: opt AppState in to the balance_decrypt handler's read-only view of
@@ -141,6 +152,10 @@ async fn main() {
     // at first balance-decrypt request if missing.
     let bridge_vault_address = std::env::var("BRIDGE_VAULT_ADDRESS").unwrap_or_default();
     let bridge_asset_type = std::env::var("BRIDGE_ASSET_TYPE").unwrap_or_default();
+    // M11: trusted bridge package address for WithdrawEventV2 event-type binding
+    // in the resync handler. Same empty-at-boot / fail-closed-at-first-request
+    // semantics as the vault/asset config above.
+    let bridge_package_address = std::env::var("BRIDGE_PACKAGE_ADDRESS").unwrap_or_default();
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .expect("valid CRYPTO_WORKER_HOST/CRYPTO_WORKER_PORT");
@@ -151,6 +166,7 @@ async fn main() {
         aptos_node_url,
         bridge_vault_address,
         bridge_asset_type,
+        bridge_package_address,
     };
 
     let app = Router::new()
@@ -284,6 +300,13 @@ async fn main() {
             "/v2/balance/decrypt_partial",
             post(eunoma_crypto_worker::balance_decrypt::handle_http::<AppState>),
         )
+        // M11: post-withdraw vault-state resync. Re-fetches the WithdrawEventV2 by
+        // tx hash from the worker's TRUSTED node URL, verifies the full event
+        // binding against the trusted package/vault/asset, then advances the
+        // persisted vault_sequence single-step + idempotently. Dual-registered
+        // like balance/decrypt_partial.
+        .route("/worker/v2/vault/resync", post(vault_resync_http))
+        .route("/v2/vault/resync", post(vault_resync_http))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -1054,6 +1077,44 @@ async fn vault_state_v2_observe_deposit(
     match run_vault_state_v2_observe_deposit(&state.state_dir, &body) {
         Ok(result) => (StatusCode::OK, Json(json!(result))),
         Err(err) => worker_error_response(err),
+    }
+}
+
+// M11 — `/worker/v2/vault/resync` (+ `/v2/vault/resync`). Advances the worker's
+// persisted `vault_sequence` after a chain-confirmed `WithdrawEventV2`. The
+// trusted node URL / bridge package / vault / asset all come from AppState
+// (worker env), NEVER the request body — the request's `bridgePackage` / `vault`
+// / `assetType` are cross-checked against the trusted config and rejected on
+// mismatch. Production fetch (override = None) hits the chain; tests inject the
+// parsed event via the library fn's override param.
+async fn vault_resync_http(
+    State(state): State<AppState>,
+    Json(body): Json<VaultResyncRequest>,
+) -> (StatusCode, Json<Value>) {
+    match run_vault_resync_v2(
+        &state.state_dir,
+        &state.aptos_node_url,
+        &state.bridge_package_address,
+        &state.bridge_vault_address,
+        &state.bridge_asset_type,
+        &body,
+        None,
+    )
+    .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(json!(resp))),
+        Err(err) => {
+            let status = StatusCode::from_u16(err.status_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (
+                status,
+                Json(json!({
+                    "error": "vault_resync_error",
+                    "code": err.code(),
+                    "message": err.code(),
+                })),
+            )
+        }
     }
 }
 

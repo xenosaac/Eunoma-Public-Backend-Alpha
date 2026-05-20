@@ -164,6 +164,151 @@ pub async fn fetch_old_balance_d_from_chain(
     parse_view_response_d(&value).map_err(|e| format!("parse:{e}"))
 }
 
+// ── M11: vault-state resync chain helper ──────────────────────────────────
+//
+// The worker's `/v2/vault/resync` endpoint re-fetches a withdraw transaction by
+// hash and verifies the emitted `WithdrawEventV2` before advancing its persisted
+// `vault_sequence`. Like the balance-decrypt re-fetch above, the tx hash is the
+// only caller-supplied input; the node URL and the expected bridge package come
+// from the worker's trusted env config, never the request body. This closes the
+// same chosen-package / chosen-target class as M10-l's chosen-D closure.
+
+/// Subset of the Aptos user-transaction `/v1/transactions/by_hash/{hash}`
+/// response that the resync handler needs. `vault_sequence` arrives as a JSON
+/// string (Aptos serializes `u64` as a string) and is parsed to `u64` here. The
+/// `root` / `nullifier_hash` / `recipient_hash` / `request_hash` fields are the
+/// `vector<u8>` event fields, returned as `0x`-prefixed hex strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxWithdrawEventV2 {
+    pub success: bool,
+    pub vm_status: String,
+    pub root: String,
+    pub nullifier_hash: String,
+    pub recipient_hash: String,
+    pub request_hash: String,
+    pub vault_sequence: u64,
+}
+
+/// Normalize an Aptos account address to 64-hex lowercase (no `0x`), left-padded
+/// with zeros. Used to compare the event-type address segment against the
+/// trusted package regardless of leading-zero / `0x` / casing differences.
+fn norm_addr(addr: &str) -> Result<String, String> {
+    let raw = addr
+        .strip_prefix("0x")
+        .or_else(|| addr.strip_prefix("0X"))
+        .unwrap_or(addr);
+    if raw.is_empty() || raw.len() > 64 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("invalid address: {addr}"));
+    }
+    Ok(format!("{:0>64}", raw.to_lowercase()))
+}
+
+/// Pure parser: given a tx JSON value and the TRUSTED bridge package address,
+/// locate the `<package>::eunoma_bridge::WithdrawEventV2` module event and
+/// extract its binding fields + the tx success flag / vm_status. Decoupled from
+/// HTTP so tests inject canned JSON. The event type's address segment is matched
+/// against the trusted package only — a tx whose WithdrawEventV2 was emitted by a
+/// different package address is treated as "not found".
+pub fn parse_tx_withdraw_event_v2(
+    value: &Value,
+    bridge_package: &str,
+) -> Result<TxWithdrawEventV2, String> {
+    let want_addr = norm_addr(bridge_package).map_err(|e| format!("bad_package:{e}"))?;
+    let success = value
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "tx missing success flag".to_string())?;
+    let vm_status = value
+        .get("vm_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let events = value
+        .get("events")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "tx missing events array".to_string())?;
+
+    for ev in events {
+        let ty = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // Aptos module-event type: "0x<addr>::eunoma_bridge::WithdrawEventV2".
+        let mut segs = ty.splitn(2, "::");
+        let addr_seg = segs.next().unwrap_or("");
+        let rest = segs.next().unwrap_or("");
+        if rest != "eunoma_bridge::WithdrawEventV2" {
+            continue;
+        }
+        let addr_norm = match norm_addr(addr_seg) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if addr_norm != want_addr {
+            // WithdrawEventV2 emitted by a non-trusted package — ignore.
+            continue;
+        }
+        let data = ev
+            .get("data")
+            .ok_or_else(|| "WithdrawEventV2 missing data".to_string())?;
+        let get_hex = |k: &str| -> Result<String, String> {
+            data.get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("WithdrawEventV2.data.{k} missing or not a string"))
+        };
+        let vault_sequence = {
+            let v = data
+                .get("vault_sequence")
+                .ok_or_else(|| "WithdrawEventV2.data.vault_sequence missing".to_string())?;
+            if let Some(s) = v.as_str() {
+                s.parse::<u64>()
+                    .map_err(|e| format!("vault_sequence parse: {e}"))?
+            } else if let Some(n) = v.as_u64() {
+                n
+            } else {
+                return Err("vault_sequence neither string nor u64".to_string());
+            }
+        };
+        return Ok(TxWithdrawEventV2 {
+            success,
+            vm_status,
+            root: get_hex("root")?,
+            nullifier_hash: get_hex("nullifier_hash")?,
+            recipient_hash: get_hex("recipient_hash")?,
+            request_hash: get_hex("request_hash")?,
+            vault_sequence,
+        });
+    }
+    Err("WithdrawEventV2 not found for trusted package".to_string())
+}
+
+/// Production helper: GET `<aptos_node_url>/v1/transactions/by_hash/<tx_hash>`
+/// and return the parsed JSON value. Same error-prefix convention as
+/// `fetch_old_balance_d_from_chain`: `network:` / `timeout:` / `bad_status:` /
+/// `bad_json:`. The caller passes `aptos_node_url` WITHOUT a trailing `/v1`
+/// (this fn appends `/v1/...`), matching the balance-decrypt convention.
+pub async fn fetch_tx_by_hash(aptos_node_url: &str, tx_hash: &str) -> Result<Value, String> {
+    let url = format!(
+        "{}/v1/transactions/by_hash/{}",
+        aptos_node_url.trim_end_matches('/'),
+        tx_hash
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("network:client_build:{e}"))?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            format!("timeout:{e}")
+        } else {
+            format!("network:{e}")
+        }
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("bad_status:{}", status.as_u16()));
+    }
+    resp.json::<Value>().await.map_err(|e| format!("bad_json:{e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +436,97 @@ mod tests {
             err.contains("neither string nor {data:string}"),
             "expected precise parse error, got {err}"
         );
+    }
+
+    // ── M11: parse_tx_withdraw_event_v2 ───────────────────────────────────
+
+    const PKG: &str = "0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1";
+
+    fn withdraw_tx(pkg: &str, seq: serde_json::Value, success: bool) -> Value {
+        json!({
+            "success": success,
+            "vm_status": if success { "Executed successfully" } else { "ABORTED" },
+            "events": [
+                { "type": "0x1::coin::WithdrawEvent", "data": { "amount": "5" } },
+                {
+                    "type": format!("{pkg}::eunoma_bridge::WithdrawEventV2"),
+                    "data": {
+                        "root": "0xaa",
+                        "nullifier_hash": "0xbb",
+                        "recipient": "0x554cd51d",
+                        "recipient_hash": "0xcc",
+                        "amount_tag": "0xdd",
+                        "ca_payload_hash": "0xee",
+                        "request_hash": "0xff",
+                        "vault_sequence": seq
+                    }
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn parse_tx_withdraw_event_v2_extracts_binding_and_parses_string_sequence() {
+        let tx = withdraw_tx(PKG, json!("1"), true);
+        let ev = parse_tx_withdraw_event_v2(&tx, PKG).expect("parse");
+        assert!(ev.success);
+        assert_eq!(ev.root, "0xaa");
+        assert_eq!(ev.nullifier_hash, "0xbb");
+        assert_eq!(ev.recipient_hash, "0xcc");
+        assert_eq!(ev.request_hash, "0xff");
+        assert_eq!(ev.vault_sequence, 1);
+    }
+
+    #[test]
+    fn parse_tx_withdraw_event_v2_accepts_numeric_sequence() {
+        let tx = withdraw_tx(PKG, json!(2u64), true);
+        let ev = parse_tx_withdraw_event_v2(&tx, PKG).expect("parse");
+        assert_eq!(ev.vault_sequence, 2);
+    }
+
+    #[test]
+    fn parse_tx_withdraw_event_v2_surfaces_failed_tx() {
+        let tx = withdraw_tx(PKG, json!("1"), false);
+        let ev = parse_tx_withdraw_event_v2(&tx, PKG).expect("parse");
+        assert!(!ev.success);
+    }
+
+    #[test]
+    fn parse_tx_withdraw_event_v2_ignores_event_from_wrong_package() {
+        let other = "0xdeadbeef";
+        let tx = withdraw_tx(other, json!("1"), true);
+        // Searching with the trusted PKG must NOT match the other package's event.
+        assert!(parse_tx_withdraw_event_v2(&tx, PKG).is_err());
+        // But searching with the actual emitting package finds it.
+        assert!(parse_tx_withdraw_event_v2(&tx, other).is_ok());
+    }
+
+    #[test]
+    fn parse_tx_withdraw_event_v2_address_normalization_matches() {
+        // Event emitted with a 0X-prefixed, mixed-case, leading-zero address must
+        // still match a trusted package given in a different but equivalent form.
+        let emitted = "0X0a08850B1Ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1";
+        let trusted = "0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1";
+        // Note: emitted has an extra leading 0 byte (0a..) vs trusted (a0..) — these
+        // are DIFFERENT addresses, so this must NOT match. Use it as a negative.
+        let tx = withdraw_tx(emitted, json!("1"), true);
+        assert!(parse_tx_withdraw_event_v2(&tx, trusted).is_err());
+        // Same address, only 0x/casing differs → matches.
+        let tx2 = withdraw_tx("0XA08850B1CA22CC5AA3A3A3FB1179CF3F1F169312CEA8038FF1B1E3B4ACE79EC1", json!("1"), true);
+        assert!(parse_tx_withdraw_event_v2(&tx2, trusted).is_ok());
+    }
+
+    #[test]
+    fn parse_tx_withdraw_event_v2_missing_event_errs() {
+        let tx = json!({ "success": true, "vm_status": "Executed successfully", "events": [
+            { "type": "0x1::coin::WithdrawEvent", "data": { "amount": "5" } }
+        ]});
+        assert!(parse_tx_withdraw_event_v2(&tx, PKG).is_err());
+    }
+
+    #[test]
+    fn parse_tx_withdraw_event_v2_missing_success_errs() {
+        let tx = json!({ "vm_status": "x", "events": [] });
+        assert!(parse_tx_withdraw_event_v2(&tx, PKG).is_err());
     }
 }
