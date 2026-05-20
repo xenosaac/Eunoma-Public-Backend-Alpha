@@ -33,6 +33,30 @@ describe("local cluster planning", () => {
     expect(plan.rosterHash).toBe(rosterHash(plan.roster));
   });
 
+  it("propagates BRIDGE_PACKAGE_ADDRESS to every worker env when supplied (M11 resync)", () => {
+    const pkg = `0x${"a08850b1".repeat(8)}`;
+    const baseInput = {
+      vaultEk: h32("a"),
+      frost: {
+        groupPublicKey: h32("b"),
+        verifyingShares: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({
+          slot,
+          frostVerifyingShare: String(slot + 1).repeat(64),
+        })),
+      },
+      randomHex: deterministicHex(),
+    };
+    const withPkg = buildLocalClusterPlan({ ...baseInput, bridgePackageAddress: pkg });
+    for (const worker of withPkg.workers) {
+      expect(worker.env.BRIDGE_PACKAGE_ADDRESS).toBe(pkg);
+    }
+    // Omitted when not supplied (optional — resync still fails closed at runtime).
+    const withoutPkg = buildLocalClusterPlan(baseInput);
+    for (const worker of withoutPkg.workers) {
+      expect(worker.env.BRIDGE_PACKAGE_ADDRESS).toBeUndefined();
+    }
+  });
+
   it("keeps bearer tokens out of the public roster", () => {
     const plan = buildLocalClusterPlan({
       vaultEk: h32("a"),

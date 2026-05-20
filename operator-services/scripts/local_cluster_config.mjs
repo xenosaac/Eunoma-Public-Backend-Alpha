@@ -26,6 +26,10 @@ const plan = buildLocalClusterPlan({
   stateRoot,
   vaultEk: ca.vault_ek,
   aptosNodeUrl: process.env.APTOS_NODE_URL,
+  // M11: thread BRIDGE_PACKAGE_ADDRESS into the generated worker env so the
+  // /v2/vault/resync handler has its trusted package without a separate shell
+  // export. Optional — undefined just omits it (resync still fails closed if absent).
+  bridgePackageAddress: process.env.BRIDGE_PACKAGE_ADDRESS,
   dkgEpoch: ca.dkg_epoch,
   caDkgScheme,
   frost: {

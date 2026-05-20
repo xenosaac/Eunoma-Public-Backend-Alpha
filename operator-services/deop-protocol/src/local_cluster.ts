@@ -68,6 +68,14 @@ export interface LocalClusterPlanOptions {
    * + workers.
    */
   bridgeAssetType?: string;
+  /**
+   * M11: bridge package address (the `@eunoma` module-publish address, distinct
+   * from the vault resource account). Propagated as `BRIDGE_PACKAGE_ADDRESS` to
+   * every worker so the /v2/vault/resync handler can build the trusted
+   * WithdrawEventV2 event type. Without it, resync fails closed with
+   * `worker_missing_bridge_config` and the coordinator fan-out never reaches quorum.
+   */
+  bridgePackageAddress?: string;
   randomHex?: (bytes: number, label: string) => string;
 }
 
@@ -246,6 +254,9 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         APTOS_NODE_URL: opts.aptosNodeUrl ?? "https://fullnode.testnet.aptoslabs.com/v1",
         ...(opts.bridgeVaultAddress ? { BRIDGE_VAULT_ADDRESS: opts.bridgeVaultAddress } : {}),
         ...(opts.bridgeAssetType ? { BRIDGE_ASSET_TYPE: opts.bridgeAssetType } : {}),
+        // M11: the /v2/vault/resync handler builds the trusted WithdrawEventV2 event
+        // type from this; without it resync fails closed `worker_missing_bridge_config`.
+        ...(opts.bridgePackageAddress ? { BRIDGE_PACKAGE_ADDRESS: opts.bridgePackageAddress } : {}),
       },
     })),
   };
