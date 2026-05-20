@@ -303,9 +303,19 @@ export function encodeCallArgs(args: WithdrawV2CallArgs): string[] {
 
 function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2CallArgs[keyof WithdrawV2CallArgs]): string {
   switch (key) {
+    case "recipient": {
+      // Move param type is `address`, NOT `vector<u8>`. Aptos CLI args for an
+      // address parameter must use the `address:0x...` prefix; `hex:0x...`
+      // gets BCS-decoded as a `vector<u8>` (length-prefixed) and the on-chain
+      // function deserialization rejects with FAILED_TO_DESERIALIZE_ARGUMENT.
+      const clean = String(value).replace(/^0x/i, "").toLowerCase();
+      if (!/^[0-9a-f]+$/.test(clean) || clean.length > 64) {
+        throw new Error(`recipient must be 0x-prefixed hex address (≤32 bytes): ${value}`);
+      }
+      return `address:0x${clean.padStart(64, "0")}`;
+    }
     case "root":
     case "nullifierHash":
-    case "recipient":
     case "recipientHash":
     case "amountTag":
     case "caPayloadHash":

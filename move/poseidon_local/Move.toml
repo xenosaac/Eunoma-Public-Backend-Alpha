@@ -13,15 +13,15 @@ eunoma_pool = "0xCAFE"
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-framework.git"
-rev = "mainnet"
+rev = "testnet"
 subdir = "aptos-framework"
 
 [dependencies.AptosStdlib]
 git = "https://github.com/aptos-labs/aptos-framework.git"
-rev = "mainnet"
+rev = "testnet"
 subdir = "aptos-stdlib"
 
 [dependencies.MoveStdlib]
 git = "https://github.com/aptos-labs/aptos-framework.git"
-rev = "mainnet"
+rev = "testnet"
 subdir = "move-stdlib"
