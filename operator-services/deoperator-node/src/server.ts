@@ -291,7 +291,8 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/frost/sign/nonce-commit"
       | "/worker/v2/frost/sign/partial"
       | "/worker/v2/frost/sign/aggregate"
-      | "/v2/balance/decrypt_partial",
+      | "/v2/balance/decrypt_partial"
+      | "/v2/vault/resync",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -670,6 +671,19 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/v2/balance/decrypt_partial", req.body, reply);
+  });
+
+  // M11: vault-state resync passthrough. The coordinator fans `/v2/vault/resync` out to each
+  // roster node; the node forwards to ITS crypto worker. The worker is authoritative for the
+  // trusted-config + event binding; this boundary only runs the forbidden-plaintext guard. No
+  // `slot` field is carried (the coordinator routes by node endpoint), so no slot assertion.
+  server.post("/v2/vault/resync", async (req, reply) => {
+    try {
+      assertNoForbiddenPlaintextFields((req.body ?? {}) as Record<string, unknown>);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/v2/vault/resync", req.body, reply);
   });
 
   return { server, store };

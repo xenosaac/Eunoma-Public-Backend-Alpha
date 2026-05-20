@@ -124,6 +124,7 @@ import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
 import { registerBalanceDecryptRoute } from "./routes/balance_decrypt.js";
+import { registerVaultResyncRoute } from "./routes/vault_resync.js";
 
 /**
  * Codex M2a P2 #3: safe-id sanitiser for caller-supplied identifiers that the coordinator
@@ -6942,6 +6943,19 @@ export function buildCoordinatorServer(
     getBridgeAssetType: () => opts.bridgeAssetType,
     forwarder: singleNodeForwarder,
   });
+
+  // M11: post-withdraw vault-state resync fan-out. Two paths (same behavior,
+  // distinguished for audit). Reuses the same roster getter, bridge config
+  // getters, and per-slot forwarder as balance-decrypt.
+  const vaultResyncOpts = {
+    getDefaultRoster: () => opts.caDkgV2Roster,
+    getBridgeVaultAddress: () => opts.bridgeVaultAddress,
+    getBridgeAssetType: () => opts.bridgeAssetType,
+    forwarder: singleNodeForwarder,
+    stateRoot: opts.stateRoot,
+  };
+  registerVaultResyncRoute(server, vaultResyncOpts, "/v2/vault/resync_after_withdraw", "after_withdraw");
+  registerVaultResyncRoute(server, vaultResyncOpts, "/v2/vault/resync_before_round1", "before_round1");
 
   return { server, store };
 }
