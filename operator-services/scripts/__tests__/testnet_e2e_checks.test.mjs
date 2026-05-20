@@ -103,7 +103,13 @@ function observedArtifactFixture(overrides = {}) {
     rosterHash: HEX_A,
     selectedSlots: [0, 1, 2, 3, 4],
     vaultEk: VAULT_EK,
-    senderAddress: SENDER_ADDR,
+    // In the V2 observed-deposit artifact, `senderAddress` is the CA-side sender of the
+    // vault operation — i.e. the bridge VAULT resource address (whose CA dk is
+    // threshold-shared and which signs confidential_transfer_raw) — NOT the depositor.
+    // compareObservedDepositArtifact binds it to EUNOMA_TESTNET_VAULT_ADDRESS, so the
+    // happy-path fixture must use VAULT_ADDR. (Depositor identity lives in
+    // DepositConfirmedV2.sender / EUNOMA_TESTNET_SENDER_ADDRESS.)
+    senderAddress: VAULT_ADDR,
     assetType: ASSET_ADDR,
     chainId: 2,
     depositCount: 1,

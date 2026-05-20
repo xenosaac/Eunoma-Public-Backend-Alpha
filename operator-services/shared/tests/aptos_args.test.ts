@@ -65,16 +65,16 @@ describe("hexArg", () => {
 
 describe("hexVectorArg (vector<vector<u8>>)", () => {
   it("formats a non-empty array", () => {
-    expect(hexVectorArg(["0xaa", "0xbb"])).toBe("hex:[0xaa,0xbb]");
+    expect(hexVectorArg(["0xaa", "0xbb"])).toBe('hex:["0xaa","0xbb"]');
   });
   it("formats an empty array", () => {
     expect(hexVectorArg([])).toBe("hex:[]");
   });
   it("preserves item order", () => {
-    expect(hexVectorArg(["0x01", "0x02", "0x03"])).toBe("hex:[0x01,0x02,0x03]");
+    expect(hexVectorArg(["0x01", "0x02", "0x03"])).toBe('hex:["0x01","0x02","0x03"]');
   });
   it("normalizes prefix and casing per item", () => {
-    expect(hexVectorArg(["AA", "0xBB"])).toBe("hex:[0xaa,0xbb]");
+    expect(hexVectorArg(["AA", "0xBB"])).toBe('hex:["0xaa","0xbb"]');
   });
   it("rejects a non-array argument", () => {
     expect(() => hexVectorArg("0xaa" as unknown as string[])).toThrow();
@@ -97,7 +97,7 @@ describe("hexVector3Arg (vector<vector<vector<u8>>>)", () => {
         ["0xaa", "0xbb"],
         ["0xcc", "0xdd"],
       ]),
-    ).toBe("hex:[[0xaa,0xbb],[0xcc,0xdd]]");
+    ).toBe('hex:[["0xaa","0xbb"],["0xcc","0xdd"]]');
   });
   it("preserves nested order", () => {
     expect(
@@ -106,7 +106,7 @@ describe("hexVector3Arg (vector<vector<vector<u8>>>)", () => {
         ["0x03"],
         [],
       ]),
-    ).toBe("hex:[[0x01,0x02],[0x03],[]]");
+    ).toBe('hex:[["0x01","0x02"],["0x03"],[]]');
   });
   it("rejects a depth-2 input (string[] instead of string[][])", () => {
     expect(() =>
@@ -123,10 +123,10 @@ describe("hexVector3Arg (vector<vector<vector<u8>>>)", () => {
       ["0x" + "33".repeat(32)],
     ];
     const out = hexVector3Arg(values);
-    // Decompose: must start hex:[ , contain 0x repeated, end with ]]
+    // Decompose: must start hex:[ , contain JSON-quoted 0x entries, end with ]]
     expect(out.startsWith("hex:[")).toBe(true);
     expect(out.endsWith("]")).toBe(true);
-    expect(out).toContain("[0x" + "11".repeat(32) + ",0x" + "22".repeat(32) + "]");
-    expect(out).toContain("[0x" + "33".repeat(32) + "]");
+    expect(out).toContain('["0x' + "11".repeat(32) + '","0x' + "22".repeat(32) + '"]');
+    expect(out).toContain('["0x' + "33".repeat(32) + '"]');
   });
 });

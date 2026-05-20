@@ -4,13 +4,14 @@
 //
 //   u64Arg(42n)                 -> "u64:42"
 //   hexArg("0x1234")            -> "hex:0x1234"
-//   hexVectorArg(["0x12"])      -> "hex:[0x12]"
-//   hexVector3Arg([["0x12"]])   -> "hex:[[0x12]]"
+//   hexVectorArg(["0x12"])      -> 'hex:["0x12"]'
+//   hexVector3Arg([["0x12"]])   -> 'hex:[["0x12"]]'
 //
-// Aptos CLI accepts vector<vector<u8>> as the comma-separated bracketed form
-// `hex:[0x..,0x..]`. For the depth-3 case (vector<vector<vector<u8>>>) the
-// outer brackets nest twice — `hex:[[0x..,0x..],[0x..]]` — which is what the
-// `amount_r_volun_auds` field of `withdraw_to_recipient_v2` requires. The
+// Aptos CLI 9.x accepts vector<vector<u8>> as the JSON-quoted bracketed form
+// `hex:["0x..","0x.."]` (the older bare `hex:[0x..,0x..]` is rejected by the
+// 9.x args parser). For the depth-3 case (vector<vector<vector<u8>>>) the
+// outer brackets nest twice — `hex:[["0x..","0x.."],["0x.."]]` — which is what
+// the `amount_r_volun_auds` field of `withdraw_to_recipient_v2` requires. The
 // depth-3 helper is new vs the .mjs lib; that lib only goes to depth 2 because
 // no V1 call needed depth-3 args.
 

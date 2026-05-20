@@ -774,6 +774,18 @@ fn build_round2_request(
     self_slot: usize,
     player_id: usize,
 ) -> MpccaRound2Request {
+    // Baseline-fix: round2 reads the per-slot M1 ingress state file that `run_round1_v2`
+    // persists. The round2/finalize fixtures previously skipped round1 entirely, so
+    // `run_round2_v2` failed closed with InvalidDkgState("round2_missing_ingress_state_file").
+    // `build_chained_request` (below) and `build_round1_request` share the SAME canonical
+    // identity (FIX_REQUEST_ID / FIX_SESSION_ID + fixture_request_* values), so seeding round1
+    // here lands the ingress file in exactly the session round2 looks in. run_round1_v2 is
+    // idempotent, so repeated builds (e.g. replay tests) are harmless. Round1's own
+    // positive/negative tests don't call build_round2_request, so they're unaffected.
+    let r1 = build_round1_request(fix, self_slot, player_id);
+    run_round1_v2(&fix.slot_dirs[self_slot], &r1)
+        .expect("seed M1 ingress state for round2/finalize");
+
     let base = build_chained_request(fix, self_slot, player_id);
     fn group(label: &str, count: usize) -> Vec<String> {
         (0..count)
@@ -2062,12 +2074,17 @@ fn m4_round2_replay_returns_stable_worker_transcript_hash() {
         result_1.worker_transcript_hash, result_2.worker_transcript_hash,
         "round2 worker_transcript_hash MUST be byte-stable across replays of identical requests"
     );
-    // Partial commitments WILL differ across replays because α_share is fresh — that's the
-    // expected privacy property. We assert distinct partials as a check on the freshness.
-    assert_ne!(
+    // Partial commitments are DETERMINISTIC: each is `base · α_share` where α_share is the
+    // FIXED M1 ingress share (decrypted from the persisted ingress envelope at lib.rs:9488,
+    // not a fresh per-call random). Replays of an identical request therefore produce
+    // byte-identical partials — which is exactly what makes the 5-worker threshold
+    // aggregation identity (`ek · s[0] = A[0] + e·H`) well-defined. The per-call freshness
+    // lives in the at-rest HPKE envelope's ephemeral key (encrypted_alpha_envelope), not in
+    // the public partial commitments.
+    assert_eq!(
         result_1.partial_dk_commitments[0].commitment_hex,
         result_2.partial_dk_commitments[0].commitment_hex,
-        "α_share is fresh per call → partial commitments MUST differ across replays"
+        "round2 partial commitments are deterministic (base · fixed ingress α_share) → byte-stable across replays"
     );
 }
 
@@ -2855,6 +2872,12 @@ fn m4_finalize_aggregates_to_valid_threshold_response_over_5_workers() {
     };
     let mut r2_results = Vec::with_capacity(5);
     for (ordinal, &slot) in sorted_slots.iter().enumerate() {
+        // Baseline-fix: seed THIS slot's M1 ingress. `build_round2_request` (the template)
+        // only seeded slot 0; the per-slot fan-out below reuses a cloned template, so slots
+        // 1..4 have no ingress state yet. run_round1_v2 is idempotent, so re-seeding slot 0 is
+        // a harmless replay.
+        let r1 = build_round1_request(&fix, slot, ordinal);
+        run_round1_v2(&fix.slot_dirs[slot], &r1).expect("seed M1 ingress per slot");
         let mut req = template.clone();
         req.base.self_slot = slot;
         req.base.player_id = ordinal;
