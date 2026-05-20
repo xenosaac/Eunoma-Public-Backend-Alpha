@@ -18,11 +18,17 @@
 // The user's proveTransfer used dk_user (fake), which the coordinator + workers then replace
 // transparently during finalize aggregation. See M4-c5 byte-canonical test for the pattern.
 // =============================================================================================
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+
+import {
+  parseWithdrawEventV2FromTx,
+  pickInitializedMin,
+  buildResyncBody,
+} from "./_lib/vault_resync_client.mjs";
 
 import {
   AVAILABLE_BALANCE_CHUNK_COUNT,
@@ -673,6 +679,132 @@ const round1Body = {
   perShareCommitments,
   ingressEnvelopes,
 };
+
+// ---- M11: pre-round1 vault-state catch-up -------------------------------------------------
+// After a prior chain withdraw, on-chain BridgeVault.vault_sequence advances but the per-worker
+// vault_state_v2.json does not (no post-submit observe pre-M11), so round1 trips
+// `stale_vault_sequence`. Before round1, read the chain sequence + every worker's persisted
+// sequence; if the selected quorum lags, advance it one VERIFIED step at a time using a TRUSTED
+// withdraw tx hash (M10_FINAL_REPORT anchor / coordinator submit artifacts) — never speculative
+// event-handle scanning. Fail closed when a step has no trusted tx, drops below threshold, or
+// leaves the selected round1 quorum unsynced.
+const BRIDGE_PACKAGE_ADDRESS = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
+const RESYNC_THRESHOLD = 5;
+
+async function fetchChainVaultSequence() {
+  const res = await fetch(`${APTOS_NODE_URL}/v1/view`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      function: `${BRIDGE_PACKAGE_ADDRESS}::eunoma_bridge::get_vault_sequence_v2`,
+      type_arguments: [],
+      arguments: [],
+    }),
+  });
+  if (!res.ok) throw new Error(`get_vault_sequence_v2: ${res.status} ${await res.text()}`);
+  const j = await res.json();
+  return Number(Array.isArray(j) ? j[0] : j);
+}
+
+function readWorkerVaultSequences() {
+  const bySlot = {};
+  for (const node of caDkgRoster.nodes) {
+    const p = resolve(serviceRoot, `.agent-local/eunoma-v2/slot-${node.slot}/vault_state_v2.json`);
+    if (!existsSync(p)) { bySlot[node.slot] = null; continue; }
+    try {
+      bySlot[node.slot] = Number(JSON.parse(readFileSync(p, "utf8")).vault_sequence);
+    } catch {
+      bySlot[node.slot] = null;
+    }
+  }
+  return bySlot;
+}
+
+// Trusted withdraw tx hashes (for resolving each catch-up step's WithdrawEventV2). Sourced from
+// the M10_FINAL_REPORT anchor + coordinator submit artifacts — NEVER from speculative scanning.
+function resolveTrustedWithdrawTxHashes() {
+  const out = [];
+  const reportPath = resolve(serviceRoot, "M10_FINAL_REPORT.json");
+  if (existsSync(reportPath)) {
+    try {
+      const rep = JSON.parse(readFileSync(reportPath, "utf8"));
+      for (const tx of [rep?.txHashes?.chainConfirmedWithdraw, rep?.txHashes?.priorChainConfirmedWithdraw]) {
+        if (typeof tx === "string" && tx.length > 0) out.push(tx);
+      }
+    } catch { /* ignore */ }
+  }
+  const submitDir = resolve(serviceRoot, ".agent-local/eunoma-v2/coordinator/mpcca_withdraw_submit");
+  if (existsSync(submitDir)) {
+    for (const f of readdirSync(submitDir)) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const a = JSON.parse(readFileSync(join(submitDir, f), "utf8"));
+        const tx = a?.txHash ?? a?.chainConfirmedWithdraw ?? a?.relayerSubmit;
+        if (typeof tx === "string" && tx.length > 0) out.push(tx);
+      } catch { /* ignore */ }
+    }
+  }
+  return [...new Set(out)];
+}
+
+async function fetchWithdrawEventBindingByTxHash(txHash) {
+  const res = await fetch(`${APTOS_NODE_URL}/v1/transactions/by_hash/${txHash}`, {
+    headers: { "content-type": "application/json" },
+  });
+  if (!res.ok) throw new Error(`tx_by_hash ${txHash}: ${res.status}`);
+  const tx = await res.json();
+  return { txHash, ...parseWithdrawEventV2FromTx(tx, BRIDGE_PACKAGE_ADDRESS) };
+}
+
+{
+  const targetSeq = Number(vaultSequenceArg);
+  const workerSeqs = readWorkerVaultSequences();
+  const { initializedSlots, workerMin } = pickInitializedMin(workerSeqs);
+  let chainSeq = null;
+  try { chainSeq = await fetchChainVaultSequence(); } catch (e) { console.error(`[m11] WARN chain vault_sequence read failed: ${e?.message ?? e}`); }
+  console.error(`[m11] pre-round1 catch-up: chain=${chainSeq} target(round1)=${targetSeq} workerMin=${workerMin} initialized=[${initializedSlots.join(",")}]`);
+
+  if (workerMin !== null && workerMin < targetSeq) {
+    const txCandidates = resolveTrustedWithdrawTxHashes();
+    for (let s = workerMin; s < targetSeq; s += 1) {
+      let binding = null;
+      for (const tx of txCandidates) {
+        try {
+          const b = await fetchWithdrawEventBindingByTxHash(tx);
+          if (b.eventVaultSequence === s && b.success) { binding = b; break; }
+        } catch { /* try next candidate */ }
+      }
+      if (!binding) {
+        console.error(`[m11] FATAL missing_withdraw_tx_history_for_resync: no trusted tx for event_vault_sequence=${s}`);
+        process.exit(36);
+      }
+      const body = buildResyncBody({
+        dkgEpoch: dkgEpochStr, requestId, txHash: binding.txHash,
+        bridgePackage: BRIDGE_PACKAGE_ADDRESS, vault: addr32(vaultAddress), assetType: addr32(assetType),
+        binding, trigger: "before_round1",
+      });
+      const resp = await post("/v2/vault/resync_before_round1", body);
+      const okSlots = resp.body?.summary?.okSlots ?? [];
+      console.error(`[m11] resync_before_round1 step ${s}→${s + 1}: HTTP ${resp.status} okSlots=[${okSlots.join(",")}]`);
+      if (resp.status !== 200 || okSlots.length < RESYNC_THRESHOLD) {
+        console.error(`[m11] FATAL resync_before_round1_subthreshold at step ${s}: ${JSON.stringify(resp.body?.summary ?? resp.body)}`);
+        process.exit(37);
+      }
+    }
+    // Verify the SELECTED round1 quorum reached the target (not a generic count — fix #4/#8).
+    const after = readWorkerVaultSequences();
+    for (const slot of selectedSlots) {
+      if (after[slot] !== targetSeq) {
+        console.error(`[m11] FATAL round1_quorum_slot_${slot}_not_synced: ${after[slot]} != ${targetSeq}`);
+        process.exit(38);
+      }
+    }
+    console.error(`[m11] pre-round1 catch-up complete: selected quorum [${selectedSlots.join(",")}] all at ${targetSeq}`);
+  } else {
+    console.error(`[m11] pre-round1 catch-up: no advance needed (workerMin=${workerMin}, target=${targetSeq})`);
+  }
+}
+
 console.error(`[m8-real] POST /v2/withdraw/mpcca/start`);
 let r = await post("/v2/withdraw/mpcca/start", round1Body);
 console.error(`[m8-real] round1 → HTTP ${r.status}`);
@@ -967,6 +1099,46 @@ if (r.status !== 200) {
 console.error(`[m8-real] POST /v2/withdraw/mpcca/submit`);
 r = await post("/v2/withdraw/mpcca/submit", { dkgEpoch: dkgEpochStr, requestId });
 console.error(`[m8-real] submit → HTTP ${r.status}`);
+
+// ---- M11: post-submit vault-state resync --------------------------------------------------
+// After a chain-confirmed WithdrawEventV2, advance every worker's vault_sequence so the NEXT
+// withdraw's round1 doesn't trip stale_vault_sequence. In production this may warn (chain is
+// authoritative; the next run's pre-round1 catch-up heals stragglers); under
+// EUNOMA_E2E_REQUIRE_RESYNC=1 (release verification) a sub-threshold result is a HARD failure —
+// otherwise "consecutive-withdraw safety" is not actually proven.
+const requireResync = process.env.EUNOMA_E2E_REQUIRE_RESYNC === "1";
+let resyncAfterSummary = null;
+if (r.status >= 200 && r.status < 300) {
+  try {
+    const newTxHash =
+      r.body?.txHash ?? r.body?.chainConfirmedWithdraw ?? r.body?.relayerSubmit ?? r.body?.responseBody?.txHash;
+    if (!newTxHash) throw new Error("submit response missing txHash");
+    const binding = await fetchWithdrawEventBindingByTxHash(newTxHash);
+    if (!binding.success) throw new Error(`submit tx ${newTxHash} not successful on chain`);
+    const body = buildResyncBody({
+      dkgEpoch: dkgEpochStr, requestId, txHash: binding.txHash,
+      bridgePackage: BRIDGE_PACKAGE_ADDRESS, vault: addr32(vaultAddress), assetType: addr32(assetType),
+      binding, trigger: "after_withdraw",
+    });
+    const resp = await post("/v2/vault/resync_after_withdraw", body);
+    const okSlots = resp.body?.summary?.okSlots ?? [];
+    resyncAfterSummary = { httpStatus: resp.status, okSlots, summary: resp.body?.summary ?? null };
+    console.error(`[m11] resync_after_withdraw: HTTP ${resp.status} okSlots=[${okSlots.join(",")}]`);
+    const subThreshold = resp.status !== 200 || okSlots.length < RESYNC_THRESHOLD;
+    if (subThreshold && requireResync) {
+      console.error(`[m11] FATAL resync_after_withdraw_subthreshold (EUNOMA_E2E_REQUIRE_RESYNC=1): ${JSON.stringify(resp.body?.summary ?? resp.body)}`);
+      process.exit(39);
+    } else if (subThreshold) {
+      console.error(`[m11] WARN resync_after_withdraw below threshold (production: chain authoritative; next run's pre-round1 catch-up heals)`);
+    }
+  } catch (err) {
+    if (requireResync) {
+      console.error(`[m11] FATAL resync_after_withdraw error (EUNOMA_E2E_REQUIRE_RESYNC=1): ${err?.message ?? err}`);
+      process.exit(39);
+    }
+    console.error(`[m11] WARN resync_after_withdraw error (production: chain authoritative): ${err?.message ?? err}`);
+  }
+}
 // M10-l (codex iter-4 P1-8): the final submit summary previously emitted
 // `amountOctas` unconditionally — the iter-2/3 plaintext gating only
 // covered the --check-balance-only path. CI / process supervisors capture
@@ -985,6 +1157,7 @@ const submitSummary = {
   caPayloadHashFr,
   proofHex,
   responseBody: r.body,
+  resyncAfterWithdraw: resyncAfterSummary,
 };
 if (debugBalanceSubmit) {
   submitSummary.amountOctas = TRANSFER_AMOUNT_OCTAS.toString();
