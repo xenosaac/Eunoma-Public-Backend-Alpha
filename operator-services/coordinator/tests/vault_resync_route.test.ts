@@ -296,4 +296,54 @@ describe("M11 — POST /v2/vault/resync_*", () => {
       expect(flat.includes(tok)).toBe(false);
     }
   });
+
+  // codex P2: a path-traversal requestId must be rejected before it reaches the
+  // transcript filename join.
+  it("rejects a path-traversal requestId before constructing the transcript path", async () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "eunoma-resync-pt-"));
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster: dkgRoster(),
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
+      stateRoot,
+      singleNodeForwarder: async () => ({ slot: -1, ok: false, statusCode: 500, error: "should_not_be_called" }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault/resync_after_withdraw",
+      payload: baseBody({ requestId: "x/../../outside" }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("requestId_must_be_safe_id");
+    // Nothing must have been written outside the vault_resync dir.
+    expect(existsSync(join(stateRoot, "outside.json"))).toBe(false);
+  });
+
+  // codex P2: a worker that echoes a forbidden plaintext key must 500 via the outbound
+  // guard BEFORE the transcript is persisted — no forbidden data lands on disk.
+  it("rejects + does NOT persist when a worker body carries a forbidden key", async () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "eunoma-resync-fk-"));
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster: dkgRoster(),
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
+      stateRoot,
+      // One worker echoes a forbidden `amount` key in its 200 body.
+      singleNodeForwarder: async (_path, _body, _roster, slot) => ({
+        slot,
+        ok: true,
+        statusCode: 200,
+        body: slot === 3 ? { vaultSequence: 2, amount: 999 } : { vaultSequence: 2, idempotent: false },
+      }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault/resync_after_withdraw",
+      payload: baseBody(),
+    });
+    expect(res.statusCode).toBe(500);
+    expect(res.json().error).toBe("outbound_forbidden_field");
+    // The transcript file must NOT exist (guard ran before persist).
+    expect(existsSync(join(stateRoot, "coordinator", "vault_resync", "1__m11-test__after_withdraw.json"))).toBe(false);
+  });
 });

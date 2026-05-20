@@ -90,6 +90,11 @@ interface ParsedResyncRequest {
 
 const HEX64_RE = /^(0x)?[0-9a-fA-F]{64}$/;
 const ADDR_RE = /^(0x)?[0-9a-fA-F]{1,64}$/;
+// dkgEpoch + requestId land in the transcript filename
+// (`<dkgEpoch>__<requestId>__<trigger>.json`), so they must be path-safe — a value like
+// `x/../../outside` would otherwise let an authenticated caller write outside the
+// vault_resync dir (codex P2). Restrict to the same charset the worker's is_safe_id allows.
+const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
 
 function parseRequest(raw: unknown): ParsedResyncRequest {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
@@ -122,6 +127,13 @@ function parseRequest(raw: unknown): ParsedResyncRequest {
     }
     return v;
   };
+  const reqSafeId = (key: string): string => {
+    const v = reqString(key);
+    if (!SAFE_ID_RE.test(v)) {
+      throw new Error(`invalid_request:${key}_must_be_safe_id`);
+    }
+    return v;
+  };
   const reqU53 = (key: string): number => {
     const v = obj[key];
     if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || !Number.isSafeInteger(v)) {
@@ -135,8 +147,8 @@ function parseRequest(raw: unknown): ParsedResyncRequest {
     throw new Error("invalid_request:expectedNextSequence_must_be_eventVaultSequence_plus_one");
   }
   return {
-    dkgEpoch: reqString("dkgEpoch"),
-    requestId: reqString("requestId"),
+    dkgEpoch: reqSafeId("dkgEpoch"),
+    requestId: reqSafeId("requestId"),
     txHash: reqAddr("txHash"),
     bridgePackage: reqAddr("bridgePackage"),
     vault: reqAddr("vault"),
@@ -307,7 +319,19 @@ export function registerVaultResyncRoute(
     };
     const responseBody = { ok: thresholdMet, trigger, requestId: parsed.requestId, summary, results };
 
-    // 6. Persist an audit transcript (public fields only).
+    // 6. Outbound forbidden-key guard FIRST — before persisting. `results` carries each
+    //    worker's response body; a buggy/compromised worker that echoed a forbidden plaintext
+    //    key must 500 here WITHOUT the transcript write landing it on disk (codex P2). The
+    //    transcript content below is a subset of what's guarded (request=workerBody from
+    //    validated fields; summary; results==responseBody.results).
+    try {
+      assertNoForbiddenKeys(responseBody);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "forbidden_field";
+      return reply.code(500).send({ error: "outbound_forbidden_field", message: msg });
+    }
+
+    // 7. Persist an audit transcript (public fields only; guard already passed).
     if (opts.stateRoot) {
       try {
         const dir = join(opts.stateRoot, "coordinator", "vault_resync");
@@ -339,14 +363,6 @@ export function registerVaultResyncRoute(
           }`,
         });
       }
-    }
-
-    // 7. Outbound forbidden-key guard (defense-in-depth).
-    try {
-      assertNoForbiddenKeys(responseBody);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "forbidden_field";
-      return reply.code(500).send({ error: "outbound_forbidden_field", message: msg });
     }
 
     return reply.code(thresholdMet ? 200 : 502).send(responseBody);
