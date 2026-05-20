@@ -1,0 +1,49 @@
+# vault_ek_inversion_v1
+#
+# Eunoma V2 DKG A — Phase 2 production MP-SPDZ program.
+#
+# Goal: open a single product m = dk * r over the Ed25519 scalar prime Q, where
+#   - dk     = sum_i(lambda_i * dk_share_i)  (Lagrange reconstruction at x=0 of a degree-(t-1)
+#                                              Shamir polynomial)
+#   - r      = sum_i(r_i)                    (additive sharing of a fresh random scalar)
+#   - lambda_i is public, dk_share_i / r_i are secret.
+#
+# Per-party inputs from Player-Data/Input-P{i}-0 (decimal, mod Q, one per line):
+#   line 1: dk_share_i  (Shamir share — sint, MAC-authenticated)
+#   line 2: r_i         (additive share of r — sint, MAC-authenticated)
+#
+# The N=5 public Lagrange coefficients are read from
+# Programs/Public-Input/vault_ek_inversion_v1 (decimal, mod Q, one per line, ordered to match
+# player ordinals 0..N-1). Since lambda_i is fully determined by the sorted selected_slots,
+# every party reads the same file; the adapter writes this file into the session dir's
+# Programs/Public-Input/ before spawning mascot-party.x.
+#
+# After this program exits cleanly, each party locally computes
+#   q_i = r_i * m^{-1}     and    h_contribution_i = H * q_i
+# so that sum_i q_i = m^{-1} * sum_i r_i = (dk*r)^{-1} * r = 1/dk, and
+# sum_i h_contribution_i = H * 1/dk = vault_ek.
+#
+# Security:
+#   - MASCOT MAC-checks the single sint MUL `dk * r`, detecting any malicious deviation.
+#   - Opening m reveals nothing about dk because r is uniformly random in Q.
+#   - q_i never enters the MPC machine; it is computed locally by party i from r_i and m^{-1}.
+#
+# The compile.py invocation must pass `-P <Q>` so MASCOT operates over the Ed25519 scalar field.
+
+N = 5
+
+lambdas = [public_input() for _ in range(N)]
+dk_shares = [sint.get_input_from(i) for i in range(N)]
+r_shares = [sint.get_input_from(i) for i in range(N)]
+
+# Lagrange reconstruction of dk at x=0: public_coef * secret_share => free in MASCOT
+# (no Beaver triple consumed).
+dk = sum(lambdas[i] * dk_shares[i] for i in range(N))
+
+# Additive sum of r contributions: secret + secret => local-only operation.
+r = sum(r_shares[i] for i in range(N))
+
+# The single MUL — Beaver triple consumed, MAC-check enforced on reveal.
+m = (dk * r).reveal()
+
+print_ln('EUNOMA_VAULT_EK_M=%s', m)

@@ -5,6 +5,8 @@ node_modules/
 # Build artifacts
 build/
 dist/
+target/
+**/target/
 *.tsbuildinfo
 .next/
 
@@ -36,10 +38,9 @@ Thumbs.db
 **/.ek.json
 **/secrets/
 
-# Testnet state — contains note nullifiers, secrets, deposit_blind, and
-# decryption keys. ROTATE keys when regenerating; never commit.
-operator-services/scripts/testnet_state.json
-operator-services/scripts/testnet_state*.json
+# Local testnet/session state can contain private witness material. Never commit.
+operator-services/**/testnet_state.json
+operator-services/**/testnet_state*.json
 
 # Circuit byproducts (keep .zkey/.ptau/.vk.json explicitly committed; ignore intermediate witness/r1cs)
 *.r1cs
@@ -73,12 +74,13 @@ Dockerfile
 /docs/CODING_AGENT_PROMPT.md
 /docs/privacy_protocol_comparison_2026-05.md
 /docs/privacy_protocol_comparison_2026-05.xlsx
+/docs/
 /circuits/scripts/README.md
 /operator-services/README.md
-/operator-services/main-operator/README.md
 /operator-services/scripts/README.md
 /move/.phase_g_archive/
 
 # Local agent handoff notes. Never commit: may include instance IDs, public IPs,
 # operational topology, deployment commands, and environment variable names.
 /.agent-local/
+**/.agent-local/
