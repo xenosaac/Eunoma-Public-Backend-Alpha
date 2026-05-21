@@ -510,30 +510,76 @@ export function buildCoordinatorServer(
   });
 
   server.addHook("onRequest", async (req) => {
-    if (req.method === "GET" && (req.url === "/v2/roster" || req.url === "/v2/health")) {
+    if (
+      req.method === "GET" &&
+      (req.url === "/v2/roster" || req.url === "/v2/health" || req.url === "/v2/pool/state")
+    ) {
       return;
     }
     requireBearer(req.headers.authorization, opts.bearerToken);
   });
 
-  server.get("/v2/health", async () => ({
-    ok: true,
-    threshold: opts.roster?.threshold ?? opts.caDkgV2Roster?.threshold,
-    rosterHash: currentRosterHash,
-    caDkgV2RosterHash: currentCaDkgV2RosterHash,
-  }));
+  server.get("/v2/health", async () => {
+    const submitEnabled = process.env.RELAYER_SUBMIT_ENABLED === "1";
+    const relayerConfigured = Boolean(process.env.RELAYER_URL);
+    return {
+      ok: true,
+      simulationReady: true,
+      submitEnabled,
+      liveSubmitReady: submitEnabled && relayerConfigured,
+      threshold: opts.roster?.threshold ?? opts.caDkgV2Roster?.threshold,
+      rosterHash: currentRosterHash,
+      caDkgV2RosterHash: currentCaDkgV2RosterHash,
+    };
+  });
 
+  // The browser verifies the roster against the on-chain DeoperatorConfigV2.roster_hash, which
+  // commits to the CaDkgV2Roster (the real DKG HPKE keys). The DeoperatorRoster carries fixture
+  // HPKE keys (different digest), so prefer the CaDkgV2Roster here whenever it is configured —
+  // otherwise the client recompute won't match chain and shares encrypt to keys nodes can't open.
   server.get("/v2/roster", async () =>
-    opts.roster
+    opts.caDkgV2Roster
       ? {
-          ...opts.roster,
-          rosterHash: currentRosterHash,
-        }
-      : {
           caDkgV2Roster: opts.caDkgV2Roster,
           caDkgV2RosterHash: currentCaDkgV2RosterHash,
+        }
+      : {
+          ...opts.roster,
+          rosterHash: currentRosterHash,
         },
   );
+
+  // Public pool state for the browser withdraw flow: the append-only commitment tree
+  // (leaves + latest root) maintained off-chain at <stateRoot>/coordinator/commitment_tree_v2.json.
+  // Safety is enforced on-chain — a withdraw is only accepted if its root is in BridgeVault.known_roots
+  // and the proof includes the note's commitment — so this data is non-authoritative (liveness only).
+  server.get("/v2/pool/state", async (_req, reply) => {
+    if (!opts.stateRoot) {
+      return reply.code(503).send({ error: "pool_state_unavailable" });
+    }
+    const treePath = join(opts.stateRoot, "coordinator", "commitment_tree_v2.json");
+    let tree: { latestRootHex?: unknown; leafCount?: unknown; leaves?: unknown };
+    try {
+      tree = JSON.parse(await readFile(treePath, "utf8")) as typeof tree;
+    } catch {
+      return reply.code(503).send({ error: "pool_state_unavailable" });
+    }
+    const root = tree.latestRootHex;
+    const leaves = tree.leaves;
+    const leafCount = tree.leafCount;
+    if (
+      typeof root !== "string" ||
+      !Array.isArray(leaves) ||
+      (typeof leafCount !== "number" && typeof leafCount !== "string")
+    ) {
+      return reply.code(503).send({ error: "pool_state_malformed" });
+    }
+    return {
+      current_finalized_root: root,
+      pending_next_index: String(leafCount),
+      commitments: leaves,
+    };
+  });
 
   server.get("/v2/status/:requestId", async (req) => {
     const params = req.params as { requestId: string };
