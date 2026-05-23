@@ -16,7 +16,7 @@
     "test": "npm run build && npm run -w @eunoma/shared test && npm run -w @eunoma/deop-protocol test && npm run -w @eunoma/crypto-worker-client test && npm run -w @eunoma/deoperator-node test && npm run -w @eunoma/coordinator test && npm run -w @eunoma/relayer test && npm run test:scripts",
     "test:scripts": "npm run test:scripts:vitest && npm run test:scripts:node",
     "test:scripts:vitest": "vitest run --config scripts/vitest.config.ts",
-    "test:scripts:node": "node --test scripts/__tests__/local_v2_withdraw_full.test.mjs scripts/__tests__/local_v2_withdraw_full_balance.test.mjs scripts/__tests__/sigma_position_17_parity.test.mjs scripts/__tests__/local_v2_withdraw_resync.test.mjs",
+    "test:scripts:node": "node --test scripts/__tests__/local_v2_withdraw_full.test.mjs scripts/__tests__/local_v2_withdraw_full_balance.test.mjs scripts/__tests__/sigma_position_17_parity.test.mjs scripts/__tests__/local_v2_withdraw_resync.test.mjs scripts/__tests__/note_v3.test.mjs",
     "tsc": "npm run build",
     "local:cluster:config": "npm run build && node scripts/local_cluster_config.mjs",
     "local:cluster:start": "node scripts/local_cluster_start.mjs",
