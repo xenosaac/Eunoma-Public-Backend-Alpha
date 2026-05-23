@@ -6120,9 +6120,24 @@ export function buildCoordinatorServer(
           });
         }
         // 6. Assemble. Either get the 27-field bundle or the NotImplemented passthrough.
+        // Stage 4 A6 gas split: callers that already verified the FROST attestation via
+        // prepare_withdraw_attestation_v2 ask submit to pass an empty groupSignature. Move
+        // then consumes the exact prepared public tuple keyed by request_hash.
+        const finalizeForAssembly =
+          parsed.preparedWithdrawAttestation === true && finalize.withdrawV2CallArgsFields
+            ? {
+                ...finalize,
+                withdrawV2CallArgsFields: {
+                  ...finalize.withdrawV2CallArgsFields,
+                  groupSignature: "0x",
+                  fallbackBitmap: 0,
+                  fallbackSignatures: [],
+                },
+              }
+            : finalize;
         let assembleResult: WithdrawV2CallArgsShape | { notImplementedPhase: string };
         try {
-          assembleResult = assembleWithdrawV2CallArgs(finalize);
+          assembleResult = assembleWithdrawV2CallArgs(finalizeForAssembly);
         } catch (err) {
           // Codex M5b P1 #1: structural no-auditor violation surfaces as 400 with the
           // stable code, mirroring the relayer parser's wire shape so callers can
@@ -6175,6 +6190,7 @@ export function buildCoordinatorServer(
             ...(finalize!.attestationConfig
               ? { attestationConfig: finalize!.attestationConfig }
               : {}),
+            preparedWithdrawAttestation: parsed.preparedWithdrawAttestation === true,
             createdAtUnixMs: Date.now(),
             ...payload,
           };

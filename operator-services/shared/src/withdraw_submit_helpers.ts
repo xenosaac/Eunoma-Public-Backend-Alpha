@@ -664,7 +664,9 @@ export function assembleWithdrawV2CallArgs(
   // has verified and cached the exact public tuple on-chain; final Move consumes it or aborts.
   hexAllowZeroBytes("withdrawProof", fields.withdrawProof);
   decimalU64("expirySecs", fields.expirySecs);
-  hexNonEmpty("groupSignature", fields.groupSignature);
+  // Stage 4 A6 split withdraw: "0x" is valid only after prepare_withdraw_attestation_v2
+  // has verified and cached the exact public tuple on-chain; final Move consumes it or aborts.
+  hexAllowZeroBytes("groupSignature", fields.groupSignature);
   u8("fallbackBitmap", fields.fallbackBitmap);
   hexArray("fallbackSignatures", fields.fallbackSignatures, { allowEmpty: true });
   hexArray("newBalanceP", fields.newBalanceP, { allowEmpty: false });

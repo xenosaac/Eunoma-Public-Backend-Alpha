@@ -1204,6 +1204,49 @@ async function submitPreparedWithdrawProof() {
 }
 const prepareWithdrawProofTxHash = await submitPreparedWithdrawProof();
 
+async function submitPreparedWithdrawAttestation(groupSignatureHex) {
+  if (typeof groupSignatureHex !== "string" || hexToBytes(groupSignatureHex).length === 0) {
+    throw new Error("frost-attest response missing non-empty groupSignature");
+  }
+  const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
+  const submitter = loadDepositorSubmitAccount();
+  const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
+  console.error("[a6] building + submitting prepare_withdraw_attestation_v2 tx");
+  const prepareTx = await aptos.transaction.build.simple({
+    sender: submitter.accountAddress,
+    data: {
+      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_attestation_v2`,
+      functionArguments: [
+        hexToBytes(rootHex),
+        hexToBytes(nullifierHashHex),
+        `0x${addr32(recipientAddress)}`,
+        hexToBytes(recipientHashHex),
+        hexToBytes(amountTagHex),
+        hexToBytes(caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : `0x${caPayloadHashFr}`),
+        hexToBytes(realRequestHashHex),
+        BigInt(vaultSequenceArg),
+        BigInt(expirySecs),
+        hexToBytes(groupSignatureHex),
+        0,
+        [],
+      ],
+    },
+    options: { maxGasAmount: 500_000, gasUnitPrice: 100 },
+  });
+  const auth = aptos.transaction.sign({ signer: submitter, transaction: prepareTx });
+  const pending = await aptos.transaction.submit.simple({
+    transaction: prepareTx,
+    senderAuthenticator: auth,
+  });
+  console.error(`[a6] submitted prepare_withdraw_attestation_v2 tx=${pending.hash}; waiting for confirmation...`);
+  const committed = await aptos.waitForTransaction({ transactionHash: pending.hash });
+  if (!committed.success) {
+    throw new Error(`prepare_withdraw_attestation_v2 failed: ${committed.vm_status}`);
+  }
+  console.error(`[a6] prepare attestation SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
+  return committed.hash;
+}
+
 // M8-r: derive circuit_versions_hash from chain DeoperatorConfigV2 (keccak256(BCS(CircuitVersionsForHash{deposit,withdraw,ca_payload}))).
 // Falling back to an env var leaves frost-attest message diverged from chain and triggers E_INVALID_DEOP_SIGNATURE.
 async function fetchCircuitVersionsHash() {
@@ -1252,10 +1295,15 @@ if (r.status !== 200) {
   console.error(JSON.stringify(r.body, null, 2));
   process.exit(34);
 }
+const prepareWithdrawAttestationTxHash = await submitPreparedWithdrawAttestation(r.body?.groupSignature);
 
 // ---- 6) submit ----------------------------------------------------------------------------
 console.error(`[m8-real] POST /v2/withdraw/mpcca/submit`);
-r = await post("/v2/withdraw/mpcca/submit", { dkgEpoch: dkgEpochStr, requestId });
+r = await post("/v2/withdraw/mpcca/submit", {
+  dkgEpoch: dkgEpochStr,
+  requestId,
+  preparedWithdrawAttestation: true,
+});
 console.error(`[m8-real] submit → HTTP ${r.status}`);
 
 // ---- M11: post-submit vault-state resync --------------------------------------------------
@@ -1315,6 +1363,7 @@ const submitSummary = {
   caPayloadHashFr,
   proofHex,
   prepareWithdrawProofTxHash,
+  prepareWithdrawAttestationTxHash,
   responseBody: r.body,
   resyncAfterWithdraw: resyncAfterSummary,
 };

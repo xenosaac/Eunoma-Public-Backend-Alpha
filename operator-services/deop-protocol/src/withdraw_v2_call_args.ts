@@ -175,7 +175,7 @@ export function parseWithdrawV2CallArgs(raw: unknown): WithdrawV2CallArgs {
     vaultSequence: decimalU64Field(obj, "vaultSequence"),
     withdrawProof: hexField(obj, "withdrawProof", undefined, { allowEmpty: true }),
     expirySecs: decimalU64Field(obj, "expirySecs"),
-    groupSignature: hexField(obj, "groupSignature"),
+    groupSignature: hexField(obj, "groupSignature", undefined, { allowEmpty: true }),
     fallbackBitmap: u8Field(obj, "fallbackBitmap"),
     fallbackSignatures: hexArrayField(obj, "fallbackSignatures", { allowEmpty: true }),
     newBalanceP: hexArrayField(obj, "newBalanceP", { allowEmpty: false }),

@@ -85,6 +85,11 @@ export interface MpccaWithdrawSubmitRequest {
   dkgEpoch: string;
   requestId: string;
   /**
+   * Stage 4 A6 gas split: when true, submit assembles the final withdraw call with
+   * an empty groupSignature so Move consumes a previously prepared attestation.
+   */
+  preparedWithdrawAttestation?: boolean;
+  /**
    * Inert in 5b. Reserved for future use (e.g. testnet rotation drills) where an operator
    * wants to override the relayer URL the submit route calls. Validated for shape but never
    * consulted by the 5b route plumbing.
@@ -139,6 +144,16 @@ export function parseMpccaWithdrawSubmitRequest(body: unknown): MpccaWithdrawSub
   // isSafeId enforcement lives in the coordinator route — we DO NOT duplicate it here so the
   // route can surface the canonical `unsafe_request_id` error code that the rest of the V2
   // surface uses (test fixtures pin that wording).
+  let preparedWithdrawAttestation: boolean | undefined;
+  if (obj.preparedWithdrawAttestation !== undefined) {
+    if (typeof obj.preparedWithdrawAttestation !== "boolean") {
+      throw new MpccaWithdrawSubmitError(
+        "invalid_request",
+        "preparedWithdrawAttestation must be a boolean when present",
+      );
+    }
+    preparedWithdrawAttestation = obj.preparedWithdrawAttestation;
+  }
   let relayerOverrides: MpccaWithdrawSubmitRequest["relayerOverrides"];
   if (obj.relayerOverrides !== undefined) {
     if (
@@ -187,6 +202,7 @@ export function parseMpccaWithdrawSubmitRequest(body: unknown): MpccaWithdrawSub
   return {
     dkgEpoch,
     requestId,
+    ...(preparedWithdrawAttestation !== undefined ? { preparedWithdrawAttestation } : {}),
     ...(relayerOverrides ? { relayerOverrides } : {}),
   };
 }

@@ -83,6 +83,7 @@ module eunoma::eunoma_bridge {
     const E_INVALID_AMOUNT_P_SHAPE: u64 = 23;
     const E_PENDING_DEPOSIT_BINDING: u64 = 24;
     const E_PENDING_WITHDRAW_PROOF: u64 = 25;
+    const E_PENDING_WITHDRAW_ATTESTATION: u64 = 26;
 
     struct BridgeVault has key {
         admin: address,
@@ -129,6 +130,28 @@ module eunoma::eunoma_bridge {
         ca_payload_hash: vector<u8>,
         vault_sequence: u64,
         amount_p_digest: vector<u8>,
+    }
+
+    struct PendingWithdrawAttestationsV2 has key {
+        by_request_hash: Table<vector<u8>, PendingWithdrawAttestationV2>,
+    }
+
+    struct PendingWithdrawAttestationV2 has store, drop {
+        vault: address,
+        asset_type: address,
+        operator_set_version: u64,
+        dkg_epoch: u64,
+        roster_hash: vector<u8>,
+        frost_group_pubkey: vector<u8>,
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        recipient: address,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        vault_sequence: u64,
+        expiry_secs: u64,
+        circuit_versions_hash: vector<u8>,
     }
 
     struct DeoperatorConfigV2 has key {
@@ -705,7 +728,7 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK {
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV2, PendingWithdrawAttestationsV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK {
         assert_initialized();
         assert_not_expired(expiry_secs);
         assert_hash(&root);
@@ -747,33 +770,22 @@ module eunoma::eunoma_bridge {
         assert!(ca_payload_hash_fr == ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
 
         let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
-        let msg = WithdrawAttestationV2Message {
-            domain: DOMAIN_WITHDRAW_V2,
-            chain_id: chain_id::get(),
-            bridge: @eunoma,
-            vault: vault_addr,
-            asset_type: object::object_address(&asset_type),
-            operator_set_version: cfg.operator_set_version,
-            dkg_epoch: cfg.dkg_epoch,
-            roster_hash: *&cfg.roster_hash,
-            frost_group_pubkey: *&cfg.frost_group_pubkey,
-            root: *&root,
-            nullifier_hash: *&nullifier_hash,
+        consume_or_verify_withdraw_attestation(
+            *&root,
+            *&nullifier_hash,
             recipient,
-            recipient_hash: *&recipient_hash,
-            amount_tag: *&amount_tag,
-            ca_payload_hash: *&ca_payload_hash,
-            request_hash: *&request_hash,
+            *&recipient_hash,
+            *&amount_tag,
+            *&ca_payload_hash,
+            *&request_hash,
             vault_sequence,
             expiry_secs,
-            circuit_versions_hash: circuit_versions_hash(cfg),
-        };
-        assert_deop_attestation_v2(
-            bcs::to_bytes(&msg),
             group_signature,
             fallback_bitmap,
             fallback_signatures,
             cfg,
+            vault_addr,
+            object::object_address(&asset_type),
         );
         let cache = borrow_global<VaultPublicInputsV2>(@eunoma);
         // Stage 3 A6: recompute amount_p_digest from the SAME 14-CA-args amount_p that goes
@@ -885,6 +897,16 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    public entry fun init_pending_withdraw_attestations_v2(
+        admin: &signer,
+    ) acquires BridgeVault {
+        assert_admin(admin);
+        assert!(!exists<PendingWithdrawAttestationsV2>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, PendingWithdrawAttestationsV2 {
+            by_request_hash: table::new<vector<u8>, PendingWithdrawAttestationV2>(),
+        });
+    }
+
     public entry fun prepare_deposit_binding_v2(
         sender: &signer,
         commitment: vector<u8>,
@@ -964,6 +986,95 @@ module eunoma::eunoma_bridge {
             ca_payload_hash,
             vault_sequence,
             amount_p_digest,
+        });
+    }
+
+    public entry fun prepare_withdraw_attestation_v2(
+        sender: &signer,
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        recipient: address,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        vault_sequence: u64,
+        expiry_secs: u64,
+        group_signature: vector<u8>,
+        fallback_bitmap: u8,
+        fallback_signatures: vector<vector<u8>>,
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawAttestationsV2, DeoperatorConfigV2 {
+        assert_initialized();
+        let _sender_addr = signer::address_of(sender);
+        assert_not_expired(expiry_secs);
+        assert_hash(&root);
+        assert_hash(&nullifier_hash);
+        assert_hash(&recipient_hash);
+        assert_hash(&amount_tag);
+        assert_hash(&ca_payload_hash);
+        assert_hash(&request_hash);
+        assert!(exists<PendingWithdrawAttestationsV2>(@eunoma), E_NOT_INITIALIZED);
+        assert!(known_root_recorded(&root), E_INVALID_ROOT);
+        assert!(!nullifier_used(&nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        let vault = borrow_global<BridgeVault>(@eunoma);
+        assert!(!vault.paused, E_PAUSED);
+        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
+        let vault_addr = vault.vault_addr;
+        let asset_type = vault.asset_type;
+        let expected_recipient_hash = derive_recipient_hash(recipient);
+        assert!(expected_recipient_hash == recipient_hash, E_RECIPIENT_HASH_MISMATCH);
+
+        let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
+        let versions_hash = circuit_versions_hash(cfg);
+        let msg = WithdrawAttestationV2Message {
+            domain: DOMAIN_WITHDRAW_V2,
+            chain_id: chain_id::get(),
+            bridge: @eunoma,
+            vault: vault_addr,
+            asset_type: object::object_address(&asset_type),
+            operator_set_version: cfg.operator_set_version,
+            dkg_epoch: cfg.dkg_epoch,
+            roster_hash: *&cfg.roster_hash,
+            frost_group_pubkey: *&cfg.frost_group_pubkey,
+            root: *&root,
+            nullifier_hash: *&nullifier_hash,
+            recipient,
+            recipient_hash: *&recipient_hash,
+            amount_tag: *&amount_tag,
+            ca_payload_hash: *&ca_payload_hash,
+            request_hash: *&request_hash,
+            vault_sequence,
+            expiry_secs,
+            circuit_versions_hash: *&versions_hash,
+        };
+        assert_deop_attestation_v2(
+            bcs::to_bytes(&msg),
+            group_signature,
+            fallback_bitmap,
+            fallback_signatures,
+            cfg,
+        );
+        let pending = borrow_global_mut<PendingWithdrawAttestationsV2>(@eunoma);
+        assert!(
+            !table::contains(&pending.by_request_hash, *&request_hash),
+            E_PENDING_WITHDRAW_ATTESTATION,
+        );
+        table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawAttestationV2 {
+            vault: vault_addr,
+            asset_type: object::object_address(&asset_type),
+            operator_set_version: cfg.operator_set_version,
+            dkg_epoch: cfg.dkg_epoch,
+            roster_hash: *&cfg.roster_hash,
+            frost_group_pubkey: *&cfg.frost_group_pubkey,
+            root,
+            nullifier_hash,
+            recipient,
+            recipient_hash,
+            amount_tag,
+            ca_payload_hash,
+            vault_sequence,
+            expiry_secs,
+            circuit_versions_hash: versions_hash,
         });
     }
 
@@ -1694,6 +1805,81 @@ module eunoma::eunoma_bridge {
                 vault_sequence,
                 amount_p_digest,
                 proof,
+            );
+        }
+    }
+
+    fun consume_or_verify_withdraw_attestation(
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        recipient: address,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        vault_sequence: u64,
+        expiry_secs: u64,
+        group_signature: vector<u8>,
+        fallback_bitmap: u8,
+        fallback_signatures: vector<vector<u8>>,
+        cfg: &DeoperatorConfigV2,
+        vault_addr: address,
+        asset_type_addr: address,
+    ) acquires PendingWithdrawAttestationsV2 {
+        let use_pending = exists<PendingWithdrawAttestationsV2>(@eunoma)
+            && vector::length(&group_signature) == 0
+            && fallback_bitmap == 0
+            && vector::length(&fallback_signatures) == 0;
+        if (use_pending) {
+            let pending = borrow_global_mut<PendingWithdrawAttestationsV2>(@eunoma);
+            assert!(
+                table::contains(&pending.by_request_hash, *&request_hash),
+                E_INVALID_DEOP_SIGNATURE,
+            );
+            let cached = table::remove(&mut pending.by_request_hash, *&request_hash);
+            assert!(cached.vault == vault_addr, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.asset_type == asset_type_addr, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.operator_set_version == cfg.operator_set_version, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.dkg_epoch == cfg.dkg_epoch, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.roster_hash == cfg.roster_hash, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.frost_group_pubkey == cfg.frost_group_pubkey, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.root == root, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.nullifier_hash == nullifier_hash, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.recipient == recipient, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.recipient_hash == recipient_hash, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.amount_tag == amount_tag, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.ca_payload_hash == ca_payload_hash, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.vault_sequence == vault_sequence, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.expiry_secs == expiry_secs, E_INVALID_DEOP_SIGNATURE);
+            assert!(cached.circuit_versions_hash == circuit_versions_hash(cfg), E_INVALID_DEOP_SIGNATURE);
+        } else {
+            let msg = WithdrawAttestationV2Message {
+                domain: DOMAIN_WITHDRAW_V2,
+                chain_id: chain_id::get(),
+                bridge: @eunoma,
+                vault: vault_addr,
+                asset_type: asset_type_addr,
+                operator_set_version: cfg.operator_set_version,
+                dkg_epoch: cfg.dkg_epoch,
+                roster_hash: *&cfg.roster_hash,
+                frost_group_pubkey: *&cfg.frost_group_pubkey,
+                root,
+                nullifier_hash,
+                recipient,
+                recipient_hash,
+                amount_tag,
+                ca_payload_hash,
+                request_hash,
+                vault_sequence,
+                expiry_secs,
+                circuit_versions_hash: circuit_versions_hash(cfg),
+            };
+            assert_deop_attestation_v2(
+                bcs::to_bytes(&msg),
+                group_signature,
+                fallback_bitmap,
+                fallback_signatures,
+                cfg,
             );
         }
     }
