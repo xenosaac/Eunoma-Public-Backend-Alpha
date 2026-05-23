@@ -31,11 +31,13 @@ test("note-v3 encrypts and decrypts with the right passphrase", () => {
 test("local_v2_deposit_submit hard-fails before chain work without note passphrase", () => {
   const stateRoot = mkdtempSync(join(tmpdir(), "eunoma-note-v3-preflight-"));
   try {
+    const childEnv = { ...process.env };
+    delete childEnv.EUNOMA_NOTE_PASSPHRASE;
     const result = spawnSync(process.execPath, ["scripts/local_v2_deposit_submit.mjs"], {
       cwd: serviceRoot,
       encoding: "utf8",
       env: {
-        ...process.env,
+        ...childEnv,
         EUNOMA_LOCAL_STATE_ROOT: stateRoot,
         BRIDGE_PACKAGE_ADDRESS: `0x${"aa".repeat(32)}`,
         COORDINATOR_BEARER_TOKEN: "test-token",
