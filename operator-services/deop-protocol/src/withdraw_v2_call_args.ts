@@ -173,7 +173,7 @@ export function parseWithdrawV2CallArgs(raw: unknown): WithdrawV2CallArgs {
     caPayloadHash: hexField(obj, "caPayloadHash", FR_BYTES),
     requestHash: hexField(obj, "requestHash", FR_BYTES),
     vaultSequence: decimalU64Field(obj, "vaultSequence"),
-    withdrawProof: hexField(obj, "withdrawProof"),
+    withdrawProof: hexField(obj, "withdrawProof", undefined, { allowEmpty: true }),
     expirySecs: decimalU64Field(obj, "expirySecs"),
     groupSignature: hexField(obj, "groupSignature"),
     fallbackBitmap: u8Field(obj, "fallbackBitmap"),

@@ -738,10 +738,10 @@ function hexNonEmpty(name: string, value: unknown): void {
 }
 
 function hexAllowZeroBytes(name: string, value: unknown): void {
-  if (typeof value !== "string" || value.length === 0) {
+  if (typeof value !== "string") {
     throw new Error(`assembleWithdrawV2CallArgs: ${name} must be a hex string`);
   }
-  hexToBytes(value);
+  if (value.length > 0) hexToBytes(value);
 }
 
 function hexMaybeEmpty(name: string, value: unknown): void {
