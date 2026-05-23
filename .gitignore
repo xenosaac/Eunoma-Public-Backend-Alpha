@@ -24,6 +24,7 @@ yarn-error.log*
 Thumbs.db
 .idea/
 .vscode/
+* 2.*
 
 # Env / secrets — NEVER commit
 .env
