@@ -43,8 +43,12 @@ module eunoma::eunoma_bridge {
     const G2_UNCOMPRESSED_BYTES: u64 = 128;
     const FQ12_BYTES: u64 = 384;
     const PROOF_BYTES: u64 = 256;
-    const DEPOSIT_VK_IC_LENGTH: u64 = 5;
-    const WITHDRAW_VK_IC_LENGTH: u64 = 9;
+    // Stage 3 A6: bumped to add amount_p_digest as additional public input.
+    // Deposit publics: commitment, amount_tag, asset_id, vault_addr_hash, amount_p_digest (5) + 1 const term = 6.
+    // Withdraw publics: root, nullifier_hash, asset_id, recipient_hash, amount_tag, ca_payload_hash,
+    //   request_hash, vault_sequence, amount_p_digest (9) + 1 const term = 10.
+    const DEPOSIT_VK_IC_LENGTH: u64 = 6;
+    const WITHDRAW_VK_IC_LENGTH: u64 = 10;
 
     const DOMAIN_DEPOSIT_V2: vector<u8> = b"EUNOMA_DEPOSIT_BIND_V2";
     const DOMAIN_WITHDRAW_V2: vector<u8> = b"EUNOMA_WITHDRAW_ATTESTATION_V2";
@@ -74,6 +78,9 @@ module eunoma::eunoma_bridge {
     const E_VAULT_SEQUENCE_MISMATCH: u64 = 20;
     const E_INVALID_ROOT: u64 = 21;
     const E_RECIPIENT_HASH_MISMATCH: u64 = 22;
+    /// Stage 3 A6: malformed amount_p (must be exactly 4 entries of 32 bytes each).
+    /// See compute_amount_p_digest_v2 + circuits/{deposit_binding,withdrawal_proof}.circom Compose8.
+    const E_INVALID_AMOUNT_P_SHAPE: u64 = 23;
 
     struct BridgeVault has key {
         admin: address,
@@ -496,9 +503,17 @@ module eunoma::eunoma_bridge {
             fallback_signatures,
             cfg,
         );
+        // Stage 3 A6: compute amount_p_digest from the 14-CA-args amount_p (4 × 32B Ristretto
+        // compressed Pedersen commits). This binds deposit commitment leaf to the CA framework's
+        // amount_p (which framework σ-proto then binds to actual transfer amount via balance
+        // equation old = new + transfer). At withdraw, the same digest is recomputed and
+        // byte-compared against the Groth16 public input — Pedersen DL binding forces
+        // withdraw amount == deposit amount (vote conservation). See plan A6 design.
+        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
         assert_valid_deposit_binding_proof(
             *&commitment,
             *&amount_tag,
+            amount_p_digest,
             deposit_binding_proof,
         );
 
@@ -658,6 +673,11 @@ module eunoma::eunoma_bridge {
             cfg,
         );
         let cache = borrow_global<VaultPublicInputsV2>(@eunoma);
+        // Stage 3 A6: recompute amount_p_digest from the SAME 14-CA-args amount_p that goes
+        // into framework's confidential_transfer_raw below. Groth16 public input
+        // amount_p_digest MUST byte-equal this — that's the binding that forces withdraw
+        // amount = deposit amount (via Pedersen DL binding on the same blind).
+        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
         assert_valid_withdraw_proof(
             *&root,
             *&nullifier_hash,
@@ -667,6 +687,7 @@ module eunoma::eunoma_bridge {
             *&ca_payload_hash,
             *&request_hash,
             vault_sequence,
+            amount_p_digest,
             withdraw_proof,
         );
 
@@ -1112,6 +1133,7 @@ module eunoma::eunoma_bridge {
     fun assert_valid_deposit_binding_proof(
         commitment: vector<u8>,
         amount_tag: vector<u8>,
+        amount_p_digest: vector<u8>,
         proof: vector<u8>,
     ) acquires PreparedDepositBindingVK, VaultPublicInputsV2 {
         assert!(exists<PreparedDepositBindingVK>(@eunoma), E_NOT_INITIALIZED);
@@ -1125,11 +1147,14 @@ module eunoma::eunoma_bridge {
             &pvk.pvk_delta_g2_neg,
             E_INVALID_DEPOSIT_BINDING_PROOF,
         );
+        // Stage 3 A6: amount_p_digest is the 5th public input (after commitment, amount_tag,
+        // asset_id, vault_addr_hash). Circuit publics order MUST match this vector exactly.
         let publics = vector[
             de_fr_with_error(commitment, E_INVALID_DEPOSIT_BINDING_PROOF),
             de_fr_with_error(amount_tag, E_INVALID_DEPOSIT_BINDING_PROOF),
             de_fr_with_error(cache.asset_id_fr, E_INVALID_DEPOSIT_BINDING_PROOF),
             de_fr_with_error(cache.vault_addr_hash_fr, E_INVALID_DEPOSIT_BINDING_PROOF),
+            de_fr_with_error(amount_p_digest, E_INVALID_DEPOSIT_BINDING_PROOF),
         ];
         assert_groth16_prepared(
             &pvk.pvk_alpha_g1_beta_g2_fq12,
@@ -1151,6 +1176,7 @@ module eunoma::eunoma_bridge {
         ca_payload_hash: vector<u8>,
         request_hash: vector<u8>,
         vault_sequence: u64,
+        amount_p_digest: vector<u8>,
         proof: vector<u8>,
     ) acquires PreparedWithdrawProofVK {
         assert!(exists<PreparedWithdrawProofVK>(@eunoma), E_NOT_INITIALIZED);
@@ -1162,6 +1188,9 @@ module eunoma::eunoma_bridge {
             &pvk.pvk_delta_g2_neg,
             E_INVALID_WITHDRAW_PROOF,
         );
+        // Stage 3 A6: amount_p_digest is the 9th public input. Circuit publics order:
+        // [root, nullifier_hash, asset_id, recipient_hash, amount_tag, ca_payload_hash,
+        //  request_hash, vault_sequence, amount_p_digest] — MUST match exactly.
         let publics = vector[
             de_fr_with_error(root, E_INVALID_WITHDRAW_PROOF),
             de_fr_with_error(nullifier_hash, E_INVALID_WITHDRAW_PROOF),
@@ -1171,6 +1200,7 @@ module eunoma::eunoma_bridge {
             de_fr_with_error(ca_payload_hash, E_INVALID_WITHDRAW_PROOF),
             de_fr_with_error(request_hash, E_INVALID_WITHDRAW_PROOF),
             de_fr_with_error(u64_to_fr_bytes(vault_sequence), E_INVALID_WITHDRAW_PROOF),
+            de_fr_with_error(amount_p_digest, E_INVALID_WITHDRAW_PROOF),
         ];
         assert_groth16_prepared(
             &pvk.pvk_alpha_g1_beta_g2_fq12,
@@ -1386,6 +1416,58 @@ module eunoma::eunoma_bridge {
         let lo = byte_slice_padded(&addr_bytes, 16, 32);
         let domain = bytes_to_field_le32(&domain_bytes);
         poseidon_bn254::hash_3(domain, hi, lo)
+    }
+
+    /// Stage 3 A6: compute amount_p_digest from the CA framework's 4 × 32B Ristretto amount_p.
+    ///
+    /// Mirrors circuits/{deposit_binding,withdrawal_proof}.circom Compose8 template +
+    /// circuits/scripts/compute_{deposit,withdraw}_witness.mjs compose8() helper.
+    ///
+    /// Each 32B compressed Ristretto point p[k] is split into 2 × 16B little-endian limbs:
+    ///   p[k]_lo = byte_slice_padded(p[k], 0, 16)   // bytes 0..16, padded right to 32B for Fr
+    ///   p[k]_hi = byte_slice_padded(p[k], 16, 32)  // bytes 16..32, padded right to 32B for Fr
+    /// Then 8 limbs are hashed in the Compose8 tree (only hash_2 + hash_3 are available in
+    /// eunoma_pool::poseidon_bn254; matches circuit Compose8 exactly):
+    ///   a = hash_3(p[0]_lo, p[0]_hi, p[1]_lo)
+    ///   b = hash_3(p[1]_hi, p[2]_lo, p[2]_hi)
+    ///   c = hash_2(p[3]_lo, p[3]_hi)
+    ///   digest = hash_3(a, b, c)
+    ///
+    /// IMPORTANT: limb ORDER must exactly match the circuit / JS witness builder, which is
+    /// [p[0]_lo, p[0]_hi, p[1]_lo, p[1]_hi, p[2]_lo, p[2]_hi, p[3]_lo, p[3]_hi]. The
+    /// Compose8 tree consumes them in that order: a takes limbs [0,1,2], b takes [3,4,5],
+    /// c takes [6,7].
+    fun compute_amount_p_digest_v2(amount_p: &vector<vector<u8>>): vector<u8> {
+        // CA framework TRANSFER_AMOUNT_CHUNK_COUNT = 4; each chunk is a 32B compressed Ristretto point.
+        assert!(vector::length(amount_p) == 4, E_INVALID_AMOUNT_P_SHAPE);
+
+        // Extract 8 limbs in [p0_lo, p0_hi, p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi] order.
+        let limbs = vector::empty<vector<u8>>();
+        let i = 0;
+        while (i < 4) {
+            let p_k = vector::borrow(amount_p, i);
+            assert!(vector::length(p_k) == 32, E_INVALID_AMOUNT_P_SHAPE);
+            vector::push_back(&mut limbs, byte_slice_padded(p_k, 0, 16));
+            vector::push_back(&mut limbs, byte_slice_padded(p_k, 16, 32));
+            i = i + 1;
+        };
+
+        // Compose8 tree (matches circom Compose8 + JS compose8).
+        let a = poseidon_bn254::hash_3(
+            *vector::borrow(&limbs, 0),
+            *vector::borrow(&limbs, 1),
+            *vector::borrow(&limbs, 2),
+        );
+        let b = poseidon_bn254::hash_3(
+            *vector::borrow(&limbs, 3),
+            *vector::borrow(&limbs, 4),
+            *vector::borrow(&limbs, 5),
+        );
+        let c = poseidon_bn254::hash_2(
+            *vector::borrow(&limbs, 6),
+            *vector::borrow(&limbs, 7),
+        );
+        poseidon_bn254::hash_3(a, b, c)
     }
 
     fun assert_hash(bytes: &vector<u8>) {
