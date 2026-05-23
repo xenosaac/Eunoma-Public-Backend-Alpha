@@ -81,6 +81,7 @@ module eunoma::eunoma_bridge {
     /// Stage 3 A6: malformed amount_p (must be exactly 4 entries of 32 bytes each).
     /// See compute_amount_p_digest_v2 + circuits/{deposit_binding,withdrawal_proof}.circom Compose8.
     const E_INVALID_AMOUNT_P_SHAPE: u64 = 23;
+    const E_PENDING_DEPOSIT_BINDING: u64 = 24;
 
     struct BridgeVault has key {
         admin: address,
@@ -103,6 +104,15 @@ module eunoma::eunoma_bridge {
         used_deposit_nonces: Table<vector<u8>, bool>,
         used_nullifiers: Table<vector<u8>, bool>,
         known_roots: Table<vector<u8>, bool>,
+    }
+
+    struct PendingDepositBindingsV2 has key {
+        by_commitment: Table<vector<u8>, PendingDepositBindingV2>,
+    }
+
+    struct PendingDepositBindingV2 has store, drop {
+        amount_tag: vector<u8>,
+        amount_p_digest: vector<u8>,
     }
 
     struct DeoperatorConfigV2 has key {
@@ -525,7 +535,7 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK {
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingDepositBindingsV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK {
         assert_initialized();
         assert_not_expired(expiry_secs);
         assert_hash(&commitment);
@@ -591,7 +601,7 @@ module eunoma::eunoma_bridge {
         // byte-compared against the Groth16 public input — Pedersen DL binding forces
         // withdraw amount == deposit amount (vote conservation). See plan A6 design.
         let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
-        assert_valid_deposit_binding_proof(
+        consume_or_verify_deposit_binding(
             *&commitment,
             *&amount_tag,
             amount_p_digest,
@@ -837,6 +847,43 @@ module eunoma::eunoma_bridge {
             sigma_proto_comm,
             sigma_proto_resp,
         );
+    }
+
+    public entry fun init_pending_deposit_bindings_v2(
+        admin: &signer,
+    ) acquires BridgeVault {
+        assert_admin(admin);
+        assert!(!exists<PendingDepositBindingsV2>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, PendingDepositBindingsV2 {
+            by_commitment: table::new<vector<u8>, PendingDepositBindingV2>(),
+        });
+    }
+
+    public entry fun prepare_deposit_binding_v2(
+        sender: &signer,
+        commitment: vector<u8>,
+        amount_tag: vector<u8>,
+        amount_p: vector<vector<u8>>,
+        deposit_binding_proof: vector<u8>,
+    ) acquires PendingDepositBindingsV2, PreparedDepositBindingVK, VaultPublicInputsV2 {
+        assert_initialized();
+        let _sender_addr = signer::address_of(sender);
+        assert_hash(&commitment);
+        assert_hash(&amount_tag);
+        assert!(exists<PendingDepositBindingsV2>(@eunoma), E_NOT_INITIALIZED);
+        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
+        assert_valid_deposit_binding_proof(
+            *&commitment,
+            *&amount_tag,
+            *&amount_p_digest,
+            deposit_binding_proof,
+        );
+        let pending = borrow_global_mut<PendingDepositBindingsV2>(@eunoma);
+        assert!(!table::contains(&pending.by_commitment, *&commitment), E_PENDING_DEPOSIT_BINDING);
+        table::add(&mut pending.by_commitment, commitment, PendingDepositBindingV2 {
+            amount_tag,
+            amount_p_digest,
+        });
     }
 
     public fun get_vault_sequence_v2(): u64 acquires BridgeVault {
@@ -1506,6 +1553,28 @@ module eunoma::eunoma_bridge {
             withdraw_circuit_version: *&cfg.withdraw_circuit_version,
             ca_payload_circuit_version: *&cfg.ca_payload_circuit_version,
         }))
+    }
+
+    fun consume_or_verify_deposit_binding(
+        commitment: vector<u8>,
+        amount_tag: vector<u8>,
+        amount_p_digest: vector<u8>,
+        proof: vector<u8>,
+    ) acquires PendingDepositBindingsV2, PreparedDepositBindingVK, VaultPublicInputsV2 {
+        if (exists<PendingDepositBindingsV2>(@eunoma) && vector::length(&proof) == 0) {
+            let pending = borrow_global_mut<PendingDepositBindingsV2>(@eunoma);
+            assert!(table::contains(&pending.by_commitment, *&commitment), E_INVALID_DEPOSIT_BINDING_PROOF);
+            let cached = table::remove(&mut pending.by_commitment, *&commitment);
+            assert!(cached.amount_tag == amount_tag, E_INVALID_DEPOSIT_BINDING_PROOF);
+            assert!(cached.amount_p_digest == amount_p_digest, E_INVALID_DEPOSIT_BINDING_PROOF);
+        } else {
+            assert_valid_deposit_binding_proof(
+                commitment,
+                amount_tag,
+                amount_p_digest,
+                proof,
+            );
+        }
     }
 
     fun assert_valid_deposit_binding_proof(

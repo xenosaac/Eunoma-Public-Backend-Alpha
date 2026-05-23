@@ -546,6 +546,35 @@ async function main() {
   const proofHex = proofRes.stdout.trim().split("\n").pop().trim();
   logStep(`deposit-binding proof bytes=${proofHex.length / 2}`);
 
+  // A6 on Aptos testnet is split into two transactions to stay below the VM execution limit:
+  // this tx verifies the Groth16 binding and caches commitment -> amount_p_digest on-chain;
+  // deposit_with_commitment_v2 later consumes that cache and performs the CA transfer.
+  logStep("building + submitting prepare_deposit_binding_v2 tx");
+  const prepareTx = await aptos.transaction.build.simple({
+    sender: depositorAccount.accountAddress,
+    data: {
+      function: `${bridgeAddr}::eunoma_bridge::prepare_deposit_binding_v2`,
+      functionArguments: [
+        hexToBytes(commitmentHex),
+        hexToBytes(amountTagHex),
+        amountP,
+        hexToBytes(`0x${proofHex}`),
+      ],
+    },
+    options: { maxGasAmount: 500_000, gasUnitPrice: 100 },
+  });
+  const prepareAuth = aptos.transaction.sign({ signer: depositorAccount, transaction: prepareTx });
+  const preparePending = await aptos.transaction.submit.simple({
+    transaction: prepareTx,
+    senderAuthenticator: prepareAuth,
+  });
+  logStep(`submitted prepare tx=${preparePending.hash}; waiting for confirmation...`);
+  const prepareCommitted = await aptos.waitForTransaction({ transactionHash: preparePending.hash });
+  if (!prepareCommitted.success) {
+    throw new Error(`prepare_deposit_binding_v2 failed: ${prepareCommitted.vm_status}`);
+  }
+  logStep(`prepare SUCCESS tx=${prepareCommitted.hash} version=${prepareCommitted.version} gas=${prepareCommitted.gas_used}`);
+
   // 8. POST coordinator /v2/deposit/frost-attest.
   const depositNonce = randomBytes(32);
   const expirySecs = BigInt(Math.floor(Date.now() / 1000) + 60 * 60);
@@ -602,7 +631,7 @@ async function main() {
         // 4. deposit_nonce
         depositNonce,
         // 5. deposit_binding_proof
-        hexToBytes(`0x${proofHex}`),
+        new Uint8Array(),
         // 6. expiry_secs
         expirySecs,
         // 7. group_signature
@@ -692,6 +721,7 @@ async function main() {
     amountPHex: `0x${amountPHex}`,
     caPayloadHashFr: `0x${caPayloadHashFr}`,
     depositTxHash: committed.hash,
+    prepareDepositBindingTxHash: prepareCommitted.hash,
     depositCount,
     txVersion: String(committed.version),
     createdAtUnixMs: Date.now(),
@@ -704,6 +734,7 @@ async function main() {
   // 12. Output summary JSON to stdout (consumable by testnet_e2e_v2 env exports).
   const summary = {
     ok: true,
+    prepareDepositBindingTxHash: prepareCommitted.hash,
     depositTxHash: committed.hash,
     depositCount,
     txVersion: String(committed.version),
