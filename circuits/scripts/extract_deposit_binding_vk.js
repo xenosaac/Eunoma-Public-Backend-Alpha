@@ -1,5 +1,5 @@
 // Mirror of extract_withdraw_vk.js for deposit_binding_vk.json.
-// Outputs: alpha_g1, beta_g2, gamma_g2, delta_g2, ic[0..ic[4] hex-encoded for
+// Outputs: alpha_g1, beta_g2, gamma_g2, delta_g2, ic[0..ic[5] hex-encoded for
 // publish_deposit_binding_vk_v2 admin entry args.
 const fs = require('fs');
 const path = require('path');
@@ -24,8 +24,8 @@ function g2Uncompr(arr) {
 const vkPath = path.resolve(__dirname, '..', 'generated', 'deposit_binding_vk.json');
 const vk = JSON.parse(fs.readFileSync(vkPath, 'utf8'));
 if (vk.protocol !== 'groth16') throw new Error(`bad protocol: ${vk.protocol}`);
-if (vk.nPublic !== 4) throw new Error(`expected 4 publics, got ${vk.nPublic}`);
-if (vk.IC.length !== 5) throw new Error(`expected IC length 5, got ${vk.IC.length}`);
+if (vk.nPublic !== 5) throw new Error(`expected 5 publics, got ${vk.nPublic}`);
+if (vk.IC.length !== 6) throw new Error(`expected IC length 6, got ${vk.IC.length}`);
 
 const out = {
   alpha_g1: g1Uncompr(vk.vk_alpha_1),

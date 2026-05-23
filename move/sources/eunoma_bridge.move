@@ -820,6 +820,40 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    public entry fun publish_deposit_binding_vk_v2_a6(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+        ic_5: vector<u8>,
+    ) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(!exists<DepositBindingVK>(@eunoma), E_ALREADY_INITIALIZED);
+        assert_g1(&alpha_g1, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&beta_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&delta_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_0, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_1, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_3, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_4, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_5, E_INVALID_DEPOSIT_BINDING_PROOF);
+        move_to(admin, DepositBindingVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5],
+        });
+    }
+
     public entry fun publish_prepared_deposit_binding_vk_v2(
         admin: &signer,
     ) acquires DepositBindingVK {
@@ -895,6 +929,58 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    /// A6 deposit-binding VK rotation. Added as a compatible sidecar because
+    /// the deployed testnet package cannot change existing public signatures.
+    public entry fun rotate_deposit_binding_vk_v2_a6(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+        ic_5: vector<u8>,
+    ) acquires DepositBindingVK, PreparedDepositBindingVK {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        if (exists<PreparedDepositBindingVK>(@eunoma)) {
+            let PreparedDepositBindingVK {
+                pvk_alpha_g1_beta_g2_fq12: _,
+                pvk_gamma_g2_neg: _,
+                pvk_delta_g2_neg: _,
+                pvk_uvw_gamma_g1: _,
+            } = move_from<PreparedDepositBindingVK>(@eunoma);
+        };
+        if (exists<DepositBindingVK>(@eunoma)) {
+            let DepositBindingVK {
+                alpha_g1: _,
+                beta_g2: _,
+                gamma_g2: _,
+                delta_g2: _,
+                ic: _,
+            } = move_from<DepositBindingVK>(@eunoma);
+        };
+        assert_g1(&alpha_g1, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&beta_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&delta_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_0, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_1, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_3, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_4, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_5, E_INVALID_DEPOSIT_BINDING_PROOF);
+        move_to(admin, DepositBindingVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5],
+        });
+    }
+
     /// V2 prepared deposit-binding VK rotation. Admin-only. Drops any cached
     /// PreparedDepositBindingVK and re-derives it from the currently-published
     /// DepositBindingVK. Call this AFTER `rotate_deposit_binding_vk_v2` so
@@ -965,12 +1051,143 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    public entry fun publish_withdraw_proof_vk_v2_a6(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+        ic_5: vector<u8>,
+        ic_6: vector<u8>,
+        ic_7: vector<u8>,
+        ic_8: vector<u8>,
+        ic_9: vector<u8>,
+    ) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(!exists<WithdrawProofVK>(@eunoma), E_ALREADY_INITIALIZED);
+        assert_g1(&alpha_g1, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&beta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&delta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_0, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_1, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_3, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_4, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_5, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_6, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_7, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_8, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_9, E_INVALID_WITHDRAW_PROOF);
+        move_to(admin, WithdrawProofVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6, ic_7, ic_8, ic_9],
+        });
+    }
+
     public entry fun publish_prepared_withdraw_proof_vk_v2(
         admin: &signer,
     ) acquires WithdrawProofVK {
         assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
         assert!(exists<WithdrawProofVK>(@eunoma), E_NOT_INITIALIZED);
         assert!(!exists<PreparedWithdrawProofVK>(@eunoma), E_ALREADY_INITIALIZED);
+        let vk = borrow_global<WithdrawProofVK>(@eunoma);
+        let alpha_g1 = de_g1(vk.alpha_g1);
+        let beta_g2 = de_g2(vk.beta_g2);
+        let gamma_g2 = de_g2(vk.gamma_g2);
+        let delta_g2 = de_g2(vk.delta_g2);
+        move_to(admin, PreparedWithdrawProofVK {
+            pvk_alpha_g1_beta_g2_fq12: pairing_fq12_bytes(&alpha_g1, &beta_g2),
+            pvk_gamma_g2_neg: neg_g2_bytes(&gamma_g2),
+            pvk_delta_g2_neg: neg_g2_bytes(&delta_g2),
+            pvk_uvw_gamma_g1: vk.ic,
+        });
+    }
+
+    /// V2 withdraw-proof VK rotation. Admin-only. Mirrors
+    /// `rotate_deposit_binding_vk_v2`: drop any stale prepared cache first,
+    /// replace the raw VK, then call `rotate_prepared_withdraw_proof_vk_v2`.
+    public entry fun rotate_withdraw_proof_vk_v2_a6(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+        ic_5: vector<u8>,
+        ic_6: vector<u8>,
+        ic_7: vector<u8>,
+        ic_8: vector<u8>,
+        ic_9: vector<u8>,
+    ) acquires WithdrawProofVK, PreparedWithdrawProofVK {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        if (exists<PreparedWithdrawProofVK>(@eunoma)) {
+            let PreparedWithdrawProofVK {
+                pvk_alpha_g1_beta_g2_fq12: _,
+                pvk_gamma_g2_neg: _,
+                pvk_delta_g2_neg: _,
+                pvk_uvw_gamma_g1: _,
+            } = move_from<PreparedWithdrawProofVK>(@eunoma);
+        };
+        if (exists<WithdrawProofVK>(@eunoma)) {
+            let WithdrawProofVK {
+                alpha_g1: _,
+                beta_g2: _,
+                gamma_g2: _,
+                delta_g2: _,
+                ic: _,
+            } = move_from<WithdrawProofVK>(@eunoma);
+        };
+        assert_g1(&alpha_g1, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&beta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&delta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_0, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_1, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_3, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_4, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_5, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_6, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_7, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_8, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_9, E_INVALID_WITHDRAW_PROOF);
+        move_to(admin, WithdrawProofVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6, ic_7, ic_8, ic_9],
+        });
+    }
+
+    /// V2 prepared withdraw-proof VK rotation. Admin-only. Drops only the
+    /// prepared cache and re-derives it from the currently-published raw VK.
+    public entry fun rotate_prepared_withdraw_proof_vk_v2(
+        admin: &signer,
+    ) acquires WithdrawProofVK, PreparedWithdrawProofVK {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(exists<WithdrawProofVK>(@eunoma), E_NOT_INITIALIZED);
+        if (exists<PreparedWithdrawProofVK>(@eunoma)) {
+            let PreparedWithdrawProofVK {
+                pvk_alpha_g1_beta_g2_fq12: _,
+                pvk_gamma_g2_neg: _,
+                pvk_delta_g2_neg: _,
+                pvk_uvw_gamma_g1: _,
+            } = move_from<PreparedWithdrawProofVK>(@eunoma);
+        };
         let vk = borrow_global<WithdrawProofVK>(@eunoma);
         let alpha_g1 = de_g1(vk.alpha_g1);
         let beta_g2 = de_g2(vk.beta_g2);
