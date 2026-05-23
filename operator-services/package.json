@@ -47,6 +47,7 @@
     "testnet:deposit-bindings:init": "node scripts/testnet_init_pending_deposit_bindings.mjs",
     "testnet:withdraw-proofs:init": "node scripts/testnet_init_pending_withdraw_proofs.mjs",
     "testnet:withdraw-attestations:init": "node scripts/testnet_init_pending_withdraw_attestations.mjs",
+    "testnet:withdraw-payloads:init": "node scripts/testnet_init_pending_withdraw_payloads.mjs",
     "testnet:provision:m6d": "node scripts/testnet_provision_m6d.mjs",
     "testnet:e2e": "node scripts/testnet_e2e_v2.mjs",
     "testnet:e2e:fail-closed-stub": "node scripts/testnet_e2e_fail_closed.mjs",

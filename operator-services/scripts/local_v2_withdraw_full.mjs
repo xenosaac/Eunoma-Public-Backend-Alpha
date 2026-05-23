@@ -98,6 +98,12 @@ function hexToBytes(hex) {
   for (let i = 0; i < norm.length; i += 2) out[i / 2] = parseInt(norm.slice(i, i + 2), 16);
   return out;
 }
+function hexArrayToBytes(values) {
+  return values.map((v) => hexToBytes(v));
+}
+function hexNestedArrayToBytes(values) {
+  return values.map((v) => hexArrayToBytes(v));
+}
 function normalizeHex(hex) {
   return hex.replace(/^0x/i, "").toLowerCase();
 }
@@ -1202,7 +1208,53 @@ async function submitPreparedWithdrawProof() {
   console.error(`[a6] prepare withdraw SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
   return committed.hash;
 }
+
+async function submitPreparedWithdrawPayload() {
+  const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
+  const submitter = loadDepositorSubmitAccount();
+  const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
+  console.error("[a6] building + submitting prepare_withdraw_payload_v2 tx");
+  const prepareTx = await aptos.transaction.build.simple({
+    sender: submitter.accountAddress,
+    data: {
+      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_payload_v2`,
+      functionArguments: [
+        `0x${addr32(recipientAddress)}`,
+        hexToBytes(caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : `0x${caPayloadHashFr}`),
+        hexToBytes(realRequestHashHex),
+        hexArrayToBytes(caPayload.newBalanceP),
+        hexArrayToBytes(caPayload.newBalanceR),
+        hexArrayToBytes(caPayload.newBalanceREffAud),
+        hexArrayToBytes(caPayload.amountP),
+        hexArrayToBytes(caPayload.amountRSender),
+        hexArrayToBytes(caPayload.amountRRecip),
+        hexArrayToBytes(caPayload.amountREffAud),
+        hexArrayToBytes(caPayload.ekVolunAuds),
+        hexNestedArrayToBytes(caPayload.amountRVolunAuds),
+        hexToBytes(caPayload.zkrpNewBalance),
+        hexToBytes(caPayload.zkrpAmount),
+        hexArrayToBytes(caPayload.sigmaProtoComm),
+        hexArrayToBytes(caPayload.sigmaProtoResp),
+        hexToBytes(caPayload.memo),
+      ],
+    },
+    options: { maxGasAmount: 500_000, gasUnitPrice: 100 },
+  });
+  const auth = aptos.transaction.sign({ signer: submitter, transaction: prepareTx });
+  const pending = await aptos.transaction.submit.simple({
+    transaction: prepareTx,
+    senderAuthenticator: auth,
+  });
+  console.error(`[a6] submitted prepare_withdraw_payload_v2 tx=${pending.hash}; waiting for confirmation...`);
+  const committed = await aptos.waitForTransaction({ transactionHash: pending.hash });
+  if (!committed.success) {
+    throw new Error(`prepare_withdraw_payload_v2 failed: ${committed.vm_status}`);
+  }
+  console.error(`[a6] prepare payload SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
+  return committed.hash;
+}
 const prepareWithdrawProofTxHash = await submitPreparedWithdrawProof();
+const prepareWithdrawPayloadTxHash = await submitPreparedWithdrawPayload();
 
 async function submitPreparedWithdrawAttestation(groupSignatureHex) {
   if (typeof groupSignatureHex !== "string" || hexToBytes(groupSignatureHex).length === 0) {
@@ -1362,6 +1414,7 @@ const submitSummary = {
   recipientAddress,
   caPayloadHashFr,
   proofHex,
+  prepareWithdrawPayloadTxHash,
   prepareWithdrawProofTxHash,
   prepareWithdrawAttestationTxHash,
   responseBody: r.body,

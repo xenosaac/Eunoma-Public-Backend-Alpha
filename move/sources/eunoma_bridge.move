@@ -84,6 +84,7 @@ module eunoma::eunoma_bridge {
     const E_PENDING_DEPOSIT_BINDING: u64 = 24;
     const E_PENDING_WITHDRAW_PROOF: u64 = 25;
     const E_PENDING_WITHDRAW_ATTESTATION: u64 = 26;
+    const E_PENDING_WITHDRAW_PAYLOAD: u64 = 27;
 
     struct BridgeVault has key {
         admin: address,
@@ -152,6 +153,31 @@ module eunoma::eunoma_bridge {
         vault_sequence: u64,
         expiry_secs: u64,
         circuit_versions_hash: vector<u8>,
+    }
+
+    struct PendingWithdrawPayloadsV2 has key {
+        by_request_hash: Table<vector<u8>, PendingWithdrawPayloadV2>,
+    }
+
+    struct PendingWithdrawPayloadV2 has store, drop {
+        asset_type: address,
+        recipient: address,
+        ca_payload_hash: vector<u8>,
+        amount_p_digest: vector<u8>,
+        new_balance_p: vector<vector<u8>>,
+        new_balance_r: vector<vector<u8>>,
+        new_balance_r_eff_aud: vector<vector<u8>>,
+        amount_p: vector<vector<u8>>,
+        amount_r_sender: vector<vector<u8>>,
+        amount_r_recip: vector<vector<u8>>,
+        amount_r_eff_aud: vector<vector<u8>>,
+        ek_volun_auds: vector<vector<u8>>,
+        amount_r_volun_auds: vector<vector<vector<u8>>>,
+        zkrp_new_balance: vector<u8>,
+        zkrp_amount: vector<u8>,
+        sigma_proto_comm: vector<vector<u8>>,
+        sigma_proto_resp: vector<vector<u8>>,
+        memo: vector<u8>,
     }
 
     struct DeoperatorConfigV2 has key {
@@ -728,7 +754,7 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV2, PendingWithdrawAttestationsV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK {
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV2, PendingWithdrawAttestationsV2, PendingWithdrawPayloadsV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK {
         assert_initialized();
         assert_not_expired(expiry_secs);
         assert_hash(&root);
@@ -748,26 +774,26 @@ module eunoma::eunoma_bridge {
         let expected_recipient_hash = derive_recipient_hash(recipient);
         assert!(expected_recipient_hash == recipient_hash, E_RECIPIENT_HASH_MISMATCH);
 
-        let ca_payload_hash_raw = hash_confidential_transfer_payload_v2(
-            asset_type,
+        let (_, amount_p_digest) = consume_or_compute_withdraw_payload(
             recipient,
-            *&new_balance_p,
-            *&new_balance_r,
-            *&new_balance_r_eff_aud,
-            *&amount_p,
-            *&amount_r_sender,
-            *&amount_r_recip,
-            *&amount_r_eff_aud,
-            *&ek_volun_auds,
-            *&amount_r_volun_auds,
-            *&zkrp_new_balance,
-            *&zkrp_amount,
-            *&sigma_proto_comm,
-            *&sigma_proto_resp,
-            *&memo,
+            asset_type,
+            &request_hash,
+            &ca_payload_hash,
+            &new_balance_p,
+            &new_balance_r,
+            &new_balance_r_eff_aud,
+            &amount_p,
+            &amount_r_sender,
+            &amount_r_recip,
+            &amount_r_eff_aud,
+            &ek_volun_auds,
+            &amount_r_volun_auds,
+            &zkrp_new_balance,
+            &zkrp_amount,
+            &sigma_proto_comm,
+            &sigma_proto_resp,
+            &memo,
         );
-        let ca_payload_hash_fr = ca_payload_hash_to_fr_safe(ca_payload_hash_raw);
-        assert!(ca_payload_hash_fr == ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
 
         let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
         consume_or_verify_withdraw_attestation(
@@ -788,11 +814,6 @@ module eunoma::eunoma_bridge {
             object::object_address(&asset_type),
         );
         let cache = borrow_global<VaultPublicInputsV2>(@eunoma);
-        // Stage 3 A6: recompute amount_p_digest from the SAME 14-CA-args amount_p that goes
-        // into framework's confidential_transfer_raw below. Groth16 public input
-        // amount_p_digest MUST byte-equal this — that's the binding that forces withdraw
-        // amount = deposit amount (via Pedersen DL binding on the same blind).
-        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
         consume_or_verify_withdraw_proof(
             *&root,
             *&nullifier_hash,
@@ -904,6 +925,16 @@ module eunoma::eunoma_bridge {
         assert!(!exists<PendingWithdrawAttestationsV2>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawAttestationsV2 {
             by_request_hash: table::new<vector<u8>, PendingWithdrawAttestationV2>(),
+        });
+    }
+
+    public entry fun init_pending_withdraw_payloads_v2(
+        admin: &signer,
+    ) acquires BridgeVault {
+        assert_admin(admin);
+        assert!(!exists<PendingWithdrawPayloadsV2>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, PendingWithdrawPayloadsV2 {
+            by_request_hash: table::new<vector<u8>, PendingWithdrawPayloadV2>(),
         });
     }
 
@@ -1075,6 +1106,87 @@ module eunoma::eunoma_bridge {
             vault_sequence,
             expiry_secs,
             circuit_versions_hash: versions_hash,
+        });
+    }
+
+    public entry fun prepare_withdraw_payload_v2(
+        sender: &signer,
+        recipient: address,
+        ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        new_balance_p: vector<vector<u8>>,
+        new_balance_r: vector<vector<u8>>,
+        new_balance_r_eff_aud: vector<vector<u8>>,
+        amount_p: vector<vector<u8>>,
+        amount_r_sender: vector<vector<u8>>,
+        amount_r_recip: vector<vector<u8>>,
+        amount_r_eff_aud: vector<vector<u8>>,
+        ek_volun_auds: vector<vector<u8>>,
+        amount_r_volun_auds: vector<vector<vector<u8>>>,
+        zkrp_new_balance: vector<u8>,
+        zkrp_amount: vector<u8>,
+        sigma_proto_comm: vector<vector<u8>>,
+        sigma_proto_resp: vector<vector<u8>>,
+        memo: vector<u8>,
+    ) acquires BridgeVault, PendingWithdrawProofsV2, PendingWithdrawPayloadsV2 {
+        assert_initialized();
+        let _sender_addr = signer::address_of(sender);
+        assert_hash(&ca_payload_hash);
+        assert_hash(&request_hash);
+        assert!(exists<PendingWithdrawPayloadsV2>(@eunoma), E_NOT_INITIALIZED);
+        assert!(exists<PendingWithdrawProofsV2>(@eunoma), E_NOT_INITIALIZED);
+        let vault = borrow_global<BridgeVault>(@eunoma);
+        assert!(!vault.paused, E_PAUSED);
+        let asset_type = vault.asset_type;
+        let computed_hash = ca_payload_hash_to_fr_safe(hash_confidential_transfer_payload_v2(
+            asset_type,
+            recipient,
+            *&new_balance_p,
+            *&new_balance_r,
+            *&new_balance_r_eff_aud,
+            *&amount_p,
+            *&amount_r_sender,
+            *&amount_r_recip,
+            *&amount_r_eff_aud,
+            *&ek_volun_auds,
+            *&amount_r_volun_auds,
+            *&zkrp_new_balance,
+            *&zkrp_amount,
+            *&sigma_proto_comm,
+            *&sigma_proto_resp,
+            *&memo,
+        ));
+        assert!(computed_hash == ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
+        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
+        let proofs = borrow_global<PendingWithdrawProofsV2>(@eunoma);
+        assert!(table::contains(&proofs.by_request_hash, *&request_hash), E_INVALID_WITHDRAW_PROOF);
+        let proof_cached = table::borrow(&proofs.by_request_hash, *&request_hash);
+        assert!(proof_cached.ca_payload_hash == ca_payload_hash, E_INVALID_WITHDRAW_PROOF);
+        assert!(proof_cached.amount_p_digest == amount_p_digest, E_INVALID_WITHDRAW_PROOF);
+        let pending = borrow_global_mut<PendingWithdrawPayloadsV2>(@eunoma);
+        assert!(
+            !table::contains(&pending.by_request_hash, *&request_hash),
+            E_PENDING_WITHDRAW_PAYLOAD,
+        );
+        table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawPayloadV2 {
+            asset_type: object::object_address(&asset_type),
+            recipient,
+            ca_payload_hash,
+            amount_p_digest,
+            new_balance_p,
+            new_balance_r,
+            new_balance_r_eff_aud,
+            amount_p,
+            amount_r_sender,
+            amount_r_recip,
+            amount_r_eff_aud,
+            ek_volun_auds,
+            amount_r_volun_auds,
+            zkrp_new_balance,
+            zkrp_amount,
+            sigma_proto_comm,
+            sigma_proto_resp,
+            memo,
         });
     }
 
@@ -1807,6 +1919,77 @@ module eunoma::eunoma_bridge {
                 proof,
             );
         }
+    }
+
+    fun consume_or_compute_withdraw_payload(
+        recipient: address,
+        asset_type: Object<fungible_asset::Metadata>,
+        request_hash: &vector<u8>,
+        ca_payload_hash: &vector<u8>,
+        new_balance_p: &vector<vector<u8>>,
+        new_balance_r: &vector<vector<u8>>,
+        new_balance_r_eff_aud: &vector<vector<u8>>,
+        amount_p: &vector<vector<u8>>,
+        amount_r_sender: &vector<vector<u8>>,
+        amount_r_recip: &vector<vector<u8>>,
+        amount_r_eff_aud: &vector<vector<u8>>,
+        ek_volun_auds: &vector<vector<u8>>,
+        amount_r_volun_auds: &vector<vector<vector<u8>>>,
+        zkrp_new_balance: &vector<u8>,
+        zkrp_amount: &vector<u8>,
+        sigma_proto_comm: &vector<vector<u8>>,
+        sigma_proto_resp: &vector<vector<u8>>,
+        memo: &vector<u8>,
+    ): (vector<u8>, vector<u8>) acquires PendingWithdrawPayloadsV2 {
+        if (
+            exists<PendingWithdrawPayloadsV2>(@eunoma)
+                && table::contains(
+                    &borrow_global<PendingWithdrawPayloadsV2>(@eunoma).by_request_hash,
+                    *request_hash,
+                )
+        ) {
+            let pending = borrow_global_mut<PendingWithdrawPayloadsV2>(@eunoma);
+            let cached = table::remove(&mut pending.by_request_hash, *request_hash);
+            assert!(cached.asset_type == object::object_address(&asset_type), E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.recipient == recipient, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.ca_payload_hash == *ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.new_balance_p == *new_balance_p, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.new_balance_r == *new_balance_r, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.new_balance_r_eff_aud == *new_balance_r_eff_aud, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.amount_p == *amount_p, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.amount_r_sender == *amount_r_sender, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.amount_r_recip == *amount_r_recip, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.amount_r_eff_aud == *amount_r_eff_aud, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.ek_volun_auds == *ek_volun_auds, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.amount_r_volun_auds == *amount_r_volun_auds, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.zkrp_new_balance == *zkrp_new_balance, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.zkrp_amount == *zkrp_amount, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.sigma_proto_comm == *sigma_proto_comm, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.sigma_proto_resp == *sigma_proto_resp, E_PAYLOAD_HASH_MISMATCH);
+            assert!(cached.memo == *memo, E_PAYLOAD_HASH_MISMATCH);
+            return (cached.ca_payload_hash, cached.amount_p_digest)
+        };
+
+        let computed_hash = ca_payload_hash_to_fr_safe(hash_confidential_transfer_payload_v2(
+            asset_type,
+            recipient,
+            *new_balance_p,
+            *new_balance_r,
+            *new_balance_r_eff_aud,
+            *amount_p,
+            *amount_r_sender,
+            *amount_r_recip,
+            *amount_r_eff_aud,
+            *ek_volun_auds,
+            *amount_r_volun_auds,
+            *zkrp_new_balance,
+            *zkrp_amount,
+            *sigma_proto_comm,
+            *sigma_proto_resp,
+            *memo,
+        ));
+        assert!(computed_hash == *ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
+        (computed_hash, compute_amount_p_digest_v2(amount_p))
     }
 
     fun consume_or_verify_withdraw_attestation(
