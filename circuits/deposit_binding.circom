@@ -1,48 +1,47 @@
 pragma circom 2.1.6;
 
-// ConfidentialAPT shielded-bridge — deposit-binding circuit (Gate 4a).
+// ConfidentialAPT shielded-bridge — deposit-binding circuit (Gate 4a, A6 binding).
 //
-// Spec ref: HANDOFF Section 5.1.
+// Spec ref: HANDOFF Section 5.1 + plans/continue-from-the-jazzy-ocean.md (A6 design).
 //
-// Public inputs (in declaration order; this is the snarkjs convention and
-// drives the order of the on-chain `public_inputs` Fr vector + the
-// `vk_uvw_gamma_g1` vector length = 1 + 6 = 7):
-//   commitment       — Poseidon-derived note commitment binding (nullifier, secret,
-//                      asset_id, amount, pool_id).
-//   amount_tag       — Poseidon-derived tag binding (amount, deposit_blind, asset_id,
-//                      vault_addr_hash, chain_id). Operators reveal amount via
-//                      the tag-blind tuple; this proof guarantees the disclosed
-//                      amount is the SAME amount baked into `commitment`.
-//   asset_id         — domain field (e.g., a Poseidon hash of the asset metadata
-//                      address; the bridge picks the canonical id).
-//   vault_addr_hash  — Poseidon-style 32-byte LE hash of the vault address.
-//   chain_id         — Aptos chain id.
-//   pool_id          — bridge pool identifier.
+// 2026-05-23 (Stage 2 A6 + Approach 4):
+//   - Replaced plaintext `amount` in commitment + amount_tag with `amount_p_digest`,
+//     a Poseidon8 over 8 × 128-bit little-endian limbs of the 4 × 32B Ristretto
+//     compressed amount_p points (Aptos CA σ-proto's Pedersen commitments of
+//     amount chunks). This makes commitment leaf carry the SAME amount_p that the
+//     framework σ-proto will later verify against the vault's CA balance flow.
+//     Withdraw circuit's Merkle inclusion + Move byte-cross-check of amount_p
+//     together force withdraw amount == deposit amount (Pedersen DL binding).
+//   - Why limbs: compressed Ristretto bytes are not guaranteed < BN254 Fr prime
+//     (~2^253.5), so we split each 32B into 2 × 16B (< 2^128 fits Fr trivially)
+//     before Poseidon hashing.
+//   - Eunoma deposit Move bridge recomputes amount_p_digest from the 14-CA-args
+//     amount_p (same limb split + Poseidon8) and passes as public input.
+//
+// Public inputs (in declaration order; snarkjs convention drives on-chain
+// `public_inputs` Fr vector + `vk_uvw_gamma_g1` length = 1 + 5 = 6):
+//   commitment       — Poseidon Compose5(nullifier, secret, asset_id, amount_p_digest, pool_id)
+//   amount_tag       — Poseidon Compose5(amount_p_digest, deposit_blind, asset_id, vault_addr_hash, chain_id)
+//   asset_id         — Poseidon-derived id from VaultPublicInputsV2
+//   vault_addr_hash  — Poseidon-style 32-byte LE hash of vault address
+//   amount_p_digest  — Poseidon8 over 8 × 128-bit limbs of 4 × 32B Ristretto amount_p (NEW)
 //
 // Private inputs:
-//   nullifier        — random 254-bit field element; user retains.
-//   secret           — random 254-bit field element; user retains.
-//   amount           — u64 deposit amount.
-//   deposit_blind    — random blinding for amount_tag.
+//   nullifier        — random 254-bit field; user retains
+//   secret           — random 254-bit field; user retains
+//   deposit_blind    — random blinding for amount_tag
+//   amount_p_limbs[8]— 4 amount_p points × 2 limbs each (lo,hi) of 128 bits
+//                      Order: [amount_p[0]_lo, amount_p[0]_hi, amount_p[1]_lo, amount_p[1]_hi, ...]
 //
 // Constraints:
-//   1. amount fits in 64 bits (Num2Bits with 64 bits).
-//   2. commitment == compose5(nullifier, secret, asset_id, amount, pool_id).
-//   3. amount_tag == compose5(amount, deposit_blind, asset_id, vault_addr_hash, chain_id).
+//   1. Each amount_p_limbs[i] fits in 128 bits.
+//   2. amount_p_digest == Poseidon8(amount_p_limbs[0..7]).
+//   3. commitment == Compose5(nullifier, secret, asset_id, amount_p_digest, pool_id).
+//   4. amount_tag == Compose5(amount_p_digest, deposit_blind, asset_id, vault_addr_hash, chain_id).
 //
-// Poseidon arity composition (matches Move-side Poseidon_Research/aptos_move/sources/poseidon_bn254.move):
-//   Move side has hash_2(t=3) and hash_3(t=4); circomlib's Poseidon template
-//   accepts arities 1..16 and matches the iden3 reference (Poseidon([0, ...inputs])
-//   with capacity 0 in the t-input case). circomlibjs's poseidon() and the Move
-//   poseidon_bn254::hash_n produce bit-identical outputs (validated by
-//   Poseidon_Research's 30+ test vectors and re-confirmed in our parity script).
-//
-//   For the 5-input hash we compose:
-//     compose5(a, b, c, d, e) = hash_2(hash_3(a, b, c), hash_2(d, e))
-//
-//   This requires only hash_2 and hash_3 on the Move side. The Move-side bridge
-//   code (Gate 4b) MUST recompute commitment and amount_tag using the SAME
-//   composition.
+// NOTE: plaintext `amount` REMOVED from circuit. Framework σ-proto + Bulletproofs
+//       on the 14 CA args binds amount_p to actual transferred amount (range +
+//       balance flow). Eunoma layer only enforces amount_p_digest consistency.
 
 include "../node_modules/circomlib/circuits/poseidon.circom";
 include "../node_modules/circomlib/circuits/bitify.circom";
@@ -50,10 +49,9 @@ include "../node_modules/circomlib/circuits/bitify.circom";
 // Phase F W3 — chain_id and pool_id are hardcoded compile-time constants
 // declared inside the template (circom 2.x requires var inside templates/functions).
 // This VK is testnet-only (CHAIN_ID = 2 = Aptos testnet, POOL_ID = 0 = frozen pool).
-// Mainnet deployment requires a separate compile+trusted-setup with CHAIN_ID = 1.
-// See circuits/CHAIN_VARIANT.md for full rationale.
 
 // 5-input Poseidon composed from hash_3 + hash_2.
+// compose5(a, b, c, d, e) = hash_2(hash_3(a, b, c), hash_2(d, e))
 template Compose5() {
     signal input in[5];
     signal output out;
@@ -79,34 +77,47 @@ template DepositBinding() {
     var CHAIN_ID = 2;
     var POOL_ID  = 0;
 
-    // -------- public inputs (Phase F W3: chain_id+pool_id removed, baked as constants) --------
+    // -------- public inputs (5) --------
     signal input commitment;
     signal input amount_tag;
     signal input asset_id;
     signal input vault_addr_hash;
+    signal input amount_p_digest;
 
     // -------- private inputs --------
     signal input nullifier;
     signal input secret;
-    signal input amount;
     signal input deposit_blind;
+    // 4 × 32B compressed Ristretto amount_p split into 2 × 128-bit LE limbs each.
+    // Index order MUST match Move-side compute_amount_p_digest (file:line tbd in Stage 3).
+    signal input amount_p_limbs[8];
 
-    // 1. Range-check: amount fits in 64 bits.
-    component amount_bits = Num2Bits(64);
-    amount_bits.in <== amount;
+    // 1. Range-check each limb fits in 128 bits (compressed Ristretto byte halves).
+    component limb_bits[8];
+    for (var i = 0; i < 8; i++) {
+        limb_bits[i] = Num2Bits(128);
+        limb_bits[i].in <== amount_p_limbs[i];
+    }
 
-    // 2. commitment = compose5(nullifier, secret, asset_id, amount, POOL_ID)
+    // 2. amount_p_digest = Poseidon8(amount_p_limbs[0..7]).
+    component digest = Poseidon(8);
+    for (var i = 0; i < 8; i++) {
+        digest.inputs[i] <== amount_p_limbs[i];
+    }
+    digest.out === amount_p_digest;
+
+    // 3. commitment = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID).
     component cmt = Compose5();
     cmt.in[0] <== nullifier;
     cmt.in[1] <== secret;
     cmt.in[2] <== asset_id;
-    cmt.in[3] <== amount;
+    cmt.in[3] <== amount_p_digest;
     cmt.in[4] <== POOL_ID;
     cmt.out === commitment;
 
-    // 3. amount_tag = compose5(amount, deposit_blind, asset_id, vault_addr_hash, CHAIN_ID)
+    // 4. amount_tag = Compose5(amount_p_digest, deposit_blind, asset_id, vault_addr_hash, CHAIN_ID).
     component tag = Compose5();
-    tag.in[0] <== amount;
+    tag.in[0] <== amount_p_digest;
     tag.in[1] <== deposit_blind;
     tag.in[2] <== asset_id;
     tag.in[3] <== vault_addr_hash;
@@ -114,6 +125,5 @@ template DepositBinding() {
     tag.out === amount_tag;
 }
 
-// Public inputs in this order: commitment, amount_tag, asset_id, vault_addr_hash.
-// (Phase F W3: chain_id, pool_id removed from publics — baked as constants above.)
-component main { public [commitment, amount_tag, asset_id, vault_addr_hash] } = DepositBinding();
+// Public inputs in this order: commitment, amount_tag, asset_id, vault_addr_hash, amount_p_digest.
+component main { public [commitment, amount_tag, asset_id, vault_addr_hash, amount_p_digest] } = DepositBinding();

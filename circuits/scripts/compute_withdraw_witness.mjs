@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 // =============================================================================================
-// V2 withdraw circuit witness builder.
+// V2 withdraw circuit witness builder — A6 amount_p binding (2026-05-23).
 //
 // Reads the depositor's persisted withdraw witness JSON (output of
 // `operator-services/scripts/local_v2_deposit_submit.mjs`) + chain state (root, vault_sequence,
 // asset_id_fr) + recipient info (recipient address, derived recipient_hash, ca_payload_hash from
-// post-MPCCA-finalize) and emits a circom witness JSON matching
-// `circuits/withdrawal_proof.circom` (TREE_DEPTH=20, CHAIN_ID=2 hardcoded, nPublic=8).
+// post-MPCCA-finalize) + amount_p (4 × 32B Ristretto compressed Pedersen, must byte-equal deposit
+// time's amount_p — depositor regenerates via SDK ConfidentialTransfer.create with deterministic
+// transferAmountRandomness = HKDF(secret)) and emits a circom witness JSON matching
+// `circuits/withdrawal_proof.circom` (A6: 9 publics, 51 privates).
 //
-// Witness shape (matches the input keys the circuit declares):
+// Witness shape:
 //   {
-//     // publics (8, in declaration order):
+//     // publics (9):
 //     "root":            "<decimal Fr>",
 //     "nullifier_hash":  "<decimal>",
 //     "asset_id":        "<decimal>",
@@ -19,55 +21,54 @@
 //     "ca_payload_hash": "<decimal>",
 //     "request_hash":    "<decimal>",
 //     "vault_sequence":  "<decimal>",
-//     // privates:
+//     "amount_p_digest": "<decimal>",
+//     // privates (51):
 //     "nullifier":       "<decimal>",
 //     "secret":          "<decimal>",
-//     "amount":          "<decimal u64>",
 //     "withdraw_blind":  "<decimal>",
 //     "merkle_path":     ["<decimal>", ...20],
-//     "merkle_indices":  ["<decimal>", ...20]
+//     "merkle_indices":  ["<decimal>", ...20],
+//     "amount_p_limbs":  ["<decimal>", ...8]
 //   }
 //
-// Constraint identities matched off-chain (must equal what the circuit recomputes):
-//   commitment       = Compose5(nullifier, secret, asset_id, amount, POOL_ID=0)
+// Constraint identities (must equal what the circuit recomputes):
+//   amount_p_digest  = Poseidon8(amount_p_limbs[0..7])
+//   commitment       = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID=0)
 //   nullifier_hash   = Poseidon([nullifier])
-//   amount_tag       = Compose6(amount, withdraw_blind, recipient_hash, asset_id, CHAIN_ID=2,
+//   amount_tag       = Compose6(amount_p_digest, withdraw_blind, recipient_hash, asset_id, CHAIN_ID=2,
 //                               vault_sequence)
 //   request_hash     = Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id,
 //                               vault_sequence, CHAIN_ID=2)
-//   root             = Merkle inclusion of commitment at leaf 0 in depth-20 Poseidon tree
-//                      with all-zero siblings (computed via poseidon_merkle.mjs).
+//   root             = Merkle inclusion of commitment at leaf in depth-20 Poseidon tree.
 //
-// recipient_hash is computed via Move's `derive_address_hash(recipient, "EUNOMA_RECIPIENT_V2")`:
+// recipient_hash derivation: Move's `derive_address_hash(recipient, "EUNOMA_RECIPIENT_V2")`
 //   addr_bytes = BCS(address)                  // 32 raw bytes
 //   hi  = byte_slice_padded(addr_bytes, 0, 16) // first 16 bytes, right-padded to 32 with zeros
 //   lo  = byte_slice_padded(addr_bytes, 16, 32)// last 16 bytes, right-padded to 32 with zeros
-//   dom = bytes_to_field_le32("EUNOMA_RECIPIENT_V2") // ASCII, right-padded to 32 with zeros
-//   recipient_hash = Poseidon([dom, hi, lo])   // 3-input
+//   dom = bytes_to_field_le32("EUNOMA_RECIPIENT_V2")
+//   recipient_hash = Poseidon([dom, hi, lo])
 //
 // Args:
-//   --depositor-witness PATH       required. Output of local_v2_deposit_submit.mjs (v2_depositor_witness_v1).
-//   --recipient HEX                required. 32-byte Aptos address (0x-prefixed).
-//   --vault-sequence N             required. u64 from BridgeVault.vault_sequence.
-//   --root HEX                     required. 32-byte LE root from local_record_known_root_v2 output.
-//   --ca-payload-hash HEX          required. 32-byte LE Fr-safe ca_payload_hash (via caPayloadHashFrV2).
-//   --commitment-tree PATH         M9: required when --testnet. Multi-leaf commitment tree artifact.
-//                                  Without it, the legacy single-leaf path (leaf 0 + zero siblings)
-//                                  is used — local-fixture only.
-//   --testnet                      M9: asserts multi-leaf path; --commitment-tree must be present and
-//                                  the depositor's commitment must be found in the tree.
-//   --withdraw-blind-hex HEX       optional. 32-byte LE Fr blinding; auto-generates if omitted.
-//   --output PATH                  optional. Write witness JSON here (0o600); default = stdout.
+//   --depositor-witness PATH       required. v2_depositor_witness_v1 (must carry amountPHex now).
+//   --recipient HEX                required.
+//   --vault-sequence N             required.
+//   --root HEX                     required.
+//   --ca-payload-hash HEX          required.
+//   --amount-p-hex HEX             optional. 128-byte hex (4 × 32B amount_p concat). If omitted,
+//                                  read from depositor-witness `amountPHex` field (A6 deposit always
+//                                  writes this). CLI override fails loud if it mismatches witness
+//                                  (transfer amount_p must byte-equal deposit's by design).
+//   --commitment-tree PATH         M9: multi-leaf path.
+//   --testnet                      M9: asserts multi-leaf path.
+//   --withdraw-blind-hex HEX       optional. auto-generates if omitted.
+//   --output PATH                  optional. Write witness JSON; default = stdout.
 //
-// Stdout JSON header (always — even when --output writes the witness to disk):
-//   { ok, witnessPath, leafIndex, treeRootHex, treeTranscriptHash, mode: "multi_leaf"|"legacy_single_leaf",
-//     publics: {...}, withdraw_blind_hex }
+// Stdout JSON header (always):
+//   { ok, witnessPath, leafIndex, treeRootHex, treeTranscriptHash, mode, publics: {...},
+//     withdraw_blind_hex, amount_p_digest_hex }
 //
 // Privacy:
-//   Witness JSON carries plaintext nullifier + secret + withdraw_blind + amount. Output file is
-//   chmod 0o600 if --output given. This file MUST stay client-side. NEVER POST it to coordinator
-//   or deoperator services. leafIndex is public-derivable (depositCount-1) and is included in the
-//   stdout header so the orchestrator can write a PUBLIC withdraw_tree_context side-car artifact.
+//   Witness JSON carries plaintext secrets. File mode 0o600 if --output. NEVER POST.
 // =============================================================================================
 import { writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -94,7 +95,7 @@ if (hasFlag("--help") || hasFlag("-h")) {
   console.log(
     "usage: compute_withdraw_witness --depositor-witness PATH --recipient HEX \\\n" +
       "                               --vault-sequence N --root HEX --ca-payload-hash HEX \\\n" +
-      "                               [--commitment-tree PATH] [--testnet] \\\n" +
+      "                               [--amount-p-hex HEX] [--commitment-tree PATH] [--testnet] \\\n" +
       "                               [--withdraw-blind-hex HEX] [--output PATH]",
   );
   process.exit(0);
@@ -105,6 +106,7 @@ const recipientArg = getArg("--recipient");
 const vaultSequenceArg = getArg("--vault-sequence");
 const rootArg = getArg("--root");
 const caPayloadHashArg = getArg("--ca-payload-hash");
+const amountPHexArg = getArg("--amount-p-hex", false);
 const commitmentTreeArg = getArg("--commitment-tree", false);
 const testnetFlag = hasFlag("--testnet");
 const withdrawBlindArg = getArg("--withdraw-blind-hex", false);
@@ -129,6 +131,15 @@ function require32ByteHex(name, value) {
   return norm;
 }
 
+function require128ByteHex(name, value) {
+  const norm = String(value ?? "").replace(/^0x/i, "").toLowerCase();
+  if (!/^[0-9a-f]{256}$/.test(norm)) {
+    console.error(`${name} must be 128-byte hex (256 chars; 4 × 32B amount_p concat); got ${norm.length} chars`);
+    process.exit(2);
+  }
+  return norm;
+}
+
 function hexToLe32(hex) {
   const norm = require32ByteHex("hex", hex);
   const out = new Uint8Array(32);
@@ -139,7 +150,6 @@ function hexToLe32(hex) {
 }
 
 function aptosAddrToBcsBytes(addrHex) {
-  // Aptos address is 32 bytes. Allow short-form hex like 0xa → pad LEFT to 32 bytes.
   const norm = String(addrHex ?? "").replace(/^0x/i, "").toLowerCase();
   if (!/^[0-9a-f]+$/.test(norm) || norm.length === 0 || norm.length > 64) {
     console.error(`recipient must be 0x-prefixed hex up to 32 bytes; got "${addrHex}"`);
@@ -204,6 +214,39 @@ function le32ToHex(buf) {
   );
 }
 
+// A6: split 4 × 32B amount_p into 8 × 16B LE limbs (each < 2^128, fits BN254 Fr).
+function amountPHexToLimbs(hex) {
+  const clean = require128ByteHex("amount-p-hex", hex);
+  const limbs = [];
+  for (let pointIdx = 0; pointIdx < 4; pointIdx += 1) {
+    const pointStart = pointIdx * 64;
+    let lo = 0n;
+    for (let b = 0; b < 16; b += 1) {
+      const byte = BigInt(parseInt(clean.slice(pointStart + b * 2, pointStart + b * 2 + 2), 16));
+      lo |= byte << (8n * BigInt(b));
+    }
+    let hi = 0n;
+    for (let b = 0; b < 16; b += 1) {
+      const byte = BigInt(
+        parseInt(clean.slice(pointStart + 32 + b * 2, pointStart + 32 + b * 2 + 2), 16),
+      );
+      hi |= byte << (8n * BigInt(b));
+    }
+    limbs.push(lo, hi);
+  }
+  return limbs;
+}
+
+function bigToLe32(value) {
+  const out = new Uint8Array(32);
+  let v = value;
+  for (let i = 0; i < 32; i += 1) {
+    out[i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
+  return out;
+}
+
 // Parse depositor witness.
 let witness;
 try {
@@ -221,10 +264,30 @@ if (witness?.schema !== "v2_depositor_witness_v1") {
 const nullifierHex = require32ByteHex("nullifierHex", witness.nullifierHex);
 const secretHex = require32ByteHex("secretHex", witness.secretHex);
 const assetIdHex = require32ByteHex("assetIdHex", witness.assetIdHex);
-const amountOctas = String(witness.amountOctas ?? "");
-if (!/^[0-9]+$/.test(amountOctas)) {
-  console.error(`amountOctas malformed: ${amountOctas}`);
-  process.exit(2);
+
+// A6: resolve amount_p_hex from CLI override OR depositor witness.
+let resolvedAmountPHex;
+if (amountPHexArg) {
+  resolvedAmountPHex = require128ByteHex("--amount-p-hex", amountPHexArg);
+  if (witness.amountPHex) {
+    const witnessAmountP = require128ByteHex("witness.amountPHex", witness.amountPHex);
+    if (resolvedAmountPHex !== witnessAmountP) {
+      console.error(
+        `--amount-p-hex (${resolvedAmountPHex.slice(0, 16)}...) mismatch with witness.amountPHex (` +
+          `${witnessAmountP.slice(0, 16)}...). Transfer amount_p MUST byte-equal deposit amount_p (A6 vote conservation).`,
+      );
+      process.exit(2);
+    }
+  }
+} else {
+  if (!witness.amountPHex) {
+    console.error(
+      "depositor witness missing amountPHex (A6: required for transfer amount_p byte-binding). " +
+        "Re-run local_v2_deposit_submit.mjs with A6 to regenerate, or pass --amount-p-hex explicitly.",
+    );
+    process.exit(2);
+  }
+  resolvedAmountPHex = require128ByteHex("witness.amountPHex", witness.amountPHex);
 }
 
 // Generate or parse withdraw_blind.
@@ -232,8 +295,6 @@ let withdrawBlindHex;
 if (withdrawBlindArg) {
   withdrawBlindHex = require32ByteHex("--withdraw-blind-hex", withdrawBlindArg);
 } else {
-  // Generate Fr-bounded random scalar: 32 bytes LE with top 2 bits cleared (matches deposit
-  // script's frRandom convention; ensures value < BN254 Fr modulus).
   const buf = randomBytes(32);
   buf[31] &= 0x3f;
   withdrawBlindHex = Array.from(buf)
@@ -241,13 +302,11 @@ if (withdrawBlindArg) {
     .join("");
 }
 
-// Vault sequence.
 if (!/^[0-9]+$/.test(vaultSequenceArg)) {
   console.error(`--vault-sequence must be decimal u64; got ${vaultSequenceArg}`);
   process.exit(2);
 }
 
-// Required public 32-byte hex.
 const rootHex = require32ByteHex("--root", rootArg);
 const caPayloadHashHex = require32ByteHex("--ca-payload-hash", caPayloadHashArg);
 
@@ -273,6 +332,10 @@ function hash2(a, b) {
 function hash3(a, b, c) {
   return frToLe(poseidon([frFromLe(a), frFromLe(b), frFromLe(c)]));
 }
+function hash8(le32x8) {
+  const inputs = le32x8.map((b) => frFromLe(b));
+  return frToLe(poseidon(inputs));
+}
 function compose5(a, b, c, d, e) {
   return hash2(hash3(a, b, c), hash2(d, e));
 }
@@ -295,7 +358,6 @@ const recipientHashLe = hash3(recipientDomainLe, recipientHiLe, recipientLoLe);
 // ---- derive nullifier_hash ----------------------------------------------------------------
 const nullifierLe = hexToLe32(nullifierHex);
 const secretLe = hexToLe32(secretHex);
-const amountLe = u64ToLe32(amountOctas);
 const withdrawBlindLe = hexToLe32(withdrawBlindHex);
 const assetIdLe = hexToLe32(assetIdHex);
 const caPayloadHashLe = hexToLe32(caPayloadHashHex);
@@ -306,10 +368,16 @@ const poolIdLe = u8ToLe32(POOL_ID);
 
 const nullifierHashLe = hash1(nullifierLe);
 
+// ---- A6: amount_p limbs + digest ----------------------------------------------------------
+const amountPLimbsBig = amountPHexToLimbs(resolvedAmountPHex);
+const amountPLimbsLe = amountPLimbsBig.map(bigToLe32);
+const amountPDigestLe = hash8(amountPLimbsLe);
+
 // ---- recompute commitment + amount_tag + request_hash (off-chain echo of circuit) ---------
-const commitmentLe = compose5(nullifierLe, secretLe, assetIdLe, amountLe, poolIdLe);
+// A6: amount_p_digest replaces plaintext amount in commitment + amount_tag.
+const commitmentLe = compose5(nullifierLe, secretLe, assetIdLe, amountPDigestLe, poolIdLe);
 const amountTagLe = compose6(
-  amountLe,
+  amountPDigestLe,
   withdrawBlindLe,
   recipientHashLe,
   assetIdLe,
@@ -342,9 +410,6 @@ if (depositorCommitmentHex !== recomputedCommitmentHex) {
 }
 
 // ---- Compute Merkle path + indices ---------------------------------------------------------
-// M9: if --commitment-tree is supplied, look up the depositor's commitment in the multi-leaf tree
-// and produce its real leaf-index path. Otherwise fall back to the M8 single-leaf helper
-// (rejected when --testnet is set; already gated above).
 const dirHere = dirname(fileURLToPath(import.meta.url));
 const merkleHelperPath = resolve(dirHere, "poseidon_merkle.mjs");
 const treeHelperPath = resolve(dirHere, "commitment_tree_v2.mjs");
@@ -406,7 +471,6 @@ const recomputedRootHex = Array.from(recomputedRootLE)
   .map((b) => b.toString(16).padStart(2, "0"))
   .join("");
 
-// Cross-check: --root must match the recomputed root.
 const rootHexLower = rootHex.toLowerCase();
 if (recomputedRootHex !== rootHexLower) {
   console.error(
@@ -429,13 +493,14 @@ const witnessJson = {
   ca_payload_hash: le32ToDec(caPayloadHashLe),
   request_hash: le32ToDec(requestHashLe),
   vault_sequence: vaultSequenceArg,
+  amount_p_digest: le32ToDec(amountPDigestLe),
   // privates
   nullifier: le32ToDec(nullifierLe),
   secret: le32ToDec(secretLe),
-  amount: amountOctas,
   withdraw_blind: le32ToDec(withdrawBlindLe),
   merkle_path: merklePathBig.map((b) => b.toString()),
   merkle_indices: merkleIndicesBig.map((b) => b.toString()),
+  amount_p_limbs: amountPLimbsBig.map((b) => b.toString()),
 };
 
 const summary = {
@@ -454,10 +519,12 @@ const summary = {
     ca_payload_hash: caPayloadHashHex.startsWith("0x") ? caPayloadHashHex : `0x${caPayloadHashHex}`,
     request_hash: le32ToHex(requestHashLe),
     vault_sequence: vaultSequenceArg,
+    amount_p_digest: le32ToHex(amountPDigestLe),
   },
   withdraw_blind_hex: withdrawBlindHex.startsWith("0x")
     ? withdrawBlindHex
     : `0x${withdrawBlindHex}`,
+  amount_p_digest_hex: le32ToHex(amountPDigestLe),
 };
 
 if (outputArg) {
@@ -470,6 +537,5 @@ if (outputArg) {
   console.error(`wrote witness JSON → ${outputArg} (0o600)`);
   process.stdout.write(JSON.stringify(summary, null, 2) + "\n");
 } else {
-  // No --output → print summary + witness to stdout (caller pipes wherever).
   process.stdout.write(JSON.stringify({ ...summary, witness: witnessJson }, null, 2) + "\n");
 }

@@ -1,63 +1,63 @@
 pragma circom 2.1.6;
 
-// ConfidentialAPT shielded-bridge — withdraw circuit (Gate 6 / Mode C v2).
+// ConfidentialAPT shielded-bridge — withdraw circuit (Gate 6 / A6 binding).
 //
-// Spec ref: HANDOFF Section 4 (withdraw flow) + Section 5.2 (circuit).
+// Spec ref: HANDOFF Section 4 (withdraw flow) + Section 5.2 (circuit)
+//           + plans/continue-from-the-jazzy-ocean.md (A6 design).
+//
+// 2026-05-23 (Stage 2 A6 + Approach 4):
+//   - Replaced plaintext `amount` in commitment + amount_tag with `amount_p_digest`
+//     (matches deposit_binding.circom). Withdraw user provides amount_p_limbs[8]
+//     (from note); circuit recomputes the digest + the Compose5 commitment + the
+//     Compose6 amount_tag. Move bridge byte-cross-checks Groth16 public output
+//     amount_p_digest vs digest recomputed from the 14-CA-args amount_p.
+//   - Pedersen binding (same blind from HKDF(note_secret) at deposit + withdraw)
+//     ensures withdraw σ-proto amount_p_wd byte-equals deposit amount_p_dep, which
+//     equals leaf's amount_p_digest pre-image — forcing withdraw amount = deposit
+//     amount (vote conservation).
 //
 // Public inputs (in declaration order; snarkjs convention drives on-chain
 // `public_inputs` Fr vector + `vk_uvw_gamma_g1` length = 1 + 9 = 10):
 //   root              — must equal a value in `RootHistory.root_history`
 //   nullifier_hash    — Poseidon(nullifier); marked spent on success
-//   asset_id          — same Poseidon-derived id as deposit (matches VaultConfigCache)
+//   asset_id          — same Poseidon-derived id as deposit
 //   recipient_hash    — Poseidon-of-recipient-address; binds payout target
-//   amount_tag        — Poseidon-derived tag binding amount + recipient (see compose6)
+//   amount_tag        — Compose5(amount_p_digest, withdraw_blind, recipient_hash, asset_id, chain_id, vault_sequence)
+//                       — NOTE: was Compose6(amount, ...); now Compose6(amount_p_digest, ...)
 //   ca_payload_hash   — keccak256 of CA outbound payload; binds operator attestation
-//   request_hash      — Poseidon-derived binding (amount_tag + ca_payload + sequence)
+//   request_hash      — Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id, vault_sequence, chain_id)
 //   vault_sequence    — anti-replay counter; bridge enforces strict +1
-//   chain_id          — Aptos chain id (testnet=2)
+//   amount_p_digest   — Poseidon8 over 8 × 128-bit limbs of 4 × 32B Ristretto amount_p (NEW)
 //
 // Private inputs:
 //   nullifier         — random 254-bit field; user retains
 //   secret            — random 254-bit field; user retains
-//   amount            — u64 withdrawal amount
 //   withdraw_blind    — random blinding for amount_tag
 //   merkle_path[20]   — sibling node at each tree level
-//   merkle_indices[20]— left/right (0/1) at each level (LSB-first bit decomposition of leaf index)
-//
-// ⚠️ Spec deviation note (intentional, documented):
-//   HANDOFF §5.2 says "Recompute commitment from nullifier, secret, asset_id, amount" (4 inputs).
-//   Actual deposit circuit (deposit_binding.circom) uses Compose5(nullifier, secret,
-//   asset_id, amount, pool_id) — 5 inputs including pool_id. Withdraw MUST recompute
-//   the same 5-input commitment (otherwise Merkle inclusion under root fails).
-//   pool_id is HARDCODED here as POOL_ID_VALUE (currently 0) to keep public inputs at
-//   HANDOFF's 9 mandatory; multi-pool support would require respec.
+//   merkle_indices[20]— left/right (0/1) at each level
+//   amount_p_limbs[8] — 4 amount_p points × 2 limbs each (lo,hi) of 128 bits
 //
 // Constants (must match Move-side aptosshield::confidential_bridge):
-//   POOL_ID_VALUE = 0           (line ~92 in confidential_bridge.move)
-//   TREE_DEPTH = 20             (matches batch_updater.ts + spike batch_root_update)
+//   POOL_ID_VALUE = 0
+//   TREE_DEPTH = 20
 //
-// Constraints (per HANDOFF §5.2):
-//   1. amount fits in 64 bits (Num2Bits)
-//   2. commitment = Compose5(nullifier, secret, asset_id, amount, pool_id) (matches deposit)
-//   3. Merkle inclusion: leaf=commitment, path, indices → equals public root
-//   4. nullifier_hash = Poseidon(nullifier) (1-input Poseidon, hash_1)
-//   5. amount_tag = Compose6(amount, withdraw_blind, recipient_hash, asset_id, chain_id, vault_sequence)
-//   6. request_hash = Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id, vault_sequence, chain_id)
-//   7. Public input equality wires (handled implicitly by signal === checks above)
+// Constraints:
+//   1. Each amount_p_limbs[i] fits in 128 bits.
+//   2. amount_p_digest = Poseidon8(amount_p_limbs[0..7]).
+//   3. commitment = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID) (matches deposit).
+//   4. Merkle inclusion: leaf=commitment, path, indices → equals public root.
+//   5. nullifier_hash = Poseidon(nullifier).
+//   6. amount_tag = Compose6(amount_p_digest, withdraw_blind, recipient_hash, asset_id, chain_id, vault_sequence).
+//   7. request_hash = Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id, vault_sequence, chain_id).
+//
+// NOTE: plaintext `amount` REMOVED from circuit. Same rationale as deposit_binding.
 
 include "../node_modules/circomlib/circuits/poseidon.circom";
 include "../node_modules/circomlib/circuits/bitify.circom";
 include "../node_modules/circomlib/circuits/comparators.circom";
 include "../node_modules/circomlib/circuits/switcher.circom";
 
-// Phase F W3 — chain_id hardcoded as compile-time constant declared inside the
-// template (pool_id was already hardcoded via `cmt.in[4] <== 0` for the commitment
-// recomputation). This VK is testnet-only (CHAIN_ID = 2 = Aptos testnet).
-// Mainnet deployment requires a separate compile+setup.
-// See circuits/CHAIN_VARIANT.md for full rationale.
-
 // 5-input Poseidon (matches deposit_binding.circom Compose5 exactly).
-// compose5(a,b,c,d,e) = hash_2(hash_3(a,b,c), hash_2(d,e))
 template Compose5() {
     signal input in[5];
     signal output out;
@@ -79,8 +79,6 @@ template Compose5() {
 }
 
 // 6-input Poseidon: compose6(a,b,c,d,e,f) = hash_2(hash_3(a,b,c), hash_3(d,e,f))
-// Uses 2× hash_3 + 1× hash_2 = 3 Poseidon calls. Off-chain operator code
-// (build_testnet_withdraw_proof.ts) MUST use the SAME composition.
 template Compose6() {
     signal input in[6];
     signal output out;
@@ -103,26 +101,19 @@ template Compose6() {
 }
 
 // Merkle inclusion verifier (binary tree, Poseidon hash_2 nodes).
-// At each level: if path_index[i] == 0, current is LEFT child → next = poseidon2(current, sibling)
-//                if path_index[i] == 1, current is RIGHT child → next = poseidon2(sibling, current)
-// Matches batch_updater.ts frontierInsert convention (hash_2 over (left, right)).
 template MerkleInclusion(depth) {
     signal input leaf;
     signal input root;
     signal input path[depth];
-    signal input path_index[depth];  // each must be 0 or 1
+    signal input path_index[depth];
 
     signal cur[depth + 1];
     cur[0] <== leaf;
 
     component hashers[depth];
-    // Phase F W4: switch from 4-mul branch-free mux to circomlib Switcher (1 mul/level).
-    //   Switcher: aux = (R-L)*sel; outL = aux+L; outR = -aux+R
-    // Same semantics as before: path_index==0 -> (cur, sibling); path_index==1 -> (sibling, cur).
     component sw[depth];
 
     for (var i = 0; i < depth; i++) {
-        // Force path_index to be 0 or 1 (Switcher does NOT enforce this).
         path_index[i] * (path_index[i] - 1) === 0;
 
         sw[i] = Switcher();
@@ -140,11 +131,10 @@ template MerkleInclusion(depth) {
 }
 
 template WithdrawProof() {
-    // Phase F W3 — hardcoded chain_id (testnet variant). pool_id was already a constant
-    // (= 0) below at the commitment-recomputation step.
+    // Phase F W3 — hardcoded chain_id (testnet variant).
     var CHAIN_ID = 2;
 
-    // -------- public inputs (Phase F W3: chain_id removed, baked as constant; 8 publics) --------
+    // -------- public inputs (9) --------
     signal input root;
     signal input nullifier_hash;
     signal input asset_id;
@@ -153,35 +143,42 @@ template WithdrawProof() {
     signal input ca_payload_hash;
     signal input request_hash;
     signal input vault_sequence;
+    signal input amount_p_digest;
 
     // -------- private inputs --------
     signal input nullifier;
     signal input secret;
-    signal input amount;
     signal input withdraw_blind;
     signal input merkle_path[20];
     signal input merkle_indices[20];
+    signal input amount_p_limbs[8];
 
     // ====================== Constraints ======================
 
-    // 1. amount fits in 64 bits.
-    component amount_bits = Num2Bits(64);
-    amount_bits.in <== amount;
+    // 1. Range-check each amount_p limb fits in 128 bits.
+    component limb_bits[8];
+    for (var i = 0; i < 8; i++) {
+        limb_bits[i] = Num2Bits(128);
+        limb_bits[i].in <== amount_p_limbs[i];
+    }
 
-    // 2. Recompute commitment using the SAME formula as deposit_binding.circom Compose5.
-    //    pool_id is HARDCODED as POOL_ID_VALUE (= 0 currently per Move-side
-    //    `aptosshield::confidential_bridge::POOL_ID_VALUE`). If pool_id ever changes,
-    //    this circuit must be regenerated and old commitments will not be withdrawable.
+    // 2. amount_p_digest = Poseidon8(amount_p_limbs[0..7]).
+    component digest = Poseidon(8);
+    for (var i = 0; i < 8; i++) {
+        digest.inputs[i] <== amount_p_limbs[i];
+    }
+    digest.out === amount_p_digest;
+
+    // 3. Recompute commitment = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID).
+    //    Matches deposit_binding.circom Compose5 exactly. POOL_ID hardcoded 0 (frozen testnet pool).
     component cmt = Compose5();
     cmt.in[0] <== nullifier;
     cmt.in[1] <== secret;
     cmt.in[2] <== asset_id;
-    cmt.in[3] <== amount;
-    cmt.in[4] <== 0;  // POOL_ID_VALUE = 0 (frozen testnet pool)
-    // cmt.out is the leaf for Merkle inclusion below (no public-input check;
-    // commitment value is private here — only the root inclusion is public).
+    cmt.in[3] <== amount_p_digest;
+    cmt.in[4] <== 0;
 
-    // 3. Merkle inclusion: cmt.out at indexed leaf position must hash up to root.
+    // 4. Merkle inclusion: cmt.out at indexed leaf must hash up to root.
     component merkle = MerkleInclusion(20);
     merkle.leaf <== cmt.out;
     merkle.root <== root;
@@ -190,14 +187,14 @@ template WithdrawProof() {
         merkle.path_index[i] <== merkle_indices[i];
     }
 
-    // 4. nullifier_hash = Poseidon([nullifier]) (1-input Poseidon = hash_1; circomlib supports arity 1)
+    // 5. nullifier_hash = Poseidon([nullifier]).
     component nh = Poseidon(1);
     nh.inputs[0] <== nullifier;
     nh.out === nullifier_hash;
 
-    // 5. amount_tag = Compose6(amount, withdraw_blind, recipient_hash, asset_id, CHAIN_ID, vault_sequence)
+    // 6. amount_tag = Compose6(amount_p_digest, withdraw_blind, recipient_hash, asset_id, CHAIN_ID, vault_sequence).
     component tag = Compose6();
-    tag.in[0] <== amount;
+    tag.in[0] <== amount_p_digest;
     tag.in[1] <== withdraw_blind;
     tag.in[2] <== recipient_hash;
     tag.in[3] <== asset_id;
@@ -205,7 +202,7 @@ template WithdrawProof() {
     tag.in[5] <== vault_sequence;
     tag.out === amount_tag;
 
-    // 6. request_hash = Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id, vault_sequence, CHAIN_ID)
+    // 7. request_hash = Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id, vault_sequence, CHAIN_ID).
     component req = Compose6();
     req.in[0] <== amount_tag;
     req.in[1] <== recipient_hash;
@@ -214,13 +211,10 @@ template WithdrawProof() {
     req.in[4] <== vault_sequence;
     req.in[5] <== CHAIN_ID;
     req.out === request_hash;
-
-    // (7. Public input equality is enforced implicitly by `===` constraints above.)
 }
 
 // Public inputs in this order: root, nullifier_hash, asset_id, recipient_hash,
-// amount_tag, ca_payload_hash, request_hash, vault_sequence.
-// (Phase F W3: chain_id removed from publics — baked as `CHAIN_ID` constant above.)
+// amount_tag, ca_payload_hash, request_hash, vault_sequence, amount_p_digest.
 component main { public [
     root,
     nullifier_hash,
@@ -229,5 +223,6 @@ component main { public [
     amount_tag,
     ca_payload_hash,
     request_hash,
-    vault_sequence
+    vault_sequence,
+    amount_p_digest
 ] } = WithdrawProof();
