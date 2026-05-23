@@ -246,6 +246,9 @@ function buildScratchDir() {
       depositorAddress: DEPOSITOR_ADDRESS,
       depositCount: 1,
       commitmentHex: "0x" + "11".repeat(32),
+      // Stage 0 P0 Bonus fix (2026-05-23): orchestrator now derives TRANSFER_AMOUNT_OCTAS
+      // from witness.amountOctas (not env). Test fixture must supply it.
+      amountOctas: "100",
     }),
   );
   const caDkgRosterPath = join(root, "ca_dkg_v2_roster.json");
@@ -342,7 +345,8 @@ async function runOrchestrator({
         FROST_DKG_V2_ROSTER_JSON_PATH: scratch.frostRosterPath,
         CHAIN_ID: "2",
         BRIDGE_PACKAGE_ADDRESS: bridge,
-        WITHDRAW_AMOUNT_OCTAS: "100",
+        // P0 Bonus fix (2026-05-23): WITHDRAW_AMOUNT_OCTAS env removed — TRANSFER_AMOUNT_OCTAS
+        // now derives from witness.amountOctas. See plan Stage 0.
         ...extraEnv,
       },
     },

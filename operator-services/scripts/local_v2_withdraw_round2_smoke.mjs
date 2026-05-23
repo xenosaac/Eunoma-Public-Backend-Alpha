@@ -77,7 +77,20 @@ const COORDINATOR_BEARER_TOKEN = required(
   process.env.COORDINATOR_BEARER_TOKEN,
   "env COORDINATOR_BEARER_TOKEN",
 );
-const TRANSFER_AMOUNT = BigInt(process.env.WITHDRAW_AMOUNT_OCTAS ?? "100");
+// P0 Bonus fix (2026-05-23): no env default — operator must pass --amount-octas explicitly
+// to surface any miswire (env-vs-real dual knob was the vault-drain exploit path closed in
+// local_v2_withdraw_full.mjs). Smoke is a round2-only dev tool, so amount comes via flag.
+const TRANSFER_AMOUNT = BigInt(required(flag("--amount-octas"), "--amount-octas"));
+if (
+  process.env.WITHDRAW_AMOUNT_OCTAS !== undefined &&
+  process.env.WITHDRAW_AMOUNT_OCTAS !== TRANSFER_AMOUNT.toString()
+) {
+  console.error(
+    `WITHDRAW_AMOUNT_OCTAS env (=${process.env.WITHDRAW_AMOUNT_OCTAS}) mismatch with --amount-octas ` +
+      `(=${TRANSFER_AMOUNT}); env is no longer honored`,
+  );
+  process.exit(2);
+}
 
 // Read round1 artifact for binding fields.
 const round1Path = resolve(

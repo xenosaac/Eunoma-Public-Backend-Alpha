@@ -151,7 +151,11 @@ const COORDINATOR_BEARER_TOKEN = required(
   "env COORDINATOR_BEARER_TOKEN",
 );
 const APTOS_NODE_URL = process.env.APTOS_TESTNET_NODE_URL ?? "https://fullnode.testnet.aptoslabs.com";
-const TRANSFER_AMOUNT_OCTAS = BigInt(process.env.WITHDRAW_AMOUNT_OCTAS ?? "100");
+// TRANSFER_AMOUNT_OCTAS no longer reads from WITHDRAW_AMOUNT_OCTAS env (P0 Bonus fix
+// 2026-05-23): env-vs-note dual knob was the orchestrator's ready-made vault-drain path
+// because Groth16 amount and σ-proof amount_p had no on-chain binding. See
+// continue-from-the-jazzy-ocean.md Stage 0 + memory feedback_codex_on_hardstop_diagnoses.
+// The const is now assigned below from depositWitness.amountOctas after schema check.
 const CA_DKG_V2_ROSTER_JSON_PATH = required(
   process.env.CA_DKG_V2_ROSTER_JSON_PATH,
   "env CA_DKG_V2_ROSTER_JSON_PATH",
@@ -166,6 +170,28 @@ const CHAIN_ID = Number(process.env.CHAIN_ID ?? "2");
 const depositWitness = JSON.parse(readFileSync(depositWitnessPath, "utf8"));
 if (depositWitness.schema !== "v2_depositor_witness_v1") {
   console.error("bad depositor witness schema");
+  process.exit(2);
+}
+
+// P0 Bonus fix (2026-05-23): transfer MUST equal note amount. Reject env override loud
+// to surface any caller still trying the old WITHDRAW_AMOUNT_OCTAS knob.
+if (typeof depositWitness.amountOctas !== "string" || depositWitness.amountOctas.length === 0) {
+  console.error("depositor witness missing amountOctas");
+  process.exit(2);
+}
+const TRANSFER_AMOUNT_OCTAS = BigInt(depositWitness.amountOctas);
+if (TRANSFER_AMOUNT_OCTAS <= 0n) {
+  console.error(`depositor witness amountOctas must be positive (got ${TRANSFER_AMOUNT_OCTAS})`);
+  process.exit(2);
+}
+if (
+  process.env.WITHDRAW_AMOUNT_OCTAS !== undefined &&
+  process.env.WITHDRAW_AMOUNT_OCTAS !== depositWitness.amountOctas
+) {
+  console.error(
+    `WITHDRAW_AMOUNT_OCTAS env (=${process.env.WITHDRAW_AMOUNT_OCTAS}) mismatch with note ` +
+      `amountOctas (=${depositWitness.amountOctas}); env is no longer honored — transfer must equal note.amount`,
+  );
   process.exit(2);
 }
 
