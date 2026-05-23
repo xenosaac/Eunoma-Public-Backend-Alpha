@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 // =============================================================================================
-// Milestone 6 sub-milestone 6-d — Real Aptos testnet operational provisioning.
+// RETIRED for A6. This pre-A6 provisioning runbook used old VK publish paths.
 //
 // One-shot operator runbook that brings a fresh Aptos testnet account from "no eunoma bridge
 // deployed" to "ready for `npm run testnet:e2e`". Composes existing Aptos CLI commands +
 // publishes the bridge package + sets the on-chain VKs.
+//
+// Use the A6 runbook instead:
+//   1. aptos move publish --package-dir move --profile <admin> --assume-yes
+//   2. RELAYER_SUBMIT_ENABLED=1 node scripts/testnet_rotate_a6_vks.mjs --submit --profile <admin>
 //
 // CRITICAL: this script invokes admin Aptos CLI calls and SENDS REAL TESTNET TRANSACTIONS.
 // It must be invoked explicitly by an operator with:
@@ -112,6 +116,12 @@ if (!profile) {
   console.error("missing required --profile");
   process.exit(EXIT_USAGE_ERROR);
 }
+
+console.error(
+  "testnet_provision_m6d.mjs is retired for A6 because it references pre-A6 VK publish flows. " +
+    "Use aptos move publish followed by scripts/testnet_rotate_a6_vks.mjs.",
+);
+process.exit(EXIT_USAGE_ERROR);
 
 // =============================================================================================
 // Step 1: aptos CLI sanity check.
