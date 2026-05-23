@@ -1609,7 +1609,6 @@ module eunoma::eunoma_bridge {
         let n = vector::length(pvk_uvw_gamma_g1);
         while (i < n) {
             let ic_bytes = *vector::borrow(pvk_uvw_gamma_g1, i);
-            assert_g1(&ic_bytes, err);
             vector::push_back(&mut vk_ic, de_g1_with_error(ic_bytes, err));
             i = i + 1;
         };
@@ -1763,8 +1762,10 @@ module eunoma::eunoma_bridge {
             vector::push_back(&mut out, *vector::borrow(src, i));
             i = i + 1;
         };
-        while (vector::length(&out) < FR_BYTES) {
+        let padded_len = end - start;
+        while (padded_len < FR_BYTES) {
             vector::push_back(&mut out, 0u8);
+            padded_len = padded_len + 1;
         };
         out
     }
@@ -1819,31 +1820,29 @@ module eunoma::eunoma_bridge {
         // CA framework TRANSFER_AMOUNT_CHUNK_COUNT = 4; each chunk is a 32B compressed Ristretto point.
         assert!(vector::length(amount_p) == 4, E_INVALID_AMOUNT_P_SHAPE);
 
-        // Extract 8 limbs in [p0_lo, p0_hi, p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi] order.
-        let limbs = vector::empty<vector<u8>>();
-        let i = 0;
-        while (i < 4) {
-            let p_k = vector::borrow(amount_p, i);
-            assert!(vector::length(p_k) == 32, E_INVALID_AMOUNT_P_SHAPE);
-            vector::push_back(&mut limbs, byte_slice_padded(p_k, 0, 16));
-            vector::push_back(&mut limbs, byte_slice_padded(p_k, 16, 32));
-            i = i + 1;
-        };
+        let p0 = vector::borrow(amount_p, 0);
+        let p1 = vector::borrow(amount_p, 1);
+        let p2 = vector::borrow(amount_p, 2);
+        let p3 = vector::borrow(amount_p, 3);
+        assert!(vector::length(p0) == 32, E_INVALID_AMOUNT_P_SHAPE);
+        assert!(vector::length(p1) == 32, E_INVALID_AMOUNT_P_SHAPE);
+        assert!(vector::length(p2) == 32, E_INVALID_AMOUNT_P_SHAPE);
+        assert!(vector::length(p3) == 32, E_INVALID_AMOUNT_P_SHAPE);
 
         // Compose8 tree (matches circom Compose8 + JS compose8).
         let a = poseidon_bn254::hash_3(
-            *vector::borrow(&limbs, 0),
-            *vector::borrow(&limbs, 1),
-            *vector::borrow(&limbs, 2),
+            byte_slice_padded(p0, 0, 16),
+            byte_slice_padded(p0, 16, 32),
+            byte_slice_padded(p1, 0, 16),
         );
         let b = poseidon_bn254::hash_3(
-            *vector::borrow(&limbs, 3),
-            *vector::borrow(&limbs, 4),
-            *vector::borrow(&limbs, 5),
+            byte_slice_padded(p1, 16, 32),
+            byte_slice_padded(p2, 0, 16),
+            byte_slice_padded(p2, 16, 32),
         );
         let c = poseidon_bn254::hash_2(
-            *vector::borrow(&limbs, 6),
-            *vector::borrow(&limbs, 7),
+            byte_slice_padded(p3, 0, 16),
+            byte_slice_padded(p3, 16, 32),
         );
         poseidon_bn254::hash_3(a, b, c)
     }
