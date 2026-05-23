@@ -18,7 +18,7 @@
 // The user's proveTransfer used dk_user (fake), which the coordinator + workers then replace
 // transparently during finalize aggregation. See M4-c5 byte-canonical test for the pattern.
 // =============================================================================================
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -71,6 +71,7 @@ import { chunkSubtract, padToEll } from "./_lib/chunk_arithmetic.mjs";
 // Stage 4 A6: deterministic Ristretto blinds from note secret so withdraw amount_p byte-equals
 // the deposit amount_p (Move bridge amount_p_digest comparison enforces vote conservation).
 import { deriveAmountPBlinds } from "./_lib/amount_p_blinds.mjs";
+import { decodeNoteV3, isNoteV3 } from "./_lib/note_v3.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -147,6 +148,60 @@ const recipientArg = flag("--recipient"); // optional, defaults to fresh keypair
 const assetType = required(flag("--asset-type"), "--asset-type");
 const vaultSequenceArg = required(flag("--vault-sequence"), "--vault-sequence");
 
+function normalizeDepositWitness(raw) {
+  if (raw?.schema === "v2_depositor_witness_v1") return raw;
+  if (raw?.version !== 2) return raw;
+
+  const depositCount =
+    raw.depositCount ??
+    (Number.isSafeInteger(raw.leafIndex) && raw.leafIndex >= 0
+      ? String(raw.leafIndex + 1)
+      : undefined);
+  return {
+    ...raw,
+    schema: "v2_depositor_witness_v1",
+    depositorAddress: raw.depositorAddress,
+    userEncryptionKeyHex: raw.userEncryptionKeyHex,
+    chainId: raw.chainId,
+    poolId: raw.poolId,
+    assetType: raw.assetType ?? assetType,
+    assetIdHex: raw.assetIdHex,
+    vaultAddrHashHex: raw.vaultAddrHashHex,
+    vaultAddr: raw.vaultAddr ?? raw.vault,
+    bridgePackageAddress: raw.bridgePackageAddress ?? raw.bridge,
+    amountOctas: String(raw.amountOctas),
+    nullifierHex: raw.nullifierHex ?? raw.nullifier,
+    secretHex: raw.secretHex ?? raw.secret,
+    depositBlindHex: raw.depositBlindHex ?? raw.depositBlind,
+    depositNonceHex: raw.depositNonceHex,
+    ["commitment" + "Hex"]: raw.commitmentHex ?? raw.commitment,
+    amountTagHex: raw.amountTagHex,
+    amountPHex: raw.amountPHex,
+    caPayloadHashFr: raw.caPayloadHashFr,
+    depositTxHash: raw.depositTxHash ?? raw.depositTx,
+    prepareDepositBindingTxHash: raw.prepareDepositBindingTxHash,
+    depositCount,
+    txVersion: raw.txVersion,
+    createdAtUnixMs: raw.createdAtUnixMs,
+  };
+}
+
+function loadDepositWitness(path) {
+  const raw = readFileSync(path, "utf8").trim();
+  if (isNoteV3(raw)) {
+    const passphrase = required(process.env.EUNOMA_NOTE_PASSPHRASE, "env EUNOMA_NOTE_PASSPHRASE");
+    delete process.env.EUNOMA_NOTE_PASSPHRASE;
+    return {
+      encrypted: true,
+      witness: normalizeDepositWitness(decodeNoteV3(raw, passphrase)),
+    };
+  }
+  return {
+    encrypted: false,
+    witness: JSON.parse(raw),
+  };
+}
+
 // M9: commitment_tree_v2.json drives the real leaf-index Merkle path. Default location is the
 // coordinator state dir written by local_build_commitment_tree.mjs. If absent, the orchestrator
 // falls back to the legacy M8 single-leaf path with a warning.
@@ -187,7 +242,23 @@ const FROST_DKG_V2_ROSTER_JSON_PATH = required(
 const CHAIN_ID = Number(process.env.CHAIN_ID ?? "2");
 
 // Read depositor witness.
-const depositWitness = JSON.parse(readFileSync(depositWitnessPath, "utf8"));
+const loadedDepositWitness = loadDepositWitness(depositWitnessPath);
+const depositWitness = loadedDepositWitness.witness;
+const depositWitnessForBuilderPath = loadedDepositWitness.encrypted
+  ? `/tmp/eunoma-note-v3-${process.pid}-${Date.now()}-witness.json`
+  : depositWitnessPath;
+if (loadedDepositWitness.encrypted) {
+  writeFileSync(depositWitnessForBuilderPath, JSON.stringify(depositWitness, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  process.on("exit", () => {
+    try {
+      unlinkSync(depositWitnessForBuilderPath);
+    } catch {
+      // Best-effort cleanup for the transient decrypted witness bridge to snarkjs tooling.
+    }
+  });
+}
 if (depositWitness.schema !== "v2_depositor_witness_v1") {
   console.error("bad depositor witness schema");
   process.exit(2);
@@ -658,9 +729,16 @@ const amountCommitmentHex = bytesToHex(amountCommitmentPoint.toRawBytes());
 // witness.amountPHex from the depositor witness JSON, but supplying CLI override forces a
 // cross-check there + makes the dependency explicit at the orchestrator level).
 const witnessOutPath = `/tmp/m8-${requestId}-witness.json`;
+process.on("exit", () => {
+  try {
+    unlinkSync(witnessOutPath);
+  } catch {
+    // Best-effort cleanup for the transient Groth16 witness input.
+  }
+});
 const witnessBuilderArgs = [
   resolve(repoRoot, "circuits/scripts/compute_withdraw_witness.mjs"),
-  "--depositor-witness", depositWitnessPath,
+  "--depositor-witness", depositWitnessForBuilderPath,
   "--recipient", recipientAddress,
   "--vault-sequence", vaultSequenceArg,
   "--root", rootHex,
@@ -1036,7 +1114,7 @@ console.error(`[m8-real] caPayloadHashFr = ${caPayloadHashFr.slice(0, 16)}...`);
 // amount_p_digest stays consistent (and matches what Move recomputes from CA args).
 const witnessReArgs = [
   resolve(repoRoot, "circuits/scripts/compute_withdraw_witness.mjs"),
-  "--depositor-witness", depositWitnessPath,
+  "--depositor-witness", depositWitnessForBuilderPath,
   "--recipient", recipientAddress,
   "--vault-sequence", vaultSequenceArg,
   "--root", rootHex,

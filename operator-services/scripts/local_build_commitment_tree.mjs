@@ -2,9 +2,9 @@
 // =============================================================================================
 // M9-b — Build the append-only commitment tree from confirmed `DepositConfirmedV2` events.
 //
-// Primary ingestion source: confirmed tx hashes from depositor witness JSONs (or `--tx-hashes`),
-// fetched via `GET /v1/transactions/by_hash/<hash>`. This is the canonical Aptos REST path for
-// confirmed-tx state and is stable across fullnode versions.
+// Primary ingestion source: confirmed tx hashes from public deposit sidecars / legacy depositor
+// witness JSONs (or `--tx-hashes`), fetched via `GET /v1/transactions/by_hash/<hash>`. This is the
+// canonical Aptos REST path for confirmed-tx state and is stable across fullnode versions.
 //
 // Optional `--refresh-from-event-feed` additionally queries the bridge's module event feed and
 // cross-checks that every feed entry's (version, sequence_number) is already in the primary set.
@@ -104,7 +104,9 @@ function loadDepositorTxHashes(dir) {
   }
   const txHashes = [];
   for (const f of entries) {
-    if (!f.startsWith("withdraw_witness_") || !f.endsWith(".json")) continue;
+    const publicSidecar = f.startsWith("deposit_public_") && f.endsWith(".json");
+    const legacyWitness = f.startsWith("withdraw_witness_") && f.endsWith(".json");
+    if (!publicSidecar && !legacyWitness) continue;
     const p = join(dir, f);
     let raw;
     try {
@@ -112,7 +114,9 @@ function loadDepositorTxHashes(dir) {
     } catch {
       continue;
     }
-    if (raw?.schema !== "v2_depositor_witness_v1") continue;
+    if (raw?.schema !== "v2_deposit_public_v1" && raw?.schema !== "v2_depositor_witness_v1") {
+      continue;
+    }
     const h = raw.depositTxHash;
     if (typeof h === "string" && /^0x[0-9a-fA-F]{64}$/.test(h)) txHashes.push(h.toLowerCase());
   }

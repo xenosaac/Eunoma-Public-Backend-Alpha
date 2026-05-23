@@ -40,7 +40,7 @@
 // caPayloadHash, sender, asset_type, vault_addr, plus a depositor-only witness file path that
 // the later MPCCA-withdraw step consumes.
 // =============================================================================================
-import { mkdirSync, existsSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync, chmodSync, unlinkSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -73,6 +73,7 @@ import { bytesToHex, hexToBytes, keccak256 } from "@eunoma/shared";
 // Stage 4 A6: deterministic Ristretto255 blinds for amount_p Pedersen commitments. Same secret
 // → same amount_p bytes at deposit and withdraw → Move bridge amount_p_digest binding holds.
 import { deriveAmountPBlinds } from "./_lib/amount_p_blinds.mjs";
+import { encodeNoteV3 } from "./_lib/note_v3.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -115,6 +116,11 @@ const ASSET_TYPE_ADDR = (process.env.ASSET_TYPE_ADDR ?? "0xa").toLowerCase();
 const DEPOSIT_AMOUNT_OCTAS = BigInt(process.env.DEPOSIT_AMOUNT_OCTAS ?? "100");
 const FUND_DEPOSITOR_OCTAS = BigInt(process.env.FUND_DEPOSITOR_OCTAS ?? "20000000");
 const CA_DEPOSIT_OCTAS = BigInt(process.env.CA_DEPOSIT_OCTAS ?? "10000");
+const NOTE_PASSPHRASE = required(
+  process.env.EUNOMA_NOTE_PASSPHRASE,
+  "EUNOMA_NOTE_PASSPHRASE",
+);
+delete process.env.EUNOMA_NOTE_PASSPHRASE;
 
 function required(value, name) {
   if (!value) {
@@ -507,7 +513,14 @@ async function main() {
   }
   logStep(`amount_p concat hex (public, already in CA payload): ${amountPHex.slice(0, 24)}...`);
 
-  const witnessPath = join(depositorStateDir, "witness.json");
+  const witnessPath = join(depositorStateDir, `.deposit_witness_${process.pid}_${Date.now()}.json`);
+  process.on("exit", () => {
+    try {
+      unlinkSync(witnessPath);
+    } catch {
+      // Best-effort cleanup for the transient Groth16 witness input.
+    }
+  });
   const proofPath = join(depositorStateDir, "proof.json");
   const witnessRes = spawnSync(
     "node",
@@ -700,6 +713,7 @@ async function main() {
   // here so compute_withdraw_witness.mjs can recompute amount_p_digest. It is the public
   // ciphertext-C component already in the on-chain CA payload, so persisting it locally adds no
   // new privacy surface.
+  const leafIndex = Number(BigInt(depositCount) - 1n);
   const witnessForWithdraw = {
     schema: "v2_depositor_witness_v1",
     depositorAddress: depositorAccount.accountAddress.toString(),
@@ -726,10 +740,46 @@ async function main() {
     txVersion: String(committed.version),
     createdAtUnixMs: Date.now(),
   };
-  const withdrawWitnessPath = join(depositorStateDir, `withdraw_witness_${committed.hash.slice(2, 10)}.json`);
-  writeFileSync(withdrawWitnessPath, JSON.stringify(witnessForWithdraw, null, 2) + "\n", { mode: 0o600 });
+  const notePlaintext = {
+    ...witnessForWithdraw,
+    version: 2,
+    network: "testnet",
+    chainId: 2,
+    bridge: bridgeAddr,
+    vault: vaultAddr,
+    poolId: "0",
+    asset: "ConfidentialAPT",
+    amountOctas: DEPOSIT_AMOUNT_OCTAS.toString(),
+    nullifier: `0x${bufToHex(nullifier)}`,
+    secret: `0x${bufToHex(secretFr)}`,
+    depositBlind: `0x${bufToHex(depositBlind)}`,
+    commitment: commitmentHex,
+    leafIndex,
+    depositTx: committed.hash,
+    rosterHash: rosterHashOnChain,
+    dkgEpoch,
+    amountPHex: `0x${amountPHex}`,
+  };
+  const encryptedNote = encodeNoteV3(notePlaintext, NOTE_PASSPHRASE);
+  const withdrawWitnessPath = join(depositorStateDir, `withdraw_note_${committed.hash.slice(2, 10)}.txt`);
+  writeFileSync(withdrawWitnessPath, encryptedNote + "\n", { mode: 0o600 });
   chmodSync(withdrawWitnessPath, 0o600);
-  logStep(`wrote depositor-only withdraw witness to ${withdrawWitnessPath}`);
+  logStep(`wrote encrypted note-v3 withdraw file to ${withdrawWitnessPath}`);
+
+  const depositPublicPath = join(depositorStateDir, `deposit_public_${committed.hash.slice(2, 10)}.json`);
+  writeFileSync(
+    depositPublicPath,
+    JSON.stringify(
+      {
+        schema: "v2_deposit_public_v1",
+        depositTxHash: committed.hash,
+        createdAtUnixMs: Date.now(),
+      },
+      null,
+      2,
+    ) + "\n",
+    { mode: 0o644 },
+  );
 
   // 12. Output summary JSON to stdout (consumable by testnet_e2e_v2 env exports).
   const summary = {
@@ -750,6 +800,8 @@ async function main() {
     groupSignature,
     attestationTranscriptHash: attest.attestationTranscriptHash,
     withdrawWitnessPath,
+    withdrawNotePath: withdrawWitnessPath,
+    depositPublicPath,
   };
   console.log(JSON.stringify(summary, null, 2));
   process.exit(0);
