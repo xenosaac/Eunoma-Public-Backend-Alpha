@@ -72,6 +72,40 @@ template Compose5() {
     out <== top.out;
 }
 
+// 8-input Poseidon composed from 3× hash_3 + 1× hash_2 (Move parity).
+// compose8(a..h) = hash_3(hash_3(a,b,c), hash_3(d,e,f), hash_2(g,h))
+// Move-side (poseidon_bn254 only exposes hash_2/hash_3) computes the same value:
+//   a = hash_3(in[0], in[1], in[2])
+//   b = hash_3(in[3], in[4], in[5])
+//   c = hash_2(in[6], in[7])
+//   digest = hash_3(a, b, c)
+// This is NOT the same as circomlib Poseidon(8) which uses t=9 fixed-arity Poseidon.
+template Compose8() {
+    signal input in[8];
+    signal output out;
+
+    component a = Poseidon(3);
+    a.inputs[0] <== in[0];
+    a.inputs[1] <== in[1];
+    a.inputs[2] <== in[2];
+
+    component b = Poseidon(3);
+    b.inputs[0] <== in[3];
+    b.inputs[1] <== in[4];
+    b.inputs[2] <== in[5];
+
+    component c = Poseidon(2);
+    c.inputs[0] <== in[6];
+    c.inputs[1] <== in[7];
+
+    component top = Poseidon(3);
+    top.inputs[0] <== a.out;
+    top.inputs[1] <== b.out;
+    top.inputs[2] <== c.out;
+
+    out <== top.out;
+}
+
 template DepositBinding() {
     // Phase F W3 — hardcoded chain_id + pool_id (testnet variant).
     var CHAIN_ID = 2;
@@ -99,10 +133,11 @@ template DepositBinding() {
         limb_bits[i].in <== amount_p_limbs[i];
     }
 
-    // 2. amount_p_digest = Poseidon8(amount_p_limbs[0..7]).
-    component digest = Poseidon(8);
+    // 2. amount_p_digest = Compose8(amount_p_limbs[0..7]) — uses hash_3/hash_2 tree
+    //    matching Move's eunoma_pool::poseidon_bn254 (only exposes hash_2 + hash_3).
+    component digest = Compose8();
     for (var i = 0; i < 8; i++) {
-        digest.inputs[i] <== amount_p_limbs[i];
+        digest.in[i] <== amount_p_limbs[i];
     }
     digest.out === amount_p_digest;
 

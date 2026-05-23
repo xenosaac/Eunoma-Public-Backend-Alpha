@@ -32,9 +32,9 @@
 // Args:
 //   --nullifier-hex      0x-prefixed 32-byte LE Fr
 //   --secret-hex         0x-prefixed 32-byte LE Fr
-//   --amount-p-hex       128 hex chars (4 × 32B amount_p compressed Ristretto, concatenated)
-//                        OR 4 separate flags. Caller (orchestrator) computes via SDK
-//                        ConfidentialTransfer.create with transferAmountRandomness = HKDF(secret).
+//   --amount-p-hex       256 hex chars (4 × 32B amount_p compressed Ristretto, concatenated).
+//                        Caller (orchestrator) computes via SDK ConfidentialTransfer.create
+//                        with transferAmountRandomness = HKDF(secret).
 //   --deposit-blind-hex  0x-prefixed 32-byte LE Fr
 //   --asset-id-hex       0x-prefixed 32-byte LE Fr (VaultPublicInputsV2.asset_id_fr)
 //   --vault-addr-hash-hex 0x-prefixed 32-byte LE Fr (VaultPublicInputsV2.vault_addr_hash_fr)
@@ -157,9 +157,13 @@ function hash3(a, b, c) {
   return frToLe(poseidon([frFromLe(a), frFromLe(b), frFromLe(c)]));
 }
 
-function hash8(le32x8) {
-  const inputs = le32x8.map((b) => frFromLe(b));
-  return frToLe(poseidon(inputs));
+// Compose8 = hash_3(hash_3(in[0..2]), hash_3(in[3..5]), hash_2(in[6..7]))
+// Matches circuit Compose8 template + Move eunoma_pool::poseidon_bn254 (hash_2/hash_3 only).
+function compose8(le32x8) {
+  const a = hash3(le32x8[0], le32x8[1], le32x8[2]);
+  const b = hash3(le32x8[3], le32x8[4], le32x8[5]);
+  const c = hash2(le32x8[6], le32x8[7]);
+  return hash3(a, b, c);
 }
 
 function compose5(a, b, c, d, e) {
@@ -177,7 +181,7 @@ const poolIdLe = u8ToLe32(POOL_ID);
 // A6: parse amount_p (4 × 32B Ristretto) into 8 × 16B LE limbs.
 const amountPLimbsBig = amountPHexToLimbs(amountPHex);
 const amountPLimbsLe = amountPLimbsBig.map(bigToLe32);
-const amountPDigestLe = hash8(amountPLimbsLe);
+const amountPDigestLe = compose8(amountPLimbsLe);
 
 // commitment = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID)
 const commitmentLe = compose5(nullifierLe, secretLe, assetIdLe, amountPDigestLe, poolIdLe);

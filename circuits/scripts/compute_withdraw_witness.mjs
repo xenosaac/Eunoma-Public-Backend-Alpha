@@ -332,9 +332,13 @@ function hash2(a, b) {
 function hash3(a, b, c) {
   return frToLe(poseidon([frFromLe(a), frFromLe(b), frFromLe(c)]));
 }
-function hash8(le32x8) {
-  const inputs = le32x8.map((b) => frFromLe(b));
-  return frToLe(poseidon(inputs));
+// Compose8 = hash_3(hash_3(in[0..2]), hash_3(in[3..5]), hash_2(in[6..7]))
+// Matches circuit Compose8 template + Move eunoma_pool::poseidon_bn254 (hash_2/hash_3 only).
+function compose8(le32x8) {
+  const a = hash3(le32x8[0], le32x8[1], le32x8[2]);
+  const b = hash3(le32x8[3], le32x8[4], le32x8[5]);
+  const c = hash2(le32x8[6], le32x8[7]);
+  return hash3(a, b, c);
 }
 function compose5(a, b, c, d, e) {
   return hash2(hash3(a, b, c), hash2(d, e));
@@ -371,7 +375,7 @@ const nullifierHashLe = hash1(nullifierLe);
 // ---- A6: amount_p limbs + digest ----------------------------------------------------------
 const amountPLimbsBig = amountPHexToLimbs(resolvedAmountPHex);
 const amountPLimbsLe = amountPLimbsBig.map(bigToLe32);
-const amountPDigestLe = hash8(amountPLimbsLe);
+const amountPDigestLe = compose8(amountPLimbsLe);
 
 // ---- recompute commitment + amount_tag + request_hash (off-chain echo of circuit) ---------
 // A6: amount_p_digest replaces plaintext amount in commitment + amount_tag.
