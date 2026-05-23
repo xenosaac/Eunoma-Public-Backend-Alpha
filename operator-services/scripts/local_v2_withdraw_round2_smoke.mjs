@@ -77,17 +77,41 @@ const COORDINATOR_BEARER_TOKEN = required(
   process.env.COORDINATOR_BEARER_TOKEN,
   "env COORDINATOR_BEARER_TOKEN",
 );
-// P0 Bonus fix (2026-05-23): no env default — operator must pass --amount-octas explicitly
-// to surface any miswire (env-vs-real dual knob was the vault-drain exploit path closed in
-// local_v2_withdraw_full.mjs). Smoke is a round2-only dev tool, so amount comes via flag.
-const TRANSFER_AMOUNT = BigInt(required(flag("--amount-octas"), "--amount-octas"));
+// P0 Bonus fix (2026-05-23, codex micro-review iter 2): amount MUST come from depositor witness
+// (matches local_v2_withdraw_full.mjs). Earlier `--amount-octas` flag is rejected if it mismatches
+// witness — the smoke's prior independent knob made amount inconsistent with round1.amountTag
+// (which was built from a different amount). round1 artifact does not persist amount (only
+// amountTag/nullifierHash hashes), so witness is the canonical source.
+const depositWitnessPath = required(flag("--depositor-witness"), "--depositor-witness");
+const depositWitness = JSON.parse(readFileSync(depositWitnessPath, "utf8"));
+if (depositWitness.schema !== "v2_depositor_witness_v1") {
+  console.error("bad depositor witness schema");
+  process.exit(2);
+}
+if (typeof depositWitness.amountOctas !== "string" || depositWitness.amountOctas.length === 0) {
+  console.error("depositor witness missing amountOctas");
+  process.exit(2);
+}
+const TRANSFER_AMOUNT = BigInt(depositWitness.amountOctas);
+if (TRANSFER_AMOUNT <= 0n) {
+  console.error(`depositor witness amountOctas must be positive (got ${TRANSFER_AMOUNT})`);
+  process.exit(2);
+}
+const amountOverride = flag("--amount-octas");
+if (amountOverride !== null && amountOverride !== depositWitness.amountOctas) {
+  console.error(
+    `--amount-octas (=${amountOverride}) mismatch with witness amountOctas ` +
+      `(=${depositWitness.amountOctas}); amount MUST come from witness`,
+  );
+  process.exit(2);
+}
 if (
   process.env.WITHDRAW_AMOUNT_OCTAS !== undefined &&
-  process.env.WITHDRAW_AMOUNT_OCTAS !== TRANSFER_AMOUNT.toString()
+  process.env.WITHDRAW_AMOUNT_OCTAS !== depositWitness.amountOctas
 ) {
   console.error(
-    `WITHDRAW_AMOUNT_OCTAS env (=${process.env.WITHDRAW_AMOUNT_OCTAS}) mismatch with --amount-octas ` +
-      `(=${TRANSFER_AMOUNT}); env is no longer honored`,
+    `WITHDRAW_AMOUNT_OCTAS env (=${process.env.WITHDRAW_AMOUNT_OCTAS}) mismatch with witness ` +
+      `(=${depositWitness.amountOctas}); env is no longer honored`,
   );
   process.exit(2);
 }
