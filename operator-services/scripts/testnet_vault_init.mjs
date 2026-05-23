@@ -29,7 +29,7 @@
 //   testnet_vault_init.mjs --ca-registration-artifact <p> --snapshot <p> --roster <p> \
 //     --frost-roster <p> [--submit]
 //
-// Default mode is --simulate. Submission gated by both --submit AND RELAYER_SUBMIT_ENABLED=1.
+// Default mode is local simulation. Submission gated by both --submit AND RELAYER_SUBMIT_ENABLED=1.
 //
 // Exit codes:
 //   0   success
@@ -280,7 +280,9 @@ if (adminProfile) {
   cliArgs.push("--profile", adminProfile);
 }
 if (!submit) {
-  cliArgs.push("--simulate");
+  cliArgs.push("--local");
+} else {
+  cliArgs.push("--assume-yes");
 }
 
 console.log(`aptos ${cliArgs.join(" ")}`);
@@ -306,7 +308,7 @@ if (run.status !== 0) {
 if (!submit) {
   console.log("");
   console.log(
-    "simulate complete. Re-run with --submit AND RELAYER_SUBMIT_ENABLED=1 to actually init the vault on-chain.",
+    "local simulation complete. Re-run with --submit AND RELAYER_SUBMIT_ENABLED=1 to actually init the vault on-chain.",
   );
   console.log(
     `Expected post-submit: BridgeVault + DeoperatorConfigV2 at @eunoma with dkgEpoch=${snapshot.dkgEpoch} rosterHash=${dkgRosterHashComputed}`,
