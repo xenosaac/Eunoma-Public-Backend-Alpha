@@ -6,24 +6,24 @@ import { fileURLToPath } from "node:url";
 // =============================================================================================
 // Milestone 2 sub-milestone 2b — confirmed-deposit observer (single-shot poll).
 //
-// Reads confirmed DepositEventV2 envelopes from an Aptos fullnode REST endpoint and POSTs
-// each to /v2/vault_state/observe_deposit on the coordinator. Each POST advances the per-worker
-// `deposit_count_observed` cursor by exactly one (strict monotonicity is enforced both on the
-// orchestrator and at the worker — see crypto-worker-rust::vault_state_v2::observe_deposit_v2).
+// Reads confirmed DepositConfirmedV2 envelopes from Aptos and POSTs each to
+// /v2/vault_state/observe_deposit on the coordinator. Each POST advances the per-worker
+// `deposit_count_observed` cursor by exactly one (strict monotonicity enforced at orchestrator
+// + worker — see crypto-worker-rust::vault_state_v2::observe_deposit_v2).
 //
-// Aptos `#[event]` module events (`event::emit(DepositEventV2 { ... })`) are accessed through
-// the events-by-handle accessor in two patterns:
+// EVENTS FETCH (2026-05-22 rewrite, primary):
+//   Aptos's events-by-struct REST accessor (/v1/accounts/{addr}/events/{struct_type}) used to
+//   work for `#[event]` module events but Aptos deprecated it; the Indexer GraphQL v1 `events`
+//   table is also deprecated (end-of-support 2025-09-08). The long-term-stable API that still
+//   works for module events is REST `/v1/transactions/by_hash/<hash>` — fundamental tx lookup
+//   that returns the full events array. The depositor's wallet already knows the tx hash, so
+//   the frontend's auto-observe path passes it straight to this script (or to the BFF route
+//   /api/eunoma/v2/observe-deposit-by-tx which delegates here in spirit).
 //
-//   1. Per-handle accessor (legacy event handles on a resource): NOT applicable here.
-//   2. Module event by struct type: GET /v1/accounts/{module_address}/events/{event_struct_type}
-//      where event_struct_type is the canonical fully-qualified Move struct path, e.g.
-//      `0xABC::eunoma_bridge::DepositEventV2`.
-//
-// We accept the accessor URL as `--events-url` with a default-construction pattern:
-//   `${aptos_node_url}/v1/accounts/${bridge_address}/events/${bridge_address}::eunoma_bridge::DepositEventV2`
-//
-// The operator should sanity-check this URL against a local cluster or test their bridge
-// publish before driving real funds through.
+// MODES:
+//   PRIMARY: --deposit-tx-hash <hex>   single-tx observe via REST by_hash.
+//   LEGACY:  --events-url <full url>   explicit override (no default-construction). Kept only
+//                                      as an escape hatch; do NOT rely on it on current testnet.
 //
 // Exit codes — operator runbook contract:
 //   0   success — all events processed; cursor advanced cleanly.
@@ -57,6 +57,7 @@ let limit; // optional u64 — fetch at most this many events
 let maxIterations; // optional u64 — process at most this many events in one run
 let bearerToken;
 let caDkgTranscriptHash;
+let depositTxHash; // PRIMARY mode (2026-05-22+): fetch events via REST tx-by-hash.
 
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i];
@@ -103,6 +104,9 @@ for (let i = 0; i < args.length; i += 1) {
     case "--ca-dkg-transcript-hash":
       caDkgTranscriptHash = args[++i];
       break;
+    case "--deposit-tx-hash":
+      depositTxHash = args[++i];
+      break;
     case "--help":
     case "-h":
       console.log(
@@ -110,18 +114,23 @@ for (let i = 0; i < args.length; i += 1) {
           "                              --bridge-address HEX --dkg-epoch N --vault-ek HEX\n" +
           "                              --sender-address HEX --asset-type HEX --chain-id N\n" +
           "                              --ca-dkg-transcript-hash HEX\n" +
-          "                              [--events-url URL] [--start-sequence N] [--limit N]\n" +
+          "                              (--deposit-tx-hash HEX  |  --events-url URL)\n" +
+          "                              [--start-sequence N] [--limit N]\n" +
           "                              [--max-iterations N] [--bearer-token TOKEN]\n" +
           "\n" +
-          "Single-shot poll: reads DepositEventV2 events from the Aptos fullnode (paginated by\n" +
-          "the per-handle sequence_number), POSTs each to /v2/vault_state/observe_deposit. The\n" +
-          "coordinator advances every worker's deposit_count_observed cursor by one per call.\n" +
+          "Single-shot observer for DepositConfirmedV2 events.\n" +
           "\n" +
-          "Aptos events URL: --events-url is RECOMMENDED for testnet/prod because Aptos' REST\n" +
-          "spec for module events varies between fullnode versions. The default constructor\n" +
-          "  ${aptosNodeUrl}/v1/accounts/${bridgeAddress}/events/${bridgeAddress}::eunoma_bridge::DepositEventV2\n" +
-          "works for some fullnodes but may return 404 on others — verify against your node before\n" +
-          "running this against real funds.\n" +
+          "PRIMARY MODE — --deposit-tx-hash <hex> (RECOMMENDED, 2026-05-22+):\n" +
+          "  Fetch the single deposit tx via REST `/v1/transactions/by_hash/<hash>` and observe\n" +
+          "  every DepositConfirmedV2 event in its events[]. Modern, long-term-stable Aptos\n" +
+          "  REST API. Pairs with the frontend's auto-observe-on-deposit flow (BFF route\n" +
+          "  /api/eunoma/v2/observe-deposit-by-tx posts the just-confirmed tx hash here).\n" +
+          "\n" +
+          "LEGACY MODE — --events-url <full url>:\n" +
+          "  Pre-2026-05-22 events-accessor URL (no default-construction; supply the full URL).\n" +
+          "  Aptos's events-by-struct REST accessor + Indexer GraphQL v1 events table are\n" +
+          "  DEPRECATED (end-of-support 2025-09-08). Only use this if you have a non-standard\n" +
+          "  indexer that still serves the old shape.\n" +
           "\n" +
           "Exit codes:\n" +
           `  ${EXIT_SUCCESS}   success — all events processed\n` +
@@ -197,54 +206,98 @@ const normalizedBridge = bridgeAddress.startsWith("0x")
   ? bridgeAddress
   : `0x${bridgeAddress}`;
 
-// Construct the events accessor URL if not supplied. The path format follows Aptos's module
-// event accessor: /v1/accounts/<module_address>/events/<event_struct_type>.
-//
-// Goal.md M3: prefer DepositConfirmedV2 (carries on-chain `deposit_count` + vault_addr +
-// asset_type natively) over the legacy DepositEventV2 (synthesized depositCount from
-// sequence_number). Operators can override via --events-url to fall back to DepositEventV2
-// if their chain doesn't have the M3 contract yet.
-if (!eventsUrl) {
-  const accessor = `${normalizedBridge}::eunoma_bridge::DepositConfirmedV2`;
-  // Construct manually because URL doesn't permit colons in pathnames cleanly without encoding.
-  const base = aptosNodeUrl.replace(/\/+$/, "");
-  eventsUrl = `${base}/v1/accounts/${normalizedBridge}/events/${encodeURIComponent(accessor)}`;
-}
-
 // =============================================================================================
-// Poll the fullnode for events. Aptos returns them as an array of
-// { sequence_number, type, data, guid: { creation_number, account_address } }.
+// Events fetch — two modes (2026-05-22 rewrite):
 //
-// We support pagination via `start` (sequence_number) + `limit` query params. The fullnode
-// caps `limit` at 100 by default; we honor that.
+//   PRIMARY (--deposit-tx-hash <hex>): fetch the single tx via REST
+//     GET ${aptosNodeUrl}/v1/transactions/by_hash/<hash>
+//   and extract DepositConfirmedV2 entries from its `events[]`. This is the long-term-stable
+//   Aptos REST API (tx-by-hash is fundamental and not subject to deprecation, unlike the
+//   events-by-struct accessor or the Indexer GraphQL v1 events table — both deprecated as of
+//   2025-09-08 per Aptos's published indexer-feature-updates). Pairs with the frontend's
+//   auto-observe-on-deposit flow which passes the just-confirmed tx hash to the BFF.
+//
+//   LEGACY (--events-url <full url>): if explicitly supplied, use the old events-accessor URL
+//   format as-is (no default-construction — the constructed default is removed). Kept as an
+//   escape hatch for non-standard indexers; do NOT rely on it against current testnet/mainnet
+//   fullnodes that have retired the events-by-struct accessor for module events.
 // =============================================================================================
-const queryParams = new URLSearchParams();
-if (startSequence) queryParams.set("start", startSequence);
-if (limit) queryParams.set("limit", limit);
-const fetchUrl = queryParams.toString() ? `${eventsUrl}?${queryParams}` : eventsUrl;
-
-let eventsRes;
-try {
-  eventsRes = await fetch(fetchUrl);
-} catch (err) {
-  console.error(`fullnode request failed: ${err?.message ?? err}`);
-  process.exit(EXIT_GENERIC_FAILURE);
-}
-if (!eventsRes.ok) {
-  const text = await eventsRes.text();
-  console.error(`fullnode returned ${eventsRes.status}: ${text}`);
-  process.exit(EXIT_GENERIC_FAILURE);
-}
+const eventTypeStr = `${normalizedBridge}::eunoma_bridge::DepositConfirmedV2`;
 let events;
-try {
-  events = await eventsRes.json();
-} catch (err) {
-  console.error(`fullnode returned non-JSON: ${err?.message ?? err}`);
-  process.exit(EXIT_GENERIC_FAILURE);
-}
-if (!Array.isArray(events)) {
-  console.error(`fullnode returned non-array events body: ${JSON.stringify(events)}`);
-  process.exit(EXIT_GENERIC_FAILURE);
+let txVersionFromTx; // populated only in tx-by-hash mode (all events share the same tx version)
+
+if (depositTxHash) {
+  const txUrl = `${aptosNodeUrl.replace(/\/+$/, "")}/v1/transactions/by_hash/${depositTxHash}`;
+  let txRes;
+  try {
+    txRes = await fetch(txUrl);
+  } catch (err) {
+    console.error(`fullnode request (by_hash) failed: ${err?.message ?? err}`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  if (!txRes.ok) {
+    const text = await txRes.text();
+    console.error(`fullnode returned ${txRes.status} for tx ${depositTxHash}: ${text}`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  let txData;
+  try {
+    txData = await txRes.json();
+  } catch (err) {
+    console.error(`fullnode returned non-JSON for tx: ${err?.message ?? err}`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  if (txData?.success === false) {
+    console.error(
+      `tx ${depositTxHash} did NOT succeed on-chain (vm_status=${txData.vm_status}); refusing to observe a failed deposit`,
+    );
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  if (typeof txData?.version === "string") txVersionFromTx = txData.version;
+  const allEvents = Array.isArray(txData?.events) ? txData.events : [];
+  events = allEvents.filter((e) => e?.type === eventTypeStr);
+  if (events.length === 0) {
+    console.error(
+      `tx ${depositTxHash} has no DepositConfirmedV2 event matching ${eventTypeStr}; not a deposit tx for this bridge`,
+    );
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+} else {
+  if (!eventsUrl) {
+    console.error(
+      "either --deposit-tx-hash (RECOMMENDED) or --events-url is required.\n" +
+        "  --deposit-tx-hash <hex>   fetch the single confirmed-deposit tx via REST by_hash (modern, stable)\n" +
+        "  --events-url <full url>   explicit override to a legacy events accessor (NOT recommended;\n" +
+        "                            Aptos's events-by-struct REST + Indexer GraphQL v1 events table are deprecated)",
+    );
+    process.exit(EXIT_USAGE_ERROR);
+  }
+  const queryParams = new URLSearchParams();
+  if (startSequence) queryParams.set("start", startSequence);
+  if (limit) queryParams.set("limit", limit);
+  const fetchUrl = queryParams.toString() ? `${eventsUrl}?${queryParams}` : eventsUrl;
+  let eventsRes;
+  try {
+    eventsRes = await fetch(fetchUrl);
+  } catch (err) {
+    console.error(`fullnode request failed: ${err?.message ?? err}`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  if (!eventsRes.ok) {
+    const text = await eventsRes.text();
+    console.error(`fullnode returned ${eventsRes.status}: ${text}`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  try {
+    events = await eventsRes.json();
+  } catch (err) {
+    console.error(`fullnode returned non-JSON: ${err?.message ?? err}`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  if (!Array.isArray(events)) {
+    console.error(`fullnode returned non-array events body: ${JSON.stringify(events)}`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
 }
 
 if (events.length === 0) {
@@ -284,10 +337,14 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
   // string in the JSON response. Strip the prefix to align with our 32-byte hex format.
   const stripHex = (h) =>
     typeof h === "string" && h.startsWith("0x") ? h.slice(2) : h;
+  // Chain emits short hex (e.g. "0xa" for APT asset_type); coordinator + observed artifacts
+  // use 64-char zero-padded form. Compare and send in padded form to avoid false mismatch.
+  const normalizeHex64 = (h) =>
+    typeof h === "string" ? stripHex(h).toLowerCase().padStart(64, "0") : h;
   // Goal.md M3 defense-in-depth: when reading DepositConfirmedV2 (default), cross-check
   // event.asset_type matches the operator's expected asset_type. Mismatched asset → stale
   // or cross-vault event, fail closed.
-  if (eventAssetType !== undefined && stripHex(eventAssetType).toLowerCase() !== stripHex(assetType).toLowerCase()) {
+  if (eventAssetType !== undefined && normalizeHex64(eventAssetType) !== normalizeHex64(assetType)) {
     console.error(
       `event ${event.sequence_number} asset_type=${eventAssetType} does not match operator expected ${assetType} — stale or cross-vault event, refusing to advance cursor`,
     );
@@ -337,23 +394,23 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
     eventGuid = `module-event:${event.type}:${sequenceNumber}`;
   }
 
-  // We don't have direct access to the transaction version in the events accessor response.
-  // Aptos returns a `version` field on each event in newer fullnode versions; fall back to
-  // sequence_number repurposed if missing (the observer's downstream auditors can cross-check
-  // against the explorer using sequence_number + bridge_address).
+  // In tx-by-hash mode the authoritative tx version comes from the top-level tx response
+  // (all events in a tx share it). In legacy events-url mode, fall back to the per-event
+  // `version`/`transaction_version` fields (older fullnodes) or sequence_number as last resort.
   const txVersion =
-    typeof event.version === "string"
+    txVersionFromTx ??
+    (typeof event.version === "string"
       ? event.version
       : typeof event.transaction_version === "string"
         ? event.transaction_version
-        : sequenceNumber;
+        : sequenceNumber);
 
   const payload = {
     requestId: `vault-state-observe-${dkgEpoch}-${depositCount}-${Date.now()}`,
     dkgEpoch,
     vaultEk,
     senderAddress,
-    assetType,
+    assetType: normalizeHex64(assetType),
     chainId: chainIdNum,
     depositCount: Number(depositCount),
     commitment: stripHex(commitment),

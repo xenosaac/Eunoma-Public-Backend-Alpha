@@ -5029,6 +5029,35 @@ export function buildCoordinatorServer(
           });
         }
 
+        // Compute caPayloadHash here (identical inputs to the M5 frost-attest pass) so the
+        // browser MPCCA withdraw driver can assemble its Groth16 proof — whose ca_payload_hash
+        // public input must byte-match the on-chain WithdrawV2CallArgs — BEFORE calling
+        // frost-attest (which carries that proof in its request body). The frost-attest pass
+        // recomputes the same value from the persisted artifacts; this is idempotent.
+        const finalizeCaPayload = buildCaPayloadFromFinalizeArtifact({
+          recipientAddressHex: parsed.recipient,
+          assetTypeHex: parsed.assetType,
+          statementInputs: {
+            recipientEk: statementInputs.recipientEk,
+            oldBalanceC: statementInputs.oldBalanceC,
+            oldBalanceD: statementInputs.oldBalanceD,
+            newBalanceC: statementInputs.newBalanceC,
+            newBalanceD: statementInputs.newBalanceD,
+            transferAmountC: statementInputs.transferAmountC,
+            transferAmountDSender: statementInputs.transferAmountDSender,
+            transferAmountDRecipient: statementInputs.transferAmountDRecipient,
+          },
+          mpccaArtifact: {
+            aggregatedSigmaCommitmentsHex,
+            sigmaResponseHex,
+            bulletproofZkrpAmountHex: userProof.bulletproofZkrpAmountHex,
+            bulletproofZkrpNewBalanceHex: userProof.bulletproofZkrpNewBalanceHex,
+          },
+          memoHex: "",
+        });
+        const finalizeCaPayloadHashRaw = caPayloadHashRawV2(finalizeCaPayload);
+        const finalizeCaPayloadHashFr = caPayloadHashRawToFrV2(finalizeCaPayloadHashRaw);
+
         // 16. Return 200 with the finalize transcript hash + per-slot contributions.
         return reply.code(200).send({
           accepted: false,
@@ -5047,6 +5076,8 @@ export function buildCoordinatorServer(
             mpccaWithdrawFinalizeAggregatedCommitmentsHash(aggregatedSigmaCommitmentsHex),
           challengeHex,
           sigmaResponseHex,
+          caPayloadHashRaw: finalizeCaPayloadHashRaw,
+          caPayloadHashFr: finalizeCaPayloadHashFr,
           transcriptPath: finalizeTranscriptPath,
           notImplementedPhase: "m4_pending_frost_signature_assembly",
           message:
