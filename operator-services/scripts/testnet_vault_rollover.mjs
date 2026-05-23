@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Operator-driven script that initializes the Eunoma bridge vault on Aptos via
-// `init_vault_with_ca_registration_v2` (Move). Consumes the M1-legacy CA registration
-// v2 transcript + Phase 2 vault_ek, validates them off-chain via the Aptos CA SDK's
-// verifyRegistration, and submits the entry under operator approval.
+// Operator-driven script that rolls the Eunoma bridge singleton to a fresh vault resource
+// account via `rollover_vault_with_ca_registration_v2` (Move). It consumes the V2 CA
+// registration transcript for the *new* vault address, validates it off-chain via the
+// Aptos CA SDK's verifyRegistration, and submits the entry under operator approval.
 //
 // Tested against Aptos CLI 3.5+. Env vars required:
 //   APTOS_NODE_URL          e.g. https://fullnode.testnet.aptoslabs.com/v1
@@ -26,7 +26,7 @@
 //                                       Provides frost_group_pubkey.
 //
 // CLI:
-//   testnet_vault_init.mjs --ca-registration-artifact <p> --snapshot <p> --roster <p> \
+//   testnet_vault_rollover.mjs --ca-registration-artifact <p> --snapshot <p> --roster <p> \
 //     --frost-roster <p> [--submit]
 //
 // Default mode is --simulate. Submission gated by both --submit AND RELAYER_SUBMIT_ENABLED=1.
@@ -42,11 +42,13 @@
 //   11  STALE_ARTIFACT_DKG_EPOCH_MISMATCH
 //   12  STALE_ARTIFACT_ROSTER_HASH_MISMATCH
 //   13  STALE_FROST_ROSTER_DKG_EPOCH_MISMATCH
-//   14  VAULT_ALREADY_INITIALIZED (chain already has BridgeVault)
+//   14  VAULT_NOT_INITIALIZED (chain has no BridgeVault to roll over)
 //   15  REGISTRATION_PROOF_REJECTED (Aptos SDK verifyRegistration returned false)
 //   16  INVALID_FALLBACK_PUBKEYS (count != 7 or not 32-byte hex)
 //   17  AGGREGATE_COMMITMENT_RESPONSE_SHAPE (not 32-byte hex)
-//   18  ASSET_TYPE_MISMATCH (artifact.assetType != snapshot.assetType)
+//   18  VAULT_ADDRESS_MISMATCH (snapshot.vaultSeed does not derive artifact.senderAddress)
+//   19  VAULT_TABLES_ALREADY_INITIALIZED (fresh table resource already exists)
+//   20  ASSET_TYPE_MISMATCH (artifact.assetType != snapshot.assetType)
 
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -56,6 +58,7 @@ import {
   TwistedEd25519PrivateKey,
   verifyRegistration,
 } from "@aptos-labs/confidential-asset";
+import { AccountAddress, createResourceAddress } from "@aptos-labs/ts-sdk";
 import { caDkgV2RosterHash, frostDkgV2RosterHash } from "@eunoma/deop-protocol";
 import { hexArg, hexVectorArg, u64Arg } from "./_lib/format_aptos_args.mjs";
 
@@ -68,11 +71,13 @@ const EXIT_ARTIFACT_VAULT_EK_MISMATCH = 10;
 const EXIT_ARTIFACT_DKG_EPOCH_MISMATCH = 11;
 const EXIT_ARTIFACT_ROSTER_HASH_MISMATCH = 12;
 const EXIT_FROST_DKG_EPOCH_MISMATCH = 13;
-const EXIT_VAULT_ALREADY_INITIALIZED = 14;
+const EXIT_VAULT_NOT_INITIALIZED = 14;
 const EXIT_REGISTRATION_PROOF_REJECTED = 15;
 const EXIT_INVALID_FALLBACK_PUBKEYS = 16;
 const EXIT_AGGREGATE_SHAPE = 17;
-const EXIT_ASSET_TYPE_MISMATCH = 18;
+const EXIT_VAULT_ADDRESS_MISMATCH = 18;
+const EXIT_VAULT_TABLES_ALREADY_INITIALIZED = 19;
+const EXIT_ASSET_TYPE_MISMATCH = 20;
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -110,7 +115,7 @@ for (let i = 0; i < args.length; i += 1) {
 }
 if (!artifactPath || !snapshotPath || !rosterPath || !frostRosterPath) {
   console.error(
-    "usage: testnet_vault_init.mjs --ca-registration-artifact <path> --snapshot <path> --roster <path> --frost-roster <path> [--submit] [--output <path>]",
+    "usage: testnet_vault_rollover.mjs --ca-registration-artifact <path> --snapshot <path> --roster <path> --frost-roster <path> [--submit] [--output <path>]",
   );
   process.exit(EXIT_USAGE);
 }
@@ -145,6 +150,24 @@ const frostRoster = parseJsonFile(frostRosterPath, "frost-roster");
 
 assertSnapshotShape(snapshot);
 assertCaRegistrationArtifactShape(artifact);
+
+const expectedVaultAddress = deriveResourceAddress(bridgePackage, snapshot.vaultSeed);
+if (normalizeHex(artifact.senderAddress) !== normalizeHex(expectedVaultAddress)) {
+  console.error(
+    `VAULT_ADDRESS_MISMATCH: artifact.senderAddress=${artifact.senderAddress} expected=${expectedVaultAddress} from snapshot.vaultSeed`,
+  );
+  process.exit(EXIT_VAULT_ADDRESS_MISMATCH);
+}
+if (
+  snapshot.vaultAddress !== undefined &&
+  normalizeHex(snapshot.vaultAddress) !== normalizeHex(expectedVaultAddress)
+) {
+  console.error(
+    `VAULT_ADDRESS_MISMATCH: snapshot.vaultAddress=${snapshot.vaultAddress} expected=${expectedVaultAddress} from snapshot.vaultSeed`,
+  );
+  process.exit(EXIT_VAULT_ADDRESS_MISMATCH);
+}
+console.log(`pre-flight: vaultSeed derives new vault address ${expectedVaultAddress}`);
 if (normalizeHex(artifact.assetType) !== normalizeHex(snapshot.assetType)) {
   console.error(
     `ASSET_TYPE_MISMATCH: artifact.assetType=${artifact.assetType} snapshot.assetType=${snapshot.assetType}`,
@@ -223,32 +246,36 @@ if (!proofOk) {
 }
 console.log("pre-flight: Aptos SDK verifyRegistration accepted the assembled proof");
 
-// Pre-flight 6: chain state — refuse to re-init an existing vault.
+// Pre-flight 6: chain state — rollover requires an existing BridgeVault singleton.
 const bridgeVaultType = `${bridgePackage}::eunoma_bridge::BridgeVault`;
-const bridgeVaultTablesType = `${bridgePackage}::eunoma_bridge::BridgeVaultTablesV2`;
 const bridgeVaultResource = await getResource(aptosNodeUrl, bridgePackage, bridgeVaultType);
-if (bridgeVaultResource.status === 200) {
-  console.error("VAULT_ALREADY_INITIALIZED: chain BridgeVault already exists. Use rotate, not init.");
-  process.exit(EXIT_VAULT_ALREADY_INITIALIZED);
+if (bridgeVaultResource.status === 404) {
+  console.error("VAULT_NOT_INITIALIZED: chain has no BridgeVault to roll over.");
+  process.exit(EXIT_VAULT_NOT_INITIALIZED);
 }
-if (bridgeVaultResource.status !== 404) {
+if (bridgeVaultResource.status !== 200) {
   console.error(
     `pre-flight BridgeVault resource read failed: status=${bridgeVaultResource.status} body=${JSON.stringify(bridgeVaultResource.body)}`,
   );
   process.exit(EXIT_USAGE);
 }
-console.log("pre-flight: chain confirms no BridgeVault yet");
-const bridgeVaultTablesResource = await getResource(aptosNodeUrl, bridgePackage, bridgeVaultTablesType);
-if (bridgeVaultTablesResource.status === 200) {
-  console.error("VAULT_ALREADY_INITIALIZED: BridgeVaultTablesV2 already exists. Use rotate, not init.");
-  process.exit(EXIT_VAULT_ALREADY_INITIALIZED);
-}
-if (bridgeVaultTablesResource.status !== 404) {
+const previousVaultAddress = bridgeVaultResource.body?.data?.vault_addr;
+console.log(`pre-flight: existing BridgeVault.vault_addr=${stringify(previousVaultAddress)}`);
+const bridgeVaultTablesType = `${bridgePackage}::eunoma_bridge::BridgeVaultTablesV2`;
+const preTablesResource = await getResource(aptosNodeUrl, bridgePackage, bridgeVaultTablesType);
+if (preTablesResource.status === 200) {
   console.error(
-    `pre-flight BridgeVaultTablesV2 resource read failed: status=${bridgeVaultTablesResource.status} body=${JSON.stringify(bridgeVaultTablesResource.body)}`,
+    "VAULT_TABLES_ALREADY_INITIALIZED: BridgeVaultTablesV2 already exists; this one-shot rollover would not create fresh nonce/nullifier/root tables.",
+  );
+  process.exit(EXIT_VAULT_TABLES_ALREADY_INITIALIZED);
+}
+if (preTablesResource.status !== 404) {
+  console.error(
+    `pre-flight BridgeVaultTablesV2 read failed: status=${preTablesResource.status} body=${JSON.stringify(preTablesResource.body)}`,
   );
   process.exit(EXIT_USAGE);
 }
+console.log("pre-flight: no BridgeVaultTablesV2 exists; rollover will create fresh tables");
 
 // Build Move call args.
 const moveArgs = [
@@ -273,7 +300,7 @@ const cliArgs = [
   "move",
   "run",
   "--function-id",
-  `${bridgePackage}::eunoma_bridge::init_vault_with_ca_registration_v2`,
+  `${bridgePackage}::eunoma_bridge::rollover_vault_with_ca_registration_v2`,
 ];
 for (const a of moveArgs) cliArgs.push("--args", a);
 if (adminProfile) {
@@ -306,10 +333,10 @@ if (run.status !== 0) {
 if (!submit) {
   console.log("");
   console.log(
-    "simulate complete. Re-run with --submit AND RELAYER_SUBMIT_ENABLED=1 to actually init the vault on-chain.",
+    "simulate complete. Re-run with --submit AND RELAYER_SUBMIT_ENABLED=1 to actually roll the vault on-chain.",
   );
   console.log(
-    `Expected post-submit: BridgeVault + DeoperatorConfigV2 at @eunoma with dkgEpoch=${snapshot.dkgEpoch} rosterHash=${dkgRosterHashComputed}`,
+    `Expected post-submit: BridgeVault.vault_addr=${expectedVaultAddress} dkgEpoch=${snapshot.dkgEpoch} rosterHash=${dkgRosterHashComputed}`,
   );
   process.exit(0);
 }
@@ -336,7 +363,7 @@ const postVaultResource = await getResource(aptosNodeUrl, bridgePackage, bridgeV
 const postTablesResource = await getResource(aptosNodeUrl, bridgePackage, bridgeVaultTablesType);
 if (postCfgResource.status !== 200 || postVaultResource.status !== 200 || postTablesResource.status !== 200) {
   console.error(
-    `submit: missing post-init resources: config=${postCfgResource.status} vault=${postVaultResource.status} tables=${postTablesResource.status}`,
+    `submit: missing post-rollover resources: config=${postCfgResource.status} vault=${postVaultResource.status} tables=${postTablesResource.status}`,
   );
   process.exit(EXIT_CHAIN_STATE_DIVERGED);
 }
@@ -351,9 +378,9 @@ const postVaultEk = stringify(postCfg.vault_ek);
 const postVaultAddress = stringify(postVault.vault_addr);
 
 const mismatches = [];
-if (normalizeHex(postVaultAddress) !== normalizeHex(artifact.senderAddress)) {
+if (normalizeHex(postVaultAddress) !== normalizeHex(expectedVaultAddress)) {
   mismatches.push(
-    `vaultAddress: chain=${normalizeHex(postVaultAddress)} artifact=${normalizeHex(artifact.senderAddress)}`,
+    `vaultAddress: chain=${normalizeHex(postVaultAddress)} local=${normalizeHex(expectedVaultAddress)}`,
   );
 }
 if (String(postOperatorSetVersion) !== String(snapshot.operatorSetVersion)) {
@@ -390,12 +417,15 @@ if (mismatches.length > 0) {
 console.log("submit: chain state matches local computation");
 
 const artifactOut = {
-  scheme: "testnet_vault_init_v1",
+  scheme: "testnet_vault_rollover_v1",
   txHash,
   dkgEpoch: snapshot.dkgEpoch,
   operatorSetVersion: snapshot.operatorSetVersion,
   rosterHash: dkgRosterHashComputed,
   frostGroupPubkey: frostRoster.frostGroupPubkey,
+  previousVaultAddress,
+  vaultAddress: expectedVaultAddress,
+  freshTablesResource: bridgeVaultTablesType,
   vaultEk: snapshot.vaultEk,
   caRegistrationTranscriptHash: artifact.transcriptHash,
   caRegistrationTranscriptPath: artifactPath,
@@ -408,8 +438,8 @@ const outPathResolved = outputPath
       serviceRoot,
       ".agent-local/eunoma-v2",
       "coordinator",
-      "testnet_vault_init",
-      `${snapshot.dkgEpoch}__init.json`,
+      "testnet_vault_rollover",
+      `${snapshot.dkgEpoch}__rollover.json`,
     );
 mkdirSync(dirname(outPathResolved), { recursive: true, mode: 0o700 });
 atomicWriteJson(outPathResolved, artifactOut);
@@ -529,6 +559,11 @@ function normalizeHex(value) {
 function normalizePrefixed(value) {
   const clean = normalizeHex(value);
   return `0x${clean}`;
+}
+
+function deriveResourceAddress(sourceAddress, seedHex) {
+  const source = AccountAddress.from(normalizePrefixed(sourceAddress));
+  return createResourceAddress(source, hexToBytes(seedHex)).toStringLong();
 }
 
 function hexToBytes(hex) {

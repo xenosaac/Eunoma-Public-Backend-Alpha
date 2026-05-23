@@ -43,6 +43,7 @@
     "mpc:check": "node scripts/mpc_spdz_check.mjs",
     "testnet:smoke": "node scripts/testnet_e2e_fail_closed.mjs",
     "testnet:vault:init": "node scripts/testnet_vault_init.mjs",
+    "testnet:vault:rollover": "node scripts/testnet_vault_rollover.mjs",
     "testnet:provision:m6d": "node scripts/testnet_provision_m6d.mjs",
     "testnet:e2e": "node scripts/testnet_e2e_v2.mjs",
     "testnet:e2e:fail-closed-stub": "node scripts/testnet_e2e_fail_closed.mjs",

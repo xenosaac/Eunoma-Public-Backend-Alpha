@@ -99,6 +99,12 @@ module eunoma::eunoma_bridge {
         known_roots: Table<vector<u8>, bool>,
     }
 
+    struct BridgeVaultTablesV2 has key {
+        used_deposit_nonces: Table<vector<u8>, bool>,
+        used_nullifiers: Table<vector<u8>, bool>,
+        known_roots: Table<vector<u8>, bool>,
+    }
+
     struct DeoperatorConfigV2 has key {
         operator_set_version: u64,
         dkg_epoch: u64,
@@ -318,6 +324,7 @@ module eunoma::eunoma_bridge {
             used_nullifiers: table::new<vector<u8>, bool>(),
             known_roots: table::new<vector<u8>, bool>(),
         });
+        move_to(admin, new_vault_tables_v2());
 
         move_to(admin, DeoperatorConfigV2 {
             operator_set_version,
@@ -331,6 +338,76 @@ module eunoma::eunoma_bridge {
             ca_payload_circuit_version,
             fallback_pubkeys,
         });
+
+        event::emit(VaultInitializedV2 {
+            vault_addr,
+            asset_type: object::object_address(&asset_type),
+            operator_set_version,
+            dkg_epoch,
+            threshold: THRESHOLD_V2,
+            roster_hash,
+        });
+    }
+
+    public entry fun rollover_vault_with_ca_registration_v2(
+        admin: &signer,
+        vault_seed: vector<u8>,
+        asset_type: Object<fungible_asset::Metadata>,
+        operator_set_version: u64,
+        dkg_epoch: u64,
+        roster_hash: vector<u8>,
+        frost_group_pubkey: vector<u8>,
+        vault_ek: vector<u8>,
+        registration_sigma_comm: vector<vector<u8>>,
+        registration_sigma_resp: vector<vector<u8>>,
+        deposit_circuit_version: vector<u8>,
+        withdraw_circuit_version: vector<u8>,
+        ca_payload_circuit_version: vector<u8>,
+        fallback_pubkeys: vector<vector<u8>>,
+    ) acquires BridgeVault, DeoperatorConfigV2, VaultPublicInputsV2, DepositBindingTestOverride {
+        assert_initialized();
+        assert_admin(admin);
+        assert!(!exists<BridgeVaultTablesV2>(@eunoma), E_ALREADY_INITIALIZED);
+        assert_hash(&roster_hash);
+        assert!(vector::length(&frost_group_pubkey) == ED25519_PUBLIC_KEY_BYTES, E_BAD_GROUP_PUBKEY);
+        assert!(vector::length(&vault_ek) == ED25519_PUBLIC_KEY_BYTES, E_BAD_VAULT_EK);
+        assert_valid_fallback_pubkeys(&fallback_pubkeys);
+
+        let (vault_signer, vault_signer_cap) = account::create_resource_account(admin, vault_seed);
+        let vault_addr = signer::address_of(&vault_signer);
+        confidential_asset::register_raw(
+            &vault_signer,
+            *&asset_type,
+            *&vault_ek,
+            registration_sigma_comm,
+            registration_sigma_resp,
+        );
+
+        let asset_id_fr = derive_asset_id(asset_type);
+        let vault_addr_hash_fr = derive_vault_addr_hash(vault_addr);
+        upsert_vault_public_inputs_v2(admin, asset_id_fr, vault_addr_hash_fr);
+        move_to(admin, new_vault_tables_v2());
+
+        let vault = borrow_global_mut<BridgeVault>(@eunoma);
+        vault.admin = signer::address_of(admin);
+        vault.vault_addr = vault_addr;
+        vault.vault_signer_cap = vault_signer_cap;
+        vault.asset_type = asset_type;
+        vault.vault_sequence = 0;
+        vault.deposit_count = 0;
+        vault.paused = false;
+
+        let cfg = borrow_global_mut<DeoperatorConfigV2>(@eunoma);
+        cfg.operator_set_version = operator_set_version;
+        cfg.dkg_epoch = dkg_epoch;
+        cfg.threshold = THRESHOLD_V2;
+        cfg.roster_hash = roster_hash;
+        cfg.frost_group_pubkey = frost_group_pubkey;
+        cfg.vault_ek = vault_ek;
+        cfg.deposit_circuit_version = deposit_circuit_version;
+        cfg.withdraw_circuit_version = withdraw_circuit_version;
+        cfg.ca_payload_circuit_version = ca_payload_circuit_version;
+        cfg.fallback_pubkeys = fallback_pubkeys;
 
         event::emit(VaultInitializedV2 {
             vault_addr,
@@ -387,6 +464,16 @@ module eunoma::eunoma_bridge {
         move_to(admin, VaultPublicInputsV2 { asset_id_fr, vault_addr_hash_fr });
     }
 
+    public entry fun refresh_vault_public_inputs_v2(
+        admin: &signer,
+    ) acquires BridgeVault, VaultPublicInputsV2, DepositBindingTestOverride {
+        assert_admin(admin);
+        let vault = borrow_global<BridgeVault>(@eunoma);
+        let asset_id_fr = derive_asset_id(vault.asset_type);
+        let vault_addr_hash_fr = derive_vault_addr_hash(vault.vault_addr);
+        upsert_vault_public_inputs_v2(admin, asset_id_fr, vault_addr_hash_fr);
+    }
+
     public entry fun pause_v2(admin: &signer) acquires BridgeVault {
         let vault = borrow_global_mut<BridgeVault>(@eunoma);
         assert!(signer::address_of(admin) == vault.admin, E_NOT_ADMIN);
@@ -406,13 +493,10 @@ module eunoma::eunoma_bridge {
     public entry fun record_known_root_v2(
         admin: &signer,
         root: vector<u8>,
-    ) acquires BridgeVault {
+    ) acquires BridgeVault, BridgeVaultTablesV2 {
         assert_admin(admin);
         assert_hash(&root);
-        let vault = borrow_global_mut<BridgeVault>(@eunoma);
-        if (!table::contains(&vault.known_roots, *&root)) {
-            table::add(&mut vault.known_roots, *&root, true);
-        };
+        record_known_root_internal(*&root);
         event::emit(RootRecordedV2 { root });
     }
 
@@ -441,19 +525,16 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK {
+    ) acquires BridgeVault, BridgeVaultTablesV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK {
         assert_initialized();
         assert_not_expired(expiry_secs);
         assert_hash(&commitment);
         assert_hash(&amount_tag);
         assert_hash(&ca_payload_hash);
 
+        assert!(!deposit_nonce_used(&deposit_nonce), E_DEPOSIT_NONCE_REPLAY);
         let vault = borrow_global<BridgeVault>(@eunoma);
         assert!(!vault.paused, E_PAUSED);
-        assert!(
-            !table::contains(&vault.used_deposit_nonces, *&deposit_nonce),
-            E_DEPOSIT_NONCE_REPLAY,
-        );
         let asset_type = vault.asset_type;
         let vault_addr = vault.vault_addr;
 
@@ -517,8 +598,7 @@ module eunoma::eunoma_bridge {
             deposit_binding_proof,
         );
 
-        let vault_mut = borrow_global_mut<BridgeVault>(@eunoma);
-        table::add(&mut vault_mut.used_deposit_nonces, *&deposit_nonce, true);
+        mark_deposit_nonce_used(*&deposit_nonce);
 
         confidential_asset::confidential_transfer_raw(
             sender,
@@ -599,7 +679,7 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK {
+    ) acquires BridgeVault, BridgeVaultTablesV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK {
         assert_initialized();
         assert_not_expired(expiry_secs);
         assert_hash(&root);
@@ -609,14 +689,11 @@ module eunoma::eunoma_bridge {
         assert_hash(&ca_payload_hash);
         assert_hash(&request_hash);
 
+        assert!(known_root_recorded(&root), E_INVALID_ROOT);
+        assert!(!nullifier_used(&nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
         let vault = borrow_global<BridgeVault>(@eunoma);
         assert!(!vault.paused, E_PAUSED);
         assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
-        assert!(table::contains(&vault.known_roots, *&root), E_INVALID_ROOT);
-        assert!(
-            !table::contains(&vault.used_nullifiers, *&nullifier_hash),
-            E_NULLIFIER_ALREADY_SPENT,
-        );
         let asset_type = vault.asset_type;
         let vault_addr = vault.vault_addr;
         let expected_recipient_hash = derive_recipient_hash(recipient);
@@ -695,8 +772,8 @@ module eunoma::eunoma_bridge {
             let vault_for_cap = borrow_global<BridgeVault>(@eunoma);
             account::create_signer_with_capability(&vault_for_cap.vault_signer_cap)
         };
+        mark_nullifier_used(*&nullifier_hash);
         let vault_mut = borrow_global_mut<BridgeVault>(@eunoma);
-        table::add(&mut vault_mut.used_nullifiers, *&nullifier_hash, true);
         vault_mut.vault_sequence = vault_mut.vault_sequence + 1;
 
         confidential_asset::confidential_transfer_raw(
@@ -783,9 +860,8 @@ module eunoma::eunoma_bridge {
         )
     }
 
-    public fun is_nullifier_used_v2(nullifier_hash: vector<u8>): bool acquires BridgeVault {
-        let vault = borrow_global<BridgeVault>(@eunoma);
-        table::contains(&vault.used_nullifiers, nullifier_hash)
+    public fun is_nullifier_used_v2(nullifier_hash: vector<u8>): bool acquires BridgeVault, BridgeVaultTablesV2 {
+        nullifier_used(&nullifier_hash)
     }
 
     public entry fun publish_deposit_binding_vk_v2(
@@ -1287,6 +1363,91 @@ module eunoma::eunoma_bridge {
             i = i + 1;
         };
         assert!(active >= THRESHOLD_V2, E_BAD_FALLBACK_PUBKEYS);
+    }
+
+    fun new_vault_tables_v2(): BridgeVaultTablesV2 {
+        BridgeVaultTablesV2 {
+            used_deposit_nonces: table::new<vector<u8>, bool>(),
+            used_nullifiers: table::new<vector<u8>, bool>(),
+            known_roots: table::new<vector<u8>, bool>(),
+        }
+    }
+
+    fun deposit_nonce_used(deposit_nonce: &vector<u8>): bool acquires BridgeVault, BridgeVaultTablesV2 {
+        if (exists<BridgeVaultTablesV2>(@eunoma)) {
+            return table::contains(
+                &borrow_global<BridgeVaultTablesV2>(@eunoma).used_deposit_nonces,
+                *deposit_nonce,
+            )
+        };
+        table::contains(&borrow_global<BridgeVault>(@eunoma).used_deposit_nonces, *deposit_nonce)
+    }
+
+    fun mark_deposit_nonce_used(deposit_nonce: vector<u8>) acquires BridgeVault, BridgeVaultTablesV2 {
+        if (exists<BridgeVaultTablesV2>(@eunoma)) {
+            table::add(
+                &mut borrow_global_mut<BridgeVaultTablesV2>(@eunoma).used_deposit_nonces,
+                deposit_nonce,
+                true,
+            );
+        } else {
+            table::add(&mut borrow_global_mut<BridgeVault>(@eunoma).used_deposit_nonces, deposit_nonce, true);
+        };
+    }
+
+    fun known_root_recorded(root: &vector<u8>): bool acquires BridgeVault, BridgeVaultTablesV2 {
+        if (exists<BridgeVaultTablesV2>(@eunoma)) {
+            return table::contains(&borrow_global<BridgeVaultTablesV2>(@eunoma).known_roots, *root)
+        };
+        table::contains(&borrow_global<BridgeVault>(@eunoma).known_roots, *root)
+    }
+
+    fun record_known_root_internal(root: vector<u8>) acquires BridgeVault, BridgeVaultTablesV2 {
+        if (exists<BridgeVaultTablesV2>(@eunoma)) {
+            let tables = borrow_global_mut<BridgeVaultTablesV2>(@eunoma);
+            if (!table::contains(&tables.known_roots, *&root)) {
+                table::add(&mut tables.known_roots, root, true);
+            };
+        } else {
+            let vault = borrow_global_mut<BridgeVault>(@eunoma);
+            if (!table::contains(&vault.known_roots, *&root)) {
+                table::add(&mut vault.known_roots, root, true);
+            };
+        };
+    }
+
+    fun nullifier_used(nullifier_hash: &vector<u8>): bool acquires BridgeVault, BridgeVaultTablesV2 {
+        if (exists<BridgeVaultTablesV2>(@eunoma)) {
+            return table::contains(
+                &borrow_global<BridgeVaultTablesV2>(@eunoma).used_nullifiers,
+                *nullifier_hash,
+            )
+        };
+        table::contains(&borrow_global<BridgeVault>(@eunoma).used_nullifiers, *nullifier_hash)
+    }
+
+    fun mark_nullifier_used(nullifier_hash: vector<u8>) acquires BridgeVault, BridgeVaultTablesV2 {
+        if (exists<BridgeVaultTablesV2>(@eunoma)) {
+            table::add(&mut borrow_global_mut<BridgeVaultTablesV2>(@eunoma).used_nullifiers, nullifier_hash, true);
+        } else {
+            table::add(&mut borrow_global_mut<BridgeVault>(@eunoma).used_nullifiers, nullifier_hash, true);
+        };
+    }
+
+    fun upsert_vault_public_inputs_v2(
+        admin: &signer,
+        asset_id_fr: vector<u8>,
+        vault_addr_hash_fr: vector<u8>,
+    ) acquires VaultPublicInputsV2 {
+        assert_hash(&asset_id_fr);
+        assert_hash(&vault_addr_hash_fr);
+        if (exists<VaultPublicInputsV2>(@eunoma)) {
+            let cache = borrow_global_mut<VaultPublicInputsV2>(@eunoma);
+            cache.asset_id_fr = asset_id_fr;
+            cache.vault_addr_hash_fr = vault_addr_hash_fr;
+        } else {
+            move_to(admin, VaultPublicInputsV2 { asset_id_fr, vault_addr_hash_fr });
+        };
     }
 
     fun hash_confidential_transfer_payload_v2(
