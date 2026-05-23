@@ -2416,9 +2416,8 @@ export interface MpccaWithdrawFrostAttestStartRequest extends MpccaWithdrawBaseR
   /** Chain-side attestation context (bridge, vault, operator set, FROST group pubkey). */
   attestationConfig: MpccaWithdrawFrostAttestConfig;
   /**
-   * User-supplied withdraw Groth16 proof bytes. The coordinator does NOT generate this
-   * — the user proves Merkle membership + nullifier binding locally and submits the
-   * proof bytes. Move's `assert_valid_withdraw_proof` verifies the proof on-chain.
+   * User-supplied withdraw Groth16 proof bytes, or "0x" after the user has already
+   * verified and cached the proof with `prepare_withdraw_proof_v2`.
    */
   withdrawProofHex: HexString;
   /** Optional memo bytes bound into the CA payload. Defaults to empty. */
@@ -2444,7 +2443,9 @@ export function parseMpccaWithdrawFinalizeOrchestrateRequest(
  *
  * Validates the base identity envelope + the chain-side attestation config (bridge,
  * vault, operatorSetVersion, frostGroupPubkey, circuitVersionsHash) + the user-supplied
- * withdrawProofHex bytes. Forbidden plaintext fields rejected via parseBaseRequest.
+ * withdrawProofHex bytes. "0x" is allowed only for the Stage 4 A6 prepared-withdraw path:
+ * Move will consume an exact pending proof tuple or abort. Forbidden plaintext fields rejected
+ * via parseBaseRequest.
  */
 export function parseMpccaWithdrawFrostAttestStartRequest(
   body: unknown,
@@ -2481,16 +2482,11 @@ export function parseMpccaWithdrawFrostAttestStartRequest(
   if (typeof withdrawProofHex !== "string" || withdrawProofHex.length === 0) {
     throw new MpccaWithdrawV2Error(
       "INVALID_BULLETPROOF_BYTES",
-      "withdrawProofHex must be a non-empty hex string (the user-supplied withdraw Groth16 proof)",
+      "withdrawProofHex must be a hex string (Groth16 proof bytes, or 0x after prepare_withdraw_proof_v2)",
     );
   }
   const withdrawProofNorm = normalizeHex(withdrawProofHex);
-  if (hexToBytes(withdrawProofNorm).length === 0) {
-    throw new MpccaWithdrawV2Error(
-      "INVALID_BULLETPROOF_BYTES",
-      "withdrawProofHex must decode to at least one byte",
-    );
-  }
+  hexToBytes(withdrawProofNorm);
   let memoHex: HexString | undefined;
   const memoRaw = obj.memoHex;
   if (memoRaw !== undefined && memoRaw !== null) {

@@ -660,7 +660,9 @@ export function assembleWithdrawV2CallArgs(
   hex32("requestHash", fields.requestHash);
   // Codex M5b P3: WITHDRAW_V2_CALL_ARGS_ORDER puts withdrawProof BEFORE expirySecs.
   decimalU64("vaultSequence", fields.vaultSequence);
-  hexNonEmpty("withdrawProof", fields.withdrawProof);
+  // Stage 4 A6 split withdraw: "0x" is valid only after prepare_withdraw_proof_v2
+  // has verified and cached the exact public tuple on-chain; final Move consumes it or aborts.
+  hexAllowZeroBytes("withdrawProof", fields.withdrawProof);
   decimalU64("expirySecs", fields.expirySecs);
   hexNonEmpty("groupSignature", fields.groupSignature);
   u8("fallbackBitmap", fields.fallbackBitmap);
@@ -733,6 +735,13 @@ function hexNonEmpty(name: string, value: unknown): void {
   if (bytes.length === 0) {
     throw new Error(`assembleWithdrawV2CallArgs: ${name} must decode to at least one byte`);
   }
+}
+
+function hexAllowZeroBytes(name: string, value: unknown): void {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`assembleWithdrawV2CallArgs: ${name} must be a hex string`);
+  }
+  hexToBytes(value);
 }
 
 function hexMaybeEmpty(name: string, value: unknown): void {

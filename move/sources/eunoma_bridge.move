@@ -82,6 +82,7 @@ module eunoma::eunoma_bridge {
     /// See compute_amount_p_digest_v2 + circuits/{deposit_binding,withdrawal_proof}.circom Compose8.
     const E_INVALID_AMOUNT_P_SHAPE: u64 = 23;
     const E_PENDING_DEPOSIT_BINDING: u64 = 24;
+    const E_PENDING_WITHDRAW_PROOF: u64 = 25;
 
     struct BridgeVault has key {
         admin: address,
@@ -112,6 +113,21 @@ module eunoma::eunoma_bridge {
 
     struct PendingDepositBindingV2 has store, drop {
         amount_tag: vector<u8>,
+        amount_p_digest: vector<u8>,
+    }
+
+    struct PendingWithdrawProofsV2 has key {
+        by_request_hash: Table<vector<u8>, PendingWithdrawProofV2>,
+    }
+
+    struct PendingWithdrawProofV2 has store, drop {
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        asset_id: vector<u8>,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        vault_sequence: u64,
         amount_p_digest: vector<u8>,
     }
 
@@ -689,7 +705,7 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK {
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV2, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK {
         assert_initialized();
         assert_not_expired(expiry_secs);
         assert_hash(&root);
@@ -765,7 +781,7 @@ module eunoma::eunoma_bridge {
         // amount_p_digest MUST byte-equal this — that's the binding that forces withdraw
         // amount = deposit amount (via Pedersen DL binding on the same blind).
         let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
-        assert_valid_withdraw_proof(
+        consume_or_verify_withdraw_proof(
             *&root,
             *&nullifier_hash,
             cache.asset_id_fr,
@@ -859,6 +875,16 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    public entry fun init_pending_withdraw_proofs_v2(
+        admin: &signer,
+    ) acquires BridgeVault {
+        assert_admin(admin);
+        assert!(!exists<PendingWithdrawProofsV2>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, PendingWithdrawProofsV2 {
+            by_request_hash: table::new<vector<u8>, PendingWithdrawProofV2>(),
+        });
+    }
+
     public entry fun prepare_deposit_binding_v2(
         sender: &signer,
         commitment: vector<u8>,
@@ -882,6 +908,61 @@ module eunoma::eunoma_bridge {
         assert!(!table::contains(&pending.by_commitment, *&commitment), E_PENDING_DEPOSIT_BINDING);
         table::add(&mut pending.by_commitment, commitment, PendingDepositBindingV2 {
             amount_tag,
+            amount_p_digest,
+        });
+    }
+
+    public entry fun prepare_withdraw_proof_v2(
+        sender: &signer,
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        vault_sequence: u64,
+        amount_p: vector<vector<u8>>,
+        withdraw_proof: vector<u8>,
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV2, PreparedWithdrawProofVK, VaultPublicInputsV2 {
+        assert_initialized();
+        let _sender_addr = signer::address_of(sender);
+        assert_hash(&root);
+        assert_hash(&nullifier_hash);
+        assert_hash(&recipient_hash);
+        assert_hash(&amount_tag);
+        assert_hash(&ca_payload_hash);
+        assert_hash(&request_hash);
+        assert!(exists<PendingWithdrawProofsV2>(@eunoma), E_NOT_INITIALIZED);
+        assert!(known_root_recorded(&root), E_INVALID_ROOT);
+        assert!(!nullifier_used(&nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        let vault = borrow_global<BridgeVault>(@eunoma);
+        assert!(!vault.paused, E_PAUSED);
+        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
+        let cache = borrow_global<VaultPublicInputsV2>(@eunoma);
+        let asset_id = cache.asset_id_fr;
+        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
+        assert_valid_withdraw_proof(
+            *&root,
+            *&nullifier_hash,
+            asset_id,
+            *&recipient_hash,
+            *&amount_tag,
+            *&ca_payload_hash,
+            *&request_hash,
+            vault_sequence,
+            *&amount_p_digest,
+            withdraw_proof,
+        );
+        let pending = borrow_global_mut<PendingWithdrawProofsV2>(@eunoma);
+        assert!(!table::contains(&pending.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_PROOF);
+        table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawProofV2 {
+            root,
+            nullifier_hash,
+            asset_id,
+            recipient_hash,
+            amount_tag,
+            ca_payload_hash,
+            vault_sequence,
             amount_p_digest,
         });
     }
@@ -1571,6 +1652,46 @@ module eunoma::eunoma_bridge {
             assert_valid_deposit_binding_proof(
                 commitment,
                 amount_tag,
+                amount_p_digest,
+                proof,
+            );
+        }
+    }
+
+    fun consume_or_verify_withdraw_proof(
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        asset_id: vector<u8>,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        vault_sequence: u64,
+        amount_p_digest: vector<u8>,
+        proof: vector<u8>,
+    ) acquires PendingWithdrawProofsV2, PreparedWithdrawProofVK {
+        if (exists<PendingWithdrawProofsV2>(@eunoma) && vector::length(&proof) == 0) {
+            let pending = borrow_global_mut<PendingWithdrawProofsV2>(@eunoma);
+            assert!(table::contains(&pending.by_request_hash, *&request_hash), E_INVALID_WITHDRAW_PROOF);
+            let cached = table::remove(&mut pending.by_request_hash, *&request_hash);
+            assert!(cached.root == root, E_INVALID_WITHDRAW_PROOF);
+            assert!(cached.nullifier_hash == nullifier_hash, E_INVALID_WITHDRAW_PROOF);
+            assert!(cached.asset_id == asset_id, E_INVALID_WITHDRAW_PROOF);
+            assert!(cached.recipient_hash == recipient_hash, E_INVALID_WITHDRAW_PROOF);
+            assert!(cached.amount_tag == amount_tag, E_INVALID_WITHDRAW_PROOF);
+            assert!(cached.ca_payload_hash == ca_payload_hash, E_INVALID_WITHDRAW_PROOF);
+            assert!(cached.vault_sequence == vault_sequence, E_INVALID_WITHDRAW_PROOF);
+            assert!(cached.amount_p_digest == amount_p_digest, E_INVALID_WITHDRAW_PROOF);
+        } else {
+            assert_valid_withdraw_proof(
+                root,
+                nullifier_hash,
+                asset_id,
+                recipient_hash,
+                amount_tag,
+                ca_payload_hash,
+                request_hash,
+                vault_sequence,
                 amount_p_digest,
                 proof,
             );

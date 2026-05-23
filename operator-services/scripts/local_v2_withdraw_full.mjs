@@ -46,6 +46,13 @@ import {
   sigmaProtocolFiatShamir,
 } from "@aptos-labs/confidential-asset";
 import { batchRangeProof } from "@aptos-labs/confidential-asset-bindings";
+import {
+  Account,
+  Aptos,
+  AptosConfig,
+  Ed25519PrivateKey,
+  Network,
+} from "@aptos-labs/ts-sdk";
 import { ed25519 } from "@noble/curves/ed25519";
 import { numberToBytesLE } from "@noble/curves/abstract/utils";
 
@@ -123,6 +130,10 @@ function randScalar() {
 // ---- args + env ---------------------------------------------------------------------------
 const requestId = flag("--request-id", `m8-real-${Date.now()}`);
 const depositWitnessPath = required(flag("--deposit-witness"), "--deposit-witness");
+const depositorStatePath = flag(
+  "--depositor-state",
+  resolve(serviceRoot, ".agent-local/eunoma-v2/depositor/state.json"),
+);
 const vaultAddress = required(flag("--vault-address"), "--vault-address");
 const vaultEk = required(flag("--vault-ek"), "--vault-ek");
 const rootHex = required(flag("--root"), "--root");
@@ -461,15 +472,14 @@ function encrypt(pk, chunks, rs) {
 const newBalanceCt = encrypt(vaultEkPub, newBalanceChunks, newBalanceRandomness);
 const transferSenderCt = encrypt(vaultEkPub, transferAmountChunks, transferAmountRandomness);
 const transferRecipientCt = encrypt(recipientEk, transferAmountChunks, transferAmountRandomness);
+const amountP = transferSenderCt.map((ct) => ct.C.toRawBytes());
 
 // Stage 4 A6: amount_p[k] = transferSenderCt[k].C (= mG + rH where r = HKDF blind). Concat the
 // 4 × 32B compressed Ristretto points into a 256-hex-char string and assert byte-equality with
 // the deposit-side amountPHex stored in the depositor witness. If they diverge, the Move
 // verifier WILL reject the withdraw — fail loudly here so the failure is obvious and we never
 // burn a coordinator slot / cluster state on a doomed withdraw.
-const withdrawAmountPHexNo0x = transferSenderCt
-  .map((ct) => bytesToHex(ct.C.toRawBytes()))
-  .join("");
+const withdrawAmountPHexNo0x = amountP.map((p) => bytesToHex(p)).join("");
 if (withdrawAmountPHexNo0x.length !== 256) {
   console.error(
     `[a6] withdraw amount_p hex must be 256 chars (4 × 32B), got ${withdrawAmountPHexNo0x.length}`,
@@ -1137,6 +1147,63 @@ const witnessJsonFinal = JSON.parse(readFileSync(witnessOutPath, "utf8"));
 const realRequestHashHex = `0x${bytesToHex(bigToLE32(BigInt(witnessJsonFinal.request_hash)))}`;
 console.error(`[m8-real] real request_hash = ${realRequestHashHex.slice(0, 16)}... (replacing round1 placeholder)`);
 
+function loadDepositorSubmitAccount() {
+  if (!existsSync(depositorStatePath)) {
+    throw new Error(`depositor state not found at ${depositorStatePath}; cannot submit prepare_withdraw_proof_v2`);
+  }
+  const state = JSON.parse(readFileSync(depositorStatePath, "utf8"));
+  if (typeof state.depositorPrivateKeyHex !== "string" || state.depositorPrivateKeyHex.length === 0) {
+    throw new Error(`depositor state at ${depositorStatePath} is missing depositorPrivateKeyHex`);
+  }
+  const account = Account.fromPrivateKey({
+    privateKey: new Ed25519PrivateKey(state.depositorPrivateKeyHex),
+  });
+  const expected = addr32(depositWitness.depositorAddress);
+  const actual = addr32(account.accountAddress.toString());
+  if (expected !== actual) {
+    throw new Error(`depositor state address mismatch: state=${actual} witness=${expected}`);
+  }
+  return account;
+}
+
+async function submitPreparedWithdrawProof() {
+  const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
+  const submitter = loadDepositorSubmitAccount();
+  const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
+  console.error("[a6] building + submitting prepare_withdraw_proof_v2 tx");
+  const prepareTx = await aptos.transaction.build.simple({
+    sender: submitter.accountAddress,
+    data: {
+      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_proof_v2`,
+      functionArguments: [
+        hexToBytes(rootHex),
+        hexToBytes(nullifierHashHex),
+        hexToBytes(recipientHashHex),
+        hexToBytes(amountTagHex),
+        hexToBytes(caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : `0x${caPayloadHashFr}`),
+        hexToBytes(realRequestHashHex),
+        BigInt(vaultSequenceArg),
+        amountP,
+        hexToBytes(proofHex),
+      ],
+    },
+    options: { maxGasAmount: 500_000, gasUnitPrice: 100 },
+  });
+  const auth = aptos.transaction.sign({ signer: submitter, transaction: prepareTx });
+  const pending = await aptos.transaction.submit.simple({
+    transaction: prepareTx,
+    senderAuthenticator: auth,
+  });
+  console.error(`[a6] submitted prepare_withdraw_proof_v2 tx=${pending.hash}; waiting for confirmation...`);
+  const committed = await aptos.waitForTransaction({ transactionHash: pending.hash });
+  if (!committed.success) {
+    throw new Error(`prepare_withdraw_proof_v2 failed: ${committed.vm_status}`);
+  }
+  console.error(`[a6] prepare withdraw SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
+  return committed.hash;
+}
+const prepareWithdrawProofTxHash = await submitPreparedWithdrawProof();
+
 // M8-r: derive circuit_versions_hash from chain DeoperatorConfigV2 (keccak256(BCS(CircuitVersionsForHash{deposit,withdraw,ca_payload}))).
 // Falling back to an env var leaves frost-attest message diverged from chain and triggers E_INVALID_DEOP_SIGNATURE.
 async function fetchCircuitVersionsHash() {
@@ -1173,7 +1240,9 @@ const frostAttestBody = {
     frostGroupPubkey: frostRoster.frostGroupPubkey,
     circuitVersionsHash: process.env.EUNOMA_TESTNET_CIRCUIT_VERSIONS_HASH ?? derivedCircuitVersionsHash,
   },
-  withdrawProofHex: proofHex,
+  // A6 testnet split: Groth16 was verified and cached by prepare_withdraw_proof_v2.
+  // Final withdraw passes an empty proof and Move consumes the exact pending public tuple.
+  withdrawProofHex: "0x",
   memoHex: "",
 };
 console.error(`[m8-real] POST /v2/withdraw/mpcca/frost-attest`);
@@ -1245,6 +1314,7 @@ const submitSummary = {
   recipientAddress,
   caPayloadHashFr,
   proofHex,
+  prepareWithdrawProofTxHash,
   responseBody: r.body,
   resyncAfterWithdraw: resyncAfterSummary,
 };
