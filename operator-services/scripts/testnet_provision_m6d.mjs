@@ -2,50 +2,16 @@
 // =============================================================================================
 // RETIRED for A6. This pre-A6 provisioning runbook used old VK publish paths.
 //
-// One-shot operator runbook that brings a fresh Aptos testnet account from "no eunoma bridge
-// deployed" to "ready for `npm run testnet:e2e`". Composes existing Aptos CLI commands +
-// publishes the bridge package + sets the on-chain VKs.
+// This file is intentionally retained as a fail-closed tombstone so old runbooks/scripts do not
+// accidentally execute the pre-A6 verification-key publication path.
 //
 // Use the A6 runbook instead:
 //   1. aptos move publish --package-dir move --profile <admin> --assume-yes
 //   2. RELAYER_SUBMIT_ENABLED=1 node scripts/testnet_rotate_a6_vks.mjs --submit --profile <admin>
 //
-// CRITICAL: this script invokes admin Aptos CLI calls and SENDS REAL TESTNET TRANSACTIONS.
-// It must be invoked explicitly by an operator with:
-//   - A funded testnet wallet (`aptos` CLI profile, e.g. `testnet-admin`)
-//   - Network access to https://fullnode.testnet.aptoslabs.com (or equivalent)
-//   - The `aptos` CLI binary on PATH (>= 4.0.0 recommended)
-//
-// Steps:
-//   1. Verify `aptos --version` is available + profile is funded.
-//   2. Compile + publish the Move package (`move/sources/eunoma_bridge.move`) under the
-//      admin's address.
-//   3. Convert circuits/generated/withdrawal_proof_vk.json + deposit_binding_vk.json to the
-//      BCS shape Move expects (8 G1 elements × 32 bytes each for IC, etc.) — wraps the
-//      existing circuits/scripts/extract_withdraw_vk.js.
-//   4. Submit `publish_deposit_binding_vk_v2` + `publish_prepared_deposit_binding_vk_v2` +
-//      `publish_withdraw_proof_vk_v2` + `publish_prepared_withdraw_proof_vk_v2` admin entries.
-//   5. Submit `publish_vault_public_inputs_v2` admin entry.
-//   6. Persist the resulting BRIDGE_PACKAGE_ADDRESS + tx hashes to a state file so
-//      `testnet:e2e` can read them.
-//   7. Print the env-var export block operators must source before `npm run testnet:e2e`.
-//
-// Args:
-//   --profile NAME             required — aptos CLI profile name
-//   --node-url URL             optional — defaults to https://fullnode.testnet.aptoslabs.com
-//   --dry-run                  optional — print the commands without executing them
-//   --skip-publish             optional — skip move publish (use already-published address)
-//   --bridge-address HEX       optional with --skip-publish — explicit bridge package addr
-//
 // Exit codes:
-//   0    success — all operations completed, env block printed
-//   1    generic failure
-//   2    usage error
-//  60    aptos CLI not found on PATH
-//  61    profile not configured / not funded (insufficient APT for gas)
-//  62    move publish failed (compilation error or chain rejection)
-//  63    VK conversion failed (circuits not built, or BCS shape mismatch)
-//  64    on-chain VK publish failed (admin entry function rejected)
+//   0    help printed
+//   2    retired script invoked
 // =============================================================================================
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -102,13 +68,12 @@ for (let i = 0; i < args.length; i += 1) {
 
 function printHelp() {
   console.log(
-    "usage: testnet_provision_m6d --profile NAME [--node-url URL] [--dry-run] " +
-      "[--skip-publish [--bridge-address 0xHEX]]\n\n" +
-      "Provisions a fresh Aptos testnet for `npm run testnet:e2e`:\n" +
-      "  1. Compiles + publishes the Eunoma bridge Move package\n" +
-      "  2. Converts + publishes Groth16 verification keys on chain\n" +
-      "  3. Initializes vault public inputs\n" +
-      "  4. Emits the env block to source before testnet:e2e",
+    "testnet_provision_m6d.mjs is retired for A6 and always exits before Aptos actions.\n\n" +
+      "Current A6 admin sequence:\n" +
+      "  1. aptos move publish --package-dir move --profile <admin> --assume-yes\n" +
+      "  2. RELAYER_SUBMIT_ENABLED=1 node scripts/testnet_rotate_a6_vks.mjs --submit --profile <admin>\n" +
+      "  3. Run the fresh v2.1 vault ceremony scripts.\n\n" +
+      "Legacy args are accepted only so stale automation reaches the retired-script guard.",
   );
 }
 
