@@ -61,6 +61,9 @@ import {
 // (sigma-position-17 verifies iff balance == <B, new_a> + <B, v>).
 import { recoverBalanceChunks } from "../../circuits/scripts/recover_balance_chunks.mjs";
 import { chunkSubtract, padToEll } from "./_lib/chunk_arithmetic.mjs";
+// Stage 4 A6: deterministic Ristretto blinds from note secret so withdraw amount_p byte-equals
+// the deposit amount_p (Move bridge amount_p_digest comparison enforces vote conservation).
+import { deriveAmountPBlinds } from "./_lib/amount_p_blinds.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -431,7 +434,26 @@ if (process.argv.includes("--check-balance-only")) {
 }
 
 const newBalanceRandomness = Array.from({ length: ell }, () => randScalar());
-const transferAmountRandomness = Array.from({ length: n }, () => randScalar());
+// Stage 4 A6: transferAmountRandomness MUST be deterministic = HKDF(note.secret) so the resulting
+// amount_p[k] = Pedersen(transferAmountChunks[k], blind[k]) byte-equals the deposit-side amount_p.
+// new_balance randomness stays random (it's bound only by σ-proof balance equation, not by Move).
+if (!depositWitness.secretHex || typeof depositWitness.secretHex !== "string") {
+  console.error("[a6] depositor witness missing secretHex");
+  process.exit(2);
+}
+const depositSecretBytes = hexToBytes(depositWitness.secretHex);
+if (depositSecretBytes.length !== 32) {
+  console.error(
+    `[a6] depositor witness secretHex must be 32 bytes (got ${depositSecretBytes.length})`,
+  );
+  process.exit(2);
+}
+const amountPBlinds = deriveAmountPBlinds(depositSecretBytes);
+if (amountPBlinds.length !== n) {
+  console.error(`[a6] deriveAmountPBlinds returned ${amountPBlinds.length} blinds, expected ${n}`);
+  process.exit(2);
+}
+const transferAmountRandomness = amountPBlinds;
 
 function encrypt(pk, chunks, rs) {
   return chunks.map((c, i) => TwistedElGamal.encryptWithPK(c, pk, rs[i]));
@@ -439,6 +461,39 @@ function encrypt(pk, chunks, rs) {
 const newBalanceCt = encrypt(vaultEkPub, newBalanceChunks, newBalanceRandomness);
 const transferSenderCt = encrypt(vaultEkPub, transferAmountChunks, transferAmountRandomness);
 const transferRecipientCt = encrypt(recipientEk, transferAmountChunks, transferAmountRandomness);
+
+// Stage 4 A6: amount_p[k] = transferSenderCt[k].C (= mG + rH where r = HKDF blind). Concat the
+// 4 × 32B compressed Ristretto points into a 256-hex-char string and assert byte-equality with
+// the deposit-side amountPHex stored in the depositor witness. If they diverge, the Move
+// verifier WILL reject the withdraw — fail loudly here so the failure is obvious and we never
+// burn a coordinator slot / cluster state on a doomed withdraw.
+const withdrawAmountPHexNo0x = transferSenderCt
+  .map((ct) => bytesToHex(ct.C.toRawBytes()))
+  .join("");
+if (withdrawAmountPHexNo0x.length !== 256) {
+  console.error(
+    `[a6] withdraw amount_p hex must be 256 chars (4 × 32B), got ${withdrawAmountPHexNo0x.length}`,
+  );
+  process.exit(2);
+}
+const depositAmountPHexNorm = normalizeHex(depositWitness.amountPHex ?? "");
+if (depositAmountPHexNorm.length !== 256) {
+  console.error(
+    `[a6] depositor witness amountPHex missing or wrong length (got ${depositAmountPHexNorm.length}); ` +
+      "re-run local_v2_deposit_submit.mjs with A6 to regenerate.",
+  );
+  process.exit(2);
+}
+if (depositAmountPHexNorm !== withdrawAmountPHexNo0x) {
+  console.error(
+    `[a6] FATAL amount_p mismatch — deposit=${depositAmountPHexNorm.slice(0, 24)}... ` +
+      `withdraw=${withdrawAmountPHexNo0x.slice(0, 24)}... ` +
+      "(transfer amount or note secret changed between deposit and withdraw; on-chain verify will fail)",
+  );
+  process.exit(2);
+}
+const amountPHex = `0x${withdrawAmountPHexNo0x}`;
+console.error(`[a6] amount_p byte-equality OK: ${withdrawAmountPHexNo0x.slice(0, 24)}...`);
 
 const valBase = RistrettoPoint.BASE.toRawBytes();
 const randBase = H_RISTRETTO.toRawBytes();
@@ -583,6 +638,9 @@ const amountCommitmentPoint = G.multiply(modN(alphaZero)).add(HRist.multiply(mod
 const amountCommitmentHex = bytesToHex(amountCommitmentPoint.toRawBytes());
 
 // ---- Compute nullifier/recipient_hash/amount_tag via the witness builder ------------------
+// Stage 4 A6: explicit --amount-p-hex defense-in-depth (the witness builder also reads
+// witness.amountPHex from the depositor witness JSON, but supplying CLI override forces a
+// cross-check there + makes the dependency explicit at the orchestrator level).
 const witnessOutPath = `/tmp/m8-${requestId}-witness.json`;
 const witnessBuilderArgs = [
   resolve(repoRoot, "circuits/scripts/compute_withdraw_witness.mjs"),
@@ -591,6 +649,7 @@ const witnessBuilderArgs = [
   "--vault-sequence", vaultSequenceArg,
   "--root", rootHex,
   "--ca-payload-hash", `0x${"00".repeat(32)}`, // placeholder for r1
+  "--amount-p-hex", amountPHex,
   "--output", witnessOutPath,
 ];
 if (commitmentTreeExists) {
@@ -956,6 +1015,9 @@ const caPayloadHashFr = caPayloadHashFrV2(caPayload);
 console.error(`[m8-real] caPayloadHashFr = ${caPayloadHashFr.slice(0, 16)}...`);
 
 // Regenerate witness with the REAL ca_payload_hash + withdraw_blind we already chose.
+// Stage 4 A6: thread amount_p_hex through here too — round1's witness used a placeholder
+// ca_payload_hash so this re-run must carry the same amount_p so the Groth16 public input
+// amount_p_digest stays consistent (and matches what Move recomputes from CA args).
 const witnessReArgs = [
   resolve(repoRoot, "circuits/scripts/compute_withdraw_witness.mjs"),
   "--depositor-witness", depositWitnessPath,
@@ -964,6 +1026,7 @@ const witnessReArgs = [
   "--root", rootHex,
   "--ca-payload-hash", caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : "0x" + caPayloadHashFr,
   "--withdraw-blind-hex", withdrawBlindHex,
+  "--amount-p-hex", amountPHex,
   "--output", witnessOutPath,
 ];
 if (commitmentTreeExists) {

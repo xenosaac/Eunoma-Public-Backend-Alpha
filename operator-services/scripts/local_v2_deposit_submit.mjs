@@ -55,6 +55,7 @@ import {
   AccountAddress,
 } from "@aptos-labs/ts-sdk";
 import {
+  AVAILABLE_BALANCE_CHUNK_COUNT,
   ConfidentialAsset,
   ConfidentialTransfer,
   TwistedEd25519PrivateKey,
@@ -68,6 +69,10 @@ import {
   caPayloadHashRawToFrV2,
 } from "@eunoma/deop-protocol";
 import { bytesToHex, hexToBytes, keccak256 } from "@eunoma/shared";
+
+// Stage 4 A6: deterministic Ristretto255 blinds for amount_p Pedersen commitments. Same secret
+// → same amount_p bytes at deposit and withdraw → Move bridge amount_p_digest binding holds.
+import { deriveAmountPBlinds } from "./_lib/amount_p_blinds.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -401,6 +406,26 @@ async function main() {
   const hasEffectiveAuditor = !!assetAuditorEk;
   const auditorKeys = assetAuditorEk ? [assetAuditorEk] : [];
 
+  // Stage 4 A6: pre-allocate nullifier/secret/deposit_blind BEFORE the SDK call so we can
+  // derive the deterministic transferAmountRandomness from `secretFr` and have the SDK use it
+  // as the blinds for amount_p[0..3]. The SDK expects a length-`AVAILABLE_BALANCE_CHUNK_COUNT`
+  // array but slices [0..TRANSFER_AMOUNT_CHUNK_COUNT) for the actual amount_p blinds (see
+  // confidentialTransfer.ts:181,296,307). Pad the remaining slots with the HKDF-derived first
+  // blind repeated — they're never read by the protocol, but a defined value avoids the SDK
+  // ever falling through to `ed25519GenRandom` in some future refactor.
+  const nullifier = fr32FromRandom();
+  const secretFr = fr32FromRandom();
+  const depositBlind = fr32FromRandom();
+  const amountPBlinds = deriveAmountPBlinds(secretFr);
+  if (amountPBlinds.length !== 4) {
+    throw new Error(`deriveAmountPBlinds returned ${amountPBlinds.length} blinds, expected 4`);
+  }
+  const transferAmountRandomness = new Array(AVAILABLE_BALANCE_CHUNK_COUNT).fill(0n);
+  for (let i = 0; i < 4; i += 1) transferAmountRandomness[i] = amountPBlinds[i];
+  for (let i = 4; i < AVAILABLE_BALANCE_CHUNK_COUNT; i += 1) {
+    transferAmountRandomness[i] = amountPBlinds[0];
+  }
+
   const transfer = await ConfidentialTransfer.create({
     senderDecryptionKey: userDk,
     senderAvailableBalanceCipherText: caBalance.available.getCipherText(),
@@ -412,6 +437,7 @@ async function main() {
     recipientAddress: addr32Bytes(vaultAddr),
     tokenAddress: addr32Bytes(ASSET_TYPE_ADDR),
     chainId: 2,
+    transferAmountRandomness,
   });
   const [
     { sigmaProof, rangeProof },
@@ -468,10 +494,18 @@ async function main() {
   const caPayloadHashFr = caPayloadHashFrV2(caPayloadObj);
   logStep(`caPayloadHashFr=0x${caPayloadHashFr}`);
 
-  // 7. Generate deposit-binding witness + proof.
-  const nullifier = fr32FromRandom();
-  const secretFr = fr32FromRandom();
-  const depositBlind = fr32FromRandom();
+  // 7. Generate deposit-binding witness + proof. Stage 4 A6: nullifier/secret/deposit_blind were
+  // pre-allocated above so the SDK call could use the HKDF(secret)-derived amount_p blinds.
+  // amount_p[0..3] = 4 × 32B compressed Ristretto points; concat into 256 hex chars and pass to
+  // the witness builder so the deposit-binding circuit hashes amount_p_digest into commitment +
+  // amount_tag (replacing the plaintext-amount fields from pre-A6).
+  const amountPHex = amountP
+    .map((b) => Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join(""))
+    .join("");
+  if (amountPHex.length !== 256) {
+    throw new Error(`amountPHex must be 256 hex chars (4 × 32B), got ${amountPHex.length}`);
+  }
+  logStep(`amount_p concat hex (public, already in CA payload): ${amountPHex.slice(0, 24)}...`);
 
   const witnessPath = join(depositorStateDir, "witness.json");
   const proofPath = join(depositorStateDir, "proof.json");
@@ -481,7 +515,7 @@ async function main() {
       resolve(repoRoot, "circuits/scripts/compute_deposit_witness.mjs"),
       "--nullifier-hex", `0x${bufToHex(nullifier)}`,
       "--secret-hex", `0x${bufToHex(secretFr)}`,
-      "--amount", DEPOSIT_AMOUNT_OCTAS.toString(),
+      "--amount-p-hex", `0x${amountPHex}`,
       "--deposit-blind-hex", `0x${bufToHex(depositBlind)}`,
       "--asset-id-hex", assetIdHex,
       "--vault-addr-hash-hex", vaultAddrHashHex,
@@ -633,6 +667,10 @@ async function main() {
   logStep(`DepositConfirmedV2: deposit_count=${depositCount}`);
 
   // 11. Persist depositor-only witness for the later MPCCA-withdraw step. NEVER POST this.
+  // Stage 4 A6: amountPHex (4 × 32B Ristretto compressed points concat, 256 hex chars) MUST be
+  // here so compute_withdraw_witness.mjs can recompute amount_p_digest. It is the public
+  // ciphertext-C component already in the on-chain CA payload, so persisting it locally adds no
+  // new privacy surface.
   const witnessForWithdraw = {
     schema: "v2_depositor_witness_v1",
     depositorAddress: depositorAccount.accountAddress.toString(),
@@ -651,6 +689,7 @@ async function main() {
     depositNonceHex: `0x${bufToHex(depositNonce)}`,
     commitmentHex,
     amountTagHex,
+    amountPHex: `0x${amountPHex}`,
     caPayloadHashFr: `0x${caPayloadHashFr}`,
     depositTxHash: committed.hash,
     depositCount,
