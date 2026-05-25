@@ -560,13 +560,14 @@ async function main() {
   logStep(`deposit-binding proof bytes=${proofHex.length / 2}`);
 
   // A6 on Aptos testnet is split into two transactions to stay below the VM execution limit:
-  // this tx verifies the Groth16 binding and caches commitment -> amount_p_digest on-chain;
-  // deposit_with_commitment_v2 later consumes that cache and performs the CA transfer.
-  logStep("building + submitting prepare_deposit_binding_v2 tx");
+  // this tx verifies the Groth16 binding and caches commitment -> {amount_p, amount_p_digest}
+  // in PendingDepositBindingsV3; deposit_with_commitment_v2 cache-hit path then byte-compares
+  // amount_p without recomputing 4 Poseidon (~700 gas saved vs the legacy v2 cache).
+  logStep("building + submitting prepare_deposit_binding_v3 tx");
   const prepareTx = await aptos.transaction.build.simple({
     sender: depositorAccount.accountAddress,
     data: {
-      function: `${bridgeAddr}::eunoma_bridge::prepare_deposit_binding_v2`,
+      function: `${bridgeAddr}::eunoma_bridge::prepare_deposit_binding_v3`,
       functionArguments: [
         hexToBytes(commitmentHex),
         hexToBytes(amountTagHex),
@@ -584,7 +585,7 @@ async function main() {
   logStep(`submitted prepare tx=${preparePending.hash}; waiting for confirmation...`);
   const prepareCommitted = await aptos.waitForTransaction({ transactionHash: preparePending.hash });
   if (!prepareCommitted.success) {
-    throw new Error(`prepare_deposit_binding_v2 failed: ${prepareCommitted.vm_status}`);
+    throw new Error(`prepare_deposit_binding_v3 failed: ${prepareCommitted.vm_status}`);
   }
   logStep(`prepare SUCCESS tx=${prepareCommitted.hash} version=${prepareCommitted.version} gas=${prepareCommitted.gas_used}`);
 
