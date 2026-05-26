@@ -161,11 +161,17 @@ function normalizeAddress(a) {
   return "0x" + hex.padStart(64, "0");
 }
 
+// R7-OPS-1: returns true if event should be included, false if cross-vault skip
+// (warns to stderr). Hard-throws for other malformed shapes. Cross-vault events
+// happen when an old BridgeVault was decommissioned and re-instantiated under
+// the same bridge package — events from the old vault stay in the chain feed
+// but are not part of the current vault's anonymity set.
 function validateEvent({ tx, ev }, expected) {
   const vaultGot = normalizeAddress(ev.data?.vault_addr);
   const vaultWant = normalizeAddress(expected.vaultAddress);
   if (vaultGot !== vaultWant) {
-    throw new Error(`wrong_vault:${tx.hash}:got=${vaultGot}:want=${vaultWant}`);
+    console.error(`[skip] cross-vault event ${tx.hash}: got=${vaultGot} want=${vaultWant}`);
+    return false;
   }
   // Aptos REST returns `asset_type` for an `Object<fungible_asset::Metadata>` as either:
   //   - { inner: "0xa" } — Object struct shape (canonical)
@@ -257,7 +263,13 @@ async function ingest({ argv }) {
       txHash,
       bridgePackageAddress: bridgeNorm,
     });
-    validateEvent({ tx, ev }, { vaultAddress: opts.vaultAddress, assetType: assetNorm });
+    // R7-OPS-1: validateEvent returns false on cross-vault skip (logs to stderr).
+    // Skip those events from the harvested set so old-vault txs don't pollute the
+    // current-vault Merkle tree.
+    const ok = validateEvent({ tx, ev }, { vaultAddress: opts.vaultAddress, assetType: assetNorm });
+    if (ok === false) {
+      continue;
+    }
     const verSeq = `${tx.version}:${ev.sequence_number}`;
     if (existingVerSeq.has(verSeq)) {
       throw new Error(`replay:${txHash}:${verSeq}`);

@@ -20,12 +20,21 @@ ASSET=0xa
 TREE_JSON=operator-services/.agent-local/eunoma-v2/coordinator/commitment_tree_v2.json
 MIN_ANONYMITY_SET=${EUNOMA_MIN_ANONYMITY_SET:-8}
 
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: fetching deposit tx hashes via GraphQL"
+TX_HASHES=$(/bin/bash /opt/eunoma/backend-deoperator-research/ops/scripts/fetch_deposit_tx_hashes.sh)
+if [ -z "$TX_HASHES" ]; then
+  echo "[$(date -u +%FT%TZ)] no deposit txs found yet, exiting clean"
+  exit 0
+fi
+echo "[$(date -u +%FT%TZ)] fetched $(echo "$TX_HASHES" | tr ',' '\n' | wc -l) tx hashes"
+
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: building commitment tree from chain events"
 node operator-services/scripts/local_build_commitment_tree.mjs \
   --bridge-package-address "${BRIDGE}" \
   --vault-address "${VAULT}" \
   --asset-type "${ASSET}" \
-  --refresh-from-event-feed --refresh
+  --tx-hashes "${TX_HASHES}" \
+  --refresh
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: recording known_root via delegate"
 node operator-services/scripts/local_record_known_root_v2.mjs \
