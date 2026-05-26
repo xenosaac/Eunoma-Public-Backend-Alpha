@@ -1,0 +1,15 @@
+[Unit]
+Description=Eunoma known_root recorder periodic timer
+Documentation=https://github.com/xenosaac/Eunoma-Testnet-Backend
+
+[Timer]
+# First run 2 min after boot (let coordinator + workers stabilize).
+OnBootSec=2min
+# Subsequent runs every 5 min (balance: chain freshness vs Aptos public RPC quota).
+OnUnitActiveSec=5min
+Unit=eunoma-record-known-root.service
+# Accuracy: ±30s drift OK (root recording is not real-time critical).
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

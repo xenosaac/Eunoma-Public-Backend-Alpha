@@ -1,0 +1,20 @@
+[Unit]
+Description=Eunoma known_root recorder (oneshot, triggered by .timer)
+Documentation=https://github.com/xenosaac/Eunoma-Testnet-Backend
+After=network-online.target eunoma-v2-alpha.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/eunoma/backend-deoperator-research
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Per memory eunoma-aws-deploy-hardening: env file mode 0600 in /etc/eunoma/
+EnvironmentFile=-/etc/eunoma/eunoma-v2-alpha.env
+ExecStart=/bin/bash /opt/eunoma/backend-deoperator-research/ops/scripts/refresh_known_root_cycle.sh
+# Soft-fail: log errors, don't crash systemd. Timer retries next cycle.
+SuccessExitStatus=0 2 3
+StandardOutput=journal
+StandardError=journal

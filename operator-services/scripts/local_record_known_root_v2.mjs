@@ -77,6 +77,11 @@ let minAnonymitySetStr =
   process.env.EUNOMA_MIN_ANONYMITY_SET ?? "8";
 let allowLocalSmokeAnonymity = false;
 let stateDir = join(serviceRoot, ".agent-local", "eunoma-v2", "coordinator");
+// R7-OPS-1: --via-delegate switches function-id to record_known_root_v2_via_delegate
+// (signed by delegate, not admin). --delegate-profile selects the Aptos CLI profile.
+// Both flags must be present together; otherwise script uses legacy admin path.
+let viaDelegate = false;
+let delegateProfile;
 
 for (let i = 0; i < args.length; ++i) {
   const a = args[i];
@@ -92,6 +97,12 @@ for (let i = 0; i < args.length; ++i) {
       break;
     case "--admin-profile":
       adminProfile = args[++i];
+      break;
+    case "--via-delegate":
+      viaDelegate = true;
+      break;
+    case "--delegate-profile":
+      delegateProfile = args[++i];
       break;
     case "--aptos-node-url":
       aptosNodeUrl = args[++i];
@@ -404,16 +415,32 @@ if (knownRootsHandle) {
   }
 }
 
-// Submit `record_known_root_v2(admin, root)` via aptos CLI.
+// R7-OPS-1: choose function-id + signer profile based on --via-delegate flag.
+// Legacy admin path: record_known_root_v2(admin, root) signed by --admin-profile.
+// Delegate path: record_known_root_v2_via_delegate(delegate, root) signed by
+// --delegate-profile (admin must have previously called admin_set_recorder_delegate).
+let functionId;
+let signerProfile;
+if (viaDelegate) {
+  if (!delegateProfile) {
+    console.error("--via-delegate requires --delegate-profile NAME");
+    process.exit(EXIT_USAGE);
+  }
+  functionId = `${bridgePackageAddress}::eunoma_bridge::record_known_root_v2_via_delegate`;
+  signerProfile = delegateProfile;
+} else {
+  functionId = `${bridgePackageAddress}::eunoma_bridge::record_known_root_v2`;
+  signerProfile = adminProfile;
+}
 const cliArgs = [
   "move",
   "run",
   "--function-id",
-  `${bridgePackageAddress}::eunoma_bridge::record_known_root_v2`,
+  functionId,
   "--args",
   `hex:${rootHex}`,
   "--profile",
-  adminProfile,
+  signerProfile,
   "--assume-yes",
   "--url",
   aptosNodeUrl,
