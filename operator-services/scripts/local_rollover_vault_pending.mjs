@@ -30,6 +30,14 @@
 //   32  fullnode unreachable
 // =============================================================================================
 import { spawnSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+// Mirrors local_record_known_root_v2.mjs: aptos CLI requires .aptos/config.yaml
+// in cwd. operator-services/.aptos/config.yaml holds the testnet-* profiles on
+// alpha box, so spawn the CLI from there regardless of the wrapper's cwd.
+const serviceRoot = resolve(scriptDir, "..");
 
 const EXIT_SUCCESS = 0;
 const EXIT_USAGE = 2;
@@ -136,6 +144,7 @@ const cliArgs = [
 ];
 console.error(`aptos ${cliArgs.join(" ")}`);
 const run = spawnSync("aptos", cliArgs, {
+  cwd: serviceRoot,
   encoding: "utf8",
   maxBuffer: 10 * 1024 * 1024,
   env: process.env,
