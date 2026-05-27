@@ -8,7 +8,8 @@
 //   1. Idempotency gate: 0x1::confidential_asset::is_normalized(vault, asset_type). If true, exit 0.
 //   2. Fetch chain `get_available_balance(vault, asset_type)` → 8 C + 8 D Twisted ElGamal points.
 //   3. POST coordinator /v2/balance/decrypt → quorum slots + Lagrange coeffs.
-//   4. recoverBalanceChunks(chunkBits=16) → 8 × 16-bit plaintext chunks (NO logging of values).
+//   4. recoverBalanceChunks(chunkBits=16), falling back to 32-bit search for
+//      stuck pre-normalize chunks that overflowed the 16-bit bound (NO logging of values).
 //   5. Reconstruct total = Σ chunk_k · 2^(16·k); re-chunk into 4 × 16-bit.
 //   6. Fetch vault ek (chain) + auditor ek (chain, may be absent on testnet APT).
 //   7. buildNormalizeProofBundle(...) → 6 Move args + α[0] + e (local only).
@@ -322,17 +323,35 @@ const lagrangeCoeffs = decryptJson.lagrangeCoeffs.map((h) => bytesToBigLE(hexToB
 console.error(`[normalize] decrypt quorum: slots=${decryptJson.slots.length} lagrangeCount=${lagrangeCoeffs.length}`);
 
 // ---- Step 4: recover plaintext chunks (NO plaintext logged by default) --------------------
-const CHUNK_BITS_OLD = 16; // chain uses 16-bit chunks; @aptos-labs/confidential-asset CHUNK_BITS=16
+const CHUNK_BITS_OLD = 16; // semantic radix; @aptos-labs/confidential-asset CHUNK_BITS=16
+const CHUNK_BITS_OLD_RECOVERY_FALLBACK = 32; // decode bound for already-stuck overflowed chunks
 let balanceChunks;
 try {
-  const recovered = recoverBalanceChunks({
-    oldBalanceC: oldBalanceCt.C,
-    oldBalanceD: oldBalanceCt.D,
-    partialsFromSlots,
-    lagrangeCoeffs,
-    chunkBits: CHUNK_BITS_OLD,
-  });
-  balanceChunks = recovered.chunks;
+  try {
+    const recovered = recoverBalanceChunks({
+      oldBalanceC: oldBalanceCt.C,
+      oldBalanceD: oldBalanceCt.D,
+      partialsFromSlots,
+      lagrangeCoeffs,
+      chunkBits: CHUNK_BITS_OLD,
+    });
+    balanceChunks = recovered.chunks;
+  } catch (err16) {
+    if (!String(err16?.message ?? err16).startsWith("bsgs_decode_failed_at_chunk_")) {
+      throw err16;
+    }
+    console.error(
+      `[normalize] 16-bit chunk recovery hit ${err16.message}; retrying with ${CHUNK_BITS_OLD_RECOVERY_FALLBACK}-bit bound`,
+    );
+    const recovered = recoverBalanceChunks({
+      oldBalanceC: oldBalanceCt.C,
+      oldBalanceD: oldBalanceCt.D,
+      partialsFromSlots,
+      lagrangeCoeffs,
+      chunkBits: CHUNK_BITS_OLD_RECOVERY_FALLBACK,
+    });
+    balanceChunks = recovered.chunks;
+  }
 } catch (err) {
   // err.message may contain "bsgs_decode_failed_at_chunk_K" — no plaintext leak.
   console.error(`[normalize] recoverBalanceChunks failed: ${err?.message ?? err}`);
