@@ -321,6 +321,13 @@ module eunoma::eunoma_bridge {
         deposit_nonce: vector<u8>,
     }
 
+    #[event]
+    struct DepositStep2aRecorded has drop, store {
+        commitment: vector<u8>,
+        sender: address,
+        expiry_secs: u64,
+    }
+
     // Goal.md M3: post-success deposit event keyed by the monotonic deposit_count. The
     // worker-side observer reads this event off the chain ledger and advances its local
     // state-share cursor IFF deposit_count == observer's local_cursor + 1. Replay,
@@ -344,6 +351,15 @@ module eunoma::eunoma_bridge {
         recipient_hash: vector<u8>,
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        vault_sequence: u64,
+    }
+
+    #[event]
+    struct WithdrawEventV3 has drop, store {
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        recipient_hash: vector<u8>,
         request_hash: vector<u8>,
         vault_sequence: u64,
     }
