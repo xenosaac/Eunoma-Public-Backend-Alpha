@@ -71,7 +71,7 @@ import { chunkSubtract, padToEll } from "./_lib/chunk_arithmetic.mjs";
 // Stage 4 A6: deterministic Ristretto blinds from note secret so withdraw amount_p byte-equals
 // the deposit amount_p (Move bridge amount_p_digest comparison enforces vote conservation).
 import { deriveAmountPBlinds } from "./_lib/amount_p_blinds.mjs";
-import { decodeNoteV3, isNoteV3 } from "./_lib/note_v3.mjs";
+import { decodeNoteV2, decodeNoteV3, isNoteV2, isNoteV3 } from "./_lib/note_v3.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
@@ -152,11 +152,6 @@ function normalizeDepositWitness(raw) {
   if (raw?.schema === "v2_depositor_witness_v1") return raw;
   if (raw?.version !== 2) return raw;
 
-  const depositCount =
-    raw.depositCount ??
-    (Number.isSafeInteger(raw.leafIndex) && raw.leafIndex >= 0
-      ? String(raw.leafIndex + 1)
-      : undefined);
   return {
     ...raw,
     schema: "v2_depositor_witness_v1",
@@ -180,7 +175,7 @@ function normalizeDepositWitness(raw) {
     caPayloadHashFr: raw.caPayloadHashFr,
     depositTxHash: raw.depositTxHash ?? raw.depositTx,
     prepareDepositBindingTxHash: raw.prepareDepositBindingTxHash,
-    depositCount,
+    depositCount: raw.depositCount,
     txVersion: raw.txVersion,
     createdAtUnixMs: raw.createdAtUnixMs,
   };
@@ -196,9 +191,17 @@ function loadDepositWitness(path) {
       witness: normalizeDepositWitness(decodeNoteV3(raw, passphrase)),
     };
   }
+  if (isNoteV2(raw)) {
+    return {
+      encrypted: false,
+      deprecatedPlaintextNoteV2: true,
+      witness: normalizeDepositWitness(decodeNoteV2(raw)),
+    };
+  }
+  const parsed = JSON.parse(raw);
   return {
     encrypted: false,
-    witness: JSON.parse(raw),
+    witness: normalizeDepositWitness(parsed),
   };
 }
 
@@ -226,6 +229,7 @@ const COORDINATOR_BEARER_TOKEN = required(
   "env COORDINATOR_BEARER_TOKEN",
 );
 const APTOS_NODE_URL = process.env.APTOS_TESTNET_NODE_URL ?? "https://fullnode.testnet.aptoslabs.com";
+const checkBalanceOnly = process.argv.includes("--check-balance-only");
 // TRANSFER_AMOUNT_OCTAS no longer reads from WITHDRAW_AMOUNT_OCTAS env (P0 Bonus fix
 // 2026-05-23): env-vs-note dual knob was the orchestrator's ready-made vault-drain path
 // because Groth16 amount and σ-proof amount_p had no on-chain binding. See
@@ -244,10 +248,10 @@ const CHAIN_ID = Number(process.env.CHAIN_ID ?? "2");
 // Read depositor witness.
 const loadedDepositWitness = loadDepositWitness(depositWitnessPath);
 const depositWitness = loadedDepositWitness.witness;
-const depositWitnessForBuilderPath = loadedDepositWitness.encrypted
-  ? `/tmp/eunoma-note-v3-${process.pid}-${Date.now()}-witness.json`
+const depositWitnessForBuilderPath = loadedDepositWitness.encrypted || loadedDepositWitness.deprecatedPlaintextNoteV2
+  ? `/tmp/eunoma-note-import-${process.pid}-${Date.now()}-witness.json`
   : depositWitnessPath;
-if (loadedDepositWitness.encrypted) {
+if (loadedDepositWitness.encrypted || loadedDepositWitness.deprecatedPlaintextNoteV2) {
   writeFileSync(depositWitnessForBuilderPath, JSON.stringify(depositWitness, null, 2) + "\n", {
     mode: 0o600,
   });
@@ -291,6 +295,106 @@ const caDkgRoster = JSON.parse(readFileSync(CA_DKG_V2_ROSTER_JSON_PATH, "utf8"))
 const frostRoster = JSON.parse(readFileSync(FROST_DKG_V2_ROSTER_JSON_PATH, "utf8"));
 const rosterHash = caDkgRoster.caDkgV2RosterHash;
 const selectedSlots = [0, 1, 2, 3, 4];
+
+function normalizeAptosAddress(value) {
+  const clean = normalizeHex(String(value ?? ""));
+  if (!/^[0-9a-f]{1,64}$/.test(clean)) {
+    throw new Error(`invalid Aptos address: ${value}`);
+  }
+  return "0x" + clean.padStart(64, "0");
+}
+
+function eventAssetAddress(assetRaw) {
+  if (typeof assetRaw === "string") return normalizeAptosAddress(assetRaw);
+  if (assetRaw && typeof assetRaw.inner === "string") return normalizeAptosAddress(assetRaw.inner);
+  throw new Error("DepositConfirmedV2 asset_type shape is not recognized");
+}
+
+async function fetchDepositConfirmedByTxHash(txHash, bridgePackageAddress) {
+  if (typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    throw new Error("depositor witness missing valid depositTxHash; refusing to infer from leafIndex");
+  }
+  const res = await fetch(`${APTOS_NODE_URL.replace(/\/+$/, "")}/v1/transactions/by_hash/${txHash}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`deposit tx fetch failed: HTTP ${res.status} ${body.slice(0, 160)}`);
+  }
+  const tx = await res.json();
+  if (tx.type !== "user_transaction" || tx.success !== true) {
+    throw new Error(`deposit tx is not a successful user transaction: ${tx.type ?? "unknown"}`);
+  }
+  const eventType = `${normalizeAptosAddress(bridgePackageAddress)}::eunoma_bridge::DepositConfirmedV2`;
+  const ev = tx.events?.find((item) => item.type === eventType);
+  if (!ev) {
+    throw new Error("deposit tx did not emit expected DepositConfirmedV2");
+  }
+  return { tx, ev };
+}
+
+async function resolveAuthoritativeDepositMetadata() {
+  if (loadedDepositWitness.deprecatedPlaintextNoteV2) {
+    console.error("[note-v2] imported deprecated plaintext note-v2; migrate by making a fresh deposit note-v3 after this withdrawal path is validated");
+  }
+  const bridgePackageAddress =
+    process.env.BRIDGE_PACKAGE_ADDRESS ?? depositWitness.bridgePackageAddress ?? depositWitness.bridge;
+  if (!bridgePackageAddress) {
+    throw new Error("BRIDGE_PACKAGE_ADDRESS env or depositor witness bridgePackageAddress is required");
+  }
+  const { ev } = await fetchDepositConfirmedByTxHash(
+    depositWitness.depositTxHash,
+    bridgePackageAddress,
+  );
+  const eventDepositCount = Number(ev.data?.deposit_count);
+  if (!Number.isSafeInteger(eventDepositCount) || eventDepositCount < 1) {
+    throw new Error("DepositConfirmedV2.deposit_count is missing or invalid");
+  }
+  const eventCommitment = normalizeHex(ev.data?.commitment ?? "");
+  const witnessCommitment = normalizeHex(depositWitness.commitmentHex ?? "");
+  if (!/^[0-9a-f]{64}$/.test(eventCommitment) || eventCommitment !== witnessCommitment) {
+    throw new Error("DepositConfirmedV2 commitment does not match depositor witness");
+  }
+  if (normalizeAptosAddress(ev.data?.vault_addr) !== normalizeAptosAddress(vaultAddress)) {
+    throw new Error("DepositConfirmedV2 vault_addr does not match withdraw vault");
+  }
+  if (eventAssetAddress(ev.data?.asset_type) !== normalizeAptosAddress(assetType)) {
+    throw new Error("DepositConfirmedV2 asset_type does not match withdraw asset");
+  }
+  if (
+    depositWitness.depositCount !== undefined &&
+    Number(depositWitness.depositCount) !== eventDepositCount
+  ) {
+    throw new Error("depositor witness depositCount does not match chain DepositConfirmedV2");
+  }
+  if (commitmentTreeExists) {
+    const tree = JSON.parse(readFileSync(commitmentTreePath, "utf8"));
+    const meta = (tree.depositMeta ?? []).find(
+      (item) =>
+        normalizeHex(item.depositTxHash ?? "") === normalizeHex(depositWitness.depositTxHash) &&
+        normalizeHex(item.commitmentHex ?? "") === witnessCommitment,
+    );
+    if (!meta) {
+      throw new Error("commitment_tree_v2 has no leaf matching depositTxHash + commitment");
+    }
+    if (Number(meta.depositCount) !== eventDepositCount) {
+      throw new Error("commitment_tree_v2 depositCount does not match chain DepositConfirmedV2");
+    }
+  }
+  depositWitness.depositCount = String(eventDepositCount);
+  if (loadedDepositWitness.encrypted || loadedDepositWitness.deprecatedPlaintextNoteV2) {
+    writeFileSync(depositWitnessForBuilderPath, JSON.stringify(depositWitness, null, 2) + "\n", {
+      mode: 0o600,
+    });
+  }
+}
+
+if (!checkBalanceOnly) {
+  try {
+    await resolveAuthoritativeDepositMetadata();
+  } catch (err) {
+    console.error(`[f16] authoritative deposit metadata check failed: ${err?.message ?? err}`);
+    process.exit(2);
+  }
+}
 
 // ---- Recipient + transfer amount ----------------------------------------------------------
 // M8-q: recipient_ek MUST be the recipient's chain-registered CA ek. The chain framework reads
@@ -390,7 +494,8 @@ const decryptJson = await decryptResp.json();
 // M10-c outbound forbidden-key guard is server-side; defense in depth here so
 // the orchestrator doesn't silently accept a key the coordinator might emit
 // in a future protocol revision.
-const FORBIDDEN_DECRYPT_RESPONSE = /^(amount|secret|nullifier|.*blind|dk|inverse|commitmentHex|leafIndex|merkle.*|.*Path|sender|amountChunks)$/i;
+const FORBIDDEN_DECRYPT_RESPONSE =
+  /^(amount|.*amount.*chunks.*|secret|.*secret.*|nullifier|plaintext.*|.*plaintext.*|balanceChunks|.*balance.*chunks.*|.*blind.*|dk|.*dkShare.*|decryptionKey|.*decryption.*key.*|inverse|commitmentHex|leafIndex|merkle.*|.*Path|sender)$/i;
 function assertNoForbiddenDecrypt(obj, pathPrefix = "") {
   if (obj === null || typeof obj !== "object") return;
   if (Array.isArray(obj)) {

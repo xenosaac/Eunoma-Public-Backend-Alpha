@@ -3,6 +3,7 @@ import { xchacha20poly1305 } from "@noble/ciphers/chacha";
 import { scrypt } from "@noble/hashes/scrypt";
 
 const NOTE_V3_PREFIX = "eunoma-note-v3.";
+const NOTE_V2_PREFIX = "eunoma-note-v2.";
 const KDF_N = 131072;
 const KDF_R = 8;
 const KDF_P = 1;
@@ -82,6 +83,25 @@ function assertEnvelopeShape(envelope) {
 
 export function isNoteV3(value) {
   return typeof value === "string" && value.trim().startsWith(NOTE_V3_PREFIX);
+}
+
+export function isNoteV2(value) {
+  return typeof value === "string" && value.trim().startsWith(NOTE_V2_PREFIX);
+}
+
+export function decodeNoteV2(value) {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith(NOTE_V2_PREFIX)) {
+    throw new Error("note must start with eunoma-note-v2.");
+  }
+  const plaintext = JSON.parse(decodeBase64Url(trimmed.slice(NOTE_V2_PREFIX.length)));
+  if (plaintext === null || typeof plaintext !== "object" || Array.isArray(plaintext)) {
+    throw new Error("invalid note-v2 payload");
+  }
+  if (plaintext.version !== 2) {
+    throw new Error("unsupported note-v2 version");
+  }
+  return plaintext;
 }
 
 export function encodeNoteV3(plaintext, passphrase) {

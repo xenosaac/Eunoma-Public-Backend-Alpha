@@ -2,17 +2,19 @@
  * M10-c regex-based forbidden-key guard. Complements the deop-protocol
  * `assertNoForbiddenPlaintextFields` (which is an exact normalized-name
  * allowlist) by adding a stricter pattern-based filter for the
- * balance-decryption surface where keys like `merklePath`, `commitmentHex`,
- * `leafIndex`, and `sender` would also leak structural information about
- * a withdraw request even though they're not raw scalars.
+ * balance-decryption / normalize surfaces where keys like `plaintextBalance`,
+ * `balanceChunks`, `dkShare`, `decryptionKey`, `merklePath`, `commitmentHex`,
+ * `leafIndex`, and `sender` would leak witness or structural information even
+ * though not all are raw scalars.
  *
  * The regex MUST stay aligned with the plan's M10-c spec — extending it
  * requires the corresponding test in `coordinator/tests/balance_decrypt_route.test.ts`.
  *
  * Pattern groups (all case-insensitive, full-token):
- *   - `amount`, `secret`, `nullifier`, `sender`     → exact tokens
- *   - `.*blind`, `merkle.*`, `.*Path`               → wildcard prefixes/suffixes
- *   - `dk`, `inverse`, `commitmentHex`, `leafIndex` → exact tokens
+ *   - `amount`, `secret`, `nullifier`, `sender`            → exact tokens
+ *   - `plaintext*`, `*balance*chunks*`, `*blind*`, `*dkShare*`,
+ *     `*decryption*key*`, `merkle.*`, `.*Path`             → wildcard forms
+ *   - `dk`, `inverse`, `commitmentHex`, `leafIndex`        → exact tokens
  *
  * Throws `Error("forbidden_field:<path>")` on the first offending key the
  * recursive visitor encounters. Path uses `$.foo.bar[0].baz` notation so the
@@ -20,7 +22,7 @@
  */
 
 export const FORBIDDEN_KEY_RE =
-  /^(amount|secret|nullifier|.*blind|dk|inverse|commitmentHex|leafIndex|merkle.*|.*Path|sender)$/i;
+  /^(amount|.*amount.*chunks.*|secret|.*secret.*|nullifier|plaintext.*|.*plaintext.*|balanceChunks|.*balance.*chunks.*|.*blind.*|dk|.*dkShare.*|decryptionKey|.*decryption.*key.*|inverse|commitmentHex|leafIndex|merkle.*|.*Path|sender)$/i;
 
 /**
  * Recursively walk `obj` and throw on the first key that matches

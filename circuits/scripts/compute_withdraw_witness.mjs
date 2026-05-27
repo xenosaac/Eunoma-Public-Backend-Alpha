@@ -456,6 +456,33 @@ if (commitmentTreeArg) {
     console.error(`pathForCommitment failed: ${err?.message ?? err}`);
     process.exit(2);
   }
+  if (typeof witness.depositTxHash === "string" && witness.depositTxHash.length > 0) {
+    const witnessTxHash = witness.depositTxHash.toLowerCase();
+    const witnessCommitment = `0x${depositorCommitmentHex}`.toLowerCase();
+    const metaIndex = tree.depositMeta.findIndex(
+      (meta) =>
+        String(meta.depositTxHash ?? "").toLowerCase() === witnessTxHash &&
+        String(meta.commitmentHex ?? "").toLowerCase() === witnessCommitment,
+    );
+    if (metaIndex < 0) {
+      console.error("commitment_tree has no leaf matching depositor witness depositTxHash + commitment");
+      process.exit(2);
+    }
+    if (metaIndex !== pathResult.leafIndex) {
+      console.error(
+        `commitment_tree leaf mismatch: commitment leaf=${pathResult.leafIndex} ` +
+          `depositTxHash+commitment leaf=${metaIndex}`,
+      );
+      process.exit(2);
+    }
+    if (
+      witness.depositCount !== undefined &&
+      Number(witness.depositCount) !== tree.depositMeta[metaIndex].depositCount
+    ) {
+      console.error("depositor witness depositCount does not match commitment_tree depositMeta");
+      process.exit(2);
+    }
+  }
   merklePathBig = pathResult.path;
   merkleIndicesBig = pathResult.indices;
   leafIndexResolved = pathResult.leafIndex;

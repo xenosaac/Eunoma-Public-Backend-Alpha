@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { decodeNoteV3, encodeNoteV3, isNoteV3 } from "../_lib/note_v3.mjs";
+import { decodeNoteV2, decodeNoteV3, encodeNoteV3, isNoteV2, isNoteV3 } from "../_lib/note_v3.mjs";
 
 const serviceRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
@@ -26,6 +26,21 @@ test("note-v3 encrypts and decrypts with the right passphrase", () => {
   assert.equal(encoded.includes("secretHex"), false);
   assert.deepEqual(decodeNoteV3(encoded, "passphrase"), plaintext);
   assert.throws(() => decodeNoteV3(encoded, "wrong"), /decrypt/);
+});
+
+test("note-v2 plaintext import decodes legacy notes without passphrase", () => {
+  const legacy = {
+    version: 2,
+    amountOctas: "123",
+    depositTxHash: `0x${"ab".repeat(32)}`,
+    leafIndex: 1,
+    commitmentHex: `0x${"44".repeat(32)}`,
+  };
+  const encoded = `eunoma-note-v2.${Buffer.from(JSON.stringify(legacy), "utf8").toString("base64url")}`;
+
+  assert.equal(isNoteV2(encoded), true);
+  assert.equal(isNoteV3(encoded), false);
+  assert.deepEqual(decodeNoteV2(encoded), legacy);
 });
 
 test("local_v2_deposit_submit hard-fails before chain work without note passphrase", () => {
