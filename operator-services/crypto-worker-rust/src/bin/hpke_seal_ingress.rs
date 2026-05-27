@@ -17,6 +17,9 @@
 use std::io::Read;
 
 use eunoma_crypto_worker::mpcca_withdraw_v2::seal_ingress_envelope_for_test;
+use eunoma_crypto_worker::normalize_sigma_partial::{
+    seal_normalize_alpha_share_for_test, NORMALIZE_ALPHA_SHARE_INFO,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -25,6 +28,7 @@ struct Request {
     recipient_pub_key_hex: String,
     aad_hex: String,
     plaintext_hex: String,
+    info_string: Option<String>,
 }
 
 fn strip_0x(s: &str) -> &str {
@@ -77,7 +81,21 @@ fn main() {
         }
     };
 
-    match seal_ingress_envelope_for_test(&pub_key_hex, &aad, &plaintext) {
+    let seal_result = match req.info_string.as_deref() {
+        None => seal_ingress_envelope_for_test(&pub_key_hex, &aad, &plaintext),
+        Some("EUNOMA_M1_AMOUNT_INGRESS_V1") => {
+            seal_ingress_envelope_for_test(&pub_key_hex, &aad, &plaintext)
+        }
+        Some(info) if info.as_bytes() == NORMALIZE_ALPHA_SHARE_INFO => {
+            seal_normalize_alpha_share_for_test(&pub_key_hex, &aad, &plaintext)
+        }
+        Some(other) => {
+            eprintln!("{{\"error\":\"unsupported infoString: {other}\"}}");
+            std::process::exit(2);
+        }
+    };
+
+    match seal_result {
         Ok(env) => {
             // env serializes as camelCase via the derive on HpkeEnvelope.
             match serde_json::to_string(&env) {

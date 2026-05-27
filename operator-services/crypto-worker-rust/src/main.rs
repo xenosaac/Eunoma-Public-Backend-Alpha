@@ -108,6 +108,24 @@ impl eunoma_crypto_worker::balance_decrypt::AppStateForBalanceDecrypt for AppSta
     }
 }
 
+// Normalize ceremony — opt AppState in to the normalize_sigma_partial
+// handler's read-only view. No chain re-fetch (no aptos_node_url needed)
+// but the (vault, asset) bridge binding still applies — same M10-l iter-6
+// closure as balance_decrypt.
+impl eunoma_crypto_worker::normalize_sigma_partial::AppStateForNormalizeSigmaPartial
+    for AppState
+{
+    fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+    fn bridge_vault_address(&self) -> &str {
+        &self.bridge_vault_address
+    }
+    fn bridge_asset_type(&self) -> &str {
+        &self.bridge_asset_type
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -299,6 +317,18 @@ async fn main() {
         .route(
             "/v2/balance/decrypt_partial",
             post(eunoma_crypto_worker::balance_decrypt::handle_http::<AppState>),
+        )
+        // Normalize ceremony — worker partial. Computes
+        // `partial_i = alpha_share_i + e · lambda_i · dk_share_i` over the
+        // Ed25519 scalar field for the σ-position-0 threshold response. Dual-registered like
+        // balance/decrypt_partial so the coordinator can target either prefix.
+        .route(
+            "/worker/v2/normalize/sigma/s0_partial",
+            post(eunoma_crypto_worker::normalize_sigma_partial::handle_http::<AppState>),
+        )
+        .route(
+            "/v2/normalize/sigma/s0_partial",
+            post(eunoma_crypto_worker::normalize_sigma_partial::handle_http::<AppState>),
         )
         // M11: post-withdraw vault-state resync. Re-fetches the WithdrawEventV2 by
         // tx hash from the worker's TRUSTED node URL, verifies the full event

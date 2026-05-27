@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CryptoWorker } from "@eunoma/crypto-worker-client";
 import type { CaDkgV2Roster } from "@eunoma/deop-protocol";
+import { caDkgV2RosterHash } from "@eunoma/deop-protocol";
 import { buildDeoperatorNodeServer } from "../src/index.js";
 
 // M10-e-fix tests for the deop-node `/v2/balance/decrypt_partial` passthrough.
@@ -113,6 +114,32 @@ function decryptPartialBody(slot: number, overrides: Record<string, unknown> = {
     oldBalanceDHex: [h32("1"), h32("2"), h32("3"), h32("4")],
     requestId: "m10-e-fix-test",
     slot,
+    ...overrides,
+  };
+}
+
+function normalizePartialBody(
+  slot: number,
+  rosterHash: string,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    dkgEpoch: "1",
+    vaultAddress: "0x".concat(h32("a").slice(0, 64)),
+    assetType: "0x1::aptos_coin::AptosCoin",
+    slot,
+    rosterHash,
+    selectedSlots: [0, 1, 2, 3, 4],
+    fiatShamirChallengeHex: h32("3"),
+    alphaShareHpke: {
+      kem: "DHKEM_X25519_HKDF_SHA256",
+      kdf: "HKDF_SHA256",
+      aead: "AES_256_GCM",
+      enc: h32("4"),
+      ciphertext: "aa",
+      aadHash: h32("5"),
+    },
+    requestId: "normalize-pass-test",
     ...overrides,
   };
 }
@@ -291,6 +318,143 @@ describe("M10-e-fix — deop-node /v2/balance/decrypt_partial passthrough", () =
       });
       expect(res.statusCode).toBe(502);
       expect(res.json().error).toBe("worker_internal");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
+describe("normalize sigma s0 — deop-node passthrough", () => {
+  it("happy: forwards a valid normalize partial request to the local worker", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    const rosterHash = caDkgV2RosterHash(caDkgV2Roster);
+    let forwardedPath: string | undefined;
+    let forwardedBody: Record<string, unknown> | undefined;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      forwardedPath = (url as URL | string).toString();
+      if (init?.body) forwardedBody = JSON.parse(init.body as string);
+      return new Response(
+        JSON.stringify({
+          slot: 0,
+          partialS0Hex: h32("f"),
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+        bearerToken: "secret",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/normalize/sigma/s0_partial",
+        headers: { authorization: "Bearer secret" },
+        payload: normalizePartialBody(0, rosterHash),
+      });
+      expect(res.statusCode).toBe(200);
+      expect(forwardedPath).toContain("/worker/v2/normalize/sigma/s0_partial");
+      expect(forwardedBody?.slot).toBe(0);
+      expect(forwardedBody?.rosterHash).toBe(rosterHash);
+      expect(res.json().partialS0Hex).toBe(h32("f"));
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects forbidden plaintext fields before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    const rosterHash = caDkgV2RosterHash(caDkgV2Roster);
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+        bearerToken: "secret",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/normalize/sigma/s0_partial",
+        headers: { authorization: "Bearer secret" },
+        payload: normalizePartialBody(0, rosterHash, { decryptionKey: h32("9") }),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("forbidden_plaintext_field");
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects wrong rosterHash before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+        bearerToken: "secret",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/normalize/sigma/s0_partial",
+        headers: { authorization: "Bearer secret" },
+        payload: normalizePartialBody(0, h32("0")),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects wrong slot before forwarding", async () => {
+    const caDkgV2Roster = testDkgRoster();
+    const rosterHash = caDkgV2RosterHash(caDkgV2Roster);
+    let workerCalled = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      workerCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { server } = buildDeoperatorNodeServer({
+        slot: 0,
+        nodeId: "node-0",
+        caDkgV2Roster,
+        cryptoWorker: worker(0),
+        cryptoWorkerUrl: "http://localhost:9000",
+        bearerToken: "secret",
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/worker/v2/normalize/sigma/s0_partial",
+        headers: { authorization: "Bearer secret" },
+        payload: normalizePartialBody(4, rosterHash),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(workerCalled).toBe(false);
     } finally {
       globalThis.fetch = oldFetch;
     }

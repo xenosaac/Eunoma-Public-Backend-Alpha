@@ -3124,6 +3124,12 @@ pub mod chain_fetch;
 
 pub mod balance_decrypt;
 
+// Normalize ceremony — worker-side partial computation for the σ-position-0
+// threshold response `s[0]_threshold = α[0] + e · dk_REAL`. Mirrors the
+// balance_decrypt pattern (load dk_share, compute, zeroize) without chain
+// re-fetch.
+pub mod normalize_sigma_partial;
+
 // =================================================================================================
 // Codex M3a P2 #2: atomic write helper applied uniformly across V2 production sites.
 //

@@ -291,6 +291,7 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/frost/sign/nonce-commit"
       | "/worker/v2/frost/sign/partial"
       | "/worker/v2/frost/sign/aggregate"
+      | "/worker/v2/normalize/sigma/s0_partial"
       | "/v2/balance/decrypt_partial"
       | "/v2/vault/resync",
     body: unknown,
@@ -671,6 +672,27 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/v2/balance/decrypt_partial", req.body, reply);
+  });
+
+  // Normalize σ-position-0 passthrough. The coordinator routes by selected slot
+  // and sends only public bindings plus this worker's HPKE-sealed alpha share.
+  // Guard rosterHash + slot at the deop-node boundary before forwarding so a
+  // stale-roster or wrong-slot normalize partial cannot reach the local worker.
+  server.post("/worker/v2/normalize/sigma/s0_partial", async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      assertNoForbiddenPlaintextFields(body);
+      const rosterHashClaim = typeof body.rosterHash === "string" ? body.rosterHash : "";
+      assertRoster(rosterHashClaim, requireHash(expectedCaDkgV2RosterHash));
+      const slot = body.slot;
+      if (typeof slot !== "number" || !Number.isInteger(slot)) {
+        throw new Error("slot must be an integer");
+      }
+      assertSlot(slot, opts.slot);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/worker/v2/normalize/sigma/s0_partial", req.body, reply);
   });
 
   // M11: vault-state resync passthrough. The coordinator fans `/v2/vault/resync` out to each
