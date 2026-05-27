@@ -85,3 +85,13 @@ Dockerfile
 # operational topology, deployment commands, and environment variable names.
 /.agent-local/
 **/.agent-local/
+/.claude/worktrees/
+/.test-petra/
+/DEBUG.md
+
+# Gas measurement artifacts (chain tx hashes + measurement timestamps; written by
+# operator-services/scripts/measure_deposit_gas.mjs and friends). Keep local-only.
+/move/.gas_measurements/
+/move/.gas_final.json
+/operator-services/scripts/measure_deposit_gas.mjs
+/operator-services/scripts/measure_deposit_gas.mjs.bak

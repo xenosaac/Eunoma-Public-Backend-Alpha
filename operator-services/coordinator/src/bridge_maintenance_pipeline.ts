@@ -25,6 +25,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 
 export interface BridgeMaintenanceContext {
@@ -94,22 +96,31 @@ export function __resetPipelineInFlightForTests(): void {
  */
 async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
   const scriptPath = "ops/scripts/refresh_known_root_cycle.sh";
+  const repoRoot = resolveRepoRoot(ctx.repoRoot, scriptPath);
+  const absoluteScriptPath = resolve(repoRoot, scriptPath);
   const logger = ctx.logger;
+  emitJournalLine("bridge maintenance pipeline spawning refresh_known_root_cycle.sh", {
+    scriptPath: absoluteScriptPath,
+    cwd: repoRoot,
+  });
   logger.info(
-    { module: "bridge_maintenance_pipeline", scriptPath, cwd: ctx.repoRoot },
+    { module: "bridge_maintenance_pipeline", scriptPath: absoluteScriptPath, cwd: repoRoot },
     "bridge maintenance pipeline spawning refresh_known_root_cycle.sh",
   );
   return new Promise<void>((resolve) => {
     let child;
     try {
-      child = spawn("bash", [scriptPath], {
-        cwd: ctx.repoRoot,
+      child = spawn("bash", [absoluteScriptPath], {
+        cwd: repoRoot,
         // Forward env so APTOS_NODE_URL / CA_DKG_V2_ROSTER_JSON_PATH / coordinator
         // bearer tokens flow through to the orchestrator scripts.
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (err) {
+      emitJournalLine("failed to spawn refresh_known_root_cycle.sh", {
+        err: serializeError(err),
+      });
       logger.error(
         { module: "bridge_maintenance_pipeline", err: serializeError(err) },
         "failed to spawn refresh_known_root_cycle.sh",
@@ -126,6 +137,7 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
 
     child.stdout?.on("data", (chunk: string) => {
       stdoutBuf = drainLines(stdoutBuf + chunk, (line) => {
+        emitJournalLine(line, { stream: "stdout" });
         logger.info({ module: "bridge_maintenance_pipeline", stream: "stdout" }, line);
       });
     });
@@ -133,11 +145,15 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
       stderrBuf = drainLines(stderrBuf + chunk, (line) => {
         // Treat script stderr as informational, not error — the wrapper deliberately uses
         // stderr for progress messages (echo to >&2 in some sub-steps).
+        emitJournalLine(line, { stream: "stderr" });
         logger.info({ module: "bridge_maintenance_pipeline", stream: "stderr" }, line);
       });
     });
 
     child.on("error", (err) => {
+      emitJournalLine("refresh_known_root_cycle.sh child emitted error event", {
+        err: serializeError(err),
+      });
       logger.error(
         { module: "bridge_maintenance_pipeline", err: serializeError(err) },
         "refresh_known_root_cycle.sh child emitted error event",
@@ -150,19 +166,26 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
     child.on("exit", (code, signal) => {
       // Flush any trailing line fragments without a newline.
       if (stdoutBuf.length > 0) {
+        emitJournalLine(stdoutBuf, { stream: "stdout" });
         logger.info({ module: "bridge_maintenance_pipeline", stream: "stdout" }, stdoutBuf);
         stdoutBuf = "";
       }
       if (stderrBuf.length > 0) {
+        emitJournalLine(stderrBuf, { stream: "stderr" });
         logger.info({ module: "bridge_maintenance_pipeline", stream: "stderr" }, stderrBuf);
         stderrBuf = "";
       }
       if (code === 0) {
+        emitJournalLine("refresh_known_root_cycle.sh completed successfully", { code });
         logger.info(
           { module: "bridge_maintenance_pipeline", code },
           "refresh_known_root_cycle.sh completed successfully",
         );
       } else {
+        emitJournalLine("refresh_known_root_cycle.sh exited non-zero (next deposit or timer will retry)", {
+          code,
+          signal,
+        });
         logger.warn(
           { module: "bridge_maintenance_pipeline", code, signal },
           "refresh_known_root_cycle.sh exited non-zero (next deposit or timer will retry)",
@@ -171,6 +194,21 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
       resolve();
     });
   });
+}
+
+function emitJournalLine(message: string, fields: Record<string, unknown> = {}): void {
+  const suffix = Object.keys(fields).length > 0 ? ` ${JSON.stringify(fields)}` : "";
+  console.log(`[bridge_maintenance_pipeline] ${new Date().toISOString()} ${message}${suffix}`);
+}
+
+function resolveRepoRoot(repoRoot: string, scriptPath: string): string {
+  const normalized = resolve(repoRoot);
+  for (const candidate of [normalized, resolve(normalized, "..")]) {
+    if (existsSync(resolve(candidate, scriptPath))) {
+      return candidate;
+    }
+  }
+  return normalized;
 }
 
 /**

@@ -104,6 +104,8 @@ module eunoma::eunoma_bridge {
     // R7-OPS-1 (recorder-delegate): delegate-based known_root recording without admin key.
     const E_RECORDER_DELEGATE_NOT_INITIALIZED: u64 = 30;
     const E_NOT_RECORDER_DELEGATE: u64 = 31;
+    const E_NOT_WITHDRAW_OWNER: u64 = 32;
+    const E_PENDING_WITHDRAW_FINALIZATION: u64 = 33;
 
     struct BridgeVault has key {
         admin: address,
@@ -332,6 +334,23 @@ module eunoma::eunoma_bridge {
     struct PendingWithdrawPayloadV3 has store, drop {
         msg_hash: vector<u8>,
         amount_p_digest: vector<u8>,
+    }
+
+    struct PendingWithdrawFinalizationsV3 has key {
+        by_request_hash: Table<vector<u8>, PendingWithdrawFinalizationV3>,
+    }
+
+    struct PendingWithdrawFinalizationV3 has store, drop {
+        sender: address,
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        recipient: address,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        vault_sequence: u64,
+        expiry_secs: u64,
     }
 
     struct DeoperatorConfigV2 has key {
@@ -1356,6 +1375,187 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    public entry fun withdraw_step2a_eunoma_verify_v3(
+        relayer: &signer,
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        recipient: address,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        vault_sequence: u64,
+        expiry_secs: u64,
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawFinalizationsV3, PendingWithdrawPayloadsV2, PendingWithdrawPayloadsV3, PendingWithdrawProofsV2, PendingWithdrawProofsV2b, PendingWithdrawProofsV3, PendingWithdrawProofsV3b, PendingWithdrawAttestationsV2, PendingWithdrawAttestationsV2b, PendingWithdrawAttestationsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK, CircuitVersionsHashCacheV2 {
+        assert_initialized();
+        assert!(exists<PendingWithdrawFinalizationsV3>(@eunoma), E_NOT_INITIALIZED);
+        assert_not_expired(expiry_secs);
+        assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
+
+        let tables = borrow_global<BridgeVaultTablesV2>(@eunoma);
+        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+
+        let vault = borrow_global<BridgeVault>(@eunoma);
+        assert!(!vault.paused, E_PAUSED);
+        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
+        let vault_addr = vault.vault_addr;
+        let asset_type = vault.asset_type;
+        let asset_type_addr = object::object_address(&asset_type);
+        let expected_recipient_hash = derive_recipient_hash(recipient);
+        assert!(expected_recipient_hash == recipient_hash, E_RECIPIENT_HASH_MISMATCH);
+
+        let amount_p_digest = consume_prepared_withdraw_payload_digest(&request_hash, &ca_payload_hash);
+        let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
+        let circuit_versions_hash = get_or_compute_circuit_versions_hash(cfg);
+        let empty_signature: vector<u8> = vector[];
+        let empty_fallback_signatures: vector<vector<u8>> = vector[];
+        consume_or_verify_withdraw_attestation(
+            &root,
+            &nullifier_hash,
+            recipient,
+            &recipient_hash,
+            &amount_tag,
+            &ca_payload_hash,
+            &request_hash,
+            vault_sequence,
+            expiry_secs,
+            empty_signature,
+            0,
+            empty_fallback_signatures,
+            cfg,
+            vault_addr,
+            asset_type_addr,
+            &circuit_versions_hash,
+        );
+
+        let asset_id = borrow_global<VaultPublicInputsV2>(@eunoma).asset_id_fr;
+        let empty_proof: vector<u8> = vector[];
+        consume_or_verify_withdraw_proof(
+            &root,
+            &nullifier_hash,
+            &asset_id,
+            &recipient_hash,
+            &amount_tag,
+            &ca_payload_hash,
+            &request_hash,
+            vault_sequence,
+            &amount_p_digest,
+            empty_proof,
+        );
+
+        let sender_addr = signer::address_of(relayer);
+        let key = compose_pending_key(sender_addr, &request_hash);
+        let pending = borrow_global_mut<PendingWithdrawFinalizationsV3>(@eunoma);
+        assert!(
+            !table::contains(&pending.by_request_hash, *&key),
+            E_PENDING_WITHDRAW_FINALIZATION,
+        );
+        table::add(&mut pending.by_request_hash, key, PendingWithdrawFinalizationV3 {
+            sender: sender_addr,
+            root,
+            nullifier_hash,
+            recipient,
+            recipient_hash,
+            amount_tag,
+            ca_payload_hash,
+            request_hash,
+            vault_sequence,
+            expiry_secs,
+        });
+    }
+
+    public entry fun withdraw_step2b_invoke_framework_v3(
+        relayer: &signer,
+        request_hash: vector<u8>,
+        new_balance_p: vector<vector<u8>>,
+        new_balance_r: vector<vector<u8>>,
+        new_balance_r_eff_aud: vector<vector<u8>>,
+        amount_p: vector<vector<u8>>,
+        amount_r_sender: vector<vector<u8>>,
+        amount_r_recip: vector<vector<u8>>,
+        amount_r_eff_aud: vector<vector<u8>>,
+        ek_volun_auds: vector<vector<u8>>,
+        amount_r_volun_auds: vector<vector<vector<u8>>>,
+        zkrp_new_balance: vector<u8>,
+        zkrp_amount: vector<u8>,
+        sigma_proto_comm: vector<vector<u8>>,
+        sigma_proto_resp: vector<vector<u8>>,
+        memo: vector<u8>,
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawFinalizationsV3 {
+        assert_initialized();
+        assert_hash(&request_hash);
+
+        let sender_addr = signer::address_of(relayer);
+        let key = compose_pending_key(sender_addr, &request_hash);
+        let pending = borrow_global_mut<PendingWithdrawFinalizationsV3>(@eunoma);
+        assert!(table::contains(&pending.by_request_hash, *&key), E_NO_PENDING_FINALIZATION);
+        let entry = table::remove(&mut pending.by_request_hash, key);
+        assert!(sender_addr == entry.sender, E_NOT_WITHDRAW_OWNER);
+        assert!(&entry.request_hash == &request_hash, E_NO_PENDING_FINALIZATION);
+        assert_not_expired(entry.expiry_secs);
+
+        let tables = borrow_global_mut<BridgeVaultTablesV2>(@eunoma);
+        assert!(known_root_recorded_with_tables(tables, &entry.root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables(tables, &entry.nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+
+        let vault = borrow_global_mut<BridgeVault>(@eunoma);
+        assert!(!vault.paused, E_PAUSED);
+        assert!(vault.vault_sequence == entry.vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
+        let asset_type = vault.asset_type;
+        let computed_hash = ca_payload_hash_to_fr_safe(hash_confidential_transfer_payload_v2(
+            &asset_type,
+            &entry.recipient,
+            &new_balance_p,
+            &new_balance_r,
+            &new_balance_r_eff_aud,
+            &amount_p,
+            &amount_r_sender,
+            &amount_r_recip,
+            &amount_r_eff_aud,
+            &ek_volun_auds,
+            &amount_r_volun_auds,
+            &zkrp_new_balance,
+            &zkrp_amount,
+            &sigma_proto_comm,
+            &sigma_proto_resp,
+            &memo,
+        ));
+        assert!(&computed_hash == &entry.ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
+
+        let vault_signer = account::create_signer_with_capability(&vault.vault_signer_cap);
+        mark_nullifier_used_with_tables(tables, *&entry.nullifier_hash);
+        vault.vault_sequence = vault.vault_sequence + 1;
+
+        confidential_asset::confidential_transfer_raw(
+            &vault_signer,
+            asset_type,
+            entry.recipient,
+            new_balance_p,
+            new_balance_r,
+            new_balance_r_eff_aud,
+            amount_p,
+            amount_r_sender,
+            amount_r_recip,
+            amount_r_eff_aud,
+            ek_volun_auds,
+            amount_r_volun_auds,
+            zkrp_new_balance,
+            zkrp_amount,
+            sigma_proto_comm,
+            sigma_proto_resp,
+            memo,
+        );
+
+        event::emit(WithdrawEventV3 {
+            root: entry.root,
+            nullifier_hash: entry.nullifier_hash,
+            recipient_hash: entry.recipient_hash,
+            request_hash: entry.request_hash,
+            vault_sequence: entry.vault_sequence,
+        });
+    }
+
     public entry fun operator_rollover_vault_pending_v2(
         operator: &signer,
     ) acquires BridgeVault {
@@ -1609,6 +1809,16 @@ module eunoma::eunoma_bridge {
         assert!(!exists<PendingWithdrawPayloadsV3>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawPayloadsV3 {
             by_request_hash: table::new<vector<u8>, PendingWithdrawPayloadV3>(),
+        });
+    }
+
+    public entry fun init_pending_withdraw_finalizations_v3(
+        admin: &signer,
+    ) acquires BridgeVault {
+        assert_admin(admin);
+        assert!(!exists<PendingWithdrawFinalizationsV3>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, PendingWithdrawFinalizationsV3 {
+            by_request_hash: table::new<vector<u8>, PendingWithdrawFinalizationV3>(),
         });
     }
 
@@ -3308,6 +3518,30 @@ module eunoma::eunoma_bridge {
         ));
         assert!(computed_hash == *ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
         (computed_hash, compute_amount_p_digest_v2(amount_p))
+    }
+
+    fun consume_prepared_withdraw_payload_digest(
+        request_hash: &vector<u8>,
+        ca_payload_hash: &vector<u8>,
+    ): vector<u8> acquires PendingWithdrawPayloadsV2, PendingWithdrawPayloadsV3 {
+        if (exists<PendingWithdrawPayloadsV3>(@eunoma)) {
+            let pending_v3 = borrow_global_mut<PendingWithdrawPayloadsV3>(@eunoma);
+            if (table::contains(&pending_v3.by_request_hash, *request_hash)) {
+                let cached_v3 = table::remove(&mut pending_v3.by_request_hash, *request_hash);
+                assert!(&cached_v3.msg_hash == ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
+                return cached_v3.amount_p_digest
+            };
+        };
+        if (exists<PendingWithdrawPayloadsV2>(@eunoma)) {
+            let pending = borrow_global_mut<PendingWithdrawPayloadsV2>(@eunoma);
+            if (table::contains(&pending.by_request_hash, *request_hash)) {
+                let cached = table::remove(&mut pending.by_request_hash, *request_hash);
+                assert!(&cached.ca_payload_hash == ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
+                return cached.amount_p_digest
+            };
+        };
+        assert!(false, E_INVALID_WITHDRAW_PROOF);
+        vector[]
     }
 
     // Round 4 WB2.E B / FR-1.3 + V3R-2: 6 hash params by-ref (drops 6 `*&` clones at withdraw
