@@ -85,6 +85,7 @@ module eunoma::eunoma_bridge {
     const E_PENDING_WITHDRAW_PROOF: u64 = 25;
     const E_PENDING_WITHDRAW_ATTESTATION: u64 = 26;
     const E_PENDING_WITHDRAW_PAYLOAD: u64 = 27;
+    const E_NOT_RECORDER_DELEGATE: u64 = 28;
 
     struct BridgeVault has key {
         admin: address,
@@ -107,6 +108,10 @@ module eunoma::eunoma_bridge {
         used_deposit_nonces: Table<vector<u8>, bool>,
         used_nullifiers: Table<vector<u8>, bool>,
         known_roots: Table<vector<u8>, bool>,
+    }
+
+    struct RecorderDelegate has key {
+        delegate: address,
     }
 
     struct PendingDepositBindingsV2 has key {
@@ -575,6 +580,29 @@ module eunoma::eunoma_bridge {
         event::emit(RootRecordedV2 { root });
     }
 
+    public entry fun admin_set_recorder_delegate(
+        admin: &signer,
+        delegate: address,
+    ) acquires BridgeVault, RecorderDelegate {
+        assert_admin(admin);
+        if (exists<RecorderDelegate>(@eunoma)) {
+            let cfg = borrow_global_mut<RecorderDelegate>(@eunoma);
+            cfg.delegate = delegate;
+        } else {
+            move_to(admin, RecorderDelegate { delegate });
+        }
+    }
+
+    public entry fun record_known_root_v2_via_delegate(
+        delegate: &signer,
+        root: vector<u8>,
+    ) acquires BridgeVault, BridgeVaultTablesV2, RecorderDelegate {
+        assert_recorder_delegate(delegate);
+        assert_hash(&root);
+        record_known_root_internal(*&root);
+        event::emit(RootRecordedV2 { root });
+    }
+
     public entry fun deposit_with_commitment_v2(
         sender: &signer,
         commitment: vector<u8>,
@@ -875,6 +903,14 @@ module eunoma::eunoma_bridge {
         confidential_asset::rollover_pending_balance(&vault_signer, asset_type);
     }
 
+    public entry fun operator_rollover_vault_pending_via_delegate(
+        delegate: &signer,
+    ) acquires BridgeVault, RecorderDelegate {
+        assert_recorder_delegate(delegate);
+        let (vault_signer, asset_type) = vault_signer_and_asset_type();
+        confidential_asset::rollover_pending_balance(&vault_signer, asset_type);
+    }
+
     public entry fun operator_normalize_vault_balance_v2(
         operator: &signer,
         new_balance_p: vector<vector<u8>>,
@@ -885,6 +921,29 @@ module eunoma::eunoma_bridge {
         sigma_proto_resp: vector<vector<u8>>,
     ) acquires BridgeVault {
         assert_admin(operator);
+        let (vault_signer, asset_type) = vault_signer_and_asset_type();
+        confidential_asset::normalize_raw(
+            &vault_signer,
+            asset_type,
+            new_balance_p,
+            new_balance_r,
+            new_balance_r_aud,
+            zkrp_new_balance,
+            sigma_proto_comm,
+            sigma_proto_resp,
+        );
+    }
+
+    public entry fun operator_normalize_vault_balance_via_delegate(
+        delegate: &signer,
+        new_balance_p: vector<vector<u8>>,
+        new_balance_r: vector<vector<u8>>,
+        new_balance_r_aud: vector<vector<u8>>,
+        zkrp_new_balance: vector<u8>,
+        sigma_proto_comm: vector<vector<u8>>,
+        sigma_proto_resp: vector<vector<u8>>,
+    ) acquires BridgeVault, RecorderDelegate {
+        assert_recorder_delegate(delegate);
         let (vault_signer, asset_type) = vault_signer_and_asset_type();
         confidential_asset::normalize_raw(
             &vault_signer,
@@ -1636,6 +1695,12 @@ module eunoma::eunoma_bridge {
     fun assert_admin(admin: &signer) acquires BridgeVault {
         let vault = borrow_global<BridgeVault>(@eunoma);
         assert!(signer::address_of(admin) == vault.admin, E_NOT_ADMIN);
+    }
+
+    fun assert_recorder_delegate(delegate: &signer) acquires RecorderDelegate {
+        assert!(exists<RecorderDelegate>(@eunoma), E_NOT_INITIALIZED);
+        let cfg = borrow_global<RecorderDelegate>(@eunoma);
+        assert!(signer::address_of(delegate) == cfg.delegate, E_NOT_RECORDER_DELEGATE);
     }
 
     fun vault_signer_and_asset_type(): (signer, Object<fungible_asset::Metadata>) acquires BridgeVault {
