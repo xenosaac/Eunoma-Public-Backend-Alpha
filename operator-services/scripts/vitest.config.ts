@@ -8,10 +8,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 // Vitest's `*.test.mjs` glob would otherwise sweep them and emit "no test suite
 // found" warnings. They run under `npm run test:scripts:node` instead.
 const NODE_TEST_RUNNER_FILES = [
+  "**/_lib/__tests__/**/*.test.mjs",
   "**/local_v2_withdraw_full.test.mjs",
   "**/local_v2_withdraw_full_balance.test.mjs",
   "**/sigma_position_17_parity.test.mjs",
   "**/local_v2_withdraw_resync.test.mjs",
+  "**/note_v3.test.mjs",
 ];
 
 export default defineConfig({
