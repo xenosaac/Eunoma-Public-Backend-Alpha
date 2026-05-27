@@ -9,7 +9,10 @@
 //   - resync request bodies carry public hashes only (no forbidden plaintext keys).
 // =============================================================================================
 
-export const WITHDRAW_EVENT_V2_TYPE_SUFFIX = "eunoma_bridge::WithdrawEventV2";
+export const WITHDRAW_EVENT_TYPE_SUFFIXES = new Set([
+  "eunoma_bridge::WithdrawEventV2",
+  "eunoma_bridge::WithdrawEventV3",
+]);
 
 /** Normalize an Aptos address to 64-hex lowercase (no 0x), left-padded. Returns null if invalid. */
 export function normAddr(addr) {
@@ -25,8 +28,9 @@ export function normHex(h) {
 }
 
 /**
- * Parse the `WithdrawEventV2` module event out of an Aptos tx-by-hash JSON, matching ONLY the
- * trusted bridge package's event type. Returns the binding + tx success flag, or throws.
+ * Parse the withdraw module event out of an Aptos tx-by-hash JSON, matching ONLY the trusted
+ * bridge package's event type. Live packages may emit the privacy-hardened WithdrawEventV3,
+ * while older txs emitted WithdrawEventV2. Returns the binding + tx success flag, or throws.
  * `vault_sequence` (Aptos u64-as-string) is parsed to a Number.
  */
 export function parseWithdrawEventV2FromTx(tx, bridgePackage) {
@@ -40,7 +44,7 @@ export function parseWithdrawEventV2FromTx(tx, bridgePackage) {
     if (firstSep < 0) continue;
     const addrSeg = type.slice(0, firstSep);
     const rest = type.slice(firstSep + 2);
-    if (rest !== WITHDRAW_EVENT_V2_TYPE_SUFFIX) continue;
+    if (!WITHDRAW_EVENT_TYPE_SUFFIXES.has(rest)) continue;
     if (normAddr(addrSeg) !== wantAddr) continue; // event from a non-trusted package — ignore
     const d = ev.data ?? {};
     const seqRaw = d.vault_sequence;
@@ -51,7 +55,7 @@ export function parseWithdrawEventV2FromTx(tx, bridgePackage) {
     }
     for (const k of ["root", "nullifier_hash", "recipient_hash", "request_hash"]) {
       if (typeof d[k] !== "string" || d[k].length === 0) {
-        throw new Error(`WithdrawEventV2.data.${k} missing`);
+        throw new Error(`withdraw event data.${k} missing`);
       }
     }
     return {

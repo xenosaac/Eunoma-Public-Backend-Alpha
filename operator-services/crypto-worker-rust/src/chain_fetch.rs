@@ -204,10 +204,10 @@ fn norm_addr(addr: &str) -> Result<String, String> {
 }
 
 /// Pure parser: given a tx JSON value and the TRUSTED bridge package address,
-/// locate the `<package>::eunoma_bridge::WithdrawEventV2` module event and
+/// locate the `<package>::eunoma_bridge::WithdrawEventV2`/`WithdrawEventV3` module event and
 /// extract its binding fields + the tx success flag / vm_status. Decoupled from
 /// HTTP so tests inject canned JSON. The event type's address segment is matched
-/// against the trusted package only — a tx whose WithdrawEventV2 was emitted by a
+/// against the trusted package only — a tx whose withdraw event was emitted by a
 /// different package address is treated as "not found".
 pub fn parse_tx_withdraw_event_v2(
     value: &Value,
@@ -230,11 +230,12 @@ pub fn parse_tx_withdraw_event_v2(
 
     for ev in events {
         let ty = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        // Aptos module-event type: "0x<addr>::eunoma_bridge::WithdrawEventV2".
+        // Aptos module-event type: "0x<addr>::eunoma_bridge::WithdrawEventV2"
+        // or the privacy-hardened "WithdrawEventV3" shape.
         let mut segs = ty.splitn(2, "::");
         let addr_seg = segs.next().unwrap_or("");
         let rest = segs.next().unwrap_or("");
-        if rest != "eunoma_bridge::WithdrawEventV2" {
+        if rest != "eunoma_bridge::WithdrawEventV2" && rest != "eunoma_bridge::WithdrawEventV3" {
             continue;
         }
         let addr_norm = match norm_addr(addr_seg) {
@@ -242,22 +243,22 @@ pub fn parse_tx_withdraw_event_v2(
             Err(_) => continue,
         };
         if addr_norm != want_addr {
-            // WithdrawEventV2 emitted by a non-trusted package — ignore.
+            // Withdraw event emitted by a non-trusted package — ignore.
             continue;
         }
         let data = ev
             .get("data")
-            .ok_or_else(|| "WithdrawEventV2 missing data".to_string())?;
+            .ok_or_else(|| "withdraw event missing data".to_string())?;
         let get_hex = |k: &str| -> Result<String, String> {
             data.get(k)
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .ok_or_else(|| format!("WithdrawEventV2.data.{k} missing or not a string"))
+                .ok_or_else(|| format!("withdraw event data.{k} missing or not a string"))
         };
         let vault_sequence = {
             let v = data
                 .get("vault_sequence")
-                .ok_or_else(|| "WithdrawEventV2.data.vault_sequence missing".to_string())?;
+                .ok_or_else(|| "withdraw event data.vault_sequence missing".to_string())?;
             if let Some(s) = v.as_str() {
                 s.parse::<u64>()
                     .map_err(|e| format!("vault_sequence parse: {e}"))?
@@ -277,7 +278,7 @@ pub fn parse_tx_withdraw_event_v2(
             vault_sequence,
         });
     }
-    Err("WithdrawEventV2 not found for trusted package".to_string())
+    Err("withdraw event not found for trusted package".to_string())
 }
 
 /// Production helper: GET `<aptos_node_url>/v1/transactions/by_hash/<tx_hash>`
@@ -442,14 +443,14 @@ mod tests {
 
     const PKG: &str = "0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1";
 
-    fn withdraw_tx(pkg: &str, seq: serde_json::Value, success: bool) -> Value {
+    fn withdraw_tx_with_event(pkg: &str, seq: serde_json::Value, success: bool, event_name: &str) -> Value {
         json!({
             "success": success,
             "vm_status": if success { "Executed successfully" } else { "ABORTED" },
             "events": [
                 { "type": "0x1::coin::WithdrawEvent", "data": { "amount": "5" } },
                 {
-                    "type": format!("{pkg}::eunoma_bridge::WithdrawEventV2"),
+                    "type": format!("{pkg}::eunoma_bridge::{event_name}"),
                     "data": {
                         "root": "0xaa",
                         "nullifier_hash": "0xbb",
@@ -463,6 +464,10 @@ mod tests {
                 }
             ]
         })
+    }
+
+    fn withdraw_tx(pkg: &str, seq: serde_json::Value, success: bool) -> Value {
+        withdraw_tx_with_event(pkg, seq, success, "WithdrawEventV2")
     }
 
     #[test]
@@ -482,6 +487,13 @@ mod tests {
         let tx = withdraw_tx(PKG, json!(2u64), true);
         let ev = parse_tx_withdraw_event_v2(&tx, PKG).expect("parse");
         assert_eq!(ev.vault_sequence, 2);
+    }
+
+    #[test]
+    fn parse_tx_withdraw_event_v2_accepts_event_v3() {
+        let tx = withdraw_tx_with_event(PKG, json!("3"), true, "WithdrawEventV3");
+        let ev = parse_tx_withdraw_event_v2(&tx, PKG).expect("parse");
+        assert_eq!(ev.vault_sequence, 3);
     }
 
     #[test]
