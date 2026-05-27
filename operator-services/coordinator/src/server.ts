@@ -125,6 +125,8 @@ import { randomBytes } from "node:crypto";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
 import { registerBalanceDecryptRoute } from "./routes/balance_decrypt.js";
 import { registerVaultResyncRoute } from "./routes/vault_resync.js";
+import { registerNormalizeSigmaS0Route } from "./routes/normalize_sigma_s0.js";
+import { triggerBridgeMaintenance } from "./bridge_maintenance_pipeline.js";
 
 /**
  * Codex M2a P2 #3: safe-id sanitiser for caller-supplied identifiers that the coordinator
@@ -2946,6 +2948,17 @@ export function buildCoordinatorServer(
           });
         }
         await store.markComplete(requestId);
+
+        // NORMALIZE plan (2026-05-27) — event-driven pipeline fan-out. Run the
+        // refresh_known_root_cycle.sh wrapper after the HTTP response has flushed, so
+        // the observe-deposit caller is not delayed by rollover/normalize/root work.
+        // Coalesce-on-contention is handled inside the trigger.
+        reply.raw.once("finish", () => {
+          triggerBridgeMaintenance({
+            repoRoot: process.env.EUNOMA_REPO_ROOT || process.cwd(),
+            logger: req.log,
+          });
+        });
 
         return reply.code(200).send({
           accepted: true,
@@ -7031,6 +7044,16 @@ export function buildCoordinatorServer(
   // env (BRIDGE_VAULT_ADDRESS / BRIDGE_ASSET_TYPE) via CoordinatorConfig; the
   // route rejects any request whose vaultAddress/assetType don't match.
   registerBalanceDecryptRoute(server, {
+    getDefaultRoster: () => opts.caDkgV2Roster,
+    getBridgeVaultAddress: () => opts.bridgeVaultAddress,
+    getBridgeAssetType: () => opts.bridgeAssetType,
+    forwarder: singleNodeForwarder,
+  });
+
+  // NORMALIZE plan (2026-05-27) — POST /v2/normalize/sigma/s0. Reuses the same
+  // bridge-config getters, default-roster source, and per-slot forwarder as the
+  // balance-decrypt route so the M10-l chosen-vault gate applies identically.
+  registerNormalizeSigmaS0Route(server, {
     getDefaultRoster: () => opts.caDkgV2Roster,
     getBridgeVaultAddress: () => opts.bridgeVaultAddress,
     getBridgeAssetType: () => opts.bridgeAssetType,

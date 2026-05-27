@@ -170,8 +170,11 @@ function validateEvent({ tx, ev }, expected) {
   const vaultGot = normalizeAddress(ev.data?.vault_addr);
   const vaultWant = normalizeAddress(expected.vaultAddress);
   if (vaultGot !== vaultWant) {
-    console.error(`[skip] cross-vault event ${tx.hash}: got=${vaultGot} want=${vaultWant}`);
-    return false;
+    if (expected.allowCrossVaultSkip === true) {
+      console.error(`[skip] cross-vault event ${tx.hash}: got=${vaultGot} want=${vaultWant}`);
+      return false;
+    }
+    throw new Error(`wrong_vault:${tx.hash}:got=${vaultGot}:want=${vaultWant}`);
   }
   // Aptos REST returns `asset_type` for an `Object<fungible_asset::Metadata>` as either:
   //   - { inner: "0xa" } — Object struct shape (canonical)
@@ -266,7 +269,14 @@ async function ingest({ argv }) {
     // R7-OPS-1: validateEvent returns false on cross-vault skip (logs to stderr).
     // Skip those events from the harvested set so old-vault txs don't pollute the
     // current-vault Merkle tree.
-    const ok = validateEvent({ tx, ev }, { vaultAddress: opts.vaultAddress, assetType: assetNorm });
+    const ok = validateEvent(
+      { tx, ev },
+      {
+        vaultAddress: opts.vaultAddress,
+        assetType: assetNorm,
+        allowCrossVaultSkip: opts.refresh,
+      },
+    );
     if (ok === false) {
       continue;
     }

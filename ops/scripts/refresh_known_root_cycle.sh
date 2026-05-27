@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# R7-OPS-1+OPS-2 wrapper: rollover vault pending → available (OPS-2), then refresh
+# R7-OPS-1+OPS-2 wrapper: normalize if needed, rollover vault pending → available
+# (OPS-2), normalize again if needed, then refresh
 # on-disk commitment tree from chain DepositConfirmedV2 events, then submit a new
 # known_root_v2 via the recorder-delegate path (OPS-1). Both delegate paths sign
 # with testnet-relayer; admin previously delegated via admin_set_recorder_delegate.
@@ -17,6 +18,13 @@
 # Exits non-zero on hard failure (timer will retry next cycle).
 set -euo pipefail
 
+LOCK_FILE=${EUNOMA_REFRESH_KNOWN_ROOT_LOCK:-/tmp/eunoma-refresh-known-root-cycle.lock}
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: another cycle is already running; exiting clean"
+  exit 0
+fi
+
 cd /opt/eunoma/backend-deoperator-research
 
 BRIDGE=0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1
@@ -25,17 +33,31 @@ ASSET=0xa
 TREE_JSON=operator-services/.agent-local/eunoma-v2/coordinator/commitment_tree_v2.json
 MIN_ANONYMITY_SET=${EUNOMA_MIN_ANONYMITY_SET:-8}
 
-echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: rolling over vault pending → available (OPS-2)"
-# OPS-2: rollover does NOT block the cycle on transient failure — if CA framework
-# rejects (e.g., pending already empty in some edge case the framework treats as
-# error), log + continue so the known_root path still runs. Real failure modes
-# (delegate misconfigured, RPC down) will fail the rollover then ALSO fail the
-# later record_known_root call → systemd reports cycle failure either way.
-if ! node operator-services/scripts/local_rollover_vault_pending.mjs \
+normalize_if_needed() {
+  local step_label="$1"
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: normalize-if-needed (${step_label})"
+  node operator-services/scripts/local_v2_normalize_full.mjs \
        --bridge-package-address "${BRIDGE}" \
-       --via-delegate --delegate-profile testnet-relayer; then
-  echo "[$(date -u +%FT%TZ)] rollover failed (continuing to known_root step; will retry next cycle)"
-fi
+       --vault-address "${VAULT}" \
+       --asset-type "${ASSET}" \
+       --via-delegate --delegate-profile testnet-relayer \
+       --aptos-node-url "${APTOS_NODE_URL:-https://fullnode.testnet.aptoslabs.com}"
+}
+
+# NORMALIZE plan (2026-05-27): re-pack chain available_balance into the 4 × 16-bit
+# chunk layout the CA framework requires for the next transfer / withdraw. Idempotent: the
+# script's first action is `is_normalized(vault, asset_type)` view — when already-normalized
+# it exits 0 with no chain tx. CA_DKG_V2_ROSTER_JSON_PATH must be in the
+# service unit's Environment= block so the orchestrator can resolve `dkgEpoch` for the
+# coordinator routes.
+normalize_if_needed "before rollover"
+
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: rolling over vault pending → available (OPS-2)"
+node operator-services/scripts/local_rollover_vault_pending.mjs \
+       --bridge-package-address "${BRIDGE}" \
+       --via-delegate --delegate-profile testnet-relayer
+
+normalize_if_needed "after rollover"
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: fetching deposit tx hashes via GraphQL"
 TX_HASHES=$(/bin/bash /opt/eunoma/backend-deoperator-research/ops/scripts/fetch_deposit_tx_hashes.sh)
