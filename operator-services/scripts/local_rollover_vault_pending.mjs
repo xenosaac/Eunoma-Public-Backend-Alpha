@@ -154,17 +154,35 @@ if (run.error) {
   process.exit(EXIT_APTOS_SPAWN);
 }
 process.stderr.write(run.stderr || "");
+
+function extractTxHash(text) {
+  const m =
+    text.match(/"transaction_hash"\s*:\s*"(0x[0-9a-fA-F]+)"/) ??
+    text.match(/\/txn\/(0x[0-9a-fA-F]+)(?:\?|$)/);
+  return m ? m[1] : null;
+}
+const combinedOutput = `${run.stdout || ""}\n${run.stderr || ""}`;
+const txHash = extractTxHash(combinedOutput);
 if (run.status !== 0) {
+  if (/E_NOTHING_TO_ROLLOVER|There are no pending transfers to roll over/i.test(combinedOutput)) {
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          status: "nothing_to_rollover",
+          txHash,
+          functionId,
+        },
+        null,
+        2,
+      ),
+    );
+    process.exit(EXIT_SUCCESS);
+  }
   console.error(`aptos CLI exited with status ${run.status}`);
   process.stdout.write(run.stdout || "");
   process.exit(EXIT_APTOS_SPAWN);
 }
-
-function extractTxHash(text) {
-  const m = text.match(/"transaction_hash"\s*:\s*"(0x[0-9a-fA-F]+)"/);
-  return m ? m[1] : null;
-}
-const txHash = extractTxHash(run.stdout || "");
 if (!txHash) {
   console.error("could not parse transaction_hash from aptos CLI output");
   process.stdout.write(run.stdout || "");
