@@ -327,7 +327,7 @@ if (dryRun) {
   process.exit(EXIT_SUCCESS);
 }
 
-// Check whether the root is already on chain via the BridgeVault.known_roots table.
+// Check whether the root is already on chain via the BridgeVaultTablesV2.known_roots table.
 async function fetchWithRetry(url, init, attempts = 3, backoffMs = 500) {
   let lastErr;
   for (let i = 0; i < attempts; ++i) {
@@ -348,18 +348,18 @@ async function fetchWithRetry(url, init, attempts = 3, backoffMs = 500) {
 
 let knownRootsHandle = null;
 try {
-  const vaultUrl = `${aptosNodeUrl}/accounts/${bridgePackageAddress}/resource/${encodeURIComponent(
-    `${bridgePackageAddress}::eunoma_bridge::BridgeVault`,
+  const tablesUrl = `${aptosNodeUrl}/accounts/${bridgePackageAddress}/resource/${encodeURIComponent(
+    `${bridgePackageAddress}::eunoma_bridge::BridgeVaultTablesV2`,
   )}`;
-  const res = await fetchWithRetry(vaultUrl, { method: "GET", headers: { accept: "application/json" } });
+  const res = await fetchWithRetry(tablesUrl, { method: "GET", headers: { accept: "application/json" } });
   if (res.ok) {
     const body = await res.json();
     knownRootsHandle = body?.data?.known_roots?.handle ?? null;
   } else if (res.status !== 404) {
-    console.error(`[warn] BridgeVault GET returned ${res.status}; continuing without membership pre-check`);
+    console.error(`[warn] BridgeVaultTablesV2 GET returned ${res.status}; continuing without membership pre-check`);
   }
 } catch (err) {
-  console.error(`[warn] failed to read BridgeVault for membership pre-check: ${err?.message ?? err}`);
+  console.error(`[warn] failed to read BridgeVaultTablesV2 for membership pre-check: ${err?.message ?? err}`);
 }
 
 if (knownRootsHandle) {
