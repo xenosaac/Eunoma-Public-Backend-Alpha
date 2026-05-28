@@ -64,7 +64,17 @@ normalize_if_needed "before tree refresh"
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: fetching deposit tx hashes via GraphQL"
 TX_HASHES=$(/bin/bash "${FETCH_DEPOSIT_TX_HASHES_SCRIPT}")
-if [ -z "$TX_HASHES" ]; then
+EXTRA_TX_HASHES=${EUNOMA_EXTRA_DEPOSIT_TX_HASHES:-}
+if [ -n "${EXTRA_TX_HASHES}" ]; then
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: including extra observed tx hashes"
+  if [ -n "${TX_HASHES}" ]; then
+    TX_HASHES="${EXTRA_TX_HASHES},${TX_HASHES}"
+  else
+    TX_HASHES="${EXTRA_TX_HASHES}"
+  fi
+fi
+TX_HASHES=$(printf '%s' "${TX_HASHES}" | tr ',' '\n' | awk 'BEGIN{ORS=""} { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); v=tolower($0); if (v ~ /^0x[0-9a-f]{64}$/ && !seen[v]++) { if (n++) printf ","; printf "%s", v } }')
+if [ -z "${TX_HASHES}" ]; then
   echo "[$(date -u +%FT%TZ)] no deposit txs found yet, exiting clean"
   exit 0
 fi

@@ -2594,6 +2594,20 @@ export function buildCoordinatorServer(
       const amountTag = amountTagField as string;
       const caPayloadHash = caPayloadHashField as string;
       const depositNonce = depositNonceField as string;
+      const depositTxHashRaw = raw.depositTxHash;
+      let depositTxHash: string | undefined;
+      if (depositTxHashRaw !== undefined) {
+        if (
+          typeof depositTxHashRaw !== "string" ||
+          !/^0x[0-9a-fA-F]{64}$/.test(depositTxHashRaw)
+        ) {
+          return reply.code(400).send({
+            error: "invalid_request",
+            message: "depositTxHash must be 0x + 64 hex chars when supplied",
+          });
+        }
+        depositTxHash = depositTxHashRaw.toLowerCase();
+      }
       const sequenceNumber = raw.sequenceNumber;
       const txVersion = raw.txVersion;
       const eventGuid = raw.eventGuid;
@@ -2957,6 +2971,7 @@ export function buildCoordinatorServer(
           triggerBridgeMaintenance({
             repoRoot: process.env.EUNOMA_REPO_ROOT || process.cwd(),
             logger: req.log,
+            extraDepositTxHashes: depositTxHash ? [depositTxHash] : undefined,
           });
         });
 

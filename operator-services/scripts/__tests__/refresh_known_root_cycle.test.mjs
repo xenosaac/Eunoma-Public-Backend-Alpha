@@ -25,6 +25,9 @@ const SCRIPT_PATH = resolve(
 
 const OLD_ROOT = `0x${"11".repeat(32)}`;
 const NEW_ROOT = `0x${"22".repeat(32)}`;
+const FETCH_TX_A = `0x${"aa".repeat(32)}`;
+const FETCH_TX_B = `0x${"bb".repeat(32)}`;
+const EXTRA_TX = `0x${"ee".repeat(32)}`;
 
 let tmpRoot;
 let repoRoot;
@@ -32,6 +35,7 @@ let stateDir;
 let fakeBin;
 let fakeFetchScript;
 let opLogPath;
+let txHashLogPath;
 
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), "eunoma-refresh-cycle-"));
@@ -40,6 +44,7 @@ beforeEach(() => {
   fakeBin = join(tmpRoot, "bin");
   fakeFetchScript = join(tmpRoot, "fetch_deposit_tx_hashes.sh");
   opLogPath = join(tmpRoot, "ops.log");
+  txHashLogPath = join(tmpRoot, "tx-hashes.log");
   mkdirSync(repoRoot, { recursive: true });
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(fakeBin, { recursive: true });
@@ -47,7 +52,7 @@ beforeEach(() => {
   writeFakeNode();
   writeFileSync(join(fakeBin, "flock"), "#!/usr/bin/env bash\nexit 0\n");
   chmodSync(join(fakeBin, "flock"), 0o755);
-  writeFileSync(fakeFetchScript, "#!/usr/bin/env bash\nprintf '0xabc,0xdef\\n'\n");
+  writeFileSync(fakeFetchScript, `#!/usr/bin/env bash\nprintf '${FETCH_TX_A},${FETCH_TX_B}\\n'\n`);
   chmodSync(fakeFetchScript, 0o755);
 });
 
@@ -94,6 +99,33 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(result.stdout).toContain("publish tree");
     expect(readOps()).toEqual(["normalize", "build", "record"]);
   });
+
+  it("uses an extra observed deposit hash when the indexer fetch has not listed it yet", () => {
+    writeFileSync(fakeFetchScript, "#!/usr/bin/env bash\nexit 0\n");
+    chmodSync(fakeFetchScript, 0o755);
+
+    const result = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      EUNOMA_EXTRA_DEPOSIT_TX_HASHES: EXTRA_TX,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("including extra observed tx hashes");
+    expect(readTree().latestRootHex).toBe(NEW_ROOT);
+    expect(readTxHashes()).toBe(EXTRA_TX);
+    expect(readOps()).toEqual(["normalize", "build", "rollover", "normalize", "record"]);
+  });
+
+  it("deduplicates extra observed hashes before building the staged tree", () => {
+    const mixedCaseExtra = FETCH_TX_A.toUpperCase().replace(/^0X/, "0x");
+    const result = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      EUNOMA_EXTRA_DEPOSIT_TX_HASHES: `${mixedCaseExtra},${EXTRA_TX},not-a-tx`,
+    });
+
+    expect(result.status).toBe(0);
+    expect(readTxHashes()).toBe(`${FETCH_TX_A},${EXTRA_TX},${FETCH_TX_B}`);
+  });
 });
 
 function runWrapper(env = {}) {
@@ -106,6 +138,7 @@ function runWrapper(env = {}) {
       PATH: `${fakeBin}:${process.env.PATH}`,
       REAL_NODE_PATH: process.execPath,
       FAKE_OP_LOG: opLogPath,
+      FAKE_TX_HASH_LOG: txHashLogPath,
       EUNOMA_REPO_ROOT: repoRoot,
       EUNOMA_COORDINATOR_STATE_DIR: stateDir,
       EUNOMA_FETCH_DEPOSIT_TX_HASHES_SCRIPT: fakeFetchScript,
@@ -150,6 +183,11 @@ function readOps() {
   return readFileSync(opLogPath, "utf8").trim().split(/\n/).filter(Boolean);
 }
 
+function readTxHashes() {
+  if (!existsSync(txHashLogPath)) return "";
+  return readFileSync(txHashLogPath, "utf8").trim();
+}
+
 function writeFakeNode() {
   const implPath = join(tmpRoot, "fake_node_impl.mjs");
   writeFileSync(
@@ -174,6 +212,7 @@ if (script.endsWith("local_v2_normalize_full.mjs")) {
 }
 if (script.endsWith("local_build_commitment_tree.mjs")) {
   append("build");
+  writeFileSync(process.env.FAKE_TX_HASH_LOG, (valueOf("--tx-hashes") ?? "") + "\\n");
   const stateDir = valueOf("--state-dir");
   mkdirSync(stateDir, { recursive: true });
   const leafCount = Number(process.env.FAKE_TREE_LEAF_COUNT ?? "9");

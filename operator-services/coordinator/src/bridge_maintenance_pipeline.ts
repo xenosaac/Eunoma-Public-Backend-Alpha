@@ -25,6 +25,10 @@
  * Error handling: this runs after the HTTP reply has flushed, so there is
  * no caller to bubble errors to. ALL failure modes are caught and logged; the function NEVER
  * throws. The next pipeline trigger (or the systemd timer) is the retry mechanism.
+ *
+ * The triggering deposit tx hash is forwarded into the wrapper when available. This closes
+ * the REST-vs-indexer race: observe_deposit proves the concrete tx by REST before GraphQL
+ * account_transactions may list it, so the first event-driven refresh can ingest it directly.
  */
 
 import { spawn } from "node:child_process";
@@ -45,6 +49,12 @@ export interface BridgeMaintenanceContext {
    * supervisors can correlate pipeline runs with the originating deposit request.
    */
   logger: FastifyBaseLogger;
+  /**
+   * Concrete deposit tx hashes already validated by the observe-deposit caller. These are
+   * added to the wrapper's GraphQL tx-hash set so the event-driven path does not wait for
+   * indexer visibility of the just-confirmed deposit.
+   */
+  extraDepositTxHashes?: string[];
 }
 
 /**
@@ -100,12 +110,19 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
   const repoRoot = resolveRepoRoot(ctx.repoRoot, scriptPath);
   const absoluteScriptPath = resolve(repoRoot, scriptPath);
   const logger = ctx.logger;
+  const extraDepositTxHashes = normalizeTxHashes(ctx.extraDepositTxHashes ?? []);
   emitJournalLine("bridge maintenance pipeline spawning refresh_known_root_cycle.sh", {
     scriptPath: absoluteScriptPath,
     cwd: repoRoot,
+    extraDepositTxHashCount: extraDepositTxHashes.length,
   });
   logger.info(
-    { module: "bridge_maintenance_pipeline", scriptPath: absoluteScriptPath, cwd: repoRoot },
+    {
+      module: "bridge_maintenance_pipeline",
+      scriptPath: absoluteScriptPath,
+      cwd: repoRoot,
+      extraDepositTxHashCount: extraDepositTxHashes.length,
+    },
     "bridge maintenance pipeline spawning refresh_known_root_cycle.sh",
   );
   return new Promise<void>((resolve) => {
@@ -115,7 +132,13 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
         cwd: repoRoot,
         // Forward env so APTOS_NODE_URL / CA_DKG_V2_ROSTER_JSON_PATH / coordinator
         // bearer tokens flow through to the orchestrator scripts.
-        env: { ...process.env, EUNOMA_REPO_ROOT: repoRoot },
+        env: {
+          ...process.env,
+          EUNOMA_REPO_ROOT: repoRoot,
+          ...(extraDepositTxHashes.length > 0
+            ? { EUNOMA_EXTRA_DEPOSIT_TX_HASHES: extraDepositTxHashes.join(",") }
+            : {}),
+        },
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (err) {
@@ -210,6 +233,18 @@ function resolveRepoRoot(repoRoot: string, scriptPath: string): string {
     }
   }
   return normalized;
+}
+
+function normalizeTxHashes(input: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of input) {
+    const normalized = value.trim().toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(normalized) || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
 }
 
 /**
