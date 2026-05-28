@@ -5,13 +5,17 @@
 // legacy single-leaf rejection paths via stdout/exitCode.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,6 +82,31 @@ function runCli(args, env = {}) {
   return spawnSync("node", [SCRIPT_PATH, ...args], {
     encoding: "utf8",
     env: { ...process.env, ...env },
+  });
+}
+
+function runCliAsync(args, env = {}) {
+  return new Promise((resolve) => {
+    const child = spawn("node", [SCRIPT_PATH, ...args], {
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      resolve({ status: null, signal: null, stdout, stderr: `${stderr}${error.message}` });
+    });
+    child.on("close", (status, signal) => {
+      resolve({ status, signal, stdout, stderr });
+    });
   });
 }
 
@@ -222,6 +251,85 @@ describe("local_record_known_root_v2 — M9 multi-leaf anonymity gate", () => {
     ]);
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/transcript_hash_mismatch|deserialize/);
+  });
+
+  it("uses BridgeVaultTablesV2.known_roots precheck to skip duplicate tx submission", async () => {
+    const { path, snapshot } = await makeTreeFixture(stateDir, 8);
+    const fakeBin = join(tmpRoot, "bin");
+    const aptosInvokedPath = join(tmpRoot, "aptos_invoked");
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      join(fakeBin, "aptos"),
+      `#!/usr/bin/env bash
+echo invoked > "${aptosInvokedPath}"
+exit 99
+`,
+    );
+    chmodSync(join(fakeBin, "aptos"), 0o755);
+
+    let tableRequestBody = null;
+    const server = createServer((req, res) => {
+      if (req.method === "GET" && req.url?.includes("/accounts/") && req.url.includes("/resource/")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { known_roots: { handle: "known-roots-handle" } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url?.endsWith("/tables/known-roots-handle/item")) {
+        let body = "";
+        req.setEncoding("utf8");
+        req.on("data", (chunk) => {
+          body += chunk;
+        });
+        req.on("end", () => {
+          tableRequestBody = JSON.parse(body);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("true");
+        });
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    try {
+      const r = await runCliAsync(
+        [
+          "--bridge-package-address",
+          BRIDGE,
+          "--commitment-tree",
+          path,
+          "--state-dir",
+          stateDir,
+          "--aptos-node-url",
+          `http://127.0.0.1:${port}/v1`,
+        ],
+        { PATH: `${fakeBin}:${process.env.PATH}` },
+      );
+      expect(r.status).toBe(0);
+      const body = parseStdoutJson(r.stdout);
+      expect(body).toMatchObject({
+        ok: true,
+        status: "already_recorded",
+        root: snapshot.latestRootHex,
+        tableHandle: "known-roots-handle",
+      });
+      expect(tableRequestBody).toMatchObject({
+        key_type: "vector<u8>",
+        value_type: "bool",
+        key: snapshot.latestRootHex,
+      });
+      expect(existsSync(aptosInvokedPath)).toBe(false);
+      const sidecar = JSON.parse(
+        readFileSync(join(stateDir, `known_root_v2_${snapshot.latestRootHex.slice(2, 10)}.json`), "utf8"),
+      );
+      expect(sidecar).toMatchObject({
+        rootHex: snapshot.latestRootHex,
+        status: "already_recorded",
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 });
 

@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# R7-OPS-1+OPS-2 wrapper: normalize if needed, rollover vault pending → available
-# (OPS-2), normalize again if needed, then refresh
-# on-disk commitment tree from chain DepositConfirmedV2 events, then submit a new
-# known_root_v2 via the recorder-delegate path (OPS-1). Both delegate paths sign
-# with testnet-relayer; admin previously delegated via admin_set_recorder_delegate.
+# Route-ready root publication wrapper.
+#
+# The public commitment tree is the withdraw pool-state source, so this script never
+# exposes a freshly-deposited root until that route is actually withdrawable. It:
+#   1. normalizes the currently-published vault route if needed;
+#   2. builds a fresh commitment tree in a private staging directory;
+#   3. when the staged root is new, rolls vault pending -> available and normalizes again;
+#   4. records the staged root in known_roots; and only then
+#   5. atomically publishes the staged tree as commitment_tree_v2.json.
+#
+# Delegate paths sign with testnet-relayer; admin previously delegated via
+# admin_set_recorder_delegate.
 #
 # Invoked by systemd unit eunoma-record-known-root.service (Type=oneshot).
 # Idempotent:
@@ -11,9 +18,10 @@
 #   - tree builder rewrites JSON with same hash on no-change
 #   - record_known_root no-ops via Move's table::contains check
 #
-# Order matters: rollover MUST run BEFORE record_known_root for a new root so that
-# when a user withdraws against that root, the freshly-deposited funds are already
-# in vault available_balance (the chunkSubtract minuend).
+# Order matters: record_known_root MUST run before publishing the staged tree, and
+# rollover/normalize MUST run before recording a new root. If any route-readiness
+# step fails, the public tree stays untouched and users keep waiting instead of
+# seeing a root that will fail route-balance verification.
 #
 # Exits non-zero on hard failure (timer will retry next cycle).
 set -euo pipefail
@@ -25,20 +33,22 @@ if ! flock -n 9; then
   exit 0
 fi
 
-cd /opt/eunoma/backend-deoperator-research
+REPO_ROOT=${EUNOMA_REPO_ROOT:-/opt/eunoma/backend-deoperator-research}
+cd "${REPO_ROOT}"
 
-BRIDGE=0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1
-VAULT=0xbbb0957ec8c26ab2652280c946dc35381dde6613b8ee9041ad6f467331dcd12a
-ASSET=0xa
-STATE_DIR=operator-services/.agent-local/eunoma-v2/coordinator
+BRIDGE=${BRIDGE_PACKAGE_ADDRESS:-0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1}
+VAULT=${BRIDGE_VAULT_ADDRESS:-0xbbb0957ec8c26ab2652280c946dc35381dde6613b8ee9041ad6f467331dcd12a}
+ASSET=${BRIDGE_ASSET_TYPE:-0xa}
+STATE_DIR=${EUNOMA_COORDINATOR_STATE_DIR:-operator-services/.agent-local/eunoma-v2/coordinator}
 TREE_JSON=${STATE_DIR}/commitment_tree_v2.json
 STAGING_DIR=${STATE_DIR}/.refresh-staging
 STAGED_TREE_JSON=${STAGING_DIR}/commitment_tree_v2.json
 MIN_ANONYMITY_SET=${EUNOMA_MIN_ANONYMITY_SET:-8}
+FETCH_DEPOSIT_TX_HASHES_SCRIPT=${EUNOMA_FETCH_DEPOSIT_TX_HASHES_SCRIPT:-${REPO_ROOT}/ops/scripts/fetch_deposit_tx_hashes.sh}
 
 normalize_if_needed() {
   local step_label="$1"
-  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: normalize-if-needed (${step_label})"
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: normalize (${step_label})"
   node operator-services/scripts/local_v2_normalize_full.mjs \
        --bridge-package-address "${BRIDGE}" \
        --vault-address "${VAULT}" \
@@ -47,16 +57,13 @@ normalize_if_needed() {
        --aptos-node-url "${APTOS_NODE_URL:-https://fullnode.testnet.aptoslabs.com}"
 }
 
-# NORMALIZE plan (2026-05-27): re-pack chain available_balance into the 4 × 16-bit
-# chunk layout the CA framework requires for the next transfer / withdraw. Idempotent: the
-# script's first action is `is_normalized(vault, asset_type)` view — when already-normalized
-# it exits 0 with no chain tx. CA_DKG_V2_ROSTER_JSON_PATH must be in the
-# service unit's Environment= block so the orchestrator can resolve `dkgEpoch` for the
-# coordinator routes.
+# Re-pack chain available_balance into the 4 x 16-bit chunk layout the CA framework
+# requires for the next transfer / withdraw. Idempotent: the script's first action
+# is `is_normalized(vault, asset_type)` view; when already normalized it exits 0.
 normalize_if_needed "before tree refresh"
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: fetching deposit tx hashes via GraphQL"
-TX_HASHES=$(/bin/bash /opt/eunoma/backend-deoperator-research/ops/scripts/fetch_deposit_tx_hashes.sh)
+TX_HASHES=$(/bin/bash "${FETCH_DEPOSIT_TX_HASHES_SCRIPT}")
 if [ -z "$TX_HASHES" ]; then
   echo "[$(date -u +%FT%TZ)] no deposit txs found yet, exiting clean"
   exit 0
@@ -69,7 +76,7 @@ if [ -f "${TREE_JSON}" ]; then
   cp "${TREE_JSON}" "${STAGED_TREE_JSON}"
 fi
 
-echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: building staged commitment tree from chain events"
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: build staged tree"
 node operator-services/scripts/local_build_commitment_tree.mjs \
   --bridge-package-address "${BRIDGE}" \
   --vault-address "${VAULT}" \
@@ -86,7 +93,7 @@ if [ -n "${LATEST_ROOT}" ]; then
   if [ -f "${ROOT_SIDECAR}" ]; then
     echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: root ${LATEST_ROOT} already has side-car; skipping rollover"
   else
-    echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: rolling over vault pending → available (OPS-2)"
+    echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: rollover"
     node operator-services/scripts/local_rollover_vault_pending.mjs \
            --bridge-package-address "${BRIDGE}" \
            --via-delegate --delegate-profile testnet-relayer
@@ -98,14 +105,15 @@ else
   exit 2
 fi
 
-echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: recording known_root via delegate"
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: record known root"
 node operator-services/scripts/local_record_known_root_v2.mjs \
   --commitment-tree "${STAGED_TREE_JSON}" \
   --bridge-package-address "${BRIDGE}" \
   --via-delegate --delegate-profile testnet-relayer \
-  --min-anonymity-set "${MIN_ANONYMITY_SET}"
+  --min-anonymity-set "${MIN_ANONYMITY_SET}" \
+  --state-dir "${STATE_DIR}"
 
-echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: publishing commitment tree"
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: publish tree"
 mv "${STAGED_TREE_JSON}" "${TREE_JSON}.tmp"
 mv "${TREE_JSON}.tmp" "${TREE_JSON}"
 rm -rf "${STAGING_DIR}"

@@ -4,11 +4,14 @@
  * The post-observe fan-out: after `/v2/vault_state/observe_deposit` ships its 200 reply,
  * the coordinator kicks off `ops/scripts/refresh_known_root_cycle.sh` so that
  *
- *   normalize → rollover → normalize → fetch_deposit_tx_hashes → build_commitment_tree → record_known_root
+ *   normalize current route → fetch_deposit_tx_hashes → build staged tree
+ *     → if staged root is new: rollover → normalize
+ *     → record_known_root → publish staged tree
  *
  * runs as an event-driven pipeline instead of waiting on the systemd timer. The shell wrapper
  * is idempotent (each step checks chain state first), so triggering it on every deposit is
- * cheap when there's no work to do.
+ * cheap when there's no work to do. The public `commitment_tree_v2.json` is replaced only
+ * after the staged root is route-ready; on failure the old public root remains visible.
  *
  * Concurrency model: **coalesce-on-contention**. If a previous deposit's pipeline is still
  * running when a new deposit arrives, `triggerBridgeMaintenance` is a no-op for the new
@@ -31,11 +34,9 @@ import type { FastifyBaseLogger } from "fastify";
 
 export interface BridgeMaintenanceContext {
   /**
-   * Repo root containing `ops/scripts/refresh_known_root_cycle.sh`. The shell script itself
-   * `cd`s to its own hardcoded path inside (`/opt/eunoma/backend-deoperator-research`), so
-   * this value is only used as the `cwd` for the spawned `bash` process — the script
-   * tolerates that mismatch via its own `cd` line. Production deployments should set this
-   * to the same path the shell script `cd`s to so the spawn's `cwd` matches.
+   * Repo root containing `ops/scripts/refresh_known_root_cycle.sh`. The shell script uses
+   * this as `EUNOMA_REPO_ROOT` when the coordinator process provides it, while retaining
+   * the alpha-box default path for systemd/manual runs.
    */
   repoRoot: string;
   /**
@@ -114,7 +115,7 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
         cwd: repoRoot,
         // Forward env so APTOS_NODE_URL / CA_DKG_V2_ROSTER_JSON_PATH / coordinator
         // bearer tokens flow through to the orchestrator scripts.
-        env: process.env,
+        env: { ...process.env, EUNOMA_REPO_ROOT: repoRoot },
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (err) {
