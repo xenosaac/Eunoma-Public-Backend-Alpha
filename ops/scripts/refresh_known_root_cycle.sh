@@ -32,6 +32,8 @@ VAULT=0xbbb0957ec8c26ab2652280c946dc35381dde6613b8ee9041ad6f467331dcd12a
 ASSET=0xa
 STATE_DIR=operator-services/.agent-local/eunoma-v2/coordinator
 TREE_JSON=${STATE_DIR}/commitment_tree_v2.json
+STAGING_DIR=${STATE_DIR}/.refresh-staging
+STAGED_TREE_JSON=${STAGING_DIR}/commitment_tree_v2.json
 MIN_ANONYMITY_SET=${EUNOMA_MIN_ANONYMITY_SET:-8}
 
 normalize_if_needed() {
@@ -61,15 +63,22 @@ if [ -z "$TX_HASHES" ]; then
 fi
 echo "[$(date -u +%FT%TZ)] fetched $(echo "$TX_HASHES" | tr ',' '\n' | wc -l) tx hashes"
 
-echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: building commitment tree from chain events"
+rm -rf "${STAGING_DIR}"
+mkdir -p "${STAGING_DIR}"
+if [ -f "${TREE_JSON}" ]; then
+  cp "${TREE_JSON}" "${STAGED_TREE_JSON}"
+fi
+
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: building staged commitment tree from chain events"
 node operator-services/scripts/local_build_commitment_tree.mjs \
   --bridge-package-address "${BRIDGE}" \
   --vault-address "${VAULT}" \
   --asset-type "${ASSET}" \
   --tx-hashes "${TX_HASHES}" \
+  --state-dir "${STAGING_DIR}" \
   --refresh
 
-LATEST_ROOT=$(node -e 'const fs=require("fs"); const p=process.argv[1]; if (!fs.existsSync(p)) process.exit(0); const j=JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(j.latestRootHex || "");' "${TREE_JSON}")
+LATEST_ROOT=$(node -e 'const fs=require("fs"); const p=process.argv[1]; if (!fs.existsSync(p)) process.exit(0); const j=JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(j.latestRootHex || "");' "${STAGED_TREE_JSON}")
 if [ -n "${LATEST_ROOT}" ]; then
   ROOT_PREFIX=${LATEST_ROOT#0x}
   ROOT_PREFIX=${ROOT_PREFIX:0:8}
@@ -91,9 +100,14 @@ fi
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: recording known_root via delegate"
 node operator-services/scripts/local_record_known_root_v2.mjs \
-  --commitment-tree "${TREE_JSON}" \
+  --commitment-tree "${STAGED_TREE_JSON}" \
   --bridge-package-address "${BRIDGE}" \
   --via-delegate --delegate-profile testnet-relayer \
   --min-anonymity-set "${MIN_ANONYMITY_SET}"
+
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: publishing commitment tree"
+mv "${STAGED_TREE_JSON}" "${TREE_JSON}.tmp"
+mv "${TREE_JSON}.tmp" "${TREE_JSON}"
+rm -rf "${STAGING_DIR}"
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: done"
