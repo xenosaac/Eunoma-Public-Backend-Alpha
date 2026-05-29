@@ -60,6 +60,14 @@ export interface CoordinatorConfig {
    * Required by `/v2/balance/decrypt` for the same chosen-balance-target reason.
    */
   bridgeAssetType?: string;
+  /**
+   * CP3 cutover: when true, the coordinator POSTs the assembled WithdrawV2CallArgs to the relayer's
+   * split-v3 route `/v3/relayer/submit/withdraw` (drives 5 v3 txs, withdraw = 0 user sigs) instead
+   * of the monolith `/v2` route. Env-gated via `RELAYER_USE_V3=1` for a controlled, reversible
+   * cutover. The /v3 route may also return a `self_submit` signal (gas breaker open / reserve low),
+   * which the submitter surfaces as a `relayer_self_submit:<reason>` error for the client fallback.
+   */
+  relayerUseV3?: boolean;
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): CoordinatorConfig {
@@ -107,6 +115,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Coordinator
     ...(chainConfirmationTimeoutMs !== undefined ? { chainConfirmationTimeoutMs } : {}),
     bridgeVaultAddress: env.BRIDGE_VAULT_ADDRESS || undefined,
     bridgeAssetType: env.BRIDGE_ASSET_TYPE || undefined,
+    relayerUseV3: env.RELAYER_USE_V3 === "1",
   };
 }
 
@@ -129,8 +138,10 @@ export function buildDefaultRelayerSubmitter(
   const relayerUrl = config.relayerUrl;
   if (!relayerUrl) return undefined;
   const bearer = config.relayerBearerToken;
+  const useV3 = config.relayerUseV3 === true;
   return async (args: unknown) => {
-    const url = new URL("/v2/relayer/submit/withdraw", relayerUrl).toString();
+    const path = useV3 ? "/v3/relayer/submit/withdraw" : "/v2/relayer/submit/withdraw";
+    const url = new URL(path, relayerUrl).toString();
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (bearer) headers.authorization = `Bearer ${bearer}`;
     const res = await fetchImpl(url, {
@@ -151,6 +162,34 @@ export function buildDefaultRelayerSubmitter(
         body && typeof body.message === "string" ? body.message : "unknown";
       throw new Error(`relayer responded ${res.status} (${errCode}): ${errMsg}`);
     }
+    if (useV3) {
+      // The /v3 route returns a 200 `{ action: "self_submit", reason }` when the gas breaker is
+      // open / reserve is low. Surface it as a distinct error so the caller can fall back to
+      // user self-submit (the FROST attestation is still unexpired).
+      if (body && body.action === "self_submit") {
+        const reason = typeof body.reason === "string" ? body.reason : "unknown";
+        throw new Error(`relayer_self_submit: ${reason}`);
+      }
+      const txHashes = body?.txHashes;
+      if (
+        !body ||
+        typeof body.accepted !== "boolean" ||
+        !Array.isArray(txHashes) ||
+        txHashes.length === 0 ||
+        typeof body.simulated !== "boolean"
+      ) {
+        throw new Error(
+          `relayer v3 response missing required fields (accepted/txHashes/simulated); got ${JSON.stringify(body)}`,
+        );
+      }
+      // The last hash is step2b — the settlement tx the coordinator's downstream (resync, response)
+      // tracks; the v2 monolith returned a single txHash, so this preserves the same contract.
+      return {
+        accepted: body.accepted,
+        txHash: String(txHashes[txHashes.length - 1]),
+        simulated: body.simulated,
+      };
+    }
     if (
       !body ||
       typeof body.accepted !== "boolean" ||
@@ -166,6 +205,58 @@ export function buildDefaultRelayerSubmitter(
       txHash: body.txHash,
       simulated: body.simulated,
     };
+  };
+}
+
+/**
+ * CP3 deposit-delegate submitter: POSTs the assembled DepositV3DelegateArgs to the relayer's
+ * `/v3/relayer/submit/deposit` (prepare_deposit_binding_v3 + deposit_step2a_v3). step2b is NEVER
+ * delegated — it is the user's own CA debit. Returns the 2 relayer tx hashes. A `self_submit`
+ * 200 (gas breaker open / reserve low) surfaces as a `relayer_self_submit:<reason>` error for the
+ * client fallback. Returns undefined when relayerUrl is unset (deposit-delegate then unavailable).
+ */
+export function buildDefaultDepositRelayerSubmitter(
+  config: CoordinatorConfig,
+  fetchImpl: typeof fetch = fetch,
+):
+  | ((args: unknown) => Promise<{ accepted: boolean; txHashes: string[]; simulated: boolean }>)
+  | undefined {
+  const relayerUrl = config.relayerUrl;
+  if (!relayerUrl) return undefined;
+  const bearer = config.relayerBearerToken;
+  return async (args: unknown) => {
+    const url = new URL("/v3/relayer/submit/deposit", relayerUrl).toString();
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (bearer) headers.authorization = `Bearer ${bearer}`;
+    const res = await fetchImpl(url, { method: "POST", headers, body: JSON.stringify(args) });
+    let body: Record<string, unknown> | null = null;
+    try {
+      body = (await res.json()) as Record<string, unknown>;
+    } catch {
+      body = null;
+    }
+    if (!res.ok) {
+      const errCode = body && typeof body.error === "string" ? body.error : `http_${res.status}`;
+      const errMsg = body && typeof body.message === "string" ? body.message : "unknown";
+      throw new Error(`relayer responded ${res.status} (${errCode}): ${errMsg}`);
+    }
+    if (body && body.action === "self_submit") {
+      const reason = typeof body.reason === "string" ? body.reason : "unknown";
+      throw new Error(`relayer_self_submit: ${reason}`);
+    }
+    const txHashes = body?.txHashes;
+    if (
+      !body ||
+      typeof body.accepted !== "boolean" ||
+      !Array.isArray(txHashes) ||
+      txHashes.length === 0 ||
+      typeof body.simulated !== "boolean"
+    ) {
+      throw new Error(
+        `relayer deposit response missing required fields (accepted/txHashes/simulated); got ${JSON.stringify(body)}`,
+      );
+    }
+    return { accepted: body.accepted, txHashes: txHashes.map(String), simulated: body.simulated };
   };
 }
 

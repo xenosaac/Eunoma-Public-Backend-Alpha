@@ -33,11 +33,12 @@ function validBody(): Record<string, unknown> {
     caPayloadHash: HEX32_A,
     depositNonce: HEX32_B,
     expirySecs: "1779000000",
+    userAddr: HEX32_C,
   };
 }
 
 describe("parseDepositFrostAttestRequest", () => {
-  it("accepts a fully-valid body and returns all 15 fields", () => {
+  it("accepts a fully-valid body and returns all 16 fields", () => {
     const result = parseDepositFrostAttestRequest(validBody());
     expect(result.requestId).toBe("deposit-1");
     expect(result.dkgEpoch).toBe("7");
@@ -55,6 +56,7 @@ describe("parseDepositFrostAttestRequest", () => {
     expect(result.caPayloadHash).toBe(HEX32_A);
     expect(result.depositNonce).toBe(HEX32_B);
     expect(result.expirySecs).toBe("1779000000");
+    expect(result.userAddr).toBe(HEX32_C);
   });
 
   it("rejects body that is not an object", () => {
@@ -83,6 +85,7 @@ describe("parseDepositFrostAttestRequest", () => {
       "caPayloadHash",
       "depositNonce",
       "expirySecs",
+      "userAddr",
     ]) {
       const body = validBody();
       delete body[key];

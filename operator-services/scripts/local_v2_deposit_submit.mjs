@@ -563,12 +563,13 @@ async function main() {
   // this tx verifies the Groth16 binding and caches commitment -> {amount_p, amount_p_digest}
   // in PendingDepositBindingsV3; deposit_with_commitment_v2 cache-hit path then byte-compares
   // amount_p without recomputing 4 Poseidon (~700 gas saved vs the legacy v2 cache).
-  logStep("building + submitting prepare_deposit_binding_v3 tx");
+  logStep("building + submitting prepare_deposit_binding_v3_for_user tx");
   const prepareTx = await aptos.transaction.build.simple({
     sender: depositorAccount.accountAddress,
     data: {
-      function: `${bridgeAddr}::eunoma_bridge::prepare_deposit_binding_v3`,
+      function: `${bridgeAddr}::eunoma_bridge::prepare_deposit_binding_v3_for_user`,
       functionArguments: [
+        depositorAccount.accountAddress,
         hexToBytes(commitmentHex),
         hexToBytes(amountTagHex),
         amountP,
@@ -585,7 +586,7 @@ async function main() {
   logStep(`submitted prepare tx=${preparePending.hash}; waiting for confirmation...`);
   const prepareCommitted = await aptos.waitForTransaction({ transactionHash: preparePending.hash });
   if (!prepareCommitted.success) {
-    throw new Error(`prepare_deposit_binding_v3 failed: ${prepareCommitted.vm_status}`);
+    throw new Error(`prepare_deposit_binding_v3_for_user failed: ${prepareCommitted.vm_status}`);
   }
   logStep(`prepare SUCCESS tx=${prepareCommitted.hash} version=${prepareCommitted.version} gas=${prepareCommitted.gas_used}`);
 

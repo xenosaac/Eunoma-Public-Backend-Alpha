@@ -457,6 +457,8 @@ export interface DepositAttestationV2Message {
   depositNonce: HexString;
   expirySecs: string;
   circuitVersionsHash: HexString;
+  // (B) deposit re-key: depositing user's address, bound into the deop-signed attestation.
+  userAddr: HexString;
 }
 
 export interface ConfidentialTransferRawPayloadV2 {

@@ -1,4 +1,8 @@
-import { buildDefaultRelayerSubmitter, configFromEnv } from "../config.js";
+import {
+  buildDefaultDepositRelayerSubmitter,
+  buildDefaultRelayerSubmitter,
+  configFromEnv,
+} from "../config.js";
 import { buildCoordinatorServer } from "../server.js";
 
 const cfg = configFromEnv();
@@ -7,9 +11,12 @@ const cfg = configFromEnv();
 // relayer submitter is constructed from RELAYER_URL + RELAYER_BEARER_TOKEN. Tests
 // inject `relayerSubmitter` directly via opts and never reach this factory.
 const relayerSubmitter = buildDefaultRelayerSubmitter(cfg);
+// CP3 deposit-delegate submitter (POST /v2/deposit/delegate-submit → relayer /v3 deposit route).
+const depositRelayerSubmitter = buildDefaultDepositRelayerSubmitter(cfg);
 const { server } = buildCoordinatorServer({
   ...cfg,
   ...(relayerSubmitter ? { relayerSubmitter } : {}),
+  ...(depositRelayerSubmitter ? { depositRelayerSubmitter } : {}),
 });
 await server.listen({ host: cfg.host, port: cfg.port });
 console.log(`coordinator listening on ${cfg.host}:${cfg.port}`);

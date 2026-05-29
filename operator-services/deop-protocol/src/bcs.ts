@@ -127,6 +127,10 @@ export function bcsEncodeDepositAttestationV2(
   w.writeHexVector(msg.depositNonce);
   w.writeU64(BigInt(msg.expirySecs));
   w.writeHexVector(msg.circuitVersionsHash);
+  // (B) deposit re-key: append depositing user's address (raw 32B via writeAddress — NOT
+  // writeHexVector, which would inject a ULEB length prefix and break the Move byte-match).
+  // Mirrors serialize_deposit_attestation_v2_msg's trailing bcs::to_bytes(&user_addr) in Move.
+  w.writeAddress(msg.userAddr);
   return w.finish();
 }
 

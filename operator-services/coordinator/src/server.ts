@@ -223,6 +223,15 @@ export interface CoordinatorServerOptions {
    */
   relayerSubmitter?: RelayerWithdrawSubmitter;
   /**
+   * CP3 deposit-delegate submitter for POST /v2/deposit/delegate-submit. Forwards the assembled
+   * DepositV3DelegateArgs to the relayer's /v3/relayer/submit/deposit (prepare + step2a; step2b
+   * stays user-signed). If absent, the route returns 502. Built via
+   * buildDefaultDepositRelayerSubmitter; tests inject mocks.
+   */
+  depositRelayerSubmitter?: (
+    args: unknown,
+  ) => Promise<{ accepted: boolean; txHashes: string[]; simulated: boolean }>;
+  /**
    * Milestone 5b: Aptos fullnode URL for waitForTx polling. If absent, the route SKIPS chain
    * confirmation (simulated submits) and returns `completed: true, simulated: true` directly
    * after the relayer accepts.
@@ -5813,6 +5822,11 @@ export function buildCoordinatorServer(
         depositNonce: parsed.depositNonce,
         expirySecs: parsed.expirySecs,
         circuitVersionsHash: parsed.circuitVersionsHash,
+        // (B) deposit re-key: bind the depositing user into the deop-signed message so a
+        // relayer-submitted step2a is authenticated to user_addr. Appended last (matches the Move
+        // serializer + struct). The 5-of-7 FROST/fallback signers cover it automatically (they sign
+        // the opaque messageBytes — no nonce/partial/aggregate phase change needed).
+        userAddr: parsed.userAddr,
       };
       const messageBytes = bcsEncodeDepositAttestationV2(attestationMessage);
       const messageHex = bytesToHex(messageBytes);
@@ -7087,6 +7101,32 @@ export function buildCoordinatorServer(
   };
   registerVaultResyncRoute(server, vaultResyncOpts, "/v2/vault/resync_after_withdraw", "after_withdraw");
   registerVaultResyncRoute(server, vaultResyncOpts, "/v2/vault/resync_before_round1", "before_round1");
+
+  // CP3 deposit-delegate: forward the assembled DepositV3DelegateArgs to the relayer's
+  // /v3/relayer/submit/deposit (prepare_deposit_binding_v3 + deposit_step2a_v3). step2b stays
+  // user-signed → deposit = 1 user sig. Bearer-protected by the global onRequest hook; the BFF
+  // forbidden-plaintext-field guard runs before this, and the relayer re-validates the body.
+  server.post("/v2/deposit/delegate-submit", async (req, reply) => {
+    if (!opts.depositRelayerSubmitter) {
+      return reply
+        .code(502)
+        .send({ error: "relayer_unreachable", message: "deposit-delegate submitter not configured" });
+    }
+    try {
+      const result = await opts.depositRelayerSubmitter(req.body);
+      return reply.code(202).send(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "unknown";
+      // The relayer's gas breaker / reserve guard surfaces as relayer_self_submit:<reason> — relay
+      // it to the browser so it falls back to Petra-signing prepare/step2a itself.
+      if (msg.startsWith("relayer_self_submit:")) {
+        return reply
+          .code(200)
+          .send({ action: "self_submit", reason: msg.slice("relayer_self_submit:".length).trim() });
+      }
+      return reply.code(502).send({ error: "relayer_returned_error", message: msg });
+    }
+  });
 
   return { server, store };
 }

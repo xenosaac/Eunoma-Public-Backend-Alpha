@@ -54,11 +54,42 @@ describe("deposit attestation BCS", () => {
       depositNonce: "99",
       expirySecs: "3",
       circuitVersionsHash: h32("9"),
+      userAddr: h32("a"),
     });
+    // (B) domain bumped V2→V3 — the deposit attestation now binds user_addr.
     expect(Buffer.from(bytes.subarray(0, 23)).toString("hex")).toBe(
-      "1645554e4f4d415f4445504f5349545f42494e445f5632",
+      "1645554e4f4d415f4445504f5349545f42494e445f5633",
     );
     expect(bytes[23]).toBe(2);
+  });
+
+  it("is byte-identical to the Move serializer with user_addr (golden cross-check)", () => {
+    // Golden = the exact bytes asserted by the Move byte-identity test
+    // (move/tests/deposit_attestation_user_addr_test.move). Same inputs; user_addr (0x..eeeeeee4)
+    // appended as raw 32B. This is the Move↔TS deposit-attestation byte contract — if either side
+    // changes field order/encoding, this fails.
+    const addr = (suffix: string) => "0".repeat(64 - suffix.length) + suffix;
+    const bytes = bcsEncodeDepositAttestationV2({
+      chainId: 2,
+      bridge: addr("eeeeeee1"),
+      vault: addr("eeeeeee2"),
+      assetType: addr("eeeeeee3"),
+      operatorSetVersion: "1",
+      dkgEpoch: "9",
+      rosterHash: h32("a"),
+      frostGroupPubkey:
+        "0e09035c98f5370bd5f1213272984e7390e1ddf21066a44bdf9fd7bb2fc668fa",
+      commitment: h32("b"),
+      amountTag: h32("c"),
+      caPayloadHash: h32("d"),
+      depositNonce: h32("e"),
+      expirySecs: "1800000000",
+      circuitVersionsHash: h32("1"),
+      userAddr: addr("eeeeeee4"),
+    });
+    expect(Buffer.from(bytes).toString("hex")).toBe(
+      "1645554e4f4d415f4445504f5349545f42494e445f56330200000000000000000000000000000000000000000000000000000000eeeeeee100000000000000000000000000000000000000000000000000000000eeeeeee200000000000000000000000000000000000000000000000000000000eeeeeee30100000000000000090000000000000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa200e09035c98f5370bd5f1213272984e7390e1ddf21066a44bdf9fd7bb2fc668fa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb20cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc20dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee00d2496b0000000020111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000eeeeeee4",
+    );
   });
 });
 

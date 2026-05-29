@@ -22,6 +22,7 @@ module eunoma::eunoma_bridge {
     };
 
     use aptos_framework::account;
+    use aptos_framework::aptos_account;
     use aptos_framework::chain_id;
     use aptos_framework::confidential_asset;
     use aptos_framework::event;
@@ -51,6 +52,9 @@ module eunoma::eunoma_bridge {
     const WITHDRAW_VK_IC_LENGTH: u64 = 10;
 
     const DOMAIN_DEPOSIT_V2: vector<u8> = b"EUNOMA_DEPOSIT_BIND_V2";
+    // Deposit re-key: V3 attestation binds user_addr so relayer-submitted step2a cannot be
+    // misdirected. Kept additive because Aptos upgrades reject layout/signature changes.
+    const DOMAIN_DEPOSIT_V3: vector<u8> = b"EUNOMA_DEPOSIT_BIND_V3";
     const DOMAIN_WITHDRAW_V2: vector<u8> = b"EUNOMA_WITHDRAW_ATTESTATION_V2";
     const POSEIDON_DOMAIN_ASSET_ID: vector<u8> = b"EUNOMA_ASSET_ID_V2";
     const POSEIDON_DOMAIN_VAULT_ADDR_HASH: vector<u8> = b"EUNOMA_VAULT_ADDR_V2";
@@ -106,6 +110,10 @@ module eunoma::eunoma_bridge {
     const E_NOT_RECORDER_DELEGATE: u64 = 31;
     const E_NOT_WITHDRAW_OWNER: u64 = 32;
     const E_PENDING_WITHDRAW_FINALIZATION: u64 = 33;
+    // (C) gas economics: GasFeeConfigV1 not initialized.
+    const E_GAS_FEE_NOT_INITIALIZED: u64 = 34;
+    // (B) deposit re-key: a (user_addr, commitment) finalization slot already exists at step2a.
+    const E_PENDING_DEPOSIT_FINALIZATION: u64 = 35;
 
     struct BridgeVault has key {
         admin: address,
@@ -181,6 +189,15 @@ module eunoma::eunoma_bridge {
     // with garbage (mitigated by assert_hash length check + table idempotent add).
     struct RecorderDelegate has key {
         addr: address,
+    }
+
+    // (C) gas economics: flat plain-APT relayer-gas fee collected at deposit step2b, routed to a
+    // communal plain-APT gas-reserve account the withdraw relayer draws gas from. FLAT only (a
+    // %-fee in cleartext APT would leak the confidential amount). Admin-settable so the fee can be
+    // retuned / the reserve rotated / the fee zeroed (kill-switch) without a redeploy.
+    struct GasFeeConfigV1 has key {
+        flat_fee_octas: u64,
+        reserve_addr: address,
     }
 
     // C1 (gas opt): cache circuit_versions_hash(cfg) so deposit/withdraw hot paths read a
@@ -428,6 +445,25 @@ module eunoma::eunoma_bridge {
         deposit_nonce: vector<u8>,
         expiry_secs: u64,
         circuit_versions_hash: vector<u8>,
+    }
+
+    struct DepositAttestationV3Message has drop, store {
+        domain: vector<u8>,
+        chain_id: u8,
+        bridge: address,
+        vault: address,
+        asset_type: address,
+        operator_set_version: u64,
+        dkg_epoch: u64,
+        roster_hash: vector<u8>,
+        frost_group_pubkey: vector<u8>,
+        commitment: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        deposit_nonce: vector<u8>,
+        expiry_secs: u64,
+        circuit_versions_hash: vector<u8>,
+        user_addr: address,
     }
 
     struct WithdrawAttestationV2Message has drop, store {
@@ -819,6 +855,32 @@ module eunoma::eunoma_bridge {
         rd.addr = delegate_addr;
     }
 
+    // (C) gas economics: one-time init of the flat plain-APT relayer-gas fee + communal reserve
+    // address. No-op-safe: until this runs, deposit_step2b collects no fee (exists<> guard there).
+    public entry fun init_gas_fee_config_v1(
+        admin: &signer,
+        flat_fee_octas: u64,
+        reserve_addr: address,
+    ) acquires BridgeVault {
+        assert_admin(admin);
+        assert!(!exists<GasFeeConfigV1>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, GasFeeConfigV1 { flat_fee_octas, reserve_addr });
+    }
+
+    // (C) gas economics: admin retunes the flat fee / rotates the reserve / zeroes the fee.
+    // flat_fee_octas = 0 is the incident kill-switch — disables collection with no redeploy.
+    public entry fun admin_set_gas_fee_config_v1(
+        admin: &signer,
+        flat_fee_octas: u64,
+        reserve_addr: address,
+    ) acquires GasFeeConfigV1, BridgeVault {
+        assert_admin(admin);
+        assert!(exists<GasFeeConfigV1>(@eunoma), E_GAS_FEE_NOT_INITIALIZED);
+        let c = borrow_global_mut<GasFeeConfigV1>(@eunoma);
+        c.flat_fee_octas = flat_fee_octas;
+        c.reserve_addr = reserve_addr;
+    }
+
     // R7-OPS-1: delegate-signed root recording. Sender must match RecorderDelegate.addr
     // (set by admin via admin_set_recorder_delegate). Same effect as record_known_root_v2
     // but no admin key required on the operator machine. Strict scope: only writes to
@@ -905,8 +967,8 @@ module eunoma::eunoma_bridge {
         // Byte-identical to bcs::to_bytes(&DepositAttestationV2Message{...}) per byte-identity
         // tests in round6_wave_d_deposit_msg_byte_identity_tests.move. Saves ~500-800 gas/deposit
         // (struct walker frame + heap alloc + drop + 6 redundant vec32 bcs allocs).
-        let msg_bytes = serialize_deposit_attestation_v2_msg(
-            &DOMAIN_DEPOSIT_V2,
+        let msg_bytes = serialize_deposit_attestation_v3_msg(
+            &DOMAIN_DEPOSIT_V3,
             chain_id::get(),
             @eunoma,
             vault_addr,
@@ -921,6 +983,8 @@ module eunoma::eunoma_bridge {
             &deposit_nonce,
             expiry_secs,
             &cvh,
+            // (B) monolith self-deposit: user IS the submitter, so user_addr = sender.
+            signer::address_of(sender),
         );
         assert_deop_attestation_v2(
             &msg_bytes,
@@ -1028,6 +1092,66 @@ module eunoma::eunoma_bridge {
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
     ) acquires BridgeVault, BridgeVaultTablesV2, PendingDepositBindingsV2, PendingDepositBindingsV3, PendingDepositFinalizationsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK, CircuitVersionsHashCacheV2 {
+        deposit_step2a_eunoma_verify_v3(
+            sender,
+            signer::address_of(sender),
+            commitment,
+            amount_tag,
+            ca_payload_hash,
+            deposit_nonce,
+            deposit_binding_proof,
+            expiry_secs,
+            group_signature,
+            fallback_bitmap,
+            fallback_signatures,
+            new_balance_p,
+            new_balance_r,
+            new_balance_r_eff_aud,
+            amount_p,
+            amount_r_sender,
+            amount_r_recip,
+            amount_r_eff_aud,
+            ek_volun_auds,
+            amount_r_volun_auds,
+            zkrp_new_balance,
+            zkrp_amount,
+            sigma_proto_comm,
+            sigma_proto_resp,
+            memo,
+        );
+    }
+
+    public entry fun deposit_step2a_eunoma_verify_v3(
+        // (B) deposit re-key: tx submitter (relayer OR the user themselves) — UNUSED for auth.
+        // Authority = the deop FROST attestation (now binds user_addr) + the deposit-binding proof.
+        _relayer: &signer,
+        // (B) the depositing user's address; the finalization + binding cache are keyed by this,
+        // and it is bound into the signed attestation message so a relayer cannot misdirect it.
+        user_addr: address,
+        commitment: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        deposit_nonce: vector<u8>,
+        deposit_binding_proof: vector<u8>,
+        expiry_secs: u64,
+        group_signature: vector<u8>,
+        fallback_bitmap: u8,
+        fallback_signatures: vector<vector<u8>>,
+        new_balance_p: vector<vector<u8>>,
+        new_balance_r: vector<vector<u8>>,
+        new_balance_r_eff_aud: vector<vector<u8>>,
+        amount_p: vector<vector<u8>>,
+        amount_r_sender: vector<vector<u8>>,
+        amount_r_recip: vector<vector<u8>>,
+        amount_r_eff_aud: vector<vector<u8>>,
+        ek_volun_auds: vector<vector<u8>>,
+        amount_r_volun_auds: vector<vector<vector<u8>>>,
+        zkrp_new_balance: vector<u8>,
+        zkrp_amount: vector<u8>,
+        sigma_proto_comm: vector<vector<u8>>,
+        sigma_proto_resp: vector<vector<u8>>,
+        memo: vector<u8>,
+    ) acquires BridgeVault, BridgeVaultTablesV2, PendingDepositBindingsV2, PendingDepositBindingsV3, PendingDepositFinalizationsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK, CircuitVersionsHashCacheV2 {
         assert_initialized();
         assert!(exists<PendingDepositFinalizationsV3>(@eunoma), E_NOT_INITIALIZED);
         assert_not_expired(expiry_secs);
@@ -1062,8 +1186,8 @@ module eunoma::eunoma_bridge {
 
         let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
         let cvh = get_or_compute_circuit_versions_hash(cfg);
-        let msg_bytes = serialize_deposit_attestation_v2_msg(
-            &DOMAIN_DEPOSIT_V2,
+        let msg_bytes = serialize_deposit_attestation_v3_msg(
+            &DOMAIN_DEPOSIT_V3,
             chain_id::get(),
             @eunoma,
             vault_addr,
@@ -1078,6 +1202,9 @@ module eunoma::eunoma_bridge {
             &deposit_nonce,
             expiry_secs,
             &cvh,
+            // (B) deposit re-key: bind the depositing user into the deop-signed attestation so a
+            // relayer-submitted step2a is authenticated to user_addr and cannot be misdirected.
+            user_addr,
         );
         assert_deop_attestation_v2(
             &msg_bytes,
@@ -1086,23 +1213,29 @@ module eunoma::eunoma_bridge {
             fallback_signatures,
             cfg,
         );
-        let sender_addr = signer::address_of(sender);
-        // R7-W1: pass sender_addr for composite (sender, commitment) V3 cache lookup.
+        // (B) consume the V3 binding cache under (user_addr, commitment) — prepare_deposit_binding_v3
+        // wrote it under the same user_addr. The deposit-binding Groth16 proof already binds the
+        // commitment to the user's private nullifier/secret, so keying by user_addr does NOT reopen
+        // the R7-W1 squat-DoS (an attacker cannot mint a valid binding for a commitment they don't own).
         consume_or_verify_deposit_binding(
-            sender_addr,
+            user_addr,
             &commitment,
             &amount_tag,
             &amount_p,
             deposit_binding_proof,
         );
 
-        // Record pending finalization. step2b must drain this via table::remove on
-        // {sender match, !expired, ca_payload_hash recompute match}.
-        // R7-W1: composite (sender, commitment) key — squat-proof.
-        let key = compose_pending_key(sender_addr, &commitment);
+        // Record pending finalization keyed by (user_addr, commitment). step2b (signed by the USER)
+        // drains it via compose_pending_key(signer::address_of(sender), commitment) + the
+        // entry.sender == signer check, so only the user — not the relayer — can finalize + CA-debit.
+        let key = compose_pending_key(user_addr, &commitment);
         let pending = borrow_global_mut<PendingDepositFinalizationsV3>(@eunoma);
+        // (B sub-4) contains-guard: a pre-existing (user_addr, commitment) finalization slot is
+        // rejected with a named error instead of a raw table::add abort. A same-nonce relayer retry
+        // is already stopped earlier by check_and_mark_deposit_nonce_v2 (E_DEPOSIT_NONCE_REPLAY).
+        assert!(!table::contains(&pending.by_commitment, *&key), E_PENDING_DEPOSIT_FINALIZATION);
         table::add(&mut pending.by_commitment, key, PendingDepositFinalizationV3 {
-            sender: sender_addr,
+            sender: user_addr,
             amount_tag: *&amount_tag,
             ca_payload_hash: *&ca_payload_hash,
             deposit_nonce: *&deposit_nonce,
@@ -1111,7 +1244,7 @@ module eunoma::eunoma_bridge {
 
         event::emit(DepositStep2aRecorded {
             commitment,
-            sender: sender_addr,
+            sender: user_addr,
             expiry_secs,
         });
 
@@ -1137,7 +1270,7 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, PendingDepositFinalizationsV3 {
+    ) acquires BridgeVault, PendingDepositFinalizationsV3, GasFeeConfigV1 {
         assert_initialized();
         assert!(exists<PendingDepositFinalizationsV3>(@eunoma), E_NOT_INITIALIZED);
 
@@ -1201,6 +1334,19 @@ module eunoma::eunoma_bridge {
             sigma_proto_resp,
             memo,
         );
+
+        // (C) gas economics — collect a FLAT plain-APT relayer-gas fee from the user (already the
+        // signer here) into the communal gas reserve. Zero extra signature. FLAT ONLY: a %-fee paid
+        // in cleartext APT would reveal the confidential amount (A = F/p). No-op until admin runs
+        // init_gas_fee_config_v1; flat_fee_octas = 0 disables it (incident kill-switch). Atomic with
+        // the CA debit above — if the user lacks APT for the fee the whole step2b reverts (no
+        // deposit without fee, no fee without deposit). Borrows a different global than `vault`.
+        if (exists<GasFeeConfigV1>(@eunoma)) {
+            let fee_cfg = borrow_global<GasFeeConfigV1>(@eunoma);
+            if (fee_cfg.flat_fee_octas > 0) {
+                aptos_account::transfer(sender, fee_cfg.reserve_addr, fee_cfg.flat_fee_octas);
+            };
+        };
 
         let new_deposit_count = vault.deposit_count + 1;
         vault.deposit_count = new_deposit_count;
@@ -1848,11 +1994,29 @@ module eunoma::eunoma_bridge {
         });
     }
 
-    // N2 gas opt: new prepare entry. Frontend switches from v2 → v3 entry. Writes V3 cache
-    // table storing amount_p directly so consume_or_verify_deposit_binding's V3 fast path
-    // can byte-compare amount_p (skipping 4-Poseidon recompute on deposit cache-hit).
     public entry fun prepare_deposit_binding_v3(
         sender: &signer,
+        commitment: vector<u8>,
+        amount_tag: vector<u8>,
+        amount_p: vector<vector<u8>>,
+        deposit_binding_proof: vector<u8>,
+    ) acquires PendingDepositBindingsV3, VaultPublicInputsV2, PreparedDepositBindingVK {
+        prepare_deposit_binding_v3_for_user(
+            sender,
+            signer::address_of(sender),
+            commitment,
+            amount_tag,
+            amount_p,
+            deposit_binding_proof,
+        );
+    }
+
+    // Deposit re-key: additive prepare entry with explicit user_addr. Writes V3 cache table under
+    // user_addr so the relayer can pre-run this proof on the depositor's behalf without changing
+    // the already-published prepare_deposit_binding_v3 ABI.
+    public entry fun prepare_deposit_binding_v3_for_user(
+        _relayer: &signer,
+        user_addr: address,
         commitment: vector<u8>,
         amount_tag: vector<u8>,
         amount_p: vector<vector<u8>>,
@@ -1868,9 +2032,9 @@ module eunoma::eunoma_bridge {
             &amount_p_digest,
             deposit_binding_proof,
         );
-        // R7-W1: composite (sender, commitment) key prevents squat-DoS by adversary
-        // pre-occupying victim's commitment slot.
-        let key = compose_pending_key(signer::address_of(sender), &commitment);
+        // R7-W1: composite (user_addr, commitment) key prevents squat-DoS by adversary
+        // pre-occupying victim's commitment slot while still allowing relayer submission.
+        let key = compose_pending_key(user_addr, &commitment);
         let pending = borrow_global_mut<PendingDepositBindingsV3>(@eunoma);
         assert!(!table::contains(&pending.by_commitment, *&key), E_PENDING_DEPOSIT_BINDING);
         table::add(&mut pending.by_commitment, key, PendingDepositBindingV3 {
@@ -3212,7 +3376,7 @@ module eunoma::eunoma_bridge {
         buf
     }
 
-    // R6-C.1 (Round 6 Wave D): struct-free BCS serializer for DepositAttestationV2Message.
+    // R6-C.1 (Round 6 Wave D): struct-free BCS serializer for DepositAttestationV3Message.
     // Mirrors R5-C serialize_withdraw_attestation_v2_msg exactly. Output is byte-identical
     // to bcs::to_bytes(&DepositAttestationV2Message{...}) because BCS struct encoding =
     // field-by-field concat in declaration order (no framing). Field order MUST match struct
@@ -3223,7 +3387,7 @@ module eunoma::eunoma_bridge {
     // to 32B via assert_3_deposit_hashes (R6-A.1) + init-time roster/pubkey + keccak256 cvh.
     // deposit_nonce uses bcs::to_bytes (variable-length, NOT length-gated) so ULEB128 prefix
     // matches BCS struct encoding for any length (test coverage at 16B + 64B variants).
-    fun serialize_deposit_attestation_v2_msg(
+    fun serialize_deposit_attestation_v3_msg(
         domain: &vector<u8>,
         chain_id: u8,
         bridge: address,
@@ -3239,6 +3403,7 @@ module eunoma::eunoma_bridge {
         deposit_nonce: &vector<u8>,
         expiry_secs: u64,
         circuit_versions_hash: &vector<u8>,
+        user_addr: address,
     ): vector<u8> {
         let buf = vector::empty<u8>();
         vector::append(&mut buf, bcs::to_bytes(domain));
@@ -3256,6 +3421,9 @@ module eunoma::eunoma_bridge {
         vector::append(&mut buf, bcs::to_bytes(deposit_nonce));
         vector::append(&mut buf, bcs::to_bytes(&expiry_secs));
         append_vec32_bcs(&mut buf, circuit_versions_hash);
+        // Append depositing user's address (raw 32B, no length prefix). The off-chain TS serializer
+        // MUST writeAddress here too.
+        vector::append(&mut buf, bcs::to_bytes(&user_addr));
         buf
     }
 
@@ -4692,7 +4860,7 @@ module eunoma::eunoma_bridge {
 
     // R6-C.1 byte-identity test shims (mirror R5-C pattern above).
     #[test_only]
-    public fun test_only_serialize_deposit_attestation_v2_msg(
+    public fun test_only_serialize_deposit_attestation_v3_msg(
         domain: vector<u8>,
         chain_id: u8,
         bridge: address,
@@ -4708,18 +4876,19 @@ module eunoma::eunoma_bridge {
         deposit_nonce: vector<u8>,
         expiry_secs: u64,
         circuit_versions_hash: vector<u8>,
+        user_addr: address,
     ): vector<u8> {
-        serialize_deposit_attestation_v2_msg(
+        serialize_deposit_attestation_v3_msg(
             &domain, chain_id, bridge, vault, asset_type,
             operator_set_version, dkg_epoch,
             &roster_hash, &frost_group_pubkey,
             &commitment, &amount_tag, &ca_payload_hash, &deposit_nonce,
-            expiry_secs, &circuit_versions_hash,
+            expiry_secs, &circuit_versions_hash, user_addr,
         )
     }
 
     #[test_only]
-    public fun test_only_struct_bcs_deposit_attestation_v2_msg(
+    public fun test_only_struct_bcs_deposit_attestation_v3_msg(
         domain: vector<u8>,
         chain_id: u8,
         bridge: address,
@@ -4735,8 +4904,9 @@ module eunoma::eunoma_bridge {
         deposit_nonce: vector<u8>,
         expiry_secs: u64,
         circuit_versions_hash: vector<u8>,
+        user_addr: address,
     ): vector<u8> {
-        let msg = DepositAttestationV2Message {
+        let msg = DepositAttestationV3Message {
             domain,
             chain_id,
             bridge,
@@ -4752,6 +4922,7 @@ module eunoma::eunoma_bridge {
             deposit_nonce,
             expiry_secs,
             circuit_versions_hash,
+            user_addr,
         };
         bcs::to_bytes(&msg)
     }

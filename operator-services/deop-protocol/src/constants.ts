@@ -4,7 +4,10 @@ export const CA_DKG_SCHEME_V2 = "ca_dkg_v2";
 export const CA_DKG_SCHEME_LOCAL = "ca_local";
 export const FROST_DKG_SCHEME_V2 = "frost_dkg_v2";
 
-export const DOMAIN_DEPOSIT_BIND_V2 = "EUNOMA_DEPOSIT_BIND_V2";
+// (B) deposit re-key: bumped V2→V3 — the deposit attestation message now binds user_addr. MUST
+// match the on-chain DOMAIN_DEPOSIT_V2 const string in eunoma_bridge.move (also "..._V3"). Const
+// name kept for minimal churn; the SIGNED STRING is the version of record.
+export const DOMAIN_DEPOSIT_BIND_V2 = "EUNOMA_DEPOSIT_BIND_V3";
 export const DOMAIN_WITHDRAW_ATTESTATION_V2 = "EUNOMA_WITHDRAW_ATTESTATION_V2";
 export const DOMAIN_ROSTER_HASH_V2 = "EUNOMA_DEOP_ROSTER_V2";
 export const DOMAIN_CA_DKG_V2_ROSTER_HASH = "EUNOMA_CA_DKG_V2_ROSTER";

@@ -35,6 +35,22 @@ import {
   u64Arg,
 } from "@eunoma/shared";
 import { spawn as nodeSpawn } from "node:child_process";
+import type { WithdrawV3SubmitResult } from "./withdraw_v3_submitter.js";
+import type { GasGuard } from "./gas_guard.js";
+import type { VaultSequencer } from "./vault_sequencer.js";
+import type { SubmitJournal } from "./submit_journal.js";
+import type { DepositV3DelegateArgs, DepositV3SubmitResult } from "./deposit_v3_submitter.js";
+import { DepositV3ArgsError, parseDepositV3DelegateArgs } from "./deposit_v3_args.js";
+
+/** The v3 split-tx withdraw submitter (createWithdrawV3Submitter's return), with optional per-step
+ *  journaling hooks the route binds to the journal + this call's request_hash. */
+export type WithdrawV3SubmitterFn = (
+  args: WithdrawV2CallArgs,
+  hooks?: {
+    onStepStart?: (step: number, fn: string) => void;
+    onStepDone?: (step: number, fn: string, txHash: string) => void;
+  },
+) => Promise<WithdrawV3SubmitResult>;
 
 export interface RelayerSubmitResult {
   accepted: true;
@@ -75,6 +91,17 @@ export interface RelayerServerOptions {
    * mocks.
    */
   submitter?: RelayerWithdrawSubmitter;
+  // ---- CP3: split-v3 withdraw route deps. When withdrawV3Submitter is set, /v3 withdraw is active. ----
+  withdrawV3Submitter?: WithdrawV3SubmitterFn;
+  /** Gas circuit breaker + reserve guard, checked STRICTLY before submission. */
+  gasGuard?: GasGuard;
+  /** Single-writer mutex serializing the step2a→step2b critical section. */
+  sequencer?: VaultSequencer;
+  /** Crash-recovery journal; the route records per-step intent/completed keyed by request_hash. */
+  journal?: SubmitJournal;
+  /** Deposit-delegate submitter (prepare_deposit_binding_v3 + deposit_step2a_v3). When set, the /v3
+   *  deposit route is active. step2b is NEVER relayer-submitted (it is the user's own CA debit). */
+  depositV3Submitter?: (args: DepositV3DelegateArgs) => Promise<DepositV3SubmitResult>;
 }
 
 export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInstance {
@@ -132,6 +159,110 @@ export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInst
       // Legacy/unstructured submitter errors (e.g. injected mocks throwing
       // bare Error). Keep the existing wire shape but constrain to message
       // text the submitter chose to expose.
+      return reply.code(502).send({
+        error: "submit_failed",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // CP3: split-v3 withdraw route. Composes gasGuard (self-submit gate) + sequencer (single-writer)
+  // + journal (per-step crash recovery) + the 5-tx withdraw_v3_submitter. Recipient is triple-pinned
+  // on-chain, so a relayer can only stall — never steal/redirect.
+  server.post("/v3/relayer/submit/withdraw", async (req, reply) => {
+    if (!opts.withdrawV3Submitter) {
+      return reply.code(501).send({ error: "v3_not_configured" });
+    }
+    let args: WithdrawV2CallArgs;
+    try {
+      args = parseWithdrawV2CallArgs(req.body);
+    } catch (err) {
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof WithdrawV2CallArgsError) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+
+    // Gas circuit breaker — STRICTLY BEFORE any submission. If the breaker is open / reserve low /
+    // RPC read failed, refuse and tell the client to self-submit. step2a must NOT land under the
+    // relayer when we bail, or the user could no longer take over (compose_pending_key namespacing).
+    if (opts.gasGuard) {
+      const decision = await opts.gasGuard.check();
+      if (!decision.allow) {
+        return reply.code(200).send({ action: "self_submit", reason: decision.reason });
+      }
+    }
+
+    const journal = opts.journal;
+    const requestHash = args.requestHash;
+    const run = (): Promise<WithdrawV3SubmitResult> =>
+      opts.withdrawV3Submitter!(
+        args,
+        journal
+          ? {
+              onStepStart: (step) => journal.recordIntent(requestHash, step),
+              onStepDone: (step, _fn, txHash) => journal.recordCompleted(requestHash, step, txHash),
+            }
+          : undefined,
+      );
+    try {
+      // Serialize the step2a→step2b critical section so concurrent withdraws don't race
+      // vault_sequence (only the first step2b would land; the rest abort E_VAULT_SEQUENCE_MISMATCH).
+      const result = opts.sequencer ? await opts.sequencer.runExclusive(run) : await run();
+      return reply.code(202).send(result);
+    } catch (err) {
+      if (err instanceof RelayerSubmitterError) {
+        return reply.code(502).send({ error: "submit_failed", code: err.code, message: err.message });
+      }
+      return reply.code(502).send({
+        error: "submit_failed",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // CP3: deposit-delegate route. Submits prepare_deposit_binding_v3 + deposit_step2a_v3 on the user's
+  // behalf (after the Move re-key to user_addr); step2b stays user-signed → deposit = 1 user sig.
+  // Fund-inert: the relayer cannot drain (it never submits step2b, the CA debit); user_addr is
+  // bound into the deop-signed attestation so a relayer cannot misdirect.
+  server.post("/v3/relayer/submit/deposit", async (req, reply) => {
+    if (!opts.depositV3Submitter) {
+      return reply.code(501).send({ error: "v3_not_configured" });
+    }
+    let args: DepositV3DelegateArgs;
+    try {
+      args = parseDepositV3DelegateArgs(req.body);
+    } catch (err) {
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof DepositV3ArgsError) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+    if (opts.gasGuard) {
+      const decision = await opts.gasGuard.check();
+      if (!decision.allow) {
+        return reply.code(200).send({ action: "self_submit", reason: decision.reason });
+      }
+    }
+    try {
+      const result = await opts.depositV3Submitter(args);
+      return reply.code(202).send(result);
+    } catch (err) {
+      if (err instanceof RelayerSubmitterError) {
+        return reply.code(502).send({ error: "submit_failed", code: err.code, message: err.message });
+      }
       return reply.code(502).send({
         error: "submit_failed",
         message: err instanceof Error ? err.message : "unknown",
@@ -301,7 +432,7 @@ export function encodeCallArgs(args: WithdrawV2CallArgs): string[] {
   return WITHDRAW_V2_CALL_ARGS_ORDER.map((key) => encodeField(key, args[key]));
 }
 
-function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2CallArgs[keyof WithdrawV2CallArgs]): string {
+export function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2CallArgs[keyof WithdrawV2CallArgs]): string {
   switch (key) {
     case "recipient": {
       // Move param type is `address`, NOT `vector<u8>`. Aptos CLI args for an
@@ -353,7 +484,7 @@ function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2CallArgs[ke
   }
 }
 
-function parseTxHashFromAptosCliStdout(stdout: string): string | undefined {
+export function parseTxHashFromAptosCliStdout(stdout: string): string | undefined {
   // The aptos CLI prints a JSON object with a "Result" key containing
   // "transaction_hash". We accept either the raw JSON form
   //   "transaction_hash": "0x.."
@@ -363,12 +494,12 @@ function parseTxHashFromAptosCliStdout(stdout: string): string | undefined {
   return undefined;
 }
 
-function chunkToString(chunk: Buffer | string): string {
+export function chunkToString(chunk: Buffer | string): string {
   if (typeof chunk === "string") return chunk;
   return chunk.toString("utf8");
 }
 
-const defaultSpawnAptos: SpawnAptosFn = (command, args) => {
+export const defaultSpawnAptos: SpawnAptosFn = (command, args) => {
   const proc = nodeSpawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
   const done = new Promise<number | null>((resolve, reject) => {
     proc.on("close", (code) => resolve(code));

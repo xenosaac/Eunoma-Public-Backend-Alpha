@@ -69,6 +69,10 @@ export interface DepositFrostAttestRequest {
   /** Decimal string. Unix-seconds-since-epoch deadline after which the attestation MUST NOT
    *  be accepted by `deposit_with_commitment_v2`. */
   expirySecs: string;
+  /** 32-byte hex (Aptos address). The depositing user's address — bound into the attested message
+   *  (B deposit re-key) so a relayer-submitted deposit step2a is authenticated to this user and
+   *  cannot be misdirected. A public chain identifier, NOT a witness. */
+  userAddr: HexString;
 }
 
 export class DepositFrostAttestError extends Error {
@@ -102,6 +106,7 @@ export function parseDepositFrostAttestRequest(body: unknown): DepositFrostAttes
   const caPayloadHash = requireHex(obj, "caPayloadHash", 32);
   const depositNonce = requireHex(obj, "depositNonce", 32);
   const expirySecs = requireDecimalString(obj, "expirySecs");
+  const userAddr = requireHex(obj, "userAddr", 32);
 
   return {
     requestId,
@@ -120,6 +125,7 @@ export function parseDepositFrostAttestRequest(body: unknown): DepositFrostAttes
     caPayloadHash,
     depositNonce,
     expirySecs,
+    userAddr,
   };
 }
 
