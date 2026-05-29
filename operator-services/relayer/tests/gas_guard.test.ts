@@ -8,6 +8,11 @@ const CFG: GasGuardConfig = {
   reserveMinBalanceOctas: 1_000_000n,
 };
 
+const CFG_WITH_NODE_ORIGIN: GasGuardConfig = {
+  ...CFG,
+  aptosNodeUrl: "https://node.example",
+};
+
 /** Build a fetch mock keyed by URL substring. */
 function mockFetch(routes: {
   gasPrice?: { ok?: boolean; status?: number; body?: unknown };
@@ -43,6 +48,25 @@ describe("createGasGuard", () => {
     expect(d.allow).toBe(true);
     expect(d.gasUnitPrice).toBe(150n); // uses the prioritized (higher) estimate
     expect(d.reserveBalanceOctas).toBe(5_000_000n);
+  });
+
+  it("normalizes Aptos node origins to the REST /v1 base path", async () => {
+    const urls: string[] = [];
+    const guard = createGasGuard(CFG_WITH_NODE_ORIGIN, {
+      fetchFn: async (url, init) => {
+        urls.push(`${init?.method ?? "GET"} ${url}`);
+        if (url.includes("estimate_gas_price")) {
+          return { ok: true, status: 200, json: async () => ({ gas_estimate: 100 }) };
+        }
+        return { ok: true, status: 200, json: async () => ["5000000"] };
+      },
+    });
+    const d = await guard.check();
+    expect(d.allow).toBe(true);
+    expect(urls).toEqual([
+      "GET https://node.example/v1/estimate_gas_price",
+      "POST https://node.example/v1/view",
+    ]);
   });
 
   it("refuses (gas_price_circuit_breaker_open) when gas spikes above max", async () => {

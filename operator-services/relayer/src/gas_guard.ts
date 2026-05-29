@@ -48,8 +48,13 @@ const APT_COIN_STORE = "0x1::coin::CoinStore<0x1::aptos_coin::AptosCoin>";
 const APT_COIN_BALANCE_VIEW = "0x1::coin::balance";
 const APT_COIN_TYPE = "0x1::aptos_coin::AptosCoin";
 
+function aptosRestBaseUrl(nodeUrl: string) {
+  const trimmed = nodeUrl.replace(/\/$/, "");
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+}
+
 async function readGasUnitPrice(fetchFn: FetchFn, nodeUrl: string): Promise<bigint> {
-  const res = await fetchFn(`${nodeUrl.replace(/\/$/, "")}/estimate_gas_price`);
+  const res = await fetchFn(`${aptosRestBaseUrl(nodeUrl)}/estimate_gas_price`);
   if (!res.ok) throw new Error(`estimate_gas_price HTTP ${res.status}`);
   const body = (await res.json()) as { gas_estimate?: number; prioritized_gas_estimate?: number };
   // Use the (higher) prioritized estimate when present so the breaker is conservative.
@@ -65,7 +70,7 @@ async function readReserveBalanceOctas(
   nodeUrl: string,
   reserveAddr: string,
 ): Promise<bigint> {
-  const baseUrl = nodeUrl.replace(/\/$/, "");
+  const baseUrl = aptosRestBaseUrl(nodeUrl);
   const viewUrl = `${baseUrl}/view`;
   try {
     const viewRes = await fetchFn(viewUrl, {
