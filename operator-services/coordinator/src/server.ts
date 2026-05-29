@@ -161,6 +161,83 @@ export function isSafeId(s: string): boolean {
   return true;
 }
 
+function normalizeEventAddr(value: string | undefined): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const stripped = value.toLowerCase().replace(/^0x/, "");
+  if (!/^[0-9a-f]{1,64}$/.test(stripped)) return null;
+  return stripped.padStart(64, "0");
+}
+
+function normalizeEventHex(value: unknown, key: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`withdraw_resync_event_${key}_missing`);
+  }
+  const stripped = value.toLowerCase().replace(/^0x/, "");
+  if (!/^[0-9a-f]{64}$/.test(stripped)) {
+    throw new Error(`withdraw_resync_event_${key}_bad_hex`);
+  }
+  return stripped;
+}
+
+function parseWithdrawEventForSubmitResync(tx: unknown, bridgePackage: string) {
+  const wantBridge = normalizeEventAddr(bridgePackage);
+  if (!wantBridge) throw new Error("withdraw_resync_bad_bridge_package");
+  if (tx === null || typeof tx !== "object" || Array.isArray(tx)) {
+    throw new Error("withdraw_resync_tx_must_be_object");
+  }
+  const txObj = tx as Record<string, unknown>;
+  const events = Array.isArray(txObj.events) ? txObj.events : null;
+  if (!events) throw new Error("withdraw_resync_tx_events_missing");
+
+  for (const event of events) {
+    if (event === null || typeof event !== "object" || Array.isArray(event)) continue;
+    const rec = event as Record<string, unknown>;
+    const type = typeof rec.type === "string" ? rec.type : "";
+    const [addr, moduleName, eventName] = type.split("::");
+    if (
+      normalizeEventAddr(addr) !== wantBridge ||
+      moduleName !== "eunoma_bridge" ||
+      (eventName !== "WithdrawEventV2" && eventName !== "WithdrawEventV3")
+    ) {
+      continue;
+    }
+    const data = rec.data;
+    if (data === null || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error("withdraw_resync_event_missing_data");
+    }
+    const body = data as Record<string, unknown>;
+    const seqRaw = body.vault_sequence;
+    const eventVaultSequence =
+      typeof seqRaw === "string" ? Number(seqRaw) : typeof seqRaw === "number" ? seqRaw : NaN;
+    if (!Number.isSafeInteger(eventVaultSequence) || eventVaultSequence < 0) {
+      throw new Error("withdraw_resync_event_bad_vault_sequence");
+    }
+    return {
+      root: normalizeEventHex(body.root, "root"),
+      nullifierHash: normalizeEventHex(body.nullifier_hash, "nullifier_hash"),
+      recipientHash: normalizeEventHex(body.recipient_hash, "recipient_hash"),
+      requestHash: normalizeEventHex(body.request_hash, "request_hash"),
+      eventVaultSequence,
+    };
+  }
+
+  throw new Error("withdraw_resync_event_not_found");
+}
+
+async function fetchAptosTransactionByHash(
+  nodeUrl: string,
+  txHash: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<unknown> {
+  const url = new URL(`/v1/transactions/by_hash/${txHash}`, nodeUrl).toString();
+  const res = await fetchImpl(url);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`withdraw_resync_tx_fetch_failed:${res.status}:${text.slice(0, 160)}`);
+  }
+  return res.json();
+}
+
 export interface ProxyForwardResult {
   slot: number;
   ok: boolean;
@@ -6411,6 +6488,7 @@ export function buildCoordinatorServer(
         }
         let confirmation: { confirmed: boolean; success?: boolean; vmStatus?: string } | null =
           null;
+        let postWithdrawResync: Record<string, unknown> | undefined;
         if (!relayerResult.simulated && opts.chainNodeUrl) {
           try {
             confirmation = await waitForTx(opts.chainNodeUrl, relayerResult.txHash, {
@@ -6483,6 +6561,63 @@ export function buildCoordinatorServer(
                 (confirmation.vmStatus ? ` (vmStatus=${confirmation.vmStatus})` : ""),
             });
           }
+
+          try {
+            const attestationConfig = finalize!.attestationConfig;
+            if (!attestationConfig) {
+              throw new Error("withdraw_resync_attestation_config_missing");
+            }
+            const tx = await fetchAptosTransactionByHash(
+              opts.chainNodeUrl,
+              relayerResult.txHash,
+              opts.chainFetch,
+            );
+            const binding = parseWithdrawEventForSubmitResync(tx, attestationConfig.bridge);
+            const resyncPayload = {
+              dkgEpoch: parsed.dkgEpoch,
+              requestId: parsed.requestId,
+              txHash: relayerResult.txHash,
+              bridgePackage: attestationConfig.bridge,
+              vault: attestationConfig.vault,
+              assetType: attestationConfig.assetType,
+              root: binding.root,
+              nullifierHash: binding.nullifierHash,
+              recipientHash: binding.recipientHash,
+              requestHash: binding.requestHash,
+              eventVaultSequence: binding.eventVaultSequence,
+              expectedNextSequence: binding.eventVaultSequence + 1,
+              trigger: "after_withdraw",
+            };
+            // Reuse the public resync route internally so the submit path inherits the same
+            // validation, worker fan-out, quorum threshold, and transcript persistence. This is
+            // best-effort after a chain-confirmed withdraw: a resync failure must not pretend the
+            // already-executed withdraw failed, but it is persisted for ops/debug and surfaced to
+            // the caller.
+            const resyncRes = await server.inject({
+              method: "POST",
+              url: "/v2/vault/resync_after_withdraw",
+              headers: opts.bearerToken ? { authorization: `Bearer ${opts.bearerToken}` } : {},
+              payload: resyncPayload,
+            });
+            let resyncBody: unknown = null;
+            try {
+              resyncBody = JSON.parse(resyncRes.payload);
+            } catch {
+              resyncBody = { raw: resyncRes.payload };
+            }
+            postWithdrawResync = {
+              attempted: true,
+              statusCode: resyncRes.statusCode,
+              ok: resyncRes.statusCode >= 200 && resyncRes.statusCode < 300,
+              body: resyncBody,
+            };
+          } catch (err) {
+            postWithdrawResync = {
+              attempted: true,
+              ok: false,
+              error: err instanceof Error ? err.message : "withdraw_resync_failed",
+            };
+          }
         }
         // 9. Persist the success submit-transcript artifact. Codex M5b P2 #1: stamp
         // `submitInputHash` so subsequent retries can verify byte-identical inputs.
@@ -6504,6 +6639,7 @@ export function buildCoordinatorServer(
                     chainVmStatus: confirmation.vmStatus,
                   }
                 : {}),
+              ...(postWithdrawResync ? { postWithdrawResync } : {}),
             },
             { noClobber: true },
           );
@@ -6538,6 +6674,7 @@ export function buildCoordinatorServer(
           completed: true,
           transcriptHash: submitTranscriptHash,
           transcriptPath: submitTranscriptPath,
+          ...(postWithdrawResync ? { postWithdrawResync } : {}),
         });
       } finally {
         lock.release();

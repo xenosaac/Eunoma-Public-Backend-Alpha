@@ -5705,6 +5705,7 @@ describe("coordinator", () => {
       dkgEpoch: string,
       requestId: string,
       fieldOverrides: Record<string, unknown> = {},
+      artifactOverrides: Record<string, unknown> = {},
     ): Promise<string> {
       const { mkdir, writeFile } = await import("node:fs/promises");
       const { join } = await import("node:path");
@@ -5758,6 +5759,7 @@ describe("coordinator", () => {
           withdrawV2CallArgsFields: fields,
           transcriptHash: h32("e"),
           createdAtUnixMs: 1_700_000_000_000,
+          ...artifactOverrides,
         }),
       );
       return path;
@@ -6280,6 +6282,103 @@ describe("coordinator", () => {
       expect(artifact.completed).toBe(false);
       expect(artifact.chainSuccess).toBe(false);
       expect(artifact.chainVmStatus).toBe("MOVE_ABORT: code=42");
+    });
+
+    it("submit_route_runs_post_withdraw_resync_after_confirmed_relayer_submit", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-resync-");
+      const attestationConfig = {
+        chainId: 2,
+        bridge: h32("1"),
+        vault: h32("2"),
+        assetType: h32("3"),
+        operatorSetVersion: "1",
+        rosterHash: h32("4"),
+        frostGroupPubkey: h32("5"),
+        circuitVersionsHash: h32("6"),
+      };
+      const txHash = "0x" + "ab".repeat(32);
+      await writeFinalizeTranscriptComplete(
+        stateRoot,
+        "1",
+        "withdraw-resync",
+        {},
+        { attestationConfig },
+      );
+      const eventData = {
+        root: h32("a"),
+        nullifier_hash: h32("b"),
+        recipient_hash: h32("c"),
+        request_hash: h32("d"),
+        vault_sequence: "42",
+      };
+      const fakeChainFetch: typeof fetch = async () =>
+        new Response(
+          JSON.stringify({
+            success: true,
+            vm_status: "Executed successfully",
+            events: [
+              {
+                type: `${attestationConfig.bridge}::eunoma_bridge::WithdrawEventV3`,
+                data: eventData,
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      const workerCalls: Array<{ path: string; slot: number; body: Record<string, unknown> }> = [];
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => ({
+          accepted: true,
+          txHash,
+          simulated: false,
+        }),
+        chainNodeUrl: "http://127.0.0.1:8080",
+        chainFetch: fakeChainFetch,
+        chainConfirmationTimeoutMs: 1000,
+        bridgeVaultAddress: attestationConfig.vault,
+        bridgeAssetType: attestationConfig.assetType,
+        singleNodeForwarder: async (path, body, _roster, slot) => {
+          workerCalls.push({ path, slot, body: body as Record<string, unknown> });
+          return { slot, ok: true, statusCode: 200, body: { vault_sequence: 43 } };
+        },
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-resync" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.completed).toBe(true);
+      expect(body.postWithdrawResync.ok).toBe(true);
+      expect(body.postWithdrawResync.statusCode).toBe(200);
+      expect(body.postWithdrawResync.body.summary.okSlots).toEqual([0, 1, 2, 3, 4, 5, 6]);
+      expect(workerCalls.map((c) => c.path)).toEqual(Array(7).fill("/v2/vault/resync"));
+      expect(workerCalls[0].body).toMatchObject({
+        txHash,
+        bridgePackage: attestationConfig.bridge,
+        vault: attestationConfig.vault,
+        assetType: attestationConfig.assetType,
+        root: eventData.root,
+        nullifierHash: eventData.nullifier_hash,
+        recipientHash: eventData.recipient_hash,
+        requestHash: eventData.request_hash,
+        eventVaultSequence: 42,
+        expectedNextSequence: 43,
+      });
+      const { readFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const resyncArtifact = JSON.parse(
+        await readFile(
+          join(stateRoot, "coordinator", "vault_resync", "1__withdraw-resync__after_withdraw.json"),
+          "utf8",
+        ),
+      );
+      expect(resyncArtifact.summary.thresholdMet).toBe(true);
+      const submitArtifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
+      expect(submitArtifact.postWithdrawResync.ok).toBe(true);
     });
 
     // KILLER (Codex M5b P1 #2): the loader enforces that the on-disk transcript's
