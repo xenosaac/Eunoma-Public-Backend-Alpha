@@ -15,7 +15,11 @@
 // and only the relayer can finish it (the user's self-submit fallback could no longer take over).
 
 /** Minimal fetch shape (matches global fetch Response) so tests can inject a deterministic mock. */
-export type FetchFn = (url: string) => Promise<{
+export type FetchFn = (url: string, init?: {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+}) => Promise<{
   ok: boolean;
   status: number;
   json: () => Promise<unknown>;
@@ -41,6 +45,8 @@ export interface GasGuardDecision {
 }
 
 const APT_COIN_STORE = "0x1::coin::CoinStore<0x1::aptos_coin::AptosCoin>";
+const APT_COIN_BALANCE_VIEW = "0x1::coin::balance";
+const APT_COIN_TYPE = "0x1::aptos_coin::AptosCoin";
 
 async function readGasUnitPrice(fetchFn: FetchFn, nodeUrl: string): Promise<bigint> {
   const res = await fetchFn(`${nodeUrl.replace(/\/$/, "")}/estimate_gas_price`);
@@ -59,7 +65,29 @@ async function readReserveBalanceOctas(
   nodeUrl: string,
   reserveAddr: string,
 ): Promise<bigint> {
-  const url = `${nodeUrl.replace(/\/$/, "")}/accounts/${reserveAddr}/resource/${encodeURIComponent(APT_COIN_STORE)}`;
+  const baseUrl = nodeUrl.replace(/\/$/, "");
+  const viewUrl = `${baseUrl}/view`;
+  try {
+    const viewRes = await fetchFn(viewUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        function: APT_COIN_BALANCE_VIEW,
+        type_arguments: [APT_COIN_TYPE],
+        arguments: [reserveAddr],
+      }),
+    });
+    if (!viewRes.ok) throw new Error(`reserve balance view HTTP ${viewRes.status}`);
+    const body = await viewRes.json();
+    if (!Array.isArray(body) || typeof body[0] !== "string" || !/^[0-9]+$/.test(body[0])) {
+      throw new Error("reserve balance view: missing/invalid balance");
+    }
+    return BigInt(body[0]);
+  } catch {
+    // Fall back to the legacy CoinStore resource shape for older nodes/tests.
+  }
+
+  const url = `${baseUrl}/accounts/${reserveAddr}/resource/${encodeURIComponent(APT_COIN_STORE)}`;
   const res = await fetchFn(url);
   // 404 = no CoinStore yet → treat as zero balance (fail-safe: triggers reserve_low refusal).
   if (res.status === 404) return 0n;

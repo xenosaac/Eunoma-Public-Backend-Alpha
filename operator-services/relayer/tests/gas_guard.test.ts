@@ -12,12 +12,17 @@ const CFG: GasGuardConfig = {
 function mockFetch(routes: {
   gasPrice?: { ok?: boolean; status?: number; body?: unknown };
   reserve?: { ok?: boolean; status?: number; body?: unknown };
+  reserveView?: { ok?: boolean; status?: number; body?: unknown };
+  reserveResource?: { ok?: boolean; status?: number; body?: unknown };
   throwOn?: "gas" | "reserve";
 }): FetchFn {
   return async (url: string) => {
     const which = url.includes("estimate_gas_price") ? "gas" : "reserve";
     if (routes.throwOn === which) throw new Error("network down");
-    const r = which === "gas" ? routes.gasPrice : routes.reserve;
+    const reserveRoute = url.endsWith("/view")
+      ? routes.reserveView ?? routes.reserve
+      : routes.reserveResource ?? routes.reserve;
+    const r = which === "gas" ? routes.gasPrice : reserveRoute;
     return {
       ok: r?.ok ?? true,
       status: r?.status ?? 200,
@@ -64,6 +69,19 @@ describe("createGasGuard", () => {
     expect(d.allow).toBe(false);
     expect(d.reason).toBe("reserve_low");
     expect(d.reserveBalanceOctas).toBe(999_999n);
+  });
+
+  it("allows when the reserve CoinStore is absent but the balance view returns funds", async () => {
+    const guard = createGasGuard(CFG, {
+      fetchFn: mockFetch({
+        gasPrice: { body: { gas_estimate: 100 } },
+        reserveView: { body: ["5000000"] },
+        reserveResource: { status: 404, ok: false },
+      }),
+    });
+    const d = await guard.check();
+    expect(d.allow).toBe(true);
+    expect(d.reserveBalanceOctas).toBe(5_000_000n);
   });
 
   it("fail-closed (read_failed) when a read throws", async () => {
