@@ -27,6 +27,9 @@ function validCallArgsFields(): FinalizeWithdrawV2CallArgsFields {
     amountTag: HEX32(0x14),
     caPayloadHash: HEX32(0x15),
     requestHash: HEX32(0x16),
+    aspRoot: HEX32(0x17),
+    stateTreeDepth: "4",
+    aspTreeDepth: "3",
     vaultSequence: "42",
     expirySecs: "1800000000",
     withdrawProof: HEXN(192, 0x20),
@@ -247,7 +250,7 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
     }
   });
 
-  it("assembles a 27-field WithdrawV2CallArgs from a complete finalize transcript", () => {
+  it("assembles a 30-field WithdrawV2CallArgs from a complete finalize transcript", () => {
     const finalize: FinalizeTranscript = {
       scheme: "mpcca_withdraw_v2_finalize",
       dkgEpoch: "1",
@@ -257,7 +260,7 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
     const result = assembleWithdrawV2CallArgs(finalize);
     expect(isNotImplementedPhasePassthrough(result)).toBe(false);
     if (!isNotImplementedPhasePassthrough(result)) {
-      // 27-field projection — assert ALL keys are present.
+      // 30-field projection — assert ALL keys are present.
       const keys = Object.keys(result);
       expect(keys).toContain("root");
       expect(keys).toContain("nullifierHash");
@@ -266,6 +269,9 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
       expect(keys).toContain("amountTag");
       expect(keys).toContain("caPayloadHash");
       expect(keys).toContain("requestHash");
+      expect(keys).toContain("aspRoot");
+      expect(keys).toContain("stateTreeDepth");
+      expect(keys).toContain("aspTreeDepth");
       expect(keys).toContain("vaultSequence");
       expect(keys).toContain("withdrawProof");
       expect(keys).toContain("expirySecs");
@@ -286,7 +292,7 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
       expect(keys).toContain("sigmaProtoComm");
       expect(keys).toContain("sigmaProtoResp");
       expect(keys).toContain("memo");
-      expect(keys.length).toBe(27);
+      expect(keys.length).toBe(30);
     }
   });
 

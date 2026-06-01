@@ -108,12 +108,19 @@ const rootArg = getArg("--root");
 const caPayloadHashArg = getArg("--ca-payload-hash");
 const amountPHexArg = getArg("--amount-p-hex", false);
 const commitmentTreeArg = getArg("--commitment-tree", false);
+// ASP (2026-05-31): the withdraw circuit is now 12-public dual-LeanIMT (state + ASP). The
+// production builder reads the LeanIMT state tree + the published ASP set and emits the
+// state_siblings/asp_siblings dual-inclusion witness. --commitment-tree (legacy depth-20) is
+// retained only for the dead 9-public path / negative tests.
+const stateTreeArg = getArg("--state-tree", false);
+const aspSetArg = getArg("--asp-set", false);
 const testnetFlag = hasFlag("--testnet");
 const withdrawBlindArg = getArg("--withdraw-blind-hex", false);
 const outputArg = getArg("--output", false);
 
-if (testnetFlag && !commitmentTreeArg) {
-  console.error(JSON.stringify({ error: "testnet_requires_commitment_tree" }));
+const aspMode = Boolean(stateTreeArg && aspSetArg);
+if (testnetFlag && !commitmentTreeArg && !aspMode) {
+  console.error(JSON.stringify({ error: "testnet_requires_commitment_tree_or_state_tree" }));
   process.exit(2);
 }
 
@@ -422,6 +429,14 @@ const { computeMerkleRootAndPathSingleLeaf, leBytesToBig, bigToLE32, le32ToHex: 
 
 const commitmentBig = leBytesToBig(commitmentLe);
 
+// ASP 12-public dual-LeanIMT fields (populated in aspMode).
+let aspRootBig = null;
+let stateDepthVal = null;
+let aspDepthVal = null;
+let stateSiblingsBig = null;
+let aspSiblingsBig = null;
+let aspLeafIndexVal = null;
+// Legacy 9-public depth-20 fields.
 let merklePathBig;
 let merkleIndicesBig;
 let recomputedRootBig;
@@ -429,7 +444,77 @@ let leafIndexResolved = 0;
 let mode = "legacy_single_leaf";
 let treeTranscriptHash = null;
 
-if (commitmentTreeArg) {
+if (aspMode) {
+  // Dual hardened-LeanIMT inclusion: the SAME commitment proven in BOTH the state tree and the
+  // published ASP set. Mirrors circuits/scripts/build_asp_witness_test.mjs (the CP1 reference
+  // that the circuit + VK were validated against) but with REAL on-chain tree state.
+  const leanHelperPath = resolve(dirHere, "leanimt.mjs");
+  const { buildLeanIMT, leanIMTPath, LEANIMT_MAX_DEPTH } = await import(`file://${leanHelperPath}`);
+  const readLeaves = (p, key) => {
+    let snap;
+    try {
+      snap = JSON.parse(readFileSync(p, "utf8"));
+    } catch (err) {
+      console.error(`failed to read ${p}: ${err?.message ?? err}`);
+      process.exit(2);
+    }
+    const arr = snap[key];
+    if (!Array.isArray(arr) || arr.length === 0) {
+      console.error(`${p}: missing/empty "${key}"`);
+      process.exit(2);
+    }
+    return { snap, bigs: arr.map((h) => leBytesToBig(hexToLe32(h))) };
+  };
+  const { snap: stateSnap, bigs: stateBigs } = readLeaves(stateTreeArg, "leaves");
+  const { bigs: aspBigs } = readLeaves(aspSetArg, "commitments");
+  const stateIdx = stateBigs.findIndex((b) => b === commitmentBig);
+  if (stateIdx < 0) {
+    console.error("commitment not found in state LeanIMT leaves (state tree stale? re-run process_deposit.sh)");
+    process.exit(2);
+  }
+  const aspIdx = aspBigs.findIndex((b) => b === commitmentBig);
+  if (aspIdx < 0) {
+    console.error("commitment not in ASP set (deposit not approved / no ASP cycle yet)");
+    process.exit(2);
+  }
+  const stateBuilt = await buildLeanIMT(stateBigs);
+  const aspBuilt = await buildLeanIMT(aspBigs);
+  const sPath = leanIMTPath(stateBuilt.levels, stateIdx, LEANIMT_MAX_DEPTH);
+  const aPath = leanIMTPath(aspBuilt.levels, aspIdx, LEANIMT_MAX_DEPTH);
+  // Circuit hardening: actualDepth ∈ [1, 32]. A single-leaf (depth-0) tree is unprovable — the
+  // pool needs ≥2 leaves in BOTH trees before any withdraw can be generated.
+  if (sPath.actualDepth < 1 || aPath.actualDepth < 1) {
+    console.error(
+      JSON.stringify({
+        error: "leanimt_depth_zero",
+        stateDepth: sPath.actualDepth,
+        aspDepth: aPath.actualDepth,
+        hint: "circuit requires actualDepth>=1; each tree needs >=2 leaves (>=2 deposits, >=2 approved)",
+      }),
+    );
+    process.exit(2);
+  }
+  // The circuit's `root` public IS the state LeanIMT root — must equal --root (the on-chain known_root).
+  const stateRootHexCalc = Array.from(bigToLE32(stateBuilt.root))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  if (stateRootHexCalc !== rootHex.toLowerCase()) {
+    console.error(
+      `state LeanIMT root mismatch — --root 0x${rootHex} but computed 0x${stateRootHexCalc}. ` +
+        "--root must equal state_leanimt_tree.json latestRootHex (the value process_deposit.sh records on-chain).",
+    );
+    process.exit(2);
+  }
+  aspRootBig = aspBuilt.root;
+  stateDepthVal = sPath.actualDepth;
+  aspDepthVal = aPath.actualDepth;
+  stateSiblingsBig = sPath.siblings;
+  aspSiblingsBig = aPath.siblings;
+  leafIndexResolved = sPath.leafIndex;
+  aspLeafIndexVal = aPath.leafIndex;
+  treeTranscriptHash = stateSnap.transcriptHash ?? null;
+  mode = "asp_dual_leanimt";
+} else if (commitmentTreeArg) {
   const { CommitmentTreeV2 } = await import(`file://${treeHelperPath}`);
   let snapshot;
   try {
@@ -497,50 +582,84 @@ if (commitmentTreeArg) {
   leafIndexResolved = 0;
 }
 
-const recomputedRootLE = bigToLE32(recomputedRootBig);
-const recomputedRootHex = Array.from(recomputedRootLE)
-  .map((b) => b.toString(16).padStart(2, "0"))
-  .join("");
+if (!aspMode) {
+  const recomputedRootLE = bigToLE32(recomputedRootBig);
+  const recomputedRootHex = Array.from(recomputedRootLE)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 
-const rootHexLower = rootHex.toLowerCase();
-if (recomputedRootHex !== rootHexLower) {
-  console.error(
-    `root mismatch — --root says 0x${rootHexLower} but recomputed 0x${recomputedRootHex}. ` +
-      (mode === "multi_leaf"
-        ? "Check that --root matches the commitment_tree_v2 latestRootHex."
-        : "Check that --root is the depth-20 single-leaf Poseidon root."),
-  );
-  process.exit(2);
+  const rootHexLower = rootHex.toLowerCase();
+  if (recomputedRootHex !== rootHexLower) {
+    console.error(
+      `root mismatch — --root says 0x${rootHexLower} but recomputed 0x${recomputedRootHex}. ` +
+        (mode === "multi_leaf"
+          ? "Check that --root matches the commitment_tree_v2 latestRootHex."
+          : "Check that --root is the depth-20 single-leaf Poseidon root."),
+    );
+    process.exit(2);
+  }
 }
 
 // ---- Build witness JSON --------------------------------------------------------------------
-const witnessJson = {
-  // publics (declaration order)
-  root: le32ToDec(rootLe),
-  nullifier_hash: le32ToDec(nullifierHashLe),
-  asset_id: le32ToDec(assetIdLe),
-  recipient_hash: le32ToDec(recipientHashLe),
-  amount_tag: le32ToDec(amountTagLe),
-  ca_payload_hash: le32ToDec(caPayloadHashLe),
-  request_hash: le32ToDec(requestHashLe),
-  vault_sequence: vaultSequenceArg,
-  amount_p_digest: le32ToDec(amountPDigestLe),
-  // privates
-  nullifier: le32ToDec(nullifierLe),
-  secret: le32ToDec(secretLe),
-  withdraw_blind: le32ToDec(withdrawBlindLe),
-  merkle_path: merklePathBig.map((b) => b.toString()),
-  merkle_indices: merkleIndicesBig.map((b) => b.toString()),
-  amount_p_limbs: amountPLimbsBig.map((b) => b.toString()),
-};
+const witnessJson = aspMode
+  ? {
+      // publics (12, circuit declaration order — mirrors withdrawal_proof.circom main + build_asp_witness_test.mjs)
+      root: le32ToDec(rootLe),
+      nullifier_hash: le32ToDec(nullifierHashLe),
+      asset_id: le32ToDec(assetIdLe),
+      recipient_hash: le32ToDec(recipientHashLe),
+      amount_tag: le32ToDec(amountTagLe),
+      ca_payload_hash: le32ToDec(caPayloadHashLe),
+      request_hash: le32ToDec(requestHashLe),
+      vault_sequence: vaultSequenceArg,
+      amount_p_digest: le32ToDec(amountPDigestLe),
+      asp_root: aspRootBig.toString(),
+      state_tree_depth: String(stateDepthVal),
+      asp_tree_depth: String(aspDepthVal),
+      // privates
+      nullifier: le32ToDec(nullifierLe),
+      secret: le32ToDec(secretLe),
+      withdraw_blind: le32ToDec(withdrawBlindLe),
+      amount_p_limbs: amountPLimbsBig.map((b) => b.toString()),
+      state_siblings: stateSiblingsBig.map((b) => b.toString()),
+      state_leaf_index: String(leafIndexResolved),
+      asp_siblings: aspSiblingsBig.map((b) => b.toString()),
+      asp_leaf_index: String(aspLeafIndexVal),
+    }
+  : {
+      // publics (declaration order) — legacy 9-public depth-20 path (dead for ASP circuit)
+      root: le32ToDec(rootLe),
+      nullifier_hash: le32ToDec(nullifierHashLe),
+      asset_id: le32ToDec(assetIdLe),
+      recipient_hash: le32ToDec(recipientHashLe),
+      amount_tag: le32ToDec(amountTagLe),
+      ca_payload_hash: le32ToDec(caPayloadHashLe),
+      request_hash: le32ToDec(requestHashLe),
+      vault_sequence: vaultSequenceArg,
+      amount_p_digest: le32ToDec(amountPDigestLe),
+      // privates
+      nullifier: le32ToDec(nullifierLe),
+      secret: le32ToDec(secretLe),
+      withdraw_blind: le32ToDec(withdrawBlindLe),
+      merkle_path: merklePathBig.map((b) => b.toString()),
+      merkle_indices: merkleIndicesBig.map((b) => b.toString()),
+      amount_p_limbs: amountPLimbsBig.map((b) => b.toString()),
+    };
 
 const summary = {
   ok: true,
   witnessPath: outputArg ?? null,
   leafIndex: leafIndexResolved,
   mode,
-  treeRootHex: `0x${rootHexLower}`,
+  treeRootHex: `0x${rootHex.toLowerCase()}`,
   treeTranscriptHash,
+  ...(aspMode
+    ? {
+        aspRootHex: `0x${Array.from(bigToLE32(aspRootBig)).map((b) => b.toString(16).padStart(2, "0")).join("")}`,
+        stateTreeDepth: stateDepthVal,
+        aspTreeDepth: aspDepthVal,
+      }
+    : {}),
   publics: {
     root: rootHex,
     nullifier_hash: le32ToHex(nullifierHashLe),
@@ -551,6 +670,13 @@ const summary = {
     request_hash: le32ToHex(requestHashLe),
     vault_sequence: vaultSequenceArg,
     amount_p_digest: le32ToHex(amountPDigestLe),
+    ...(aspMode
+      ? {
+          asp_root: `0x${Array.from(bigToLE32(aspRootBig)).map((b) => b.toString(16).padStart(2, "0")).join("")}`,
+          state_tree_depth: String(stateDepthVal),
+          asp_tree_depth: String(aspDepthVal),
+        }
+      : {}),
   },
   withdraw_blind_hex: withdrawBlindHex.startsWith("0x")
     ? withdrawBlindHex

@@ -1,5 +1,6 @@
-// Quick extractor: withdrawal_proof_vk.json → hex strings ready for
-// publish_withdraw_proof_vk admin entry args. Mirrors export_to_move.js conventions.
+// Quick extractor: ragequit_vk.json → hex strings ready for the
+// publish_ragequit_proof_vk admin entry args. Mirrors extract_withdraw_vk.js.
+// Ragequit has 4 public inputs → VK IC length = 5.
 const fs = require('fs');
 const path = require('path');
 
@@ -20,11 +21,11 @@ function g2Uncompr(arr) {
   return bigToLE32hex(x[0]) + bigToLE32hex(x[1]) + bigToLE32hex(y[0]) + bigToLE32hex(y[1]);
 }
 
-const vkPath = path.resolve(__dirname, '..', 'generated', 'withdrawal_proof_vk.json');
+const vkPath = path.resolve(__dirname, '..', 'generated', 'ragequit_vk.json');
 const vk = JSON.parse(fs.readFileSync(vkPath, 'utf8'));
 if (vk.protocol !== 'groth16') throw new Error(`bad protocol: ${vk.protocol}`);
-if (vk.nPublic !== 12) throw new Error(`expected 12 publics, got ${vk.nPublic}`);
-if (vk.IC.length !== 13) throw new Error(`expected IC length 13, got ${vk.IC.length}`);
+if (vk.nPublic !== 4) throw new Error(`expected 4 publics, got ${vk.nPublic}`);
+if (vk.IC.length !== 5) throw new Error(`expected IC length 5, got ${vk.IC.length}`);
 
 const out = {
   alpha_g1: g1Uncompr(vk.vk_alpha_1),

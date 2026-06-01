@@ -11,7 +11,18 @@
 // Module event feed alone is NOT trusted to append leaves because the REST shape varies between
 // Aptos fullnode versions.
 //
-// Persisted artifact (atomic write, 0o644): `<state-dir>/commitment_tree_v2.json`.
+// Persisted artifacts (atomic writes, 0o644):
+//   `<state-dir>/commitment_tree_v2.json`   — legacy fixed-depth-20 snapshot (kept for the
+//                                              `/v2/pool/state` liveness endpoint + back-compat).
+//   `<state-dir>/state_leanimt_tree.json`   — NEW dynamic-depth LeanIMT snapshot. This is the
+//                                              circuit/frontend/recorder source of truth: the
+//                                              recorded on-chain state root is THIS snapshot's
+//                                              `latestRootHex` (see local_record_known_root_v2.mjs
+//                                              + ops/scripts/refresh_known_root_cycle.sh).
+//
+// Both trees are built from the SAME harvested leaves/depositMeta; only the tree shape differs
+// (fixed-20 vs LeanIMT dynamic). The LeanIMT snapshot is byte-parity-proven against the withdraw
+// circuit + the frontend lib/protocol/leanimt.ts.
 // =============================================================================================
 import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -20,6 +31,7 @@ import {
   CommitmentTreeV2,
   assertTreeArtifactPublicOnly,
 } from "../../circuits/scripts/commitment_tree_v2.mjs";
+import { LeanIMTTree } from "../../circuits/scripts/leanimt_tree.mjs";
 import { hexToLE32, leBytesToBig } from "../../circuits/scripts/poseidon_merkle.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -341,12 +353,31 @@ async function ingest({ argv }) {
   const snapshot = await tree.serialize();
   assertTreeArtifactPublicOnly(snapshot);
 
+  // Build the dynamic-depth LeanIMT over the SAME leaves (in deposit_count order) — this is the
+  // circuit/frontend/recorder source-of-truth snapshot. Its `latestRootHex` is what the on-chain
+  // state root recorder commits (NOT the fixed-20 root above).
+  const leanTree = new LeanIMTTree();
+  for (let i = 0; i < tree.leaves.length; i++) {
+    const m = tree.depositMeta[i];
+    leanTree.append(tree.leaves[i], {
+      commitmentHex: m.commitmentHex,
+      sender: m.sender,
+      depositTxHash: m.depositTxHash,
+      txVersion: m.txVersion,
+      sequenceNumber: m.sequenceNumber,
+    });
+  }
+  const leanSnapshot = await leanTree.serialize();
+  assertTreeArtifactPublicOnly(leanSnapshot);
+
   if (opts.dryRun) {
     console.log(JSON.stringify({
       mode: "dry_run",
       leafCount: snapshot.leafCount,
       rootHex: snapshot.latestRootHex,
       transcriptHash: snapshot.transcriptHash,
+      leanImtRootHex: leanSnapshot.latestRootHex,
+      leanImtTreeDepth: leanSnapshot.treeDepth,
       depositTxHashes: snapshot.depositMeta.map((m) => m.depositTxHash),
       distinctSenders: new Set(snapshot.depositMeta.map((m) => m.sender)).size,
       eventFeedNotes,
@@ -354,19 +385,27 @@ async function ingest({ argv }) {
     return 0;
   }
 
-  // Atomic write
+  // Atomic writes — both the legacy fixed-20 snapshot and the LeanIMT snapshot.
   mkdirSync(opts.stateDir, { recursive: true });
   const tmp = artifactPath + ".tmp";
   writeFileSync(tmp, JSON.stringify(snapshot, null, 2) + "\n", { mode: 0o644 });
   renameSync(tmp, artifactPath);
 
+  const leanArtifactPath = join(opts.stateDir, "state_leanimt_tree.json");
+  const leanTmp = leanArtifactPath + ".tmp";
+  writeFileSync(leanTmp, JSON.stringify(leanSnapshot, null, 2) + "\n", { mode: 0o644 });
+  renameSync(leanTmp, leanArtifactPath);
+
   console.log(JSON.stringify({
     leafCount: snapshot.leafCount,
     rootHex: snapshot.latestRootHex,
     transcriptHash: snapshot.transcriptHash,
+    leanImtRootHex: leanSnapshot.latestRootHex,
+    leanImtTreeDepth: leanSnapshot.treeDepth,
     depositTxHashes: snapshot.depositMeta.map((m) => m.depositTxHash),
     distinctSenders: new Set(snapshot.depositMeta.map((m) => m.sender)).size,
     stateFile: artifactPath,
+    leanImtStateFile: leanArtifactPath,
     eventFeedNotes,
   }, null, 2));
   return 0;

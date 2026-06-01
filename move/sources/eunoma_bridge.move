@@ -46,10 +46,26 @@ module eunoma::eunoma_bridge {
     const PROOF_BYTES: u64 = 256;
     // Stage 3 A6: bumped to add amount_p_digest as additional public input.
     // Deposit publics: commitment, amount_tag, asset_id, vault_addr_hash, amount_p_digest (5) + 1 const term = 6.
-    // Withdraw publics: root, nullifier_hash, asset_id, recipient_hash, amount_tag, ca_payload_hash,
-    //   request_hash, vault_sequence, amount_p_digest (9) + 1 const term = 10.
+    // ASP (2026-05-30, asp-tree-design §5.2/§6): withdraw circuit gains 3 publics
+    //   (asp_root, state_tree_depth, asp_tree_depth) so publics 9 -> 12, VK IC 10 -> 13.
+    // Withdraw publics (EXACT order, must match Move publics vector byte-for-byte):
+    //   [0]root [1]nullifier_hash [2]asset_id [3]recipient_hash [4]amount_tag [5]ca_payload_hash
+    //   [6]request_hash [7]vault_sequence [8]amount_p_digest [9]asp_root [10]state_tree_depth
+    //   [11]asp_tree_depth (12) + 1 const term = 13.
     const DEPOSIT_VK_IC_LENGTH: u64 = 6;
-    const WITHDRAW_VK_IC_LENGTH: u64 = 10;
+    const WITHDRAW_VK_IC_LENGTH: u64 = 13;
+    // CP6 ragequit (asp-tree-design §8 / §5.4): the standalone transparent-exit circuit has 4
+    // publics (EXACT order, must match the Move publics vector byte-for-byte):
+    //   [0]commitment [1]nullifier_hash [2]root [3]state_tree_depth
+    // commitment is REVEALED (transparent link); NO asp_root / no ASP inclusion. 4 publics + 1
+    // const term = VK IC length 5.
+    const RAGEQUIT_VK_IC_LENGTH: u64 = 5;
+
+    // ASP (2026-05-30, asp-tree-design §6 / D3): withdraw accepts an asp_root that matches any
+    // of the LAST K recorded ASP roots. Small window so a periodic re-fork (which pushes a fresh
+    // root) does not instantly invalidate in-flight proofs, while revoked commitments age out
+    // once their root falls past the window. K is a plan-time parameter (§13).
+    const ASP_ROOT_WINDOW_K: u64 = 32;
 
     const DOMAIN_DEPOSIT_V2: vector<u8> = b"EUNOMA_DEPOSIT_BIND_V2";
     // Deposit re-key: V3 attestation binds user_addr so relayer-submitted step2a cannot be
@@ -114,6 +130,14 @@ module eunoma::eunoma_bridge {
     const E_GAS_FEE_NOT_INITIALIZED: u64 = 34;
     // (B) deposit re-key: a (user_addr, commitment) finalization slot already exists at step2a.
     const E_PENDING_DEPOSIT_FINALIZATION: u64 = 35;
+    // ASP (2026-05-30, asp-tree-design §6): curated private-exit Association Set Provider errors.
+    // asp_root supplied to a withdraw is not in the recent ASP-root window (revoked / unknown root).
+    const E_INVALID_ASP_ROOT: u64 = 36;
+    // ASP recorder delegate (low-priv, no admin key) errors — mirror E_RECORDER_DELEGATE_*.
+    const E_ASP_RECORDER_DELEGATE_NOT_INITIALIZED: u64 = 37;
+    const E_NOT_ASP_RECORDER_DELEGATE: u64 = 38;
+    // CP6 ragequit (transparent exit): only the original depositor may ragequit a commitment.
+    const E_NOT_ORIGINAL_DEPOSITOR: u64 = 39;
 
     struct BridgeVault has key {
         admin: address,
@@ -188,6 +212,41 @@ module eunoma::eunoma_bridge {
     // or change roster. Worst-case alpha-box compromise = attacker spams known_roots table
     // with garbage (mitigated by assert_hash length check + table idempotent add).
     struct RecorderDelegate has key {
+        addr: address,
+    }
+
+    // ASP (2026-05-30, asp-tree-design §4.2 / §6): one recorded Association Set = the ASP-tree
+    // root over the curator-approved commitment subset, the IPFS CID of the full plaintext set
+    // (published for auditability), and the recording timestamp. associationSets-style append-only
+    // log; withdraw verifies asp_root ∈ the recent window (asp_root_in_recent_window).
+    struct AssociationSetData has store, drop, copy {
+        root: vector<u8>,
+        ipfs_cid: vector<u8>,
+        timestamp: u64,
+    }
+
+    // ASP: append-only log of recorded Association Sets. Seeded empty at init_asp_recorder_delegate
+    // time; the asp-recorder delegate appends one entry per re-fork epoch.
+    struct KnownASPRoots has key {
+        sets: vector<AssociationSetData>,
+    }
+
+    // CP6 ragequit (asp-tree-design §8): records the original depositor address keyed by commitment,
+    // written at deposit finalization. Used by the (future, CP6) ragequit entry to enforce
+    // `recipient == deposit_sender[commitment]` (resources can only exit back to the original
+    // depositor — closes the "deposit -> ragequit to a clean address" laundering escape). The
+    // map itself is needed now; the ragequit entry is CP6.
+    struct DepositSenderMap has key {
+        by_commitment: Table<vector<u8>, address>,
+    }
+
+    // ASP recorder delegate authorization. Mirrors RecorderDelegate exactly: admin one-time init
+    // seeds addr = admin; admin_set_asp_recorder_delegate rotates to a low-priv operator addr.
+    // record_asp_root_via_delegate accepts the delegate's signer (no admin key on the operator
+    // box). Strict scope: the delegate can ONLY append to KnownASPRoots — cannot touch any other
+    // admin-controlled state. ASP roots encode compliance (curator/KYT) decisions, not privacy
+    // secrets, and the full set is public on IPFS so a bad root is detectable (asp-tree-design D4).
+    struct ASPRecorderDelegate has key {
         addr: address,
     }
 
@@ -413,6 +472,24 @@ module eunoma::eunoma_bridge {
         pvk_uvw_gamma_g1: vector<vector<u8>>,
     }
 
+    // CP6 ragequit (asp-tree-design §8): VK for the standalone transparent-exit circuit. Mirrors
+    // WithdrawProofVK exactly but the stored ic vector has RAGEQUIT_VK_IC_LENGTH = 5 elements
+    // (4 publics + const term), vs 13 for the ASP withdraw circuit.
+    struct RagequitProofVK has key {
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic: vector<vector<u8>>,
+    }
+
+    struct PreparedRagequitProofVK has key {
+        pvk_alpha_g1_beta_g2_fq12: vector<u8>,
+        pvk_gamma_g2_neg: vector<u8>,
+        pvk_delta_g2_neg: vector<u8>,
+        pvk_uvw_gamma_g1: vector<vector<u8>>,
+    }
+
     struct DepositBindingTestOverride has key {
         asset_id_fr: vector<u8>,
         vault_addr_hash_fr: vector<u8>,
@@ -592,6 +669,27 @@ module eunoma::eunoma_bridge {
         root: vector<u8>,
     }
 
+    // ASP (2026-05-30, asp-tree-design §6): emitted when the asp-recorder delegate appends a new
+    // Association Set (root + IPFS CID of the full plaintext approved-commitment set).
+    #[event]
+    struct ASPRootRecorded has drop, store {
+        root: vector<u8>,
+        ipfs_cid: vector<u8>,
+    }
+
+    // CP6 ragequit (asp-tree-design §8): emitted when an original depositor reclaims their deposit
+    // via the transparent original-path exit. commitment is REVEALED on purpose (the deposit<->exit
+    // link is public by design — that is what blocks the "deposit -> ragequit to a clean address"
+    // laundering escape). original_sender == the recorded deposit_sender[commitment] == the signer.
+    // The amount stays confidential (the CA transfer hides it); no amount field is emitted.
+    #[event]
+    struct RagequitEventV1 has drop, store {
+        commitment: vector<u8>,
+        original_sender: address,
+        nullifier_hash: vector<u8>,
+        timestamp: u64,
+    }
+
     public entry fun init_vault_with_ca_registration_v2(
         admin: &signer,
         vault_seed: vector<u8>,
@@ -639,6 +737,8 @@ module eunoma::eunoma_bridge {
             known_roots: table::new<vector<u8>, bool>(),
         });
         move_to(admin, new_vault_tables_v2());
+        // ASP/CP6 (asp-tree-design §6/§8): deposit_sender[commitment] map for ragequit (CP6).
+        move_to(admin, DepositSenderMap { by_commitment: table::new<vector<u8>, address>() });
 
         move_to(admin, DeoperatorConfigV2 {
             operator_set_version,
@@ -705,6 +805,11 @@ module eunoma::eunoma_bridge {
         let vault_addr_hash_fr = derive_vault_addr_hash(vault_addr);
         upsert_vault_public_inputs_v2(admin, asset_id_fr, vault_addr_hash_fr);
         move_to(admin, new_vault_tables_v2());
+        // ASP/CP6 (asp-tree-design §6/§8): seed deposit_sender map at the V1->V2 rollover bootstrap.
+        // Guarded because rollover may be re-run paths; the map is additive and never reset.
+        if (!exists<DepositSenderMap>(@eunoma)) {
+            move_to(admin, DepositSenderMap { by_commitment: table::new<vector<u8>, address>() });
+        };
 
         let vault = borrow_global_mut<BridgeVault>(@eunoma);
         vault.admin = signer::address_of(admin);
@@ -895,6 +1000,54 @@ module eunoma::eunoma_bridge {
         assert_hash(&root);
         record_known_root_internal(*&root);
         event::emit(RootRecordedV2 { root });
+    }
+
+    // ASP (2026-05-30, asp-tree-design §6 / D4): admin one-time init seeds ASPRecorderDelegate.addr
+    // = admin's own address, and seeds an empty KnownASPRoots log. After init, admin can rotate the
+    // delegate via admin_set_asp_recorder_delegate. Required before any record_asp_root_via_delegate.
+    // Mirrors init_recorder_delegate exactly (same low-priv, no-admin-key delegate pattern).
+    public entry fun init_asp_recorder_delegate(admin: &signer) acquires BridgeVault {
+        assert_admin(admin);
+        assert!(!exists<ASPRecorderDelegate>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, ASPRecorderDelegate { addr: signer::address_of(admin) });
+        if (!exists<KnownASPRoots>(@eunoma)) {
+            move_to(admin, KnownASPRoots { sets: vector::empty<AssociationSetData>() });
+        };
+    }
+
+    // ASP: admin rotates the asp-recorder delegate address. Setting to a low-priv operator address
+    // lets the off-chain re-fork timer push ASP roots without holding admin keys. Re-callable any
+    // time by admin to revoke (set back to admin addr) or rotate. Mirrors admin_set_recorder_delegate.
+    public entry fun admin_set_asp_recorder_delegate(
+        admin: &signer,
+        delegate_addr: address,
+    ) acquires ASPRecorderDelegate, BridgeVault {
+        assert_admin(admin);
+        assert!(exists<ASPRecorderDelegate>(@eunoma), E_ASP_RECORDER_DELEGATE_NOT_INITIALIZED);
+        let rd = borrow_global_mut<ASPRecorderDelegate>(@eunoma);
+        rd.addr = delegate_addr;
+    }
+
+    // ASP: delegate-signed ASP-root recording. Sender must match ASPRecorderDelegate.addr (set by
+    // admin). Appends one AssociationSetData{root, ipfs_cid, now} to the KnownASPRoots log and emits
+    // ASPRootRecorded. Strict scope: only appends to KnownASPRoots — cannot touch any other state.
+    // No admin key required on the operator box. Mirrors record_known_root_v2_via_delegate.
+    public entry fun record_asp_root_via_delegate(
+        delegate: &signer,
+        root: vector<u8>,
+        ipfs_cid: vector<u8>,
+    ) acquires ASPRecorderDelegate, KnownASPRoots {
+        assert!(exists<ASPRecorderDelegate>(@eunoma), E_ASP_RECORDER_DELEGATE_NOT_INITIALIZED);
+        let rd = borrow_global<ASPRecorderDelegate>(@eunoma);
+        assert!(signer::address_of(delegate) == rd.addr, E_NOT_ASP_RECORDER_DELEGATE);
+        assert_hash(&root);
+        let known = borrow_global_mut<KnownASPRoots>(@eunoma);
+        vector::push_back(&mut known.sets, AssociationSetData {
+            root: *&root,
+            ipfs_cid: *&ipfs_cid,
+            timestamp: timestamp::now_seconds(),
+        });
+        event::emit(ASPRootRecorded { root, ipfs_cid });
     }
 
     public entry fun deposit_with_commitment_v2(
@@ -1270,7 +1423,7 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, PendingDepositFinalizationsV3, GasFeeConfigV1 {
+    ) acquires BridgeVault, DepositSenderMap, PendingDepositFinalizationsV3, GasFeeConfigV1 {
         assert_initialized();
         assert!(exists<PendingDepositFinalizationsV3>(@eunoma), E_NOT_INITIALIZED);
 
@@ -1351,6 +1504,21 @@ module eunoma::eunoma_bridge {
         let new_deposit_count = vault.deposit_count + 1;
         vault.deposit_count = new_deposit_count;
 
+        // ASP/CP6 (asp-tree-design §6/§8): record deposit_sender[commitment] = sender now that the
+        // deposit is final (CA transfer succeeded) + commitment known + sender = the signer here.
+        // Used by the CP6 ragequit entry to enforce `recipient == deposit_sender[commitment]` so
+        // unapproved funds can only exit back to the original depositor. Contains-guard: a duplicate
+        // (sender, commitment) finalization cannot reach here (the PendingDepositFinalizationsV3 slot
+        // is removed above), but commitment uniqueness across senders is enforced upstream — the
+        // guard keeps this idempotent and abort-free. No-op if the map is not yet seeded (a pre-ASP
+        // deploy runs init_deposit_sender_map once).
+        if (exists<DepositSenderMap>(@eunoma)) {
+            let dsm = borrow_global_mut<DepositSenderMap>(@eunoma);
+            if (!table::contains(&dsm.by_commitment, *&commitment)) {
+                table::add(&mut dsm.by_commitment, *&commitment, sender_addr);
+            };
+        };
+
         event::emit(DepositConfirmedV2 {
             vault_addr,
             asset_type: asset_type_addr,
@@ -1362,6 +1530,19 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    // ASP/CP6 (asp-tree-design §6/§8): one-time admin seed of the deposit_sender map for deploys
+    // that predate this CP (init/rollover seed it for fresh deploys). No-op-safe via exists guard.
+    public entry fun init_deposit_sender_map(admin: &signer) acquires BridgeVault {
+        assert_admin(admin);
+        assert!(!exists<DepositSenderMap>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, DepositSenderMap { by_commitment: table::new<vector<u8>, address>() });
+    }
+
+    // ASP (2026-05-30, asp-tree-design §6): monolith withdraw path. The 3 new publics (asp_root,
+    // state_tree_depth, asp_tree_depth) are appended AFTER request_hash (before vault_sequence),
+    // the same relative position the relayer uses for prepare_withdraw_proof_v{2,3}. This entry
+    // hits the VERIFY branch of consume_or_verify_withdraw_proof, so it both enforces the recent
+    // ASP-root window and binds the 3 publics into the Groth16 verify.
     public entry fun withdraw_to_recipient_v2(
         _relayer: &signer,
         root: vector<u8>,
@@ -1371,6 +1552,9 @@ module eunoma::eunoma_bridge {
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         request_hash: vector<u8>,
+        asp_root: vector<u8>,
+        state_tree_depth: u64,
+        asp_tree_depth: u64,
         vault_sequence: u64,
         withdraw_proof: vector<u8>,
         expiry_secs: u64,
@@ -1391,11 +1575,13 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV2, PendingWithdrawProofsV2b, PendingWithdrawProofsV3, PendingWithdrawProofsV3b, PendingWithdrawAttestationsV2, PendingWithdrawAttestationsV2b, PendingWithdrawAttestationsV3, PendingWithdrawPayloadsV2, PendingWithdrawPayloadsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK, CircuitVersionsHashCacheV2 {
+    ) acquires BridgeVault, BridgeVaultTablesV2, KnownASPRoots, PendingWithdrawProofsV2, PendingWithdrawProofsV2b, PendingWithdrawProofsV3, PendingWithdrawProofsV3b, PendingWithdrawAttestationsV2, PendingWithdrawAttestationsV2b, PendingWithdrawAttestationsV3, PendingWithdrawPayloadsV2, PendingWithdrawPayloadsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK, CircuitVersionsHashCacheV2 {
         assert_initialized();
         assert_not_expired(expiry_secs);
         // R5-P (Wave G.2): inlined 6-hash assertion block.
         assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
+        // ASP: asp_root is a 32B Fr like root.
+        assert_hash(&asp_root);
 
         // WB2.D/FW8.3: hold ONE mut borrow on BridgeVaultTablesV2 across known_root check +
         // nullifier check + nullifier mark. Round-1 deposit V1 did the same for nonce check+mark
@@ -1404,6 +1590,9 @@ module eunoma::eunoma_bridge {
         let tables = borrow_global_mut<BridgeVaultTablesV2>(@eunoma);
         assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
         assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        // ASP (asp-tree-design §6): asp_root must be in the recent ASP-root window, parallel to the
+        // state-root check above. Reads KnownASPRoots (a different global than `tables`).
+        assert!(asp_root_in_recent_window(&asp_root), E_INVALID_ASP_ROOT);
 
         // WB2.B/FS1.5+FW2.1: hold a single mut borrow on BridgeVault across the whole withdraw
         // body (round-1 A4 deposit-side pattern, now applied to withdraw). Replaces 3 separate
@@ -1469,6 +1658,8 @@ module eunoma::eunoma_bridge {
         // a named address-of target for asset_id_fr.
         let asset_id = borrow_global<VaultPublicInputsV2>(@eunoma).asset_id_fr;
         // FR-1.3: 7 `*&` clones eliminated; all hash args now passed as &vector<u8> refs.
+        // ASP: monolith hits the VERIFY branch — pass the real asp_root + depths so they are bound
+        // into the Groth16 publics.
         consume_or_verify_withdraw_proof(
             &root,
             &nullifier_hash,
@@ -1479,6 +1670,9 @@ module eunoma::eunoma_bridge {
             &request_hash,
             vault_sequence,
             &amount_p_digest,
+            &asp_root,
+            state_tree_depth,
+            asp_tree_depth,
             withdraw_proof,
         );
 
@@ -1577,6 +1771,11 @@ module eunoma::eunoma_bridge {
 
         let asset_id = borrow_global<VaultPublicInputsV2>(@eunoma).asset_id_fr;
         let empty_proof: vector<u8> = vector[];
+        // ASP: step2a is CACHE-ONLY (empty_proof -> cache-path early return in
+        // consume_or_verify_withdraw_proof). The asp_root window + the 3 asp publics were already
+        // enforced/bound when the proof was first verified at prepare_withdraw_proof_v{2,3}, so the
+        // asp_root / depths are UNUSED here — pass placeholders (empty asp_root, 0, 0).
+        let empty_asp_root: vector<u8> = vector[];
         consume_or_verify_withdraw_proof(
             &root,
             &nullifier_hash,
@@ -1587,6 +1786,9 @@ module eunoma::eunoma_bridge {
             &request_hash,
             vault_sequence,
             &amount_p_digest,
+            &empty_asp_root,
+            0,
+            0,
             empty_proof,
         );
 
@@ -1699,6 +1901,134 @@ module eunoma::eunoma_bridge {
             recipient_hash: entry.recipient_hash,
             request_hash: entry.request_hash,
             vault_sequence: entry.vault_sequence,
+        });
+    }
+
+    // CP6 ragequit access control (asp-tree-design §8 iron law): resolve the original depositor for
+    // `commitment` from DepositSenderMap and assert the caller IS that original depositor. Returns
+    // the original deposit address (the forced exit recipient). Aborts E_NOT_ORIGINAL_DEPOSITOR if
+    // the map is unseeded, the commitment was never deposited, or the caller is not the original
+    // depositor. Extracted so the production `ragequit` entry and the CP6 access-control unit tests
+    // exercise the SAME code (not a copy).
+    fun resolve_ragequit_original_sender(
+        depositor_addr: address,
+        commitment: &vector<u8>,
+    ): address acquires DepositSenderMap {
+        assert!(exists<DepositSenderMap>(@eunoma), E_NOT_ORIGINAL_DEPOSITOR);
+        let dsm = borrow_global<DepositSenderMap>(@eunoma);
+        assert!(table::contains(&dsm.by_commitment, *commitment), E_NOT_ORIGINAL_DEPOSITOR);
+        let original_sender = *table::borrow(&dsm.by_commitment, *commitment);
+        assert!(depositor_addr == original_sender, E_NOT_ORIGINAL_DEPOSITOR);
+        original_sender
+    }
+
+    // CP6 ragequit / transparent original-path exit (asp-tree-design §8).
+    //
+    // The ORIGINAL depositor reclaims their (unapproved / revoked / not-waiting-for-approval)
+    // deposit back to the ORIGINAL deposit address, transparently. Security iron law (§8):
+    //   - only the original depositor may initiate (assert signer == deposit_sender[commitment]);
+    //   - funds can ONLY exit back to the original deposit address (recipient == original_sender);
+    //   - the deposit<->exit link is public (commitment is REVEALED in the proof + event).
+    // This closes the "deposit -> ragequit to a clean address" laundering escape. NO ASP inclusion
+    // and NO asp_root anywhere in ragequit (that is withdraw's job; ragequit is the transparent
+    // escape hatch so funds are never frozen). The amount stays CONFIDENTIAL — it rides the exact
+    // same CA confidential_transfer_raw path withdraw uses, which hides the amount; ragequit does
+    // NOT bypass the CA framework's own σ-proto / range-proof checks (the 14 CA args still pass
+    // through confidential_transfer_raw unchanged).
+    //
+    // vault_sequence binding (the subtle part): the ragequit circuit has NO vault_sequence public
+    // input (its 4 publics are commitment/nullifier_hash/root/state_tree_depth), and
+    // confidential_transfer_raw itself never takes vault_sequence — vault_sequence is purely
+    // Eunoma's own exit-side monotonic nonce. Ragequit's anti-replay is the NULLIFIER: it is a
+    // public input of the ragequit proof and is marked spent ATOMICALLY before the transfer, so a
+    // given commitment can ragequit at most once (and can never afterwards withdraw privately —
+    // same shared nullifier table). We DO still advance vault.vault_sequence after the CA transfer,
+    // exactly like both withdraw paths (withdraw_to_recipient_v2:1649 / step2b:1839), so the vault's
+    // exit-side counter stays monotonic across every CA transfer the vault performs. We do NOT
+    // accept a caller-supplied vault_sequence and do NOT assert vault.vault_sequence == <param>,
+    // because there is no proof binding to such a param (the circuit has no vault_sequence public).
+    public entry fun ragequit(
+        depositor: &signer,
+        commitment: vector<u8>,
+        nullifier_hash: vector<u8>,
+        root: vector<u8>,
+        state_tree_depth: u64,
+        ragequit_proof: vector<u8>,
+        // The SAME 14 CA-transfer args as withdraw_step2b_invoke_framework_v3, forwarded verbatim
+        // into confidential_transfer_raw (recipient is forced = original_sender, not a caller arg).
+        new_balance_p: vector<vector<u8>>,
+        new_balance_r: vector<vector<u8>>,
+        new_balance_r_eff_aud: vector<vector<u8>>,
+        amount_p: vector<vector<u8>>,
+        amount_r_sender: vector<vector<u8>>,
+        amount_r_recip: vector<vector<u8>>,
+        amount_r_eff_aud: vector<vector<u8>>,
+        ek_volun_auds: vector<vector<u8>>,
+        amount_r_volun_auds: vector<vector<vector<u8>>>,
+        zkrp_new_balance: vector<u8>,
+        zkrp_amount: vector<u8>,
+        sigma_proto_comm: vector<vector<u8>>,
+        sigma_proto_resp: vector<vector<u8>>,
+        memo: vector<u8>,
+    ) acquires BridgeVault, BridgeVaultTablesV2, DepositSenderMap, PreparedRagequitProofVK {
+        // (a) bridge must be initialized + not paused.
+        assert_initialized();
+
+        // (b)+(c) resolve the original depositor for this commitment and enforce that the signer IS
+        // that original depositor. Returns the original deposit address (the forced exit recipient).
+        // Aborts E_NOT_ORIGINAL_DEPOSITOR if the commitment was never deposited (or the map is not
+        // seeded) or the signer is not the original depositor. Shared with the CP6 access-control
+        // unit tests via test_only_resolve_ragequit_original_sender.
+        let original_sender = resolve_ragequit_original_sender(signer::address_of(depositor), &commitment);
+
+        // (d) root must be a known state root + the nullifier must not already be spent. Single
+        // mut borrow held across the known-root check + nullifier check + mark (same pattern as
+        // withdraw_to_recipient_v2).
+        let tables = borrow_global_mut<BridgeVaultTablesV2>(@eunoma);
+        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+
+        // (e) verify the standalone ragequit Groth16 (4 publics, exact order; commitment revealed).
+        assert_valid_ragequit_proof(&commitment, &nullifier_hash, &root, state_tree_depth, ragequit_proof);
+
+        let vault = borrow_global_mut<BridgeVault>(@eunoma);
+        assert!(!vault.paused, E_PAUSED);
+        let asset_type = vault.asset_type;
+        let vault_signer = account::create_signer_with_capability(&vault.vault_signer_cap);
+
+        // (f) mark the nullifier spent BEFORE the transfer (anti-replay), then advance the exit-side
+        // vault_sequence counter consistently with both withdraw CA-transfer paths.
+        mark_nullifier_used_with_tables(tables, *&nullifier_hash);
+        vault.vault_sequence = vault.vault_sequence + 1;
+
+        // (g) CA transfer the (confidential) amount back to the ORIGINAL depositor. Identical
+        // confidential_transfer_raw call as withdraw, recipient forced = original_sender.
+        confidential_asset::confidential_transfer_raw(
+            &vault_signer,
+            asset_type,
+            original_sender,
+            new_balance_p,
+            new_balance_r,
+            new_balance_r_eff_aud,
+            amount_p,
+            amount_r_sender,
+            amount_r_recip,
+            amount_r_eff_aud,
+            ek_volun_auds,
+            amount_r_volun_auds,
+            zkrp_new_balance,
+            zkrp_amount,
+            sigma_proto_comm,
+            sigma_proto_resp,
+            memo,
+        );
+
+        // (h) emit the transparent ragequit event (commitment revealed; amount stays confidential).
+        event::emit(RagequitEventV1 {
+            commitment,
+            original_sender,
+            nullifier_hash,
+            timestamp: timestamp::now_seconds(),
         });
     }
 
@@ -2044,6 +2374,9 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    // ASP (2026-05-30, asp-tree-design §6): legacy path — same treatment as prepare_withdraw_proof_v3.
+    // The 3 new publics (asp_root, state_tree_depth, asp_tree_depth) are appended AFTER request_hash
+    // (before vault_sequence), identical relative position to v3.
     public entry fun prepare_withdraw_proof_v2(
         _sender: &signer,
         root: vector<u8>,
@@ -2052,13 +2385,18 @@ module eunoma::eunoma_bridge {
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         request_hash: vector<u8>,
+        asp_root: vector<u8>,
+        state_tree_depth: u64,
+        asp_tree_depth: u64,
         vault_sequence: u64,
         amount_p: vector<vector<u8>>,
         withdraw_proof: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV2b, PreparedWithdrawProofVK, VaultPublicInputsV2 {
+    ) acquires BridgeVault, BridgeVaultTablesV2, KnownASPRoots, PendingWithdrawProofsV2b, PreparedWithdrawProofVK, VaultPublicInputsV2 {
         assert_initialized();
         // R5-P (Wave G.2): inlined 6-hash assertion block.
         assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
+        // ASP: asp_root is a 32B Fr like root.
+        assert_hash(&asp_root);
         // Round 5 Wave E.2 (P06-1): write target migrated V2 → V2b (drops asset_id field;
         // consume re-reads from VaultPublicInputsV2 — safe because asset_type is immutable
         // post-V2-bootstrap).
@@ -2072,6 +2410,8 @@ module eunoma::eunoma_bridge {
         let tables = borrow_global<BridgeVaultTablesV2>(@eunoma);
         assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
         assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        // ASP (asp-tree-design §6): asp_root must be in the recent ASP-root window.
+        assert!(asp_root_in_recent_window(&asp_root), E_INVALID_ASP_ROOT);
         let vault = borrow_global<BridgeVault>(@eunoma);
         assert!(!vault.paused, E_PAUSED);
         assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
@@ -2087,6 +2427,9 @@ module eunoma::eunoma_bridge {
             &request_hash,
             vault_sequence,
             &amount_p_digest,
+            &asp_root,
+            state_tree_depth,
+            asp_tree_depth,
             withdraw_proof,
         );
         let pending = borrow_global_mut<PendingWithdrawProofsV2b>(@eunoma);
@@ -2106,6 +2449,11 @@ module eunoma::eunoma_bridge {
     // Consume uses field-by-field equality instead of keccak. The cross-stage payload
     // reader (prepare_withdraw_payload_v3) still finds ca_payload_hash + amount_p_digest
     // because V3b retains both — codex guard for the FR-4.6 P0 hotfix is preserved.
+    // ASP (2026-05-30, asp-tree-design §6): the 3 new withdraw publics (asp_root, state_tree_depth,
+    // asp_tree_depth) are appended AFTER request_hash (before vault_sequence) in the entry signature.
+    // The relayer MUST keep this exact relative position when it builds the prepare_withdraw_proof_v3
+    // call (same order in prepare_withdraw_proof_v2). asp_root is additionally checked against the
+    // recent ASP-root window here; the Groth16 verify binds all 3 publics.
     public entry fun prepare_withdraw_proof_v3(
         _sender: &signer,
         root: vector<u8>,
@@ -2114,13 +2462,18 @@ module eunoma::eunoma_bridge {
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         request_hash: vector<u8>,
+        asp_root: vector<u8>,
+        state_tree_depth: u64,
+        asp_tree_depth: u64,
         vault_sequence: u64,
         amount_p: vector<vector<u8>>,
         withdraw_proof: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawProofsV3b, PreparedWithdrawProofVK, VaultPublicInputsV2 {
+    ) acquires BridgeVault, BridgeVaultTablesV2, KnownASPRoots, PendingWithdrawProofsV3b, PreparedWithdrawProofVK, VaultPublicInputsV2 {
         assert_initialized();
         // R5-P (Wave G.2): inlined 6-hash assertion block.
         assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
+        // ASP: asp_root is a 32B Fr like root.
+        assert_hash(&asp_root);
         // Round 5 Wave E.5 (R5-R): write target migrated V3 → V3b (field-by-field cache).
         assert!(exists<PendingWithdrawProofsV3b>(@eunoma), E_NOT_INITIALIZED);
         // R5-B (Round 5 Wave B): hoist duplicate-pending check BEFORE Groth16 verify.
@@ -2132,6 +2485,10 @@ module eunoma::eunoma_bridge {
         let tables = borrow_global<BridgeVaultTablesV2>(@eunoma);
         assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
         assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        // ASP (asp-tree-design §6): asp_root must be in the recent ASP-root window (parallel to the
+        // state-root known_roots check above). Revoked commitments age out once their root falls
+        // past the window.
+        assert!(asp_root_in_recent_window(&asp_root), E_INVALID_ASP_ROOT);
         let vault = borrow_global<BridgeVault>(@eunoma);
         assert!(!vault.paused, E_PAUSED);
         assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
@@ -2147,6 +2504,9 @@ module eunoma::eunoma_bridge {
             &request_hash,
             vault_sequence,
             &amount_p_digest,
+            &asp_root,
+            state_tree_depth,
+            asp_tree_depth,
             withdraw_proof,
         );
         let pending = borrow_global_mut<PendingWithdrawProofsV3b>(@eunoma);
@@ -2866,6 +3226,63 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    // ASP (2026-05-30, asp-tree-design §5.2/§6): publish the v-next withdraw VK with 13 IC elements
+    // (was 10). The ASP withdraw circuit added 3 publics (asp_root, state_tree_depth, asp_tree_depth)
+    // so the VK has IC[0..12]. Clone of publish_withdraw_proof_vk_v2_a6 with 3 extra IC args; the
+    // stored ic vector therefore has 13 elements, matching WITHDRAW_VK_IC_LENGTH = 13.
+    public entry fun publish_withdraw_proof_vk_v3_asp(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+        ic_5: vector<u8>,
+        ic_6: vector<u8>,
+        ic_7: vector<u8>,
+        ic_8: vector<u8>,
+        ic_9: vector<u8>,
+        ic_10: vector<u8>,
+        ic_11: vector<u8>,
+        ic_12: vector<u8>,
+    ) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(!exists<WithdrawProofVK>(@eunoma), E_ALREADY_INITIALIZED);
+        assert_g1(&alpha_g1, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&beta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&delta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_0, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_1, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_3, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_4, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_5, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_6, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_7, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_8, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_9, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_10, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_11, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_12, E_INVALID_WITHDRAW_PROOF);
+        let ic = vector[
+            ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6,
+            ic_7, ic_8, ic_9, ic_10, ic_11, ic_12,
+        ];
+        assert!(vector::length(&ic) == WITHDRAW_VK_IC_LENGTH, E_INVALID_WITHDRAW_PROOF);
+        move_to(admin, WithdrawProofVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic,
+        });
+    }
+
     public entry fun publish_prepared_withdraw_proof_vk_v2(
         admin: &signer,
     ) acquires WithdrawProofVK {
@@ -2878,6 +3295,65 @@ module eunoma::eunoma_bridge {
         let gamma_g2 = de_g2(&vk.gamma_g2);
         let delta_g2 = de_g2(&vk.delta_g2);
         move_to(admin, PreparedWithdrawProofVK {
+            pvk_alpha_g1_beta_g2_fq12: pairing_fq12_bytes(&alpha_g1, &beta_g2),
+            pvk_gamma_g2_neg: neg_g2_bytes(&gamma_g2),
+            pvk_delta_g2_neg: neg_g2_bytes(&delta_g2),
+            pvk_uvw_gamma_g1: vk.ic,
+        });
+    }
+
+    // CP6 ragequit (asp-tree-design §8): publish the standalone ragequit-circuit VK with 5 IC
+    // elements (ic_0..ic_4). Clone of publish_withdraw_proof_vk_v3_asp but with 5 IC args (the
+    // ragequit circuit has 4 publics + const term, so IC length = RAGEQUIT_VK_IC_LENGTH = 5).
+    // Admin-only; one-shot (aborts if a RagequitProofVK already exists).
+    public entry fun publish_ragequit_proof_vk(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+    ) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(!exists<RagequitProofVK>(@eunoma), E_ALREADY_INITIALIZED);
+        assert_g1(&alpha_g1, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&beta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&delta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_0, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_1, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_3, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_4, E_INVALID_WITHDRAW_PROOF);
+        let ic = vector[ic_0, ic_1, ic_2, ic_3, ic_4];
+        assert!(vector::length(&ic) == RAGEQUIT_VK_IC_LENGTH, E_INVALID_WITHDRAW_PROOF);
+        move_to(admin, RagequitProofVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic,
+        });
+    }
+
+    // CP6 ragequit: derive the prepared ragequit VK from the published raw VK. Mirrors
+    // publish_prepared_withdraw_proof_vk_v2 exactly (admin-only, one-shot).
+    public entry fun publish_prepared_ragequit_proof_vk(
+        admin: &signer,
+    ) acquires RagequitProofVK {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(exists<RagequitProofVK>(@eunoma), E_NOT_INITIALIZED);
+        assert!(!exists<PreparedRagequitProofVK>(@eunoma), E_ALREADY_INITIALIZED);
+        let vk = borrow_global<RagequitProofVK>(@eunoma);
+        let alpha_g1 = de_g1(&vk.alpha_g1);
+        let beta_g2 = de_g2(&vk.beta_g2);
+        let gamma_g2 = de_g2(&vk.gamma_g2);
+        let delta_g2 = de_g2(&vk.delta_g2);
+        move_to(admin, PreparedRagequitProofVK {
             pvk_alpha_g1_beta_g2_fq12: pairing_fq12_bytes(&alpha_g1, &beta_g2),
             pvk_gamma_g2_neg: neg_g2_bytes(&gamma_g2),
             pvk_delta_g2_neg: neg_g2_bytes(&delta_g2),
@@ -3136,6 +3612,34 @@ module eunoma::eunoma_bridge {
         if (!table::contains(&tables.known_roots, *&root)) {
             table::add(&mut tables.known_roots, root, true);
         };
+    }
+
+    // ASP (2026-05-30, asp-tree-design §6 / D3): returns true iff `asp_root` byte-equals the root
+    // of any of the LAST ASP_ROOT_WINDOW_K recorded Association Sets. Iterates from the end of the
+    // append-only KnownASPRoots.sets log, scanning at most min(K, len) entries so older roots age
+    // out of the window (revocation takes effect once a commitment's root falls past the window).
+    // Returns false if KnownASPRoots does not exist or is empty.
+    fun asp_root_in_recent_window(asp_root: &vector<u8>): bool acquires KnownASPRoots {
+        if (!exists<KnownASPRoots>(@eunoma)) {
+            return false
+        };
+        let sets = &borrow_global<KnownASPRoots>(@eunoma).sets;
+        let len = vector::length(sets);
+        if (len == 0) {
+            return false
+        };
+        // Walk backwards from the newest entry, up to K entries.
+        let scanned = 0;
+        let i = len;
+        while (i > 0 && scanned < ASP_ROOT_WINDOW_K) {
+            i = i - 1;
+            let entry = vector::borrow(sets, i);
+            if (&entry.root == asp_root) {
+                return true
+            };
+            scanned = scanned + 1;
+        };
+        false
     }
 
     fun nullifier_used(nullifier_hash: &vector<u8>): bool acquires BridgeVaultTablesV2 {
@@ -3500,6 +4004,13 @@ module eunoma::eunoma_bridge {
         request_hash: &vector<u8>,
         vault_sequence: u64,
         amount_p_digest: &vector<u8>,
+        // ASP (2026-05-30, asp-tree-design §6): the 3 new withdraw publics. ONLY the VERIFY branch
+        // (proof non-empty) uses them; the cache-path (proof empty) byte-equality branches do NOT —
+        // the asp_root window check + the asp publics were already enforced when the proof was first
+        // verified at prepare time, so the cache-path callers may pass placeholders here.
+        asp_root: &vector<u8>,
+        state_tree_depth: u64,
+        asp_tree_depth: u64,
         proof: vector<u8>,
     ) acquires PendingWithdrawProofsV2, PendingWithdrawProofsV2b, PendingWithdrawProofsV3, PendingWithdrawProofsV3b, PreparedWithdrawProofVK {
         let is_cache_path = vector::length(&proof) == 0;
@@ -3579,7 +4090,8 @@ module eunoma::eunoma_bridge {
         };
         assert_valid_withdraw_proof(
             root, nullifier_hash, asset_id, recipient_hash, amount_tag,
-            ca_payload_hash, request_hash, vault_sequence, amount_p_digest, proof,
+            ca_payload_hash, request_hash, vault_sequence, amount_p_digest,
+            asp_root, state_tree_depth, asp_tree_depth, proof,
         );
     }
 
@@ -3920,6 +4432,10 @@ module eunoma::eunoma_bridge {
         request_hash: &vector<u8>,
         vault_sequence: u64,
         amount_p_digest: &vector<u8>,
+        // ASP (2026-05-30, asp-tree-design §5.2/§6): 3 new publics appended after amount_p_digest.
+        asp_root: &vector<u8>,
+        state_tree_depth: u64,
+        asp_tree_depth: u64,
         proof: vector<u8>,
     ) acquires PreparedWithdrawProofVK {
         assert!(exists<PreparedWithdrawProofVK>(@eunoma), E_NOT_INITIALIZED);
@@ -3929,9 +4445,11 @@ module eunoma::eunoma_bridge {
         // assert_valid_deposit_binding_proof for the invariant: prepared-VK byte fields are
         // produced exclusively by canonical crypto_algebra::serialize helpers; resource is
         // replaced-not-mutated; no `borrow_global_mut<PreparedWithdrawProofVK>` exists.
-        // Stage 3 A6: amount_p_digest is the 9th public input. Circuit publics order:
-        // [root, nullifier_hash, asset_id, recipient_hash, amount_tag, ca_payload_hash,
-        //  request_hash, vault_sequence, amount_p_digest] — MUST match exactly.
+        // ASP (asp-tree-design §5.2/§6): circuit publics order is now 12 (was 9). MUST match the
+        // circuit's public-input order byte-for-byte:
+        // [0]root [1]nullifier_hash [2]asset_id [3]recipient_hash [4]amount_tag [5]ca_payload_hash
+        // [6]request_hash [7]vault_sequence [8]amount_p_digest [9]asp_root [10]state_tree_depth
+        // [11]asp_tree_depth.
         let publics = vector[
             de_fr_with_error(root, E_INVALID_WITHDRAW_PROOF),
             de_fr_with_error(nullifier_hash, E_INVALID_WITHDRAW_PROOF),
@@ -3952,6 +4470,47 @@ module eunoma::eunoma_bridge {
             // R5-T (Wave F.2): amount_p_digest is compute_amount_p_digest_v2 output —
             // Poseidon hash_2 of 4 hash_3 outputs, all canonical Fr by construction.
             de_fr_unchecked(amount_p_digest),
+            // ASP (asp-tree-design §5.2): asp_root is a 32B Fr like root — validate via de_fr_with_error.
+            de_fr_with_error(asp_root, E_INVALID_WITHDRAW_PROOF),
+            // ASP: LeanIMT actual depths as field elements (native u64 -> Fr, no temp vector).
+            crypto_algebra::from_u64<Fr>(state_tree_depth),
+            crypto_algebra::from_u64<Fr>(asp_tree_depth),
+        ];
+        assert_groth16_prepared(
+            &pvk.pvk_alpha_g1_beta_g2_fq12,
+            &pvk.pvk_gamma_g2_neg,
+            &pvk.pvk_delta_g2_neg,
+            &pvk.pvk_uvw_gamma_g1,
+            &publics,
+            proof,
+            E_INVALID_WITHDRAW_PROOF,
+        );
+    }
+
+    // CP6 ragequit (asp-tree-design §8 / §5.4): verify the standalone transparent-exit Groth16.
+    // Mirrors assert_valid_withdraw_proof but uses the PreparedRagequitProofVK + the 4-public
+    // ragequit circuit. The publics order MUST match the circuit byte-for-byte:
+    //   [0]commitment [1]nullifier_hash [2]root [3]state_tree_depth
+    // commitment, nullifier_hash and root are 32B Fr supplied by the caller -> de_fr_with_error
+    // (validates canonicity); state_tree_depth is a native u64 -> from_u64<Fr> (no temp vector).
+    // NO asp_root / no asp_tree_depth — ragequit skips ASP inclusion entirely. NO vault_sequence
+    // public input either: the ragequit circuit does not bind vault_sequence (see the ragequit
+    // entry for the anti-replay rationale: the nullifier is the anti-replay).
+    fun assert_valid_ragequit_proof(
+        commitment: &vector<u8>,
+        nullifier_hash: &vector<u8>,
+        root: &vector<u8>,
+        state_tree_depth: u64,
+        proof: vector<u8>,
+    ) acquires PreparedRagequitProofVK {
+        assert!(exists<PreparedRagequitProofVK>(@eunoma), E_NOT_INITIALIZED);
+        let pvk = borrow_global<PreparedRagequitProofVK>(@eunoma);
+        assert!(vector::length(&pvk.pvk_uvw_gamma_g1) == RAGEQUIT_VK_IC_LENGTH, E_INVALID_WITHDRAW_PROOF);
+        let publics = vector[
+            de_fr_with_error(commitment, E_INVALID_WITHDRAW_PROOF),
+            de_fr_with_error(nullifier_hash, E_INVALID_WITHDRAW_PROOF),
+            de_fr_with_error(root, E_INVALID_WITHDRAW_PROOF),
+            crypto_algebra::from_u64<Fr>(state_tree_depth),
         ];
         assert_groth16_prepared(
             &pvk.pvk_alpha_g1_beta_g2_fq12,
@@ -4378,6 +4937,84 @@ module eunoma::eunoma_bridge {
     public fun test_call_ca_payload_hash_to_fr_safe_v2(raw: vector<u8>): vector<u8> {
         ca_payload_hash_to_fr_safe(raw)
     }
+
+    // =================================================================================
+    // ASP (2026-05-30, asp-tree-design §6) test-only scaffolding. Seeds ASPRecorderDelegate +
+    // KnownASPRoots directly at @eunoma (avoids a full vault bootstrap) so tests can exercise the
+    // real record_asp_root_via_delegate entry + asp_root_in_recent_window helper. Production paths
+    // are unchanged (these are #[test_only], excluded from production bytecode).
+    // =================================================================================
+    #[test_only]
+    public fun test_only_seed_asp_delegate(admin: &signer, delegate_addr: address) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_INITIALIZED);
+        if (!exists<ASPRecorderDelegate>(@eunoma)) {
+            move_to(admin, ASPRecorderDelegate { addr: delegate_addr });
+        };
+        if (!exists<KnownASPRoots>(@eunoma)) {
+            move_to(admin, KnownASPRoots { sets: vector::empty<AssociationSetData>() });
+        };
+    }
+
+    #[test_only]
+    public fun test_only_asp_root_in_recent_window(asp_root: vector<u8>): bool acquires KnownASPRoots {
+        asp_root_in_recent_window(&asp_root)
+    }
+
+    #[test_only]
+    public fun test_only_asp_sets_len(): u64 acquires KnownASPRoots {
+        if (!exists<KnownASPRoots>(@eunoma)) {
+            return 0
+        };
+        vector::length(&borrow_global<KnownASPRoots>(@eunoma).sets)
+    }
+
+    public fun asp_root_window_k(): u64 { ASP_ROOT_WINDOW_K }
+    public fun e_invalid_asp_root(): u64 { E_INVALID_ASP_ROOT }
+    public fun e_not_asp_recorder_delegate(): u64 { E_NOT_ASP_RECORDER_DELEGATE }
+    public fun e_asp_recorder_delegate_not_initialized(): u64 { E_ASP_RECORDER_DELEGATE_NOT_INITIALIZED }
+
+    // =================================================================================
+    // CP6 ragequit (asp-tree-design §8) test-only scaffolding. These shims plant the
+    // DepositSenderMap entry + a prepared ragequit VK directly at @eunoma so unit tests can drive
+    // the REAL deposit_sender lookup + the REAL E_NOT_ORIGINAL_DEPOSITOR access-control abort
+    // inside the production `ragequit` entry, without a full vault/CA bootstrap (the full
+    // proof + confidential_transfer_raw flow is E2E, exercised on testnet later). Mirrors the
+    // CP2 test_only_seed_asp_delegate shim style. #[test_only] -> excluded from production bytecode.
+    // =================================================================================
+    #[test_only]
+    public fun test_only_seed_deposit_sender(admin: &signer, commitment: vector<u8>, sender: address) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_INITIALIZED);
+        if (!exists<DepositSenderMap>(@eunoma)) {
+            move_to(admin, DepositSenderMap { by_commitment: table::new<vector<u8>, address>() });
+        };
+        let dsm = borrow_global_mut<DepositSenderMap>(@eunoma);
+        if (!table::contains(&dsm.by_commitment, *&commitment)) {
+            table::add(&mut dsm.by_commitment, commitment, sender);
+        };
+    }
+
+    // Read the IC length of the raw RagequitProofVK published by publish_ragequit_proof_vk (proves
+    // the stored ic vector has exactly RAGEQUIT_VK_IC_LENGTH = 5 elements).
+    #[test_only]
+    public fun test_only_ragequit_vk_ic_len(): u64 acquires RagequitProofVK {
+        if (!exists<RagequitProofVK>(@eunoma)) { return 0 };
+        vector::length(&borrow_global<RagequitProofVK>(@eunoma).ic)
+    }
+
+    // Drive the REAL ragequit access-control path (the exact deposit_sender lookup +
+    // E_NOT_ORIGINAL_DEPOSITOR assertions the production `ragequit` entry runs at step (b)/(c)),
+    // bypassing only the unrelated assert_initialized() / CA-transfer machinery (those are E2E).
+    // Returns the resolved original depositor address.
+    #[test_only]
+    public fun test_only_resolve_ragequit_original_sender(
+        depositor_addr: address,
+        commitment: vector<u8>,
+    ): address acquires DepositSenderMap {
+        resolve_ragequit_original_sender(depositor_addr, &commitment)
+    }
+
+    public fun e_not_original_depositor(): u64 { E_NOT_ORIGINAL_DEPOSITOR }
+    public fun ragequit_vk_ic_length(): u64 { RAGEQUIT_VK_IC_LENGTH }
 
     public fun e_bad_threshold(): u64 { E_BAD_THRESHOLD }
     public fun e_invalid_deop_signature(): u64 { E_INVALID_DEOP_SIGNATURE }

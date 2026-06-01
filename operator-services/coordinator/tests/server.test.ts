@@ -5453,7 +5453,7 @@ describe("coordinator", () => {
   // Milestone 5 sub-milestone 5-c1 — POST /v2/withdraw/mpcca/frost-attest orchestrator.
   //
   // Reads __round2.json + __finalize.json, builds CA payload + caPayloadHash, drives the
-  // 3-round FROST signing ceremony, assembles 27-field WithdrawV2CallArgs, and persists the
+  // 3-round FROST signing ceremony, assembles 30-field WithdrawV2CallArgs, and persists the
   // updated __finalize.json (removes notImplementedPhase, adds withdrawV2CallArgsFields).
   //
   // Happy-path with canonical Ristretto + real FROST keys is deferred to local cluster
@@ -5492,6 +5492,9 @@ describe("coordinator", () => {
         vaultSequence: 0,
         expirySecs: 1_700_000_000,
         requestHash: h32("6"),
+        aspRoot: h32("a"),
+        stateTreeDepth: 4,
+        aspTreeDepth: 3,
         depositCount: 1,
         attestationConfig: {
           bridge: "11".repeat(32),
@@ -5728,6 +5731,9 @@ describe("coordinator", () => {
         amountTag: hex32(0x14),
         caPayloadHash: hex32(0x15),
         requestHash: hex32(0x16),
+        aspRoot: hex32(0x17),
+        stateTreeDepth: "4",
+        aspTreeDepth: "3",
         vaultSequence: "42",
         expirySecs: "1800000000",
         withdrawProof: hexN(192, 0x20),
@@ -5878,9 +5884,9 @@ describe("coordinator", () => {
       expect(body.txHash).toBe("0x" + "ab".repeat(32));
       expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
       expect(body.transcriptPath).toContain("mpcca_withdraw_submit");
-      // LOAD-BEARING: 27 fields handed to the relayer.
+      // LOAD-BEARING: 30 fields handed to the relayer.
       expect(receivedArgs).toBeDefined();
-      expect(Object.keys(receivedArgs!).length).toBe(27);
+      expect(Object.keys(receivedArgs!).length).toBe(30);
       expect(receivedArgs!.root).toBeDefined();
       expect(receivedArgs!.vaultSequence).toBe("42");
       expect(receivedArgs!.memo).toBe("");
@@ -6020,7 +6026,7 @@ describe("coordinator", () => {
 
     // Codex M5b P2 #3: when the finalize transcript carries an `attestationConfig`
     // block, the submit artifact MUST mirror it verbatim — but the relayer MUST NOT
-    // receive these fields (only the 27-field WithdrawV2CallArgs).
+    // receive these fields (only the 30-field WithdrawV2CallArgs).
     it("submit_route_persists_attestationConfig_into_submit_artifact", async () => {
       const stateRoot = await makeStateRoot("eunoma-mpcca-submit-attest-");
       const { mkdir, writeFile, readFile } = await import("node:fs/promises");
@@ -6053,6 +6059,9 @@ describe("coordinator", () => {
         amountTag: hex32(0x14),
         caPayloadHash: hex32(0x15),
         requestHash: hex32(0x16),
+        aspRoot: hex32(0x17),
+        stateTreeDepth: "4",
+        aspTreeDepth: "3",
         vaultSequence: "42",
         expirySecs: "1800000000",
         withdrawProof: hexN(192, 0x20),
@@ -6100,11 +6109,11 @@ describe("coordinator", () => {
         payload: { dkgEpoch: "1", requestId: "withdraw-attest" },
       });
       expect(res.statusCode).toBe(202);
-      // Relayer must receive ONLY the 27 call-args fields; attestationConfig keys must
+      // Relayer must receive ONLY the 30 call-args fields; attestationConfig keys must
       // NOT appear.
       expect(relayerArgs).toBeDefined();
       const relayerKeys = Object.keys(relayerArgs!);
-      expect(relayerKeys.length).toBe(27);
+      expect(relayerKeys.length).toBe(30);
       for (const k of [
         "chainId",
         "bridge",
@@ -6461,6 +6470,149 @@ describe("coordinator", () => {
         expect(body.message, label).toMatch(/Eunoma is no-auditor today/);
         // CRITICAL: the relayer must NEVER have been invoked.
         expect(submitterInvoked, label).toBe(false);
+      }
+    });
+  });
+});
+
+describe("coordinator ASP / state-tree public endpoints", () => {
+  async function makeStateRoot(): Promise<{ stateRoot: string; coordinatorDir: string }> {
+    const { mkdtemp, mkdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const os = await import("node:os");
+    const stateRoot = await mkdtemp(join(os.tmpdir(), "eunoma-coord-tree-"));
+    const coordinatorDir = join(stateRoot, "coordinator");
+    await mkdir(coordinatorDir, { recursive: true });
+    return { stateRoot, coordinatorDir };
+  }
+
+  // Build a REAL LeanIMT snapshot via the circuit-parity class so the fixture is byte-identical to
+  // what scripts/local_build_commitment_tree.mjs writes.
+  async function leanImtSnapshot(commitmentBigs: bigint[]) {
+    const mod = await import(
+      "../../../circuits/scripts/leanimt_tree.mjs"
+    );
+    const tree = new mod.LeanIMTTree();
+    for (const c of commitmentBigs) tree.append(c, {});
+    return tree.serialize();
+  }
+
+  describe("GET /v2/state-tree", () => {
+    it("returns the LeanIMT snapshot verbatim", async () => {
+      const { writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      const snap = await leanImtSnapshot([101n, 202n, 303n, 404n, 505n]);
+      await writeFile(join(coordinatorDir, "state_leanimt_tree.json"), JSON.stringify(snap));
+
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/state-tree" });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.scheme).toBe("eunoma_leanimt_tree_v1");
+      expect(body.treeDepth).toBe(snap.treeDepth);
+      expect(body.latestRootHex).toBe(snap.latestRootHex);
+      expect(body.leaves).toEqual(snap.leaves);
+      expect(body.depositMeta).toEqual(snap.depositMeta);
+    });
+
+    it("is reachable WITHOUT a bearer token (public route)", async () => {
+      const { writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      const snap = await leanImtSnapshot([1n, 2n]);
+      await writeFile(join(coordinatorDir, "state_leanimt_tree.json"), JSON.stringify(snap));
+
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot, bearerToken: "secret" });
+      const res = await server.inject({ method: "GET", url: "/v2/state-tree" });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("returns 503 when the snapshot file is missing (mirrors /v2/pool/state)", async () => {
+      const { stateRoot } = await makeStateRoot();
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/state-tree" });
+      expect(res.statusCode).toBe(503);
+      expect(res.json().error).toBe("state_tree_unavailable");
+    });
+
+    it("returns 503 when stateRoot is unconfigured", async () => {
+      const { server } = buildCoordinatorServer({ roster: roster() });
+      const res = await server.inject({ method: "GET", url: "/v2/state-tree" });
+      expect(res.statusCode).toBe(503);
+    });
+  });
+
+  describe("GET /v2/asp-set and /v2/asp-root-current", () => {
+    const aspArtifact = {
+      scheme: "eunoma_asp_set_v1",
+      version: 1,
+      treeDepth: 3,
+      leafCount: 4,
+      rootHex: `0x${"ab".repeat(32)}`,
+      commitments: [
+        `0x${"11".repeat(32)}`,
+        `0x${"22".repeat(32)}`,
+        `0x${"33".repeat(32)}`,
+        `0x${"44".repeat(32)}`,
+      ],
+      ipfsCid: "bafytestcid",
+      updatedAtUnix: 1700000000,
+    };
+
+    it("/v2/asp-set maps the artifact to { aspRootHex, aspTreeDepth, ipfsCid, commitments }", async () => {
+      const { writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeFile(join(coordinatorDir, "asp_set.json"), JSON.stringify(aspArtifact));
+
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/asp-set" });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        aspRootHex: aspArtifact.rootHex,
+        aspTreeDepth: aspArtifact.treeDepth,
+        ipfsCid: aspArtifact.ipfsCid,
+        commitments: aspArtifact.commitments,
+      });
+    });
+
+    it("/v2/asp-root-current is the lightweight pointer (no commitments)", async () => {
+      const { writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeFile(join(coordinatorDir, "asp_set.json"), JSON.stringify(aspArtifact));
+
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/asp-root-current" });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        aspRootHex: aspArtifact.rootHex,
+        aspTreeDepth: aspArtifact.treeDepth,
+        ipfsCid: aspArtifact.ipfsCid,
+      });
+    });
+
+    it("both ASP routes are reachable WITHOUT a bearer token (public)", async () => {
+      const { writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeFile(join(coordinatorDir, "asp_set.json"), JSON.stringify(aspArtifact));
+
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot, bearerToken: "secret" });
+      for (const url of ["/v2/asp-set", "/v2/asp-root-current"]) {
+        const res = await server.inject({ method: "GET", url });
+        expect(res.statusCode, url).toBe(200);
+      }
+    });
+
+    it("both ASP routes return 503 when asp_set.json is missing", async () => {
+      const { stateRoot } = await makeStateRoot();
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      for (const url of ["/v2/asp-set", "/v2/asp-root-current"]) {
+        const res = await server.inject({ method: "GET", url });
+        expect(res.statusCode, url).toBe(503);
+        expect(res.json().error, url).toBe("asp_set_unavailable");
       }
     });
   });

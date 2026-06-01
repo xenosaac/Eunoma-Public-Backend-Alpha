@@ -21,6 +21,9 @@ function fixtureCallArgs(): WithdrawV2CallArgs {
     amountTag: hex32(0x14),
     caPayloadHash: hex32(0x15),
     requestHash: hex32(0x16),
+    aspRoot: hex32(0x17),
+    stateTreeDepth: "4",
+    aspTreeDepth: "3",
     vaultSequence: "42",
     withdrawProof: hexN(192, 0x20),
     expirySecs: "1800000000",
@@ -83,7 +86,7 @@ describe("WITHDRAW_V3_ENTRIES — field mapping", () => {
     // Arg counts match the Move signatures (leading &signer excluded).
     const counts = Object.fromEntries(WITHDRAW_V3_ENTRIES.map((e) => [e.fn, e.keys.length]));
     expect(counts).toEqual({
-      prepare_withdraw_proof_v3: 9,
+      prepare_withdraw_proof_v3: 12,
       prepare_withdraw_attestation_v3: 12,
       prepare_withdraw_payload_v3: 17,
       withdraw_step2a_eunoma_verify_v3: 9,

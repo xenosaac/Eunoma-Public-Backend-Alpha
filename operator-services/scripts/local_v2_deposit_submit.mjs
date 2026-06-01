@@ -600,6 +600,9 @@ async function main() {
     dkgEpoch,
     rosterHash: rosterHashOnChain,
     selectedSlots,
+    // R7-W1: prepare_deposit_binding_v3_for_user binds user_addr on-chain; the coordinator
+    // attest contract requires the matching 32-byte userAddr (same value passed to the Move call).
+    userAddr: `0x${bufToHex(addr32Bytes(depositorAccount.accountAddress.toString()))}`,
     bridge: `0x${bufToHex(addr32Bytes(bridgeAddr))}`,
     vault: vaultAddrHex,
     assetType: assetTypeHex,

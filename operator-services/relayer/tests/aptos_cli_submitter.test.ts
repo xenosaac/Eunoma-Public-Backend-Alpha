@@ -30,6 +30,9 @@ function fixtureCallArgs(): WithdrawV2CallArgs {
     amountTag: hex32(0x14),
     caPayloadHash: hex32(0x15),
     requestHash: hex32(0x16),
+    aspRoot: hex32(0x17),
+    stateTreeDepth: "4",
+    aspTreeDepth: "3",
     vaultSequence: "42",
     withdrawProof: hexN(192, 0x20),
     expirySecs: "1800000000",
@@ -222,7 +225,7 @@ describe("createAptosCliSubmitter — argv encoding", () => {
     const argsIdx = capture.args!.indexOf("--args");
     expect(argsIdx).toBeGreaterThanOrEqual(0);
     const positional = capture.args!.slice(argsIdx + 1);
-    expect(positional.length).toBe(27);
+    expect(positional.length).toBe(30);
 
     // Recompute the expected positional vector from the canonical Move-order
     // manifest. If the encoder or the manifest drift, this catches it.
@@ -234,10 +237,12 @@ describe("createAptosCliSubmitter — argv encoding", () => {
     // prefix (u64:, hex:, u8:). The order is locked, so we can predict the
     // prefixes positionally.
     expect(positional[0]).toMatch(/^hex:0x/); // root
-    expect(positional[7]).toMatch(/^u64:/); // vaultSequence
-    expect(positional[9]).toMatch(/^u64:/); // expirySecs
-    expect(positional[11]).toMatch(/^u8:/); // fallbackBitmap
-    expect(positional[21]).toMatch(/^hex:\[/); // amountRVolunAuds (vector form)
+    expect(positional[7]).toMatch(/^hex:0x/); // aspRoot (ASP)
+    expect(positional[8]).toMatch(/^u64:/); // stateTreeDepth (ASP)
+    expect(positional[10]).toMatch(/^u64:/); // vaultSequence
+    expect(positional[12]).toMatch(/^u64:/); // expirySecs
+    expect(positional[14]).toMatch(/^u8:/); // fallbackBitmap
+    expect(positional[24]).toMatch(/^hex:\[/); // amountRVolunAuds (vector form)
   });
 });
 

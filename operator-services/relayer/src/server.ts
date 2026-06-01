@@ -451,6 +451,7 @@ export function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2Call
     case "amountTag":
     case "caPayloadHash":
     case "requestHash":
+    case "aspRoot":
     case "withdrawProof":
     case "groupSignature":
     case "zkrpNewBalance":
@@ -459,6 +460,8 @@ export function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2Call
       return hexArg(value as string);
     case "vaultSequence":
     case "expirySecs":
+    case "stateTreeDepth":
+    case "aspTreeDepth":
       return u64Arg(value as string);
     case "fallbackBitmap":
       // u8 is encoded as a decimal-tagged u8:N for the aptos CLI.

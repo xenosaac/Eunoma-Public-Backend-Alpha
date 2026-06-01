@@ -90,6 +90,8 @@ Dockerfile
 /DEBUG.md
 /DEOPERATOR_RESEARCH.md
 /goal.md
+/ASP_DEPLOY_RUNBOOK.md
+/ASP_E2E_HANDOFF.md
 
 # Gas measurement artifacts (chain tx hashes + measurement timestamps; written by
 # operator-services/scripts/measure_deposit_gas.mjs and friends). Keep local-only.

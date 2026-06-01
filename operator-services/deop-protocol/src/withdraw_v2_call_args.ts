@@ -61,6 +61,9 @@ export const WITHDRAW_V2_CALL_ARGS_ORDER = [
   "amountTag",
   "caPayloadHash",
   "requestHash",
+  "aspRoot",
+  "stateTreeDepth",
+  "aspTreeDepth",
   "vaultSequence",
   "withdrawProof",
   "expirySecs",
@@ -105,6 +108,12 @@ export interface WithdrawV2CallArgs {
   caPayloadHash: HexString;
   /** 32-byte Fr hash. Move: `request_hash: vector<u8>` + `assert_hash`. */
   requestHash: HexString;
+  /** 32-byte Fr hash. Move: `asp_root: vector<u8>` (ASP tree root) + `assert_hash`. ASP. */
+  aspRoot: HexString;
+  /** Decimal string. Move: `state_tree_depth: u64` (state LeanIMT depth). ASP. */
+  stateTreeDepth: string;
+  /** Decimal string. Move: `asp_tree_depth: u64` (ASP LeanIMT depth). ASP. */
+  aspTreeDepth: string;
   /** Decimal string. Move: `vault_sequence: u64`. */
   vaultSequence: string;
   /** Variable-length Groth16 proof bytes. Move: `withdraw_proof: vector<u8>`. */
@@ -172,6 +181,9 @@ export function parseWithdrawV2CallArgs(raw: unknown): WithdrawV2CallArgs {
     amountTag: hexField(obj, "amountTag", FR_BYTES),
     caPayloadHash: hexField(obj, "caPayloadHash", FR_BYTES),
     requestHash: hexField(obj, "requestHash", FR_BYTES),
+    aspRoot: hexField(obj, "aspRoot", FR_BYTES),
+    stateTreeDepth: decimalU64Field(obj, "stateTreeDepth"),
+    aspTreeDepth: decimalU64Field(obj, "aspTreeDepth"),
     vaultSequence: decimalU64Field(obj, "vaultSequence"),
     withdrawProof: hexField(obj, "withdrawProof", undefined, { allowEmpty: true }),
     expirySecs: decimalU64Field(obj, "expirySecs"),

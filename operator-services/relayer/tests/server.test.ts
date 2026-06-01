@@ -27,6 +27,9 @@ function validWithdrawV2Body(): Record<string, unknown> {
     amountTag: hex32(0x14),
     caPayloadHash: hex32(0x15),
     requestHash: hex32(0x16),
+    aspRoot: hex32(0x17),
+    stateTreeDepth: "4",
+    aspTreeDepth: "3",
     vaultSequence: "42",
     withdrawProof: hexN(192, 0x20),
     expirySecs: "1800000000",
@@ -97,7 +100,7 @@ describe("relayer /v2/relayer/submit/withdraw — killer tests", () => {
     // Move-signature order. If the parser or the manifest ever reorder, this
     // test fails — which is the whole point of locking the order in.
     expect(Object.keys(received!)).toEqual([...WITHDRAW_V2_CALL_ARGS_ORDER]);
-    expect(Object.keys(received!).length).toBe(27);
+    expect(Object.keys(received!).length).toBe(30);
     // Spot-check a few fields end-to-end.
     expect(received!.vaultSequence).toBe("42");
     expect(received!.expirySecs).toBe("1800000000");

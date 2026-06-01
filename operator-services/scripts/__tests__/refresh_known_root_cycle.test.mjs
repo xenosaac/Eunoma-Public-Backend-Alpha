@@ -236,6 +236,24 @@ if (script.endsWith("local_build_commitment_tree.mjs")) {
       2,
     ) + "\\n",
   );
+  // The real builder also emits the LeanIMT snapshot; the wrapper records ITS root.
+  writeFileSync(
+    stateDir + "/state_leanimt_tree.json",
+    JSON.stringify(
+      {
+        scheme: "eunoma_leanimt_tree_v1",
+        version: 1,
+        treeDepth: 4,
+        latestRootHex: process.env.FAKE_TREE_ROOT,
+        leafCount,
+        leaves,
+        depositMeta: leaves.map((commitmentHex) => ({ commitmentHex })),
+        transcriptHash: "0x" + "55".repeat(32),
+      },
+      null,
+      2,
+    ) + "\\n",
+  );
   process.exit(0);
 }
 if (script.endsWith("local_rollover_vault_pending.mjs")) {

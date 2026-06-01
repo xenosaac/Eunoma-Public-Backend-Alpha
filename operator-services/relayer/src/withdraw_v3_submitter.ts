@@ -43,8 +43,11 @@ export const WITHDRAW_V3_ENTRIES: ReadonlyArray<WithdrawV3Entry> = [
   {
     fn: "prepare_withdraw_proof_v3",
     keys: [
+      // ASP (2026-05-30): asp_root + the 2 LeanIMT depths are inserted AFTER requestHash and
+      // BEFORE vaultSequence — matching prepare_withdraw_proof_v3's Move signature exactly.
       "root", "nullifierHash", "recipientHash", "amountTag", "caPayloadHash",
-      "requestHash", "vaultSequence", "amountP", "withdrawProof",
+      "requestHash", "aspRoot", "stateTreeDepth", "aspTreeDepth",
+      "vaultSequence", "amountP", "withdrawProof",
     ],
   },
   {

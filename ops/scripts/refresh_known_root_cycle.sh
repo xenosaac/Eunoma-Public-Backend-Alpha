@@ -41,8 +41,10 @@ VAULT=${BRIDGE_VAULT_ADDRESS:-0xbbb0957ec8c26ab2652280c946dc35381dde6613b8ee9041
 ASSET=${BRIDGE_ASSET_TYPE:-0xa}
 STATE_DIR=${EUNOMA_COORDINATOR_STATE_DIR:-operator-services/.agent-local/eunoma-v2/coordinator}
 TREE_JSON=${STATE_DIR}/commitment_tree_v2.json
+LEANIMT_JSON=${STATE_DIR}/state_leanimt_tree.json
 STAGING_DIR=${STATE_DIR}/.refresh-staging
 STAGED_TREE_JSON=${STAGING_DIR}/commitment_tree_v2.json
+STAGED_LEANIMT_JSON=${STAGING_DIR}/state_leanimt_tree.json
 MIN_ANONYMITY_SET=${EUNOMA_MIN_ANONYMITY_SET:-8}
 FETCH_DEPOSIT_TX_HASHES_SCRIPT=${EUNOMA_FETCH_DEPOSIT_TX_HASHES_SCRIPT:-${REPO_ROOT}/ops/scripts/fetch_deposit_tx_hashes.sh}
 
@@ -85,6 +87,9 @@ mkdir -p "${STAGING_DIR}"
 if [ -f "${TREE_JSON}" ]; then
   cp "${TREE_JSON}" "${STAGED_TREE_JSON}"
 fi
+if [ -f "${LEANIMT_JSON}" ]; then
+  cp "${LEANIMT_JSON}" "${STAGED_LEANIMT_JSON}"
+fi
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: build staged tree"
 node operator-services/scripts/local_build_commitment_tree.mjs \
@@ -95,7 +100,12 @@ node operator-services/scripts/local_build_commitment_tree.mjs \
   --state-dir "${STAGING_DIR}" \
   --refresh
 
-LATEST_ROOT=$(node -e 'const fs=require("fs"); const p=process.argv[1]; if (!fs.existsSync(p)) process.exit(0); const j=JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(j.latestRootHex || "");' "${STAGED_TREE_JSON}")
+# The recorded on-chain state root is the LeanIMT root (the dynamic-depth tree the withdraw
+# circuit + frontend verify against), read from the LeanIMT snapshot — NOT the legacy fixed-20
+# commitment_tree_v2.json. Fall back to the staged LeanIMT path; the build step above always
+# emits it alongside commitment_tree_v2.json.
+ROOT_SOURCE_JSON=${STAGED_LEANIMT_JSON}
+LATEST_ROOT=$(node -e 'const fs=require("fs"); const p=process.argv[1]; if (!fs.existsSync(p)) process.exit(0); const j=JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(j.latestRootHex || "");' "${ROOT_SOURCE_JSON}")
 if [ -n "${LATEST_ROOT}" ]; then
   ROOT_PREFIX=${LATEST_ROOT#0x}
   ROOT_PREFIX=${ROOT_PREFIX:0:8}
@@ -111,13 +121,13 @@ if [ -n "${LATEST_ROOT}" ]; then
     normalize_if_needed "after rollover"
   fi
 else
-  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: latest root missing from ${TREE_JSON}"
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: latest root missing from ${ROOT_SOURCE_JSON}"
   exit 2
 fi
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: record known root"
 node operator-services/scripts/local_record_known_root_v2.mjs \
-  --commitment-tree "${STAGED_TREE_JSON}" \
+  --commitment-tree "${STAGED_LEANIMT_JSON}" \
   --bridge-package-address "${BRIDGE}" \
   --via-delegate --delegate-profile testnet-relayer \
   --min-anonymity-set "${MIN_ANONYMITY_SET}" \
@@ -126,6 +136,10 @@ node operator-services/scripts/local_record_known_root_v2.mjs \
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: publish tree"
 mv "${STAGED_TREE_JSON}" "${TREE_JSON}.tmp"
 mv "${TREE_JSON}.tmp" "${TREE_JSON}"
+if [ -f "${STAGED_LEANIMT_JSON}" ]; then
+  mv "${STAGED_LEANIMT_JSON}" "${LEANIMT_JSON}.tmp"
+  mv "${LEANIMT_JSON}.tmp" "${LEANIMT_JSON}"
+fi
 rm -rf "${STAGING_DIR}"
 
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: done"

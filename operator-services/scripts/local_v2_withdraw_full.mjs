@@ -78,6 +78,13 @@ const serviceRoot = resolve(scriptDir, "..");
 const repoRoot = resolve(serviceRoot, "..");
 const HPKE_SEAL_BIN = resolve(serviceRoot, "crypto-worker-rust/target/release/hpke_seal_ingress");
 
+// ASP (2026-05-31): the local state base is parameterized so the ASP testnet deploy can point at
+// `.agent-local/eunoma-v2-asp/` (coordinator/depositor/slot artifacts) while the legacy local
+// fixtures + the --check-balance-only test default to `.agent-local/eunoma-v2/`. EUNOMA_LOCAL_STATE_BASE
+// may be absolute or relative-to-serviceRoot.
+const localStateBaseEnv = process.env.EUNOMA_LOCAL_STATE_BASE ?? ".agent-local/eunoma-v2";
+const localStateBase = resolve(serviceRoot, localStateBaseEnv);
+
 function flag(name, def) {
   const i = process.argv.indexOf(name);
   if (i < 0) return def;
@@ -139,7 +146,7 @@ const requestId = flag("--request-id", `m8-real-${Date.now()}`);
 const depositWitnessPath = required(flag("--deposit-witness"), "--deposit-witness");
 const depositorStatePath = flag(
   "--depositor-state",
-  resolve(serviceRoot, ".agent-local/eunoma-v2/depositor/state.json"),
+  resolve(localStateBase, "depositor/state.json"),
 );
 const vaultAddress = required(flag("--vault-address"), "--vault-address");
 const vaultEk = required(flag("--vault-ek"), "--vault-ek");
@@ -210,17 +217,38 @@ function loadDepositWitness(path) {
 // falls back to the legacy M8 single-leaf path with a warning.
 const commitmentTreePath =
   flag("--commitment-tree") ??
-  resolve(serviceRoot, ".agent-local/eunoma-v2/coordinator/commitment_tree_v2.json");
+  resolve(localStateBase, "coordinator/commitment_tree_v2.json");
 const commitmentTreeExists = existsSync(commitmentTreePath);
-const witnessMode = commitmentTreeExists ? "multi_leaf" : "legacy_single_leaf";
-if (!commitmentTreeExists) {
+
+// ASP (2026-05-31): the withdraw circuit is now 12-public dual-LeanIMT. When the state LeanIMT
+// snapshot + the published ASP set are present, the witness builder runs in aspMode (state_siblings
+// + asp_siblings dual inclusion) and emits asp_root + the 2 tree depths. The state LeanIMT root is
+// the circuit's `root` public and MUST equal --root (the on-chain known_root that
+// process_deposit.sh records). These default to the coordinator dir under the local state base.
+const stateTreePath =
+  flag("--state-tree") ?? resolve(localStateBase, "coordinator/state_leanimt_tree.json");
+const aspSetPath = flag("--asp-set") ?? resolve(localStateBase, "coordinator/asp_set.json");
+const aspModeAvailable = existsSync(stateTreePath) && existsSync(aspSetPath);
+const witnessMode = aspModeAvailable
+  ? "asp_dual_leanimt"
+  : commitmentTreeExists
+    ? "multi_leaf"
+    : "legacy_single_leaf";
+if (aspModeAvailable) {
+  console.error(
+    `[asp] using state LeanIMT ${stateTreePath} + ASP set ${aspSetPath} (12-public dual-LeanIMT witness)`,
+  );
+} else if (!commitmentTreeExists) {
   console.error(
     `[m9] WARNING: commitment_tree_v2.json not found at ${commitmentTreePath}; falling back to ` +
       "legacy single-leaf witness path (M8 behavior). For real M9 testnet runs, build the tree " +
       "with local_build_commitment_tree.mjs first.",
   );
 } else {
-  console.error(`[m9] using commitment_tree_v2.json at ${commitmentTreePath} (multi-leaf path)`);
+  console.error(
+    `[m9] WARNING: ASP state-tree/asp-set not found (state=${existsSync(stateTreePath)} asp=${existsSync(aspSetPath)}); ` +
+      `using legacy commitment_tree_v2.json at ${commitmentTreePath} — the 12-public ASP circuit will NOT verify.`,
+  );
 }
 
 const COORDINATOR_URL = process.env.COORDINATOR_URL ?? "http://127.0.0.1:4200";
@@ -851,7 +879,12 @@ const witnessBuilderArgs = [
   "--amount-p-hex", amountPHex,
   "--output", witnessOutPath,
 ];
-if (commitmentTreeExists) {
+// ASP (2026-05-31): aspMode needs --state-tree + --asp-set (dual-LeanIMT inclusion → 12 publics +
+// asp_root + 2 depths). Falls back to legacy --commitment-tree depth-20 (dead 9-public path) only
+// when the ASP artifacts are missing.
+if (aspModeAvailable) {
+  witnessBuilderArgs.push("--state-tree", stateTreePath, "--asp-set", aspSetPath, "--testnet");
+} else if (commitmentTreeExists) {
   witnessBuilderArgs.push("--commitment-tree", commitmentTreePath, "--testnet");
 }
 const witnessTempProc = spawnSync("node", witnessBuilderArgs, {
@@ -863,6 +896,23 @@ if (witnessTempProc.status !== 0) {
   process.exit(1);
 }
 const witnessSummary = JSON.parse(witnessTempProc.stdout.trim());
+// ASP: capture asp_root + tree depths emitted by the witness builder summary (aspMode). These are
+// public inputs of the 12-public proof and must be threaded into the Move prepare/withdraw call
+// args + the coordinator frost-attest body.
+const aspRootHex = witnessSummary.aspRootHex ?? null;
+const stateTreeDepth = witnessSummary.stateTreeDepth ?? null;
+const aspTreeDepth = witnessSummary.aspTreeDepth ?? null;
+if (aspModeAvailable) {
+  if (!aspRootHex || stateTreeDepth == null || aspTreeDepth == null) {
+    console.error(
+      `[asp] witness summary missing aspRootHex/stateTreeDepth/aspTreeDepth (got ${JSON.stringify({ aspRootHex, stateTreeDepth, aspTreeDepth })})`,
+    );
+    process.exit(1);
+  }
+  console.error(
+    `[asp] aspRoot=${aspRootHex.slice(0, 18)}... stateTreeDepth=${stateTreeDepth} aspTreeDepth=${aspTreeDepth}`,
+  );
+}
 const witnessJson = JSON.parse(readFileSync(witnessOutPath, "utf8"));
 const nullifierHashHex = `0x${bytesToHex(bigToLE32(BigInt(witnessJson.nullifier_hash)))}`;
 const recipientHashHex = `0x${bytesToHex(bigToLE32(BigInt(witnessJson.recipient_hash)))}`;
@@ -993,7 +1043,7 @@ async function fetchChainVaultSequence() {
 function readWorkerVaultSequences() {
   const bySlot = {};
   for (const node of caDkgRoster.nodes) {
-    const p = resolve(serviceRoot, `.agent-local/eunoma-v2/slot-${node.slot}/vault_state_v2.json`);
+    const p = resolve(localStateBase, `slot-${node.slot}/vault_state_v2.json`);
     if (!existsSync(p)) { bySlot[node.slot] = null; continue; }
     try {
       bySlot[node.slot] = Number(JSON.parse(readFileSync(p, "utf8")).vault_sequence);
@@ -1008,7 +1058,7 @@ function readWorkerVaultSequences() {
 // the M10_FINAL_REPORT anchor + coordinator submit artifacts — NEVER from speculative scanning.
 function resolveTrustedWithdrawTxHashes() {
   const out = [];
-  const reportPath = resolve(serviceRoot, "M10_FINAL_REPORT.json");
+  const reportPath = resolve(localStateBase, "M10_FINAL_REPORT.json");
   if (existsSync(reportPath)) {
     try {
       const rep = JSON.parse(readFileSync(reportPath, "utf8"));
@@ -1017,7 +1067,7 @@ function resolveTrustedWithdrawTxHashes() {
       }
     } catch { /* ignore */ }
   }
-  const submitDir = resolve(serviceRoot, ".agent-local/eunoma-v2/coordinator/mpcca_withdraw_submit");
+  const submitDir = resolve(localStateBase, "coordinator/mpcca_withdraw_submit");
   if (existsSync(submitDir)) {
     for (const f of readdirSync(submitDir)) {
       if (!f.endsWith(".json")) continue;
@@ -1192,9 +1242,9 @@ if (r.status !== 200) {
 }
 
 // ---- 4) Compute real ca_payload_hash + Groth16 proof --------------------------------------
-const finalizePath = resolve(serviceRoot, `.agent-local/eunoma-v2/coordinator/mpcca_withdraw/${dkgEpochStr}__${requestId}__finalize.json`);
+const finalizePath = resolve(localStateBase, `coordinator/mpcca_withdraw/${dkgEpochStr}__${requestId}__finalize.json`);
 const finalizeArtifact = JSON.parse(readFileSync(finalizePath, "utf8"));
-const round2Path = resolve(serviceRoot, `.agent-local/eunoma-v2/coordinator/mpcca_withdraw/${dkgEpochStr}__${requestId}__round2.json`);
+const round2Path = resolve(localStateBase, `coordinator/mpcca_withdraw/${dkgEpochStr}__${requestId}__round2.json`);
 const round2Artifact = JSON.parse(readFileSync(round2Path, "utf8"));
 
 const caPayload = buildCaPayloadFromFinalizeArtifact({
@@ -1228,7 +1278,9 @@ const witnessReArgs = [
   "--amount-p-hex", amountPHex,
   "--output", witnessOutPath,
 ];
-if (commitmentTreeExists) {
+if (aspModeAvailable) {
+  witnessReArgs.push("--state-tree", stateTreePath, "--asp-set", aspSetPath, "--testnet");
+} else if (commitmentTreeExists) {
   witnessReArgs.push("--commitment-tree", commitmentTreePath, "--testnet");
 }
 const witnessReProc = spawnSync("node", witnessReArgs, {
@@ -1253,7 +1305,7 @@ try {
 // anonymitySetSize, distinctDepositSenders. Strictly NO amount/nullifier/secret/blind here,
 // AND (M10-f) no commitmentHex/leafIndex either — see comment on the ctx literal below.
 {
-  const ctxStateDir = resolve(serviceRoot, ".agent-local/eunoma-v2/coordinator");
+  const ctxStateDir = resolve(localStateBase, "coordinator");
   mkdirSync(ctxStateDir, { recursive: true });
   let anonymitySetSize = null;
   let distinctDepositSenders = null;
@@ -1355,15 +1407,32 @@ function loadDepositorSubmitAccount() {
   return account;
 }
 
+function assertAspFieldsForChainCall() {
+  // ASP: the v3 chain entries require asp_root (32B Fr) + the 2 LeanIMT depths (u64 ∈ [1,32]).
+  // These come from the aspMode witness builder summary. Fail loud rather than submit a doomed tx.
+  if (!aspModeAvailable) {
+    console.error(
+      "[asp] FATAL withdraw requires the 12-public ASP path (state_leanimt_tree.json + asp_set.json). " +
+        "Run process_deposit.sh for >=2 deposits so both trees have depth>=1.",
+    );
+    process.exit(40);
+  }
+  if (!aspRootHex || stateTreeDepth == null || aspTreeDepth == null) {
+    console.error("[asp] FATAL missing asp_root / tree depths from witness summary");
+    process.exit(40);
+  }
+}
+
 async function submitPreparedWithdrawProof() {
+  assertAspFieldsForChainCall();
   const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
   const submitter = loadDepositorSubmitAccount();
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
-  console.error("[a6] building + submitting prepare_withdraw_proof_v2 tx");
+  console.error("[asp] building + submitting prepare_withdraw_proof_v3 tx");
   const prepareTx = await aptos.transaction.build.simple({
     sender: submitter.accountAddress,
     data: {
-      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_proof_v2`,
+      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_proof_v3`,
       functionArguments: [
         hexToBytes(rootHex),
         hexToBytes(nullifierHashHex),
@@ -1371,6 +1440,11 @@ async function submitPreparedWithdrawProof() {
         hexToBytes(amountTagHex),
         hexToBytes(caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : `0x${caPayloadHashFr}`),
         hexToBytes(realRequestHashHex),
+        // ASP: asp_root (32B Fr) + state_tree_depth (u64) + asp_tree_depth (u64), inserted AFTER
+        // request_hash and BEFORE vault_sequence (matches the Move v3 signature byte-for-byte).
+        hexToBytes(aspRootHex),
+        BigInt(stateTreeDepth),
+        BigInt(aspTreeDepth),
         BigInt(vaultSequenceArg),
         amountP,
         hexToBytes(proofHex),
@@ -1383,12 +1457,12 @@ async function submitPreparedWithdrawProof() {
     transaction: prepareTx,
     senderAuthenticator: auth,
   });
-  console.error(`[a6] submitted prepare_withdraw_proof_v2 tx=${pending.hash}; waiting for confirmation...`);
+  console.error(`[asp] submitted prepare_withdraw_proof_v3 tx=${pending.hash}; waiting for confirmation...`);
   const committed = await aptos.waitForTransaction({ transactionHash: pending.hash });
   if (!committed.success) {
-    throw new Error(`prepare_withdraw_proof_v2 failed: ${committed.vm_status}`);
+    throw new Error(`prepare_withdraw_proof_v3 failed: ${committed.vm_status}`);
   }
-  console.error(`[a6] prepare withdraw SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
+  console.error(`[asp] prepare withdraw proof SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
   return committed.hash;
 }
 
@@ -1396,11 +1470,11 @@ async function submitPreparedWithdrawPayload() {
   const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
   const submitter = loadDepositorSubmitAccount();
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
-  console.error("[a6] building + submitting prepare_withdraw_payload_v2 tx");
+  console.error("[asp] building + submitting prepare_withdraw_payload_v3 tx");
   const prepareTx = await aptos.transaction.build.simple({
     sender: submitter.accountAddress,
     data: {
-      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_payload_v2`,
+      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_payload_v3`,
       functionArguments: [
         `0x${addr32(recipientAddress)}`,
         hexToBytes(caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : `0x${caPayloadHashFr}`),
@@ -1431,9 +1505,9 @@ async function submitPreparedWithdrawPayload() {
   console.error(`[a6] submitted prepare_withdraw_payload_v2 tx=${pending.hash}; waiting for confirmation...`);
   const committed = await aptos.waitForTransaction({ transactionHash: pending.hash });
   if (!committed.success) {
-    throw new Error(`prepare_withdraw_payload_v2 failed: ${committed.vm_status}`);
+    throw new Error(`prepare_withdraw_payload_v3 failed: ${committed.vm_status}`);
   }
-  console.error(`[a6] prepare payload SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
+  console.error(`[asp] prepare payload SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
   return committed.hash;
 }
 const prepareWithdrawProofTxHash = await submitPreparedWithdrawProof();
@@ -1446,11 +1520,15 @@ async function submitPreparedWithdrawAttestation(groupSignatureHex) {
   const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
   const submitter = loadDepositorSubmitAccount();
   const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
-  console.error("[a6] building + submitting prepare_withdraw_attestation_v2 tx");
+  console.error("[asp] building + submitting prepare_withdraw_attestation_v3 tx");
   const prepareTx = await aptos.transaction.build.simple({
     sender: submitter.accountAddress,
     data: {
-      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_attestation_v2`,
+      function: `${bridgePkg}::eunoma_bridge::prepare_withdraw_attestation_v3`,
+      // v3 attestation signature: root, nullifier_hash, recipient (address), recipient_hash,
+      // amount_tag, ca_payload_hash, request_hash, vault_sequence, expiry_secs, group_signature,
+      // fallback_bitmap, fallback_signatures. (Same shape as v2 — the v3 variant writes the
+      // PendingWithdrawAttestationsV3 table the v3 withdraw consume path reads.)
       functionArguments: [
         hexToBytes(rootHex),
         hexToBytes(nullifierHashHex),
@@ -1473,12 +1551,96 @@ async function submitPreparedWithdrawAttestation(groupSignatureHex) {
     transaction: prepareTx,
     senderAuthenticator: auth,
   });
-  console.error(`[a6] submitted prepare_withdraw_attestation_v2 tx=${pending.hash}; waiting for confirmation...`);
+  console.error(`[asp] submitted prepare_withdraw_attestation_v3 tx=${pending.hash}; waiting for confirmation...`);
   const committed = await aptos.waitForTransaction({ transactionHash: pending.hash });
   if (!committed.success) {
-    throw new Error(`prepare_withdraw_attestation_v2 failed: ${committed.vm_status}`);
+    throw new Error(`prepare_withdraw_attestation_v3 failed: ${committed.vm_status}`);
   }
-  console.error(`[a6] prepare attestation SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
+  console.error(`[asp] prepare attestation SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
+  return committed.hash;
+}
+
+// ASP v3 split FINAL step. The monolith `withdraw_to_recipient_v2` packs ALL 27 args (incl. the
+// full CA payload: 8+8 newBalance points, 4+4+4 amount points, 2 bulletproofs ~700B each, 30+25
+// sigma points) into ONE `aptos move run --args …` invocation, which overflows the Aptos CLI's
+// command-line arg limit (the relayer's monolith submitter exits 1 with empty stderr). The v3
+// split moves the heavy CA payload into `withdraw_step2b_invoke_framework_v3` as a STANDALONE tx
+// (step2a carries only hashes + sequence). Both must be submitted from the SAME key as the
+// prepares (step2a/2b key the finalization row by compose_pending_key(submitter, request_hash));
+// the depositor submitted the prepares, so it submits step2a + step2b too. The cached proof_v3 /
+// payload_v3 / attestation_v3 pending rows (keyed by request_hash only) are consumed inside
+// step2a, so no signature/proof is re-passed here.
+async function submitWithdrawStep2aVerify() {
+  const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
+  const submitter = loadDepositorSubmitAccount();
+  const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
+  console.error("[asp] building + submitting withdraw_step2a_eunoma_verify_v3 tx");
+  const tx = await aptos.transaction.build.simple({
+    sender: submitter.accountAddress,
+    data: {
+      function: `${bridgePkg}::eunoma_bridge::withdraw_step2a_eunoma_verify_v3`,
+      functionArguments: [
+        hexToBytes(rootHex),
+        hexToBytes(nullifierHashHex),
+        `0x${addr32(recipientAddress)}`,
+        hexToBytes(recipientHashHex),
+        hexToBytes(amountTagHex),
+        hexToBytes(caPayloadHashFr.startsWith("0x") ? caPayloadHashFr : `0x${caPayloadHashFr}`),
+        hexToBytes(realRequestHashHex),
+        BigInt(vaultSequenceArg),
+        BigInt(expirySecs),
+      ],
+    },
+    options: { maxGasAmount: 500_000, gasUnitPrice: 100 },
+  });
+  const auth = aptos.transaction.sign({ signer: submitter, transaction: tx });
+  const pending = await aptos.transaction.submit.simple({ transaction: tx, senderAuthenticator: auth });
+  console.error(`[asp] submitted withdraw_step2a tx=${pending.hash}; waiting for confirmation...`);
+  const committed = await aptos.waitForTransaction({ transactionHash: pending.hash });
+  if (!committed.success) {
+    throw new Error(`withdraw_step2a_eunoma_verify_v3 failed: ${committed.vm_status}`);
+  }
+  console.error(`[asp] withdraw_step2a SUCCESS tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
+  return committed.hash;
+}
+
+async function submitWithdrawStep2bFramework() {
+  const bridgePkg = required(process.env.BRIDGE_PACKAGE_ADDRESS, "env BRIDGE_PACKAGE_ADDRESS");
+  const submitter = loadDepositorSubmitAccount();
+  const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
+  console.error("[asp] building + submitting withdraw_step2b_invoke_framework_v3 tx");
+  const tx = await aptos.transaction.build.simple({
+    sender: submitter.accountAddress,
+    data: {
+      function: `${bridgePkg}::eunoma_bridge::withdraw_step2b_invoke_framework_v3`,
+      functionArguments: [
+        hexToBytes(realRequestHashHex),
+        hexArrayToBytes(caPayload.newBalanceP),
+        hexArrayToBytes(caPayload.newBalanceR),
+        hexArrayToBytes(caPayload.newBalanceREffAud),
+        hexArrayToBytes(caPayload.amountP),
+        hexArrayToBytes(caPayload.amountRSender),
+        hexArrayToBytes(caPayload.amountRRecip),
+        hexArrayToBytes(caPayload.amountREffAud),
+        hexArrayToBytes(caPayload.ekVolunAuds),
+        hexNestedArrayToBytes(caPayload.amountRVolunAuds),
+        hexToBytes(caPayload.zkrpNewBalance),
+        hexToBytes(caPayload.zkrpAmount),
+        hexArrayToBytes(caPayload.sigmaProtoComm),
+        hexArrayToBytes(caPayload.sigmaProtoResp),
+        hexToBytes(caPayload.memo),
+      ],
+    },
+    options: { maxGasAmount: 800_000, gasUnitPrice: 100 },
+  });
+  const auth = aptos.transaction.sign({ signer: submitter, transaction: tx });
+  const pending = await aptos.transaction.submit.simple({ transaction: tx, senderAuthenticator: auth });
+  console.error(`[asp] submitted withdraw_step2b tx=${pending.hash}; waiting for confirmation...`);
+  const committed = await aptos.waitForTransaction({ transactionHash: pending.hash });
+  if (!committed.success) {
+    throw new Error(`withdraw_step2b_invoke_framework_v3 failed: ${committed.vm_status}`);
+  }
+  console.error(`[asp] withdraw_step2b SUCCESS (CONFIDENTIAL TRANSFER LANDED) tx=${committed.hash} version=${committed.version} gas=${committed.gas_used}`);
   return committed.hash;
 }
 
@@ -1511,6 +1673,12 @@ console.error(`[m8-r] circuit_versions_hash (chain-derived) = ${derivedCircuitVe
 const frostAttestBody = {
   ...finalizeBody,
   requestHash: normalizeHex(realRequestHashHex),
+  // ASP: the coordinator's frost-attest parser requires asp_root + the 2 LeanIMT depths (public
+  // inputs of the 12-public withdraw proof). It threads them into the 27-field
+  // withdrawV2CallArgsFields the /submit route consumes for the final withdraw_to_recipient_v2 tx.
+  aspRoot: normalizeHex(aspRootHex),
+  stateTreeDepth: Number(stateTreeDepth),
+  aspTreeDepth: Number(aspTreeDepth),
   attestationConfig: {
     bridge: process.env.BRIDGE_PACKAGE_ADDRESS,
     vault: vaultAddress,
@@ -1533,13 +1701,43 @@ if (r.status !== 200) {
 const prepareWithdrawAttestationTxHash = await submitPreparedWithdrawAttestation(r.body?.groupSignature);
 
 // ---- 6) submit ----------------------------------------------------------------------------
-console.error(`[m8-real] POST /v2/withdraw/mpcca/submit`);
-r = await post("/v2/withdraw/mpcca/submit", {
-  dkgEpoch: dkgEpochStr,
-  requestId,
-  preparedWithdrawAttestation: true,
-});
-console.error(`[m8-real] submit → HTTP ${r.status}`);
+// ASP v3 split: the monolith `withdraw_to_recipient_v2` (coordinator /submit → relayer) overflows
+// the Aptos CLI arg limit. Drive the final 2 v3 txs (step2a verify-only [small] + step2b framework
+// invoke [carries the CA payload as a STANDALONE tx]) directly from the depositor — the same
+// submitter that prepared proof_v3/payload_v3/attestation_v3, which is REQUIRED because step2a/2b
+// key the finalization row by compose_pending_key(submitter, request_hash). Default ON in aspMode;
+// EUNOMA_WITHDRAW_V3_SPLIT_SUBMIT=0 forces the legacy coordinator monolith path.
+const useV3SplitSubmit =
+  process.env.EUNOMA_WITHDRAW_V3_SPLIT_SUBMIT === "1" ||
+  (aspModeAvailable && process.env.EUNOMA_WITHDRAW_V3_SPLIT_SUBMIT !== "0");
+let withdrawStep2aTxHash = null;
+let withdrawStep2bTxHash = null;
+let withdrawFinalTxHash = null;
+if (useV3SplitSubmit) {
+  withdrawStep2aTxHash = await submitWithdrawStep2aVerify();
+  withdrawStep2bTxHash = await submitWithdrawStep2bFramework();
+  withdrawFinalTxHash = withdrawStep2bTxHash;
+  // Synthesize a 2xx-shaped result so the downstream resync + summary logic treats this as success.
+  r = {
+    status: 200,
+    body: {
+      txHash: withdrawStep2bTxHash,
+      chainConfirmedWithdraw: withdrawStep2bTxHash,
+      withdrawStep2aTxHash,
+      withdrawStep2bTxHash,
+      submitPath: "v3_split_step2a_step2b",
+    },
+  };
+  console.error(`[asp] v3 split submit COMPLETE → step2a=${withdrawStep2aTxHash} step2b=${withdrawStep2bTxHash}`);
+} else {
+  console.error(`[m8-real] POST /v2/withdraw/mpcca/submit`);
+  r = await post("/v2/withdraw/mpcca/submit", {
+    dkgEpoch: dkgEpochStr,
+    requestId,
+    preparedWithdrawAttestation: true,
+  });
+  console.error(`[m8-real] submit → HTTP ${r.status}`);
+}
 
 // ---- M11: post-submit vault-state resync --------------------------------------------------
 // After a chain-confirmed WithdrawEventV2, advance every worker's vault_sequence so the NEXT
@@ -1600,6 +1798,9 @@ const submitSummary = {
   prepareWithdrawPayloadTxHash,
   prepareWithdrawProofTxHash,
   prepareWithdrawAttestationTxHash,
+  withdrawStep2aTxHash,
+  withdrawStep2bTxHash,
+  withdrawFinalTxHash,
   responseBody: r.body,
   resyncAfterWithdraw: resyncAfterSummary,
 };

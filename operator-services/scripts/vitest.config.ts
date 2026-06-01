@@ -14,6 +14,9 @@ const NODE_TEST_RUNNER_FILES = [
   "**/sigma_position_17_parity.test.mjs",
   "**/local_v2_withdraw_resync.test.mjs",
   "**/note_v3.test.mjs",
+  "**/asp_tree.test.mjs",
+  "**/asp_refork.test.mjs",
+  "**/asp_set_artifact.test.mjs",
 ];
 
 export default defineConfig({

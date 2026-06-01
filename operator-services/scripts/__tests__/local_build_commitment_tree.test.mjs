@@ -20,6 +20,8 @@ import {
   le32ToHex,
   leBytesToBig,
 } from "../../../circuits/scripts/poseidon_merkle.mjs";
+import { LeanIMTTree } from "../../../circuits/scripts/leanimt_tree.mjs";
+import { leanIMTRootFromPath } from "../../../circuits/scripts/leanimt.mjs";
 
 const BRIDGE = "0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1";
 const VAULT = "0x554cd51d88770c83ace72ffbeca7644f00ca32b86c852182b98cc0223c1ac43b";
@@ -341,6 +343,96 @@ describe("local_build_commitment_tree.mjs — ordering and idempotency", () => {
     const out = JSON.parse(readFileSync(join(stateDir, "commitment_tree_v2.json"), "utf8"));
     expect(out.leafCount).toBe(2);
     expect(out.depositMeta.map((m) => m.depositCount)).toEqual([1, 2]);
+  });
+});
+
+describe("local_build_commitment_tree.mjs — LeanIMT state-tree snapshot", () => {
+  it("emits state_leanimt_tree.json whose latestRootHex recomputes from LeanIMTTree.deserialize (root parity)", async () => {
+    const commits = [leafHex("L1"), leafHex("L2"), leafHex("L3"), leafHex("L4"), leafHex("L5")];
+    const txes = commits.map((c, i) => ({
+      // distinct first-8-hex (witness filenames key off txHash.slice(2,10))
+      txHash: "0x" + `a${i}`.padEnd(64, "0"),
+      depositCount: i + 1,
+      commitmentHex: c,
+      sender: senderHex(i + 1),
+      version: 7000 + i,
+      sequenceNumber: i,
+    }));
+    const byHash = Object.fromEntries(txes.map((t) => [t.txHash.toLowerCase(), txFor(t)]));
+    globalThis.fetch = makeFetchStub(byHash);
+    for (const t of txes) writeWitness(witnessDir, t);
+
+    const code = await ingest({ argv: baseArgs() });
+    expect(code).toBe(0);
+
+    // Both artifacts written.
+    expect(existsSync(join(stateDir, "commitment_tree_v2.json"))).toBe(true);
+    expect(existsSync(join(stateDir, "state_leanimt_tree.json"))).toBe(true);
+
+    const lean = JSON.parse(readFileSync(join(stateDir, "state_leanimt_tree.json"), "utf8"));
+    expect(lean.scheme).toBe("eunoma_leanimt_tree_v1");
+    expect(lean.leafCount).toBe(5);
+    // dynamic depth (5 leaves → depth 3), NOT a fixed 20.
+    expect(lean.treeDepth).toBeGreaterThanOrEqual(1);
+    expect(lean.treeDepth).toBeLessThan(20);
+    expect(lean.leaves.map((l) => l.toLowerCase())).toEqual(commits.map((c) => c.toLowerCase()));
+
+    // Root parity: deserialize recomputes the root and asserts it equals the declared latestRootHex
+    // (deserialize throws on mismatch). Re-derive independently here too.
+    const tree = await LeanIMTTree.deserialize(lean);
+    const recomputed = le32ToHex(bigToLE32(await tree.root()));
+    expect(recomputed.toLowerCase()).toBe(lean.latestRootHex.toLowerCase());
+  });
+
+  it("LeanIMT snapshot meta carries the same senders/depositTxHashes as the fixed-20 snapshot", async () => {
+    const commits = [leafHex("M1"), leafHex("M2")];
+    const txes = commits.map((c, i) => ({
+      txHash: "0x" + `b${i}`.padEnd(64, "0"),
+      depositCount: i + 1,
+      commitmentHex: c,
+      sender: senderHex(i + 10),
+      version: 8000 + i,
+      sequenceNumber: i,
+    }));
+    const byHash = Object.fromEntries(txes.map((t) => [t.txHash.toLowerCase(), txFor(t)]));
+    globalThis.fetch = makeFetchStub(byHash);
+    for (const t of txes) writeWitness(witnessDir, t);
+    await ingest({ argv: baseArgs() });
+
+    const v2 = JSON.parse(readFileSync(join(stateDir, "commitment_tree_v2.json"), "utf8"));
+    const lean = JSON.parse(readFileSync(join(stateDir, "state_leanimt_tree.json"), "utf8"));
+    expect(lean.depositMeta.map((m) => m.sender)).toEqual(v2.depositMeta.map((m) => m.sender));
+    expect(lean.depositMeta.map((m) => m.depositTxHash)).toEqual(
+      v2.depositMeta.map((m) => m.depositTxHash),
+    );
+  });
+});
+
+describe("LeanIMT snapshot ↔ frontend/circuit consumption parity (CRITICAL GATE)", () => {
+  it("deserialize → pathForCommitment → root recomputes via the same convention the frontend + circuit use", async () => {
+    // Build a LeanIMTTree with known commitments, serialize, then prove the frontend's expected
+    // consumption works against the served snapshot: deserialize, pull the co-path for a known
+    // commitment, and recompute the root via leanIMTRootFromPath (the exact propagate-on-zero /
+    // carry-above-actualDepth convention frontend lib/protocol/leanimt.ts + the withdraw circuit
+    // share — proven byte-identical).
+    const known = leBytesToBig(hexToLE32(leafHex("known-commitment")));
+    const others = ["o1", "o2", "o3", "o4", "o5"].map((s) => leBytesToBig(hexToLE32(leafHex(s))));
+    const tree = new LeanIMTTree();
+    // interleave so the known commitment is at a non-trivial index
+    const order = [others[0], others[1], known, others[2], others[3], others[4]];
+    for (const c of order) tree.append(c, {});
+    const snapshot = await tree.serialize();
+
+    // The coordinator serves `snapshot` verbatim. The browser deserializes it:
+    const rebuilt = await LeanIMTTree.deserialize(snapshot);
+    const declaredRoot = leBytesToBig(hexToLE32(snapshot.latestRootHex));
+    expect(await rebuilt.root()).toBe(declaredRoot);
+
+    // pathForCommitment → root recomputes via the shared circuit/frontend convention.
+    const { siblings, leafIndex, actualDepth } = await rebuilt.pathForCommitment(known);
+    expect(leafIndex).toBe(2);
+    const recomputed = await leanIMTRootFromPath(known, siblings, leafIndex, actualDepth);
+    expect(recomputed).toBe(declaredRoot);
   });
 });
 

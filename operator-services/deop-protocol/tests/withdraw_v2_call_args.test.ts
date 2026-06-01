@@ -9,7 +9,7 @@ import {
 
 // 27 entries — matches the Move signature at
 // move/sources/eunoma_bridge.move:515-543 (excluding `_relayer: &signer`).
-const EXPECTED_FIELD_COUNT = 27;
+const EXPECTED_FIELD_COUNT = 30;
 const EXPECTED_MOVE_ORDER = [
   "root",
   "nullifierHash",
@@ -18,6 +18,9 @@ const EXPECTED_MOVE_ORDER = [
   "amountTag",
   "caPayloadHash",
   "requestHash",
+  "aspRoot",
+  "stateTreeDepth",
+  "aspTreeDepth",
   "vaultSequence",
   "withdrawProof",
   "expirySecs",
@@ -66,6 +69,9 @@ function buildValidFixture(): Record<string, unknown> {
     amountTag: hex32(0x14),
     caPayloadHash: hex32(0x15),
     requestHash: hex32(0x16),
+    aspRoot: hex32(0x17),
+    stateTreeDepth: "4",
+    aspTreeDepth: "3",
     vaultSequence: "42",
     withdrawProof: hexN(192, 0x20), // Groth16 BN254 proof = 192 bytes (3 G1 + 1 G2 in compressed form)
     expirySecs: "1800000000",

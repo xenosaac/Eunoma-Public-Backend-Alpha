@@ -161,6 +161,52 @@ export function isSafeId(s: string): boolean {
   return true;
 }
 
+/**
+ * Validated public ASP-set artifact shape (subset the coordinator serves). Written by
+ * scripts/local_run_asp_cycle.mjs (makeAspSetArtifact). Public commitments only — no secrets.
+ */
+interface AspSetArtifact {
+  rootHex: string;
+  treeDepth: number;
+  ipfsCid?: string | null;
+  commitments: string[];
+}
+
+/**
+ * Read + validate <stateRoot>/coordinator/asp_set.json. Returns the artifact, or null when
+ * stateRoot is unconfigured / the file is missing / unreadable / malformed (callers map null
+ * to a 503, mirroring /v2/pool/state's missing-tree behavior).
+ */
+async function readAspSetArtifact(stateRoot: string | undefined): Promise<AspSetArtifact | null> {
+  if (!stateRoot) return null;
+  const aspPath = join(stateRoot, "coordinator", "asp_set.json");
+  let raw: {
+    rootHex?: unknown;
+    treeDepth?: unknown;
+    ipfsCid?: unknown;
+    commitments?: unknown;
+  };
+  try {
+    raw = JSON.parse(await readFile(aspPath, "utf8")) as typeof raw;
+  } catch {
+    return null;
+  }
+  if (
+    typeof raw.rootHex !== "string" ||
+    typeof raw.treeDepth !== "number" ||
+    !Array.isArray(raw.commitments) ||
+    !raw.commitments.every((c) => typeof c === "string")
+  ) {
+    return null;
+  }
+  return {
+    rootHex: raw.rootHex,
+    treeDepth: raw.treeDepth,
+    ipfsCid: typeof raw.ipfsCid === "string" ? raw.ipfsCid : null,
+    commitments: raw.commitments as string[],
+  };
+}
+
 function normalizeEventAddr(value: string | undefined): string | null {
   if (typeof value !== "string" || value.length === 0) return null;
   const stripped = value.toLowerCase().replace(/^0x/, "");
@@ -600,7 +646,12 @@ export function buildCoordinatorServer(
   server.addHook("onRequest", async (req) => {
     if (
       req.method === "GET" &&
-      (req.url === "/v2/roster" || req.url === "/v2/health" || req.url === "/v2/pool/state")
+      (req.url === "/v2/roster" ||
+        req.url === "/v2/health" ||
+        req.url === "/v2/pool/state" ||
+        req.url === "/v2/state-tree" ||
+        req.url === "/v2/asp-set" ||
+        req.url === "/v2/asp-root-current")
     ) {
       return;
     }
@@ -637,16 +688,19 @@ export function buildCoordinatorServer(
         },
   );
 
-  // Public pool state for the browser withdraw flow: the append-only commitment tree
-  // (leaves + latest root) maintained off-chain at <stateRoot>/coordinator/commitment_tree_v2.json.
-  // Safety is enforced on-chain — a withdraw is only accepted if its root is in BridgeVault.known_roots
-  // and the proof includes the note's commitment — so this data is non-authoritative (liveness only).
+  // Public pool state for the browser withdraw flow: the ASP-era dynamic-depth LeanIMT state tree
+  // maintained off-chain at <stateRoot>/coordinator/state_leanimt_tree.json. Its latestRootHex is the
+  // root recorded on-chain and the root the 12-public withdraw/ragequit circuits prove against. The
+  // older fixed-depth commitment_tree_v2.json is retained as a build artifact, but must not be served
+  // as current_finalized_root here. Safety is enforced on-chain — a withdraw is only accepted if its
+  // root is in BridgeVault.known_roots and the proof includes the note's commitment — so this data is
+  // non-authoritative (liveness only).
   server.get("/v2/pool/state", async (_req, reply) => {
     if (!opts.stateRoot) {
       return reply.code(503).send({ error: "pool_state_unavailable" });
     }
-    const treePath = join(opts.stateRoot, "coordinator", "commitment_tree_v2.json");
-    let tree: { latestRootHex?: unknown; leafCount?: unknown; leaves?: unknown };
+    const treePath = join(opts.stateRoot, "coordinator", "state_leanimt_tree.json");
+    let tree: { scheme?: unknown; latestRootHex?: unknown; leafCount?: unknown; leaves?: unknown };
     try {
       tree = JSON.parse(await readFile(treePath, "utf8")) as typeof tree;
     } catch {
@@ -656,6 +710,7 @@ export function buildCoordinatorServer(
     const leaves = tree.leaves;
     const leafCount = tree.leafCount;
     if (
+      tree.scheme !== "eunoma_leanimt_tree_v1" ||
       typeof root !== "string" ||
       !Array.isArray(leaves) ||
       (typeof leafCount !== "number" && typeof leafCount !== "string")
@@ -666,6 +721,79 @@ export function buildCoordinatorServer(
       current_finalized_root: root,
       pending_next_index: String(leafCount),
       commitments: leaves,
+    };
+  });
+
+  // Dynamic-depth LeanIMT STATE tree snapshot for the browser withdraw flow. This is the tree the
+  // withdraw circuit verifies state inclusion against (the recorded on-chain state root is this
+  // snapshot's latestRootHex — see ops/scripts/refresh_known_root_cycle.sh). Served verbatim from
+  // <stateRoot>/coordinator/state_leanimt_tree.json. Same liveness-only / non-authoritative
+  // posture as /v2/pool/state: safety is enforced on-chain (root ∈ known_roots + proof binds the
+  // note's commitment). Mirrors /v2/pool/state's 503-on-missing behavior.
+  server.get("/v2/state-tree", async (_req, reply) => {
+    if (!opts.stateRoot) {
+      return reply.code(503).send({ error: "state_tree_unavailable" });
+    }
+    const treePath = join(opts.stateRoot, "coordinator", "state_leanimt_tree.json");
+    let snap: {
+      scheme?: unknown;
+      treeDepth?: unknown;
+      leaves?: unknown;
+      depositMeta?: unknown;
+      latestRootHex?: unknown;
+    };
+    try {
+      snap = JSON.parse(await readFile(treePath, "utf8")) as typeof snap;
+    } catch {
+      return reply.code(503).send({ error: "state_tree_unavailable" });
+    }
+    if (
+      snap.scheme !== "eunoma_leanimt_tree_v1" ||
+      typeof snap.latestRootHex !== "string" ||
+      typeof snap.treeDepth !== "number" ||
+      !Array.isArray(snap.leaves) ||
+      !Array.isArray(snap.depositMeta)
+    ) {
+      return reply.code(503).send({ error: "state_tree_malformed" });
+    }
+    return {
+      scheme: snap.scheme,
+      treeDepth: snap.treeDepth,
+      leaves: snap.leaves,
+      depositMeta: snap.depositMeta,
+      latestRootHex: snap.latestRootHex,
+    };
+  });
+
+  // The PUBLIC ASP (Association Set Provider) approved-commitment set + its LeanIMT root. The
+  // browser pulls this to build the second (ASP) inclusion proof for a curated private withdraw.
+  // Written by scripts/local_run_asp_cycle.mjs (makeAspSetArtifact) to
+  // <stateRoot>/coordinator/asp_set.json. Public commitments only — no secrets.
+  // Mirrors /v2/pool/state's 503-on-missing behavior.
+  server.get("/v2/asp-set", async (_req, reply) => {
+    const artifact = await readAspSetArtifact(opts.stateRoot);
+    if (!artifact) {
+      return reply.code(503).send({ error: "asp_set_unavailable" });
+    }
+    return {
+      aspRootHex: artifact.rootHex,
+      aspTreeDepth: artifact.treeDepth,
+      ipfsCid: artifact.ipfsCid ?? null,
+      commitments: artifact.commitments,
+    };
+  });
+
+  // Lightweight ASP root pointer (no commitment list) from the same asp_set.json — for clients
+  // that only need to know which ASP root/CID is current. Mirrors /v2/pool/state's 503-on-missing.
+  server.get("/v2/asp-root-current", async (_req, reply) => {
+    const artifact = await readAspSetArtifact(opts.stateRoot);
+    if (!artifact) {
+      return reply.code(503).send({ error: "asp_set_unavailable" });
+    }
+    return {
+      aspRootHex: artifact.rootHex,
+      aspTreeDepth: artifact.treeDepth,
+      ipfsCid: artifact.ipfsCid ?? null,
     };
   });
 
@@ -5690,6 +5818,11 @@ export function buildCoordinatorServer(
           amountTag: parsed.amountTag,
           caPayloadHash: caPayloadHashFr,
           requestHash: parsed.requestHash,
+          // ASP: asp_root + the 2 LeanIMT depths are public inputs of the withdraw proof, carried
+          // on the finalize request (same as root/requestHash). Threaded into the call-args.
+          aspRoot: parsed.aspRoot,
+          stateTreeDepth: String(parsed.stateTreeDepth),
+          aspTreeDepth: String(parsed.aspTreeDepth),
           vaultSequence: String(parsed.vaultSequence),
           withdrawProof: parsed.withdrawProofHex,
           expirySecs: String(parsed.expirySecs),

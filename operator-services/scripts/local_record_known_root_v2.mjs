@@ -186,6 +186,7 @@ if (!/^0x[0-9a-fA-F]{1,64}$/.test(bridgePackageAddress)) {
 // Resolve circuits-side Merkle helpers.
 const merkleHelperPath = resolve(repoRoot, "circuits/scripts/poseidon_merkle.mjs");
 const treeHelperPath = resolve(repoRoot, "circuits/scripts/commitment_tree_v2.mjs");
+const leanTreeHelperPath = resolve(repoRoot, "circuits/scripts/leanimt_tree.mjs");
 if (!existsSync(merkleHelperPath)) {
   console.error(`circuits/scripts/poseidon_merkle.mjs not found at ${merkleHelperPath}`);
   process.exit(EXIT_GENERIC_FAILURE);
@@ -196,6 +197,11 @@ const { hexToLE32, leBytesToBig, le32ToHex, computeMerkleRootAndPathSingleLeaf }
 let CommitmentTreeV2;
 if (existsSync(treeHelperPath)) {
   ({ CommitmentTreeV2 } = await import(`file://${treeHelperPath}`));
+}
+let LeanIMTTree;
+let LEANIMT_TREE_SCHEME;
+if (existsSync(leanTreeHelperPath)) {
+  ({ LeanIMTTree, LEANIMT_TREE_SCHEME } = await import(`file://${leanTreeHelperPath}`));
 }
 
 // Compute Merkle root. Branch: M9 multi-leaf (commitmentTreePath) vs. M8 legacy single-leaf.
@@ -217,11 +223,11 @@ if (rootOverride) {
     `[warn] using --root-override ${rootHex} — for negative tests only; chain will reject if unrelated to any recorded leaf`,
   );
 } else if (commitmentTreePath) {
-  // M9 PRIMARY — multi-leaf commitment tree path.
-  if (!CommitmentTreeV2) {
-    console.error(`commitment_tree_v2.mjs not found at ${treeHelperPath}; required for --commitment-tree`);
-    process.exit(EXIT_GENERIC_FAILURE);
-  }
+  // M9 PRIMARY — multi-leaf commitment tree path. Auto-detects the artifact scheme:
+  //   - "eunoma_leanimt_tree_v1" → dynamic-depth LeanIMT state tree (NEW source of truth; the
+  //      recorded on-chain state root is this snapshot's latestRootHex). treeDepth is dynamic, so
+  //      the fixed `--depth` check is SKIPPED for LeanIMT artifacts.
+  //   - "commitment_tree_v2"     → legacy fixed-depth-20 snapshot (depth check enforced).
   let snapshot;
   try {
     snapshot = JSON.parse(readFileSync(commitmentTreePath, "utf8"));
@@ -229,15 +235,36 @@ if (rootOverride) {
     console.error(`failed to read --commitment-tree ${commitmentTreePath}: ${err?.message ?? err}`);
     process.exit(EXIT_USAGE);
   }
+  const isLeanImt = LEANIMT_TREE_SCHEME && snapshot?.scheme === LEANIMT_TREE_SCHEME;
   let tree;
-  try {
-    tree = await CommitmentTreeV2.deserialize(snapshot);
-  } catch (err) {
-    console.error(`commitment_tree deserialize failed: ${err?.message ?? err}`);
-    process.exit(EXIT_USAGE);
+  if (isLeanImt) {
+    if (!LeanIMTTree) {
+      console.error(`leanimt_tree.mjs not found at ${leanTreeHelperPath}; required for LeanIMT artifact`);
+      process.exit(EXIT_GENERIC_FAILURE);
+    }
+    try {
+      tree = await LeanIMTTree.deserialize(snapshot);
+    } catch (err) {
+      console.error(`state_leanimt_tree deserialize failed: ${err?.message ?? err}`);
+      process.exit(EXIT_USAGE);
+    }
+    mode = "leanimt_state_tree";
+  } else {
+    if (!CommitmentTreeV2) {
+      console.error(`commitment_tree_v2.mjs not found at ${treeHelperPath}; required for --commitment-tree`);
+      process.exit(EXIT_GENERIC_FAILURE);
+    }
+    try {
+      tree = await CommitmentTreeV2.deserialize(snapshot);
+    } catch (err) {
+      console.error(`commitment_tree deserialize failed: ${err?.message ?? err}`);
+      process.exit(EXIT_USAGE);
+    }
+    mode = "multi_leaf";
   }
   leafCount = tree.leaves.length;
-  if (snapshot.treeDepth !== depth) {
+  // Fixed-depth check only applies to the legacy fixed-20 snapshot; LeanIMT depth is dynamic.
+  if (!isLeanImt && snapshot.treeDepth !== depth) {
     console.error(
       `tree depth mismatch: artifact treeDepth=${snapshot.treeDepth}, --depth=${depth}`,
     );
@@ -262,9 +289,10 @@ if (rootOverride) {
   rootHex = snapshot.latestRootHex;
   treeTranscriptHash = snapshot.transcriptHash;
   depositTxHashes = snapshot.depositMeta.map((m) => m.depositTxHash);
-  mode = "multi_leaf";
+  // `mode` was set above per the detected scheme (leanimt_state_tree | multi_leaf).
+  const reportedDepth = isLeanImt ? snapshot.treeDepth : depth;
   console.error(
-    `M9 multi-leaf root (depth=${depth}, leafCount=${leafCount}, transcriptHash=${treeTranscriptHash}): ${rootHex}`,
+    `${mode} root (depth=${reportedDepth}, leafCount=${leafCount}, transcriptHash=${treeTranscriptHash}): ${rootHex}`,
   );
 } else {
   // LEGACY single-leaf path — only allowed under EUNOMA_LOCAL_SMOKE=1 + --allow-local-smoke-anonymity.

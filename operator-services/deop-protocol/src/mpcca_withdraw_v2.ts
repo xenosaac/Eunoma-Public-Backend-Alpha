@@ -2422,6 +2422,10 @@ export interface MpccaWithdrawFrostAttestStartRequest extends MpccaWithdrawBaseR
   withdrawProofHex: HexString;
   /** Optional memo bytes bound into the CA payload. Defaults to empty. */
   memoHex?: HexString;
+  /** ASP: asp_root (32B Fr) + the 2 LeanIMT depths — public inputs of the withdraw proof. */
+  aspRoot: HexString;
+  stateTreeDepth: number;
+  aspTreeDepth: number;
 }
 
 /**
@@ -2500,8 +2504,26 @@ export function parseMpccaWithdrawFrostAttestStartRequest(
     // Sanity: decode to validate it's hex.
     hexToBytes(memoHex);
   }
+  // ASP: asp_root (32B Fr) + the 2 LeanIMT depths (1..32). Public inputs of the withdraw proof.
+  const aspRoot = requireHex(obj, "aspRoot", 32);
+  const stateTreeDepthRaw = obj.stateTreeDepth;
+  const aspTreeDepthRaw = obj.aspTreeDepth;
+  if (
+    typeof stateTreeDepthRaw !== "number" || !Number.isInteger(stateTreeDepthRaw) ||
+    stateTreeDepthRaw < 1 || stateTreeDepthRaw > 32 ||
+    typeof aspTreeDepthRaw !== "number" || !Number.isInteger(aspTreeDepthRaw) ||
+    aspTreeDepthRaw < 1 || aspTreeDepthRaw > 32
+  ) {
+    throw new MpccaWithdrawV2Error(
+      "INVALID_WITHDRAW_FIELD_SHAPE",
+      "stateTreeDepth and aspTreeDepth must be integers in [1,32]",
+    );
+  }
   return {
     ...base,
+    aspRoot,
+    stateTreeDepth: stateTreeDepthRaw,
+    aspTreeDepth: aspTreeDepthRaw,
     attestationConfig: {
       bridge,
       vault,

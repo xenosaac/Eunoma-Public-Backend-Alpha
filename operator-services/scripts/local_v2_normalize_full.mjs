@@ -79,6 +79,12 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
 const HPKE_SEAL_BIN = resolve(serviceRoot, "crypto-worker-rust/target/release/hpke_seal_ingress");
 
+function fullnodeRestUrl(path) {
+  const base = aptosNodeUrl.replace(/\/+$/u, "");
+  const root = base.endsWith("/v1") ? base : `${base}/v1`;
+  return `${root}${path}`;
+}
+
 // ---- Exit codes ----------------------------------------------------------------------------
 const EXIT_SUCCESS = 0;
 const EXIT_USAGE = 2;
@@ -739,7 +745,7 @@ async function pollTx(hash, timeoutMs = 90_000) {
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await fetchWithRetry(
-        `${aptosNodeUrl}/v1/transactions/by_hash/${hash}`,
+        fullnodeRestUrl(`/transactions/by_hash/${hash}`),
         { method: "GET", headers: { accept: "application/json" } },
         2,
       );

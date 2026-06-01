@@ -193,6 +193,11 @@ export interface FinalizeWithdrawV2CallArgsFields {
   amountTag: HexString;
   caPayloadHash: HexString;
   requestHash: HexString;
+  // ASP (2026-05-30): asp_root (32B Fr) + the 2 LeanIMT depths (u64), inserted AFTER requestHash /
+  // before vaultSequence — matches the withdraw circuit publics + WITHDRAW_V2_CALL_ARGS_ORDER.
+  aspRoot: HexString;
+  stateTreeDepth: string;
+  aspTreeDepth: string;
   // u64 vaultSequence, then variable-length proof, then u64 expirySecs (matches Move
   // signature and WITHDRAW_V2_CALL_ARGS_ORDER):
   vaultSequence: string;
@@ -658,6 +663,10 @@ export function assembleWithdrawV2CallArgs(
   hex32("amountTag", fields.amountTag);
   hex32("caPayloadHash", fields.caPayloadHash);
   hex32("requestHash", fields.requestHash);
+  // ASP: asp_root (32B Fr) + the 2 LeanIMT depths (u64), in WITHDRAW_V2_CALL_ARGS_ORDER position.
+  hex32("aspRoot", fields.aspRoot);
+  decimalU64("stateTreeDepth", fields.stateTreeDepth);
+  decimalU64("aspTreeDepth", fields.aspTreeDepth);
   // Codex M5b P3: WITHDRAW_V2_CALL_ARGS_ORDER puts withdrawProof BEFORE expirySecs.
   decimalU64("vaultSequence", fields.vaultSequence);
   // Stage 4 A6 split withdraw: "0x" is valid only after prepare_withdraw_proof_v2
@@ -696,6 +705,9 @@ export function assembleWithdrawV2CallArgs(
     amountTag: fields.amountTag,
     caPayloadHash: fields.caPayloadHash,
     requestHash: fields.requestHash,
+    aspRoot: fields.aspRoot,
+    stateTreeDepth: fields.stateTreeDepth,
+    aspTreeDepth: fields.aspTreeDepth,
     vaultSequence: fields.vaultSequence,
     withdrawProof: fields.withdrawProof,
     expirySecs: fields.expirySecs,
