@@ -15,8 +15,8 @@
 # if no txs found (caller should treat as no-op).
 set -euo pipefail
 
-BRIDGE=${EUNOMA_BRIDGE_PACKAGE_ADDRESS:-0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1}
-APTOS_NODE_URL=${APTOS_TESTNET_NODE_URL:-https://api.testnet.aptoslabs.com/v1}
+BRIDGE=${EUNOMA_BRIDGE_PACKAGE_ADDRESS:-${BRIDGE_PACKAGE_ADDRESS:-0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1}}
+APTOS_NODE_URL=${APTOS_TESTNET_NODE_URL:-${APTOS_NODE_URL:-https://api.testnet.aptoslabs.com/v1}}
 LIMIT=${EUNOMA_TX_FETCH_LIMIT:-500}
 
 # Step 1: GraphQL — list all account_transactions for bridge package addr,
