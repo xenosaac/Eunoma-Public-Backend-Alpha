@@ -344,6 +344,51 @@ describe("local_build_commitment_tree.mjs — ordering and idempotency", () => {
     expect(out.leafCount).toBe(2);
     expect(out.depositMeta.map((m) => m.depositCount)).toEqual([1, 2]);
   });
+
+  it("--refresh defers future deposit-count gaps while appending the contiguous next leaf", async () => {
+    const tx1 = { txHash: "0x" + "1".repeat(64), depositCount: 1, commitmentHex: leafHex("fg1"), sender: senderHex(1), version: 10, sequenceNumber: 0 };
+    const tx2 = { txHash: "0x" + "2".repeat(64), depositCount: 2, commitmentHex: leafHex("fg2"), sender: senderHex(2), version: 20, sequenceNumber: 1 };
+    const tx4 = { txHash: "0x" + "4".repeat(64), depositCount: 4, commitmentHex: leafHex("fg4"), sender: senderHex(4), version: 40, sequenceNumber: 3 };
+
+    globalThis.fetch = makeFetchStub({ [tx1.txHash.toLowerCase()]: txFor(tx1) });
+    writeWitness(witnessDir, tx1);
+    await ingest({ argv: baseArgs() });
+
+    globalThis.fetch = makeFetchStub({
+      [tx1.txHash.toLowerCase()]: txFor(tx1),
+      [tx2.txHash.toLowerCase()]: txFor(tx2),
+      [tx4.txHash.toLowerCase()]: txFor(tx4),
+    });
+    writeWitness(witnessDir, tx2);
+    writeWitness(witnessDir, tx4);
+
+    const code = await ingest({ argv: [...baseArgs(), "--refresh"] });
+    expect(code).toBe(0);
+
+    const out = JSON.parse(readFileSync(join(stateDir, "commitment_tree_v2.json"), "utf8"));
+    expect(out.leafCount).toBe(2);
+    expect(out.depositMeta.map((m) => m.depositCount)).toEqual([1, 2]);
+    expect(out.depositMeta.map((m) => m.depositTxHash)).not.toContain(tx4.txHash);
+  });
+
+  it("--refresh exits cleanly when only future deposits are visible", async () => {
+    const tx1 = { txHash: "0x" + "5".repeat(64), depositCount: 1, commitmentHex: leafHex("og1"), sender: senderHex(1), version: 50, sequenceNumber: 0 };
+    const tx3 = { txHash: "0x" + "6".repeat(64), depositCount: 3, commitmentHex: leafHex("og3"), sender: senderHex(3), version: 60, sequenceNumber: 2 };
+
+    globalThis.fetch = makeFetchStub({ [tx1.txHash.toLowerCase()]: txFor(tx1) });
+    writeWitness(witnessDir, tx1);
+    await ingest({ argv: baseArgs() });
+
+    globalThis.fetch = makeFetchStub({ [tx3.txHash.toLowerCase()]: txFor(tx3) });
+    writeWitness(witnessDir, tx3);
+
+    const code = await ingest({ argv: [...baseArgs(), "--refresh"] });
+    expect(code).toBe(0);
+
+    const out = JSON.parse(readFileSync(join(stateDir, "commitment_tree_v2.json"), "utf8"));
+    expect(out.leafCount).toBe(1);
+    expect(out.depositMeta.map((m) => m.depositCount)).toEqual([1]);
+  });
 });
 
 describe("local_build_commitment_tree.mjs — LeanIMT state-tree snapshot", () => {

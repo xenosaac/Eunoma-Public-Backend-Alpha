@@ -110,9 +110,11 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     });
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("including extra observed tx hashes");
+    expect(result.stdout).toContain("queued 1 observed tx hashes for durable retry");
+    expect(result.stdout).toContain("including 1 persisted observed tx hashes");
     expect(readTree().latestRootHex).toBe(NEW_ROOT);
     expect(readTxHashes()).toBe(EXTRA_TX);
+    expect(readQueue()).toBe("");
     expect(readOps()).toEqual(["normalize", "build", "rollover", "normalize", "record"]);
   });
 
@@ -126,6 +128,49 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(result.status).toBe(0);
     expect(readTxHashes()).toBe(`${FETCH_TX_A},${EXTRA_TX},${FETCH_TX_B}`);
   });
+
+  it("keeps observed deposit hashes queued when route-ready publication fails", () => {
+    writeFileSync(fakeFetchScript, "#!/usr/bin/env bash\nexit 0\n");
+    chmodSync(fakeFetchScript, 0o755);
+
+    const result = runWrapper({
+      FAKE_RECORD_FAIL: "1",
+      FAKE_TREE_ROOT: NEW_ROOT,
+      EUNOMA_EXTRA_DEPOSIT_TX_HASHES: EXTRA_TX,
+    });
+
+    expect(result.status).toBe(31);
+    expect(readQueue()).toBe(EXTRA_TX);
+  });
+
+  it("retries persisted observed hashes on the next cycle without a new HTTP trigger", () => {
+    writeFileSync(fakeFetchScript, "#!/usr/bin/env bash\nexit 0\n");
+    chmodSync(fakeFetchScript, 0o755);
+    writeFileSync(join(stateDir, "observed_deposit_tx_hashes.queue"), `${EXTRA_TX}\n`);
+
+    const result = runWrapper({ FAKE_TREE_ROOT: NEW_ROOT });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("including 1 persisted observed tx hashes");
+    expect(readTxHashes()).toBe(EXTRA_TX);
+    expect(readQueue()).toBe("");
+  });
+
+  it("derives coordinator state dir from EUNOMA_STATE_ROOT when no explicit state dir is set", () => {
+    const stateRoot = join(tmpRoot, "state-root");
+    stateDir = join(stateRoot, "coordinator");
+    mkdirSync(stateDir, { recursive: true });
+    writeTree(OLD_ROOT, 8);
+
+    const result = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      EUNOMA_COORDINATOR_STATE_DIR: "",
+      EUNOMA_STATE_ROOT: stateRoot,
+    });
+
+    expect(result.status).toBe(0);
+    expect(readTree().latestRootHex).toBe(NEW_ROOT);
+  });
 });
 
 function runWrapper(env = {}) {
@@ -134,7 +179,6 @@ function runWrapper(env = {}) {
     encoding: "utf8",
     env: {
       ...process.env,
-      ...env,
       PATH: `${fakeBin}:${process.env.PATH}`,
       REAL_NODE_PATH: process.execPath,
       FAKE_OP_LOG: opLogPath,
@@ -147,6 +191,7 @@ function runWrapper(env = {}) {
       BRIDGE_VAULT_ADDRESS: `0x${"b".repeat(64)}`,
       BRIDGE_ASSET_TYPE: "0xa",
       EUNOMA_MIN_ANONYMITY_SET: "8",
+      ...env,
     },
   });
 }
@@ -188,6 +233,12 @@ function readTxHashes() {
   return readFileSync(txHashLogPath, "utf8").trim();
 }
 
+function readQueue() {
+  const p = join(stateDir, "observed_deposit_tx_hashes.queue");
+  if (!existsSync(p)) return "";
+  return readFileSync(p, "utf8").trim();
+}
+
 function writeFakeNode() {
   const implPath = join(tmpRoot, "fake_node_impl.mjs");
   writeFileSync(
@@ -212,7 +263,8 @@ if (script.endsWith("local_v2_normalize_full.mjs")) {
 }
 if (script.endsWith("local_build_commitment_tree.mjs")) {
   append("build");
-  writeFileSync(process.env.FAKE_TX_HASH_LOG, (valueOf("--tx-hashes") ?? "") + "\\n");
+  const txHashes = (valueOf("--tx-hashes") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  writeFileSync(process.env.FAKE_TX_HASH_LOG, txHashes.join(",") + "\\n");
   const stateDir = valueOf("--state-dir");
   mkdirSync(stateDir, { recursive: true });
   const leafCount = Number(process.env.FAKE_TREE_LEAF_COUNT ?? "9");
@@ -227,7 +279,7 @@ if (script.endsWith("local_build_commitment_tree.mjs")) {
         leafCount,
         leaves,
         depositMeta: leaves.map((commitmentHex, i) => ({
-          depositTxHash: "0x" + String(i + 1).padStart(64, "a"),
+          depositTxHash: txHashes[i] ?? "0x" + String(i + 1).padStart(64, "a"),
           commitmentHex,
         })),
         transcriptHash: "0x" + "44".repeat(32),
@@ -247,7 +299,10 @@ if (script.endsWith("local_build_commitment_tree.mjs")) {
         latestRootHex: process.env.FAKE_TREE_ROOT,
         leafCount,
         leaves,
-        depositMeta: leaves.map((commitmentHex) => ({ commitmentHex })),
+        depositMeta: leaves.map((commitmentHex, i) => ({
+          commitmentHex,
+          depositTxHash: txHashes[i] ?? "0x" + String(i + 1).padStart(64, "a"),
+        })),
         transcriptHash: "0x" + "55".repeat(32),
       },
       null,

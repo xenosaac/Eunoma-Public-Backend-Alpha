@@ -7,9 +7,9 @@
 # Why: events v1 GraphQL table is deprecated (Sep 2025). account_transactions
 # table is the supported replacement. We filter by entry function name to find
 # every deposit_step2b_invoke_framework + deposit_with_commitment_v2 call ever
-# sent to the bridge package. Cross-vault txs from old vault era will be
-# auto-filtered by local_build_commitment_tree.mjs validateEvent (R7-OPS-1
-# patch: cross-vault events log + skip instead of throw).
+# sent to the bridge package. This is only a retry/backfill feed; the route-ready
+# wrapper persists concrete observe_deposit tx hashes and the tree builder only
+# appends the next contiguous current-vault deposit counts.
 #
 # Output: comma-separated hex tx hashes (e.g., 0x123...,0x456...). Empty string
 # if no txs found (caller should treat as no-op).

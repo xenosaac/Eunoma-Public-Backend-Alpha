@@ -15,12 +15,10 @@
  *
  * Concurrency model: **coalesce-on-contention**. If a previous deposit's pipeline is still
  * running when a new deposit arrives, `triggerBridgeMaintenance` is a no-op for the new
- * deposit. Rationale: the in-flight pipeline will see the new deposit when it rebuilds the
- * commitment tree from chain events (the tree builder reads chain DepositConfirmedV2 events,
- * not a queue). Worst case the systemd timer's next cycle picks up any deposit that
- * arrived after both the most recent triggered pipeline started AND the most recent
- * commitment-tree build completed — which is exactly the failure mode the timer was
- * designed to backstop.
+ * deposit. Rationale: the wrapper durably queues concrete observed tx hashes before it
+ * stages the tree, and the GraphQL fetch remains a backfill source. Worst case a deposit
+ * that arrives after both the most recent triggered pipeline started AND the most recent
+ * commitment-tree build completed is picked up by the next trigger or timer cycle.
  *
  * Error handling: this runs after the HTTP reply has flushed, so there is
  * no caller to bubble errors to. ALL failure modes are caught and logged; the function NEVER
@@ -50,9 +48,9 @@ export interface BridgeMaintenanceContext {
    */
   logger: FastifyBaseLogger;
   /**
-   * Concrete deposit tx hashes already validated by the observe-deposit caller. These are
-   * added to the wrapper's GraphQL tx-hash set so the event-driven path does not wait for
-   * indexer visibility of the just-confirmed deposit.
+   * Concrete deposit tx hashes already validated by the observe-deposit caller. The wrapper
+   * persists them into a retry queue before staging so a failed publication run does not lose
+   * the just-confirmed deposit while waiting for indexer catch-up.
    */
   extraDepositTxHashes?: string[];
 }

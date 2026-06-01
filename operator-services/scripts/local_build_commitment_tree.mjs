@@ -272,6 +272,7 @@ async function ingest({ argv }) {
 
   // Fetch + validate each
   const harvested = [];
+  const eventFeedNotes = [];
   for (const txHash of primarySet) {
     const { tx, ev } = await fetchDepositEventByTxHash({
       aptosNodeUrl: opts.aptosNodeUrl,
@@ -304,9 +305,27 @@ async function ingest({ argv }) {
   harvested.sort((a, b) =>
     Number(BigInt(a.ev.data.deposit_count) - BigInt(b.ev.data.deposit_count)),
   );
+  const appendableHarvested = [];
+  let expectedCount = BigInt(tree.leaves.length + 1);
   for (let i = 0; i < harvested.length; i++) {
-    const expectedCount = BigInt(tree.leaves.length + i + 1);
     const got = BigInt(harvested[i].ev.data.deposit_count);
+    if (got < expectedCount && opts.refresh) {
+      eventFeedNotes.push(
+        `stale_deposit_count:expected_at_least:${expectedCount}:got:${got}:tx:${harvested[i].tx.hash}`,
+      );
+      continue;
+    }
+    if (got === expectedCount) {
+      appendableHarvested.push(harvested[i]);
+      expectedCount += 1n;
+      continue;
+    }
+    if (opts.refresh) {
+      eventFeedNotes.push(
+        `deferred_deposit_count_gap:expected:${expectedCount}:got:${got}:tx:${harvested[i].tx.hash}`,
+      );
+      continue;
+    }
     if (got !== expectedCount) {
       throw new Error(
         `deposit_count_gap: at index ${i}, expected ${expectedCount}, got ${got}; tx=${harvested[i].tx.hash}`,
@@ -315,7 +334,7 @@ async function ingest({ argv }) {
   }
 
   // Append using LE-correct decoder
-  for (const { tx, ev } of harvested) {
+  for (const { tx, ev } of appendableHarvested) {
     const commitmentHex = ev.data.commitment.toLowerCase();
     const commitmentBig = leBytesToBig(hexToLE32(commitmentHex));
     tree.append(commitmentBig, {
@@ -329,7 +348,6 @@ async function ingest({ argv }) {
   }
 
   // Optional event-feed cross-check (advisory only)
-  const eventFeedNotes = [];
   if (opts.refreshFromEventFeed) {
     try {
       const feedUrl =

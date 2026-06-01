@@ -39,14 +39,86 @@ cd "${REPO_ROOT}"
 BRIDGE=${BRIDGE_PACKAGE_ADDRESS:-0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1}
 VAULT=${BRIDGE_VAULT_ADDRESS:-0xbbb0957ec8c26ab2652280c946dc35381dde6613b8ee9041ad6f467331dcd12a}
 ASSET=${BRIDGE_ASSET_TYPE:-0xa}
-STATE_DIR=${EUNOMA_COORDINATOR_STATE_DIR:-operator-services/.agent-local/eunoma-v2/coordinator}
+STATE_ROOT=${EUNOMA_STATE_ROOT:-${EUNOMA_LOCAL_STATE_ROOT:-operator-services/.agent-local/eunoma-v2}}
+STATE_DIR=${EUNOMA_COORDINATOR_STATE_DIR:-${STATE_ROOT%/}/coordinator}
 TREE_JSON=${STATE_DIR}/commitment_tree_v2.json
 LEANIMT_JSON=${STATE_DIR}/state_leanimt_tree.json
 STAGING_DIR=${STATE_DIR}/.refresh-staging
 STAGED_TREE_JSON=${STAGING_DIR}/commitment_tree_v2.json
 STAGED_LEANIMT_JSON=${STAGING_DIR}/state_leanimt_tree.json
+OBSERVED_QUEUE=${EUNOMA_OBSERVED_DEPOSIT_QUEUE:-${STATE_DIR}/observed_deposit_tx_hashes.queue}
 MIN_ANONYMITY_SET=${EUNOMA_MIN_ANONYMITY_SET:-8}
 FETCH_DEPOSIT_TX_HASHES_SCRIPT=${EUNOMA_FETCH_DEPOSIT_TX_HASHES_SCRIPT:-${REPO_ROOT}/ops/scripts/fetch_deposit_tx_hashes.sh}
+
+normalize_tx_hashes() {
+  awk 'BEGIN{RS="[,\n\r\t ]+"; ORS=""}
+    /^0x[0-9a-fA-F]{64}$/ {
+      v=tolower($0);
+      if (!seen[v]++) {
+        if (n++) printf ",";
+        printf "%s", v;
+      }
+    }'
+}
+
+count_tx_hashes() {
+  if [ -z "$1" ]; then
+    printf '0'
+  else
+    printf '%s' "$1" | tr ',' '\n' | awk 'NF { n++ } END { printf "%d", n + 0 }'
+  fi
+}
+
+persist_observed_tx_hashes() {
+  local raw_hashes="$1"
+  local normalized
+  normalized=$(printf '%s' "${raw_hashes}" | normalize_tx_hashes)
+  if [ -z "${normalized}" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "${OBSERVED_QUEUE}")"
+  {
+    if [ -f "${OBSERVED_QUEUE}" ]; then
+      cat "${OBSERVED_QUEUE}"
+    fi
+    printf '%s' "${normalized}" | tr ',' '\n'
+  } | normalize_tx_hashes | tr ',' '\n' > "${OBSERVED_QUEUE}.tmp"
+  mv "${OBSERVED_QUEUE}.tmp" "${OBSERVED_QUEUE}"
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: queued $(count_tx_hashes "${normalized}") observed tx hashes for durable retry"
+}
+
+read_observed_queue() {
+  if [ ! -f "${OBSERVED_QUEUE}" ]; then
+    return 0
+  fi
+  normalize_tx_hashes < "${OBSERVED_QUEUE}"
+}
+
+prune_observed_queue() {
+  if [ ! -f "${OBSERVED_QUEUE}" ]; then
+    return 0
+  fi
+  node -e '
+const fs = require("fs");
+const queuePath = process.argv[1];
+const treePath = process.argv[2];
+const normalize = (s) => (typeof s === "string" && /^0x[0-9a-fA-F]{64}$/.test(s) ? s.toLowerCase() : null);
+const queue = fs.existsSync(queuePath)
+  ? fs.readFileSync(queuePath, "utf8").split(/\s|,/).map(normalize).filter(Boolean)
+  : [];
+const tree = fs.existsSync(treePath) ? JSON.parse(fs.readFileSync(treePath, "utf8")) : {};
+const published = new Set((tree.depositMeta || []).map((m) => normalize(m.depositTxHash)).filter(Boolean));
+const seen = new Set();
+const remaining = [];
+for (const h of queue) {
+  if (seen.has(h) || published.has(h)) continue;
+  seen.add(h);
+  remaining.push(h);
+}
+fs.writeFileSync(queuePath, remaining.length ? `${remaining.join("\n")}\n` : "");
+console.log(`observed tx queue pruned: before=${queue.length} after=${remaining.length}`);
+' "${OBSERVED_QUEUE}" "${LEANIMT_JSON}"
+}
 
 normalize_if_needed() {
   local step_label="$1"
@@ -64,18 +136,18 @@ normalize_if_needed() {
 # is `is_normalized(vault, asset_type)` view; when already normalized it exits 0.
 normalize_if_needed "before tree refresh"
 
-echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: fetching deposit tx hashes via GraphQL"
-TX_HASHES=$(/bin/bash "${FETCH_DEPOSIT_TX_HASHES_SCRIPT}")
 EXTRA_TX_HASHES=${EUNOMA_EXTRA_DEPOSIT_TX_HASHES:-}
 if [ -n "${EXTRA_TX_HASHES}" ]; then
-  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: including extra observed tx hashes"
-  if [ -n "${TX_HASHES}" ]; then
-    TX_HASHES="${EXTRA_TX_HASHES},${TX_HASHES}"
-  else
-    TX_HASHES="${EXTRA_TX_HASHES}"
-  fi
+  persist_observed_tx_hashes "${EXTRA_TX_HASHES}"
 fi
-TX_HASHES=$(printf '%s' "${TX_HASHES}" | tr ',' '\n' | awk 'BEGIN{ORS=""} { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); v=tolower($0); if (v ~ /^0x[0-9a-f]{64}$/ && !seen[v]++) { if (n++) printf ","; printf "%s", v } }')
+QUEUED_TX_HASHES=$(read_observed_queue)
+if [ -n "${QUEUED_TX_HASHES}" ]; then
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: including $(count_tx_hashes "${QUEUED_TX_HASHES}") persisted observed tx hashes"
+fi
+
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: fetching deposit tx hashes via GraphQL backfill"
+BACKFILL_TX_HASHES=$(/bin/bash "${FETCH_DEPOSIT_TX_HASHES_SCRIPT}")
+TX_HASHES=$(printf '%s,%s' "${QUEUED_TX_HASHES}" "${BACKFILL_TX_HASHES}" | normalize_tx_hashes)
 if [ -z "${TX_HASHES}" ]; then
   echo "[$(date -u +%FT%TZ)] no deposit txs found yet, exiting clean"
   exit 0
@@ -142,4 +214,5 @@ if [ -f "${STAGED_LEANIMT_JSON}" ]; then
 fi
 rm -rf "${STAGING_DIR}"
 
+prune_observed_queue
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: done"
