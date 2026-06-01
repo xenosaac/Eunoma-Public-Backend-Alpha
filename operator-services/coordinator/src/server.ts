@@ -5346,6 +5346,227 @@ export function buildCoordinatorServer(
   });
 
   // =================================================================================================
+  // Ragequit/transparent-exit CA payload projection.
+  //
+  // POST /v2/withdraw/mpcca/ca-payload reads the same persisted __round2.json + __finalize.json
+  // artifacts as frost-attest, validates the caller's immutable identity envelope against round2,
+  // builds the canonical Aptos CA TransferV1 payload, and returns only the public 14 CA args plus
+  // payload hashes. It intentionally does NOT run withdraw FROST signing and does NOT assemble a
+  // WithdrawV2CallArgs object: Ragequit is signer-authorized by the original depositor wallet and
+  // enforced on-chain by deposit_sender[commitment] == signer.
+  // =================================================================================================
+  server.post("/v2/withdraw/mpcca/ca-payload", async (req, reply) => {
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    let requestId: string | undefined;
+    try {
+      let parsed: MpccaWithdrawFinalizeOrchestrateRequest;
+      try {
+        parsed = parseMpccaWithdrawFinalizeOrchestrateRequest(raw);
+      } catch (err) {
+        if (err instanceof ForbiddenPlaintextFieldError) {
+          return reply
+            .code(400)
+            .send({ error: "forbidden_plaintext_field", field: err.path });
+        }
+        if (err instanceof MpccaWithdrawV2Error) {
+          return reply.code(400).send({ error: err.code, message: err.message });
+        }
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: err instanceof Error ? err.message : "unknown",
+        });
+      }
+
+      const dkgRoster = raw.caDkgV2Roster
+        ? parseCaDkgV2Roster(raw.caDkgV2Roster)
+        : requireCaDkgV2Roster(opts.caDkgV2Roster);
+      validateCaDkgV2Roster(dkgRoster);
+      const dkgRosterHash = caDkgV2RosterHash(dkgRoster);
+      if (parsed.rosterHash !== dkgRosterHash) {
+        return reply.code(400).send({
+          error: "stale_roster_hash",
+          requestId: parsed.requestId,
+          message: `rosterHash mismatch (request=${parsed.rosterHash}, roster=${dkgRosterHash})`,
+        });
+      }
+      if (parsed.dkgEpoch !== dkgRoster.dkgEpoch) {
+        return reply.code(400).send({
+          error: "stale_dkg_epoch",
+          requestId: parsed.requestId,
+          message: `dkgEpoch mismatch (request=${parsed.dkgEpoch}, roster=${dkgRoster.dkgEpoch})`,
+        });
+      }
+
+      requestId = parsed.requestId;
+      if (!isSafeId(requestId)) {
+        return reply.code(400).send({
+          error: "unsafe_request_id",
+          message:
+            "requestId must be 1..=128 chars of [A-Za-z0-9._-]; coordinator embeds it into FS paths",
+        });
+      }
+      if (!opts.stateRoot) {
+        return reply.code(400).send({
+          error: "state_root_not_configured",
+          requestId,
+          message:
+            "MPCCA CA payload projection requires stateRoot to be configured so __round2.json " +
+            "+ __finalize.json can be read from disk.",
+        });
+      }
+
+      const round2ArtifactPath = join(
+        opts.stateRoot,
+        "coordinator",
+        "mpcca_withdraw",
+        `${parsed.dkgEpoch}__${requestId}__round2.json`,
+      );
+      let round2Artifact: Record<string, unknown>;
+      try {
+        round2Artifact = JSON.parse(
+          await readFile(round2ArtifactPath, "utf8"),
+        ) as Record<string, unknown>;
+      } catch (err) {
+        return reply.code(400).send({
+          error: "round2_transcript_not_found",
+          requestId,
+          path: round2ArtifactPath,
+          message: err instanceof Error ? err.message : "unable to read round2 artifact",
+        });
+      }
+
+      const round2SelectedSlots = round2Artifact.selectedSlots;
+      if (!Array.isArray(round2SelectedSlots) || round2SelectedSlots.length !== DEOPERATOR_THRESHOLD) {
+        return reply.code(400).send({
+          error: "round2_transcript_selected_slots_missing",
+          requestId,
+          message: `__round2.json must carry selectedSlots[${DEOPERATOR_THRESHOLD}]; got ${round2SelectedSlots ? (round2SelectedSlots as unknown[]).length : "<missing>"}`,
+        });
+      }
+      const sortedSelectedSlots = [...(round2SelectedSlots as number[])].sort((a, b) => a - b);
+      const callerSorted = [...parsed.selectedSlots].sort((a, b) => a - b);
+      if (
+        callerSorted.length !== sortedSelectedSlots.length ||
+        callerSorted.some((v, i) => v !== sortedSelectedSlots[i])
+      ) {
+        return reply.code(400).send({
+          error: "ca_payload_caller_quorum_mismatch",
+          requestId,
+          callerSelectedSlots: callerSorted,
+          round2SelectedSlots: sortedSelectedSlots,
+          message:
+            "caller-supplied selectedSlots differs from the persisted __round2.json quorum; " +
+            "coordinator only projects the original round2 quorum",
+        });
+      }
+
+      const identityMismatch = compareFinalizeIdentityWithRound2(
+        parsed,
+        round2Artifact,
+        sortedSelectedSlots,
+      );
+      if (identityMismatch) {
+        return reply.code(400).send({
+          error: "round2_transcript_identity_mismatch",
+          requestId,
+          field: identityMismatch.field,
+          round2Value: identityMismatch.round2Value,
+          requestValue: identityMismatch.requestValue,
+        });
+      }
+
+      const finalizeArtifactPath = join(
+        opts.stateRoot,
+        "coordinator",
+        "mpcca_withdraw",
+        `${parsed.dkgEpoch}__${requestId}__finalize.json`,
+      );
+      let finalizeArtifact: Record<string, unknown>;
+      try {
+        finalizeArtifact = JSON.parse(
+          await readFile(finalizeArtifactPath, "utf8"),
+        ) as Record<string, unknown>;
+      } catch (err) {
+        return reply.code(400).send({
+          error: "finalize_transcript_not_found",
+          requestId,
+          path: finalizeArtifactPath,
+          message: err instanceof Error ? err.message : "unable to read finalize artifact",
+        });
+      }
+      const mpccaArtifact = finalizeArtifact.mpccaWithdrawFinalizeArtifact as
+        | Record<string, unknown>
+        | undefined;
+      if (!mpccaArtifact || typeof mpccaArtifact !== "object") {
+        return reply.code(400).send({
+          error: "finalize_artifact_missing",
+          requestId,
+          message:
+            "__finalize.json is missing mpccaWithdrawFinalizeArtifact; the M4-c4 finalize " +
+            "route must run first",
+        });
+      }
+      const statementInputs = round2Artifact.statementInputs as Record<string, unknown>;
+      if (!statementInputs || typeof statementInputs !== "object") {
+        return reply.code(400).send({
+          error: "round2_statement_inputs_missing",
+          requestId,
+        });
+      }
+
+      const caPayload = buildCaPayloadFromFinalizeArtifact({
+        recipientAddressHex: parsed.recipient,
+        assetTypeHex: parsed.assetType,
+        statementInputs: {
+          recipientEk: statementInputs.recipientEk as string,
+          oldBalanceC: statementInputs.oldBalanceC as string[],
+          oldBalanceD: statementInputs.oldBalanceD as string[],
+          newBalanceC: statementInputs.newBalanceC as string[],
+          newBalanceD: statementInputs.newBalanceD as string[],
+          transferAmountC: statementInputs.transferAmountC as string[],
+          transferAmountDSender: statementInputs.transferAmountDSender as string[],
+          transferAmountDRecipient: statementInputs.transferAmountDRecipient as string[],
+        },
+        mpccaArtifact: {
+          aggregatedSigmaCommitmentsHex:
+            mpccaArtifact.aggregatedSigmaCommitmentsHex as string[],
+          sigmaResponseHex: mpccaArtifact.sigmaResponseHex as string[],
+          bulletproofZkrpAmountHex: mpccaArtifact.bulletproofZkrpAmountHex as string,
+          bulletproofZkrpNewBalanceHex:
+            mpccaArtifact.bulletproofZkrpNewBalanceHex as string,
+        },
+        memoHex: "",
+      });
+      const caPayloadHashRaw = caPayloadHashRawV2(caPayload);
+      const caPayloadHashFr = caPayloadHashRawToFrV2(caPayloadHashRaw);
+
+      return reply.code(200).send({
+        accepted: true,
+        requestId,
+        dkgEpoch: parsed.dkgEpoch,
+        rosterHash: dkgRosterHash,
+        selectedSlots: sortedSelectedSlots,
+        caPayload,
+        caPayloadHashRaw,
+        caPayloadHashFr,
+        transcriptPath: finalizeArtifactPath,
+      });
+    } catch (err) {
+      if (requestId) await store.markAborted(requestId);
+      if (err instanceof ForbiddenPlaintextFieldError) {
+        return reply.code(400).send({ error: "forbidden_plaintext_field", field: err.path });
+      }
+      if (err instanceof MpccaWithdrawV2Error) {
+        return reply.code(400).send({ error: err.code, message: err.message });
+      }
+      return reply.code(400).send({
+        error: "invalid_request",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  });
+
+  // =================================================================================================
   // Milestone 5 sub-milestone 5-c1 — MPCCA withdraw V2 FROST attestation orchestrator.
   //
   // POST /v2/withdraw/mpcca/frost-attest reads the persisted __round2.json + __finalize.json
