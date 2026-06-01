@@ -45,15 +45,33 @@ STATE_ROOT=${EUNOMA_STATE_ROOT:-${EUNOMA_LOCAL_STATE_ROOT:-operator-services/.ag
 STATE_DIR=${EUNOMA_COORDINATOR_STATE_DIR:-${STATE_ROOT%/}/coordinator}
 TREE_JSON=${STATE_DIR}/commitment_tree_v2.json
 LEANIMT_JSON=${STATE_DIR}/state_leanimt_tree.json
+ASP_SET_JSON=${STATE_DIR}/asp_set.json
+ASP_APPROVED_STATE=${STATE_DIR}/asp_approved_state.json
 STAGING_DIR=${STATE_DIR}/.refresh-staging
 STAGED_TREE_JSON=${STAGING_DIR}/commitment_tree_v2.json
 STAGED_LEANIMT_JSON=${STAGING_DIR}/state_leanimt_tree.json
+STAGED_ASP_SET_JSON=${STAGING_DIR}/asp_set.json
+STAGED_ASP_NEW_DEPOSITS_JSON=${STAGING_DIR}/asp_new_deposits.json
 OBSERVED_QUEUE=${EUNOMA_OBSERVED_DEPOSIT_QUEUE:-${STATE_DIR}/observed_deposit_tx_hashes.queue}
 MIN_ANONYMITY_SET=${EUNOMA_MIN_ANONYMITY_SET:-8}
 FETCH_DEPOSIT_TX_HASHES_SCRIPT=${EUNOMA_FETCH_DEPOSIT_TX_HASHES_SCRIPT:-${REPO_ROOT}/ops/scripts/fetch_deposit_tx_hashes.sh}
 SIGNER_MODE=${EUNOMA_REFRESH_SIGNER_MODE:-admin}
 ADMIN_PROFILE=${EUNOMA_REFRESH_ADMIN_PROFILE:-${ADMIN_PROFILE:-testnet-admin}}
 DELEGATE_PROFILE=${EUNOMA_REFRESH_DELEGATE_PROFILE:-${DELEGATE_PROFILE:-testnet-relayer}}
+ASP_RECORDER_PROFILE=${EUNOMA_REFRESH_ASP_RECORDER_PROFILE:-${ASP_RECORDER_PROFILE:-${ADMIN_PROFILE}}}
+ALLOW_TESTNET_SANCTIONS_STUB=${EUNOMA_ALLOW_TESTNET_SANCTIONS_STUB:-1}
+SANCTIONS_STUB_PID=""
+SANCTIONS_STUB_DIR=""
+
+cleanup_sanctions_stub() {
+  if [ -n "${SANCTIONS_STUB_PID}" ]; then
+    kill "${SANCTIONS_STUB_PID}" 2>/dev/null || true
+  fi
+  if [ -n "${SANCTIONS_STUB_DIR}" ]; then
+    rm -rf "${SANCTIONS_STUB_DIR}" 2>/dev/null || true
+  fi
+}
+trap cleanup_sanctions_stub EXIT
 
 case "${SIGNER_MODE}" in
   admin)
@@ -142,6 +160,87 @@ console.log(`observed tx queue pruned: before=${queue.length} after=${remaining.
 ' "${OBSERVED_QUEUE}" "${LEANIMT_JSON}"
 }
 
+ensure_kyt_provider_for_asp() {
+  if [ -n "${CHAINALYSIS_API_KEY:-}" ]; then
+    return 0
+  fi
+  if [ "${ALLOW_TESTNET_SANCTIONS_STUB}" != "1" ]; then
+    echo "CHAINALYSIS_API_KEY is required for ASP refresh; set EUNOMA_ALLOW_TESTNET_SANCTIONS_STUB=1 only for testnet" >&2
+    exit 34
+  fi
+  local stub_port="${SANCTIONS_STUB_PORT:-4556}"
+  SANCTIONS_STUB_DIR="$(mktemp -d -t eunoma_sanctions_stub.XXXXXX)"
+  local stub_js="${SANCTIONS_STUB_DIR}/sanctions_stub.mjs"
+  cat > "${stub_js}" <<'STUB'
+import { createServer } from "node:http";
+const PORT = Number(process.env.SANCTIONS_STUB_PORT || 4556);
+createServer((req, res) => {
+  if (req.method === "GET" && /\/address\/[^/]+$/.test(req.url || "")) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ identifications: [] }));
+    return;
+  }
+  res.writeHead(404, { "content-type": "application/json" });
+  res.end(JSON.stringify({ message: "not found" }));
+}).listen(PORT, "127.0.0.1", () => process.stderr.write(`[sanctions-stub] :${PORT}\n`));
+STUB
+  SANCTIONS_STUB_PORT="${stub_port}" node "${stub_js}" &
+  SANCTIONS_STUB_PID=$!
+  for _ in $(seq 1 50); do
+    if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:${stub_port}/api/v1/address/0x0"; then
+      break
+    fi
+    sleep 0.2
+  done
+  export CHAINALYSIS_API_KEY="testnet-local-stub"
+  export CHAINALYSIS_SANCTIONS_BASE_URL="http://127.0.0.1:${stub_port}/api/v1"
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: using local testnet sanctions stub for ASP screening"
+}
+
+stage_asp_new_deposits() {
+  mkdir -p "$(dirname "${STAGED_ASP_NEW_DEPOSITS_JSON}")"
+  [ -f "${ASP_APPROVED_STATE}" ] || printf '{"approved":[]}\n' > "${ASP_APPROVED_STATE}"
+  node -e '
+const fs = require("fs");
+const approvedPath = process.argv[1];
+const stagedTreePath = process.argv[2];
+const outPath = process.argv[3];
+const norm = (s) => (typeof s === "string" ? (s.startsWith("0x") ? s : `0x${s}`).toLowerCase() : "");
+const approved = fs.existsSync(approvedPath) ? JSON.parse(fs.readFileSync(approvedPath, "utf8")) : { approved: [] };
+const staged = JSON.parse(fs.readFileSync(stagedTreePath, "utf8"));
+const approvedCommitments = new Set((approved.approved || []).map((a) => norm(a.commitment)).filter(Boolean));
+const out = [];
+const meta = staged.depositMeta || [];
+for (let i = 0; i < meta.length; i++) {
+  const m = meta[i] || {};
+  const commitment = norm(m.commitment || m.commitmentHex || (staged.leaves || [])[i]);
+  if (!commitment || approvedCommitments.has(commitment)) continue;
+  const sender = norm(m.sender);
+  if (!sender) throw new Error(`missing_sender_for_asp_commitment:${commitment}`);
+  out.push({ commitment, sender });
+}
+fs.writeFileSync(outPath, `${JSON.stringify(out, null, 2)}\n`);
+process.stdout.write(String(out.length));
+' "${ASP_APPROVED_STATE}" "${STAGED_TREE_JSON}" "${STAGED_ASP_NEW_DEPOSITS_JSON}"
+}
+
+run_asp_refresh_if_needed() {
+  local new_count="$1"
+  if [ "${new_count}" = "0" ]; then
+    echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: asp refresh skipped; no new approved-state deposits"
+    return 0
+  fi
+  ensure_kyt_provider_for_asp
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: asp refork + record (${new_count} new deposits)"
+  EUNOMA_ASP_RECORDER_PROFILE="${ASP_RECORDER_PROFILE}" \
+    node operator-services/scripts/local_run_asp_cycle.mjs \
+      --state "${ASP_APPROVED_STATE}" \
+      --new-deposits "${STAGED_ASP_NEW_DEPOSITS_JSON}" \
+      --bridge "${BRIDGE}" \
+      --record \
+      --asp-set-out "${STAGED_ASP_SET_JSON}"
+}
+
 normalize_if_needed() {
   local step_label="$1"
   echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: normalize (${step_label})"
@@ -193,6 +292,8 @@ node operator-services/scripts/local_build_commitment_tree.mjs \
   --tx-hashes "${TX_HASHES}" \
   --state-dir "${STAGING_DIR}" \
   --refresh
+ASP_NEW_DEPOSIT_COUNT=$(stage_asp_new_deposits)
+echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: staged ASP new deposits count=${ASP_NEW_DEPOSIT_COUNT}"
 
 # The recorded on-chain state root is the LeanIMT root (the dynamic-depth tree the withdraw
 # circuit + frontend verify against), read from the LeanIMT snapshot — NOT the legacy fixed-20
@@ -227,12 +328,18 @@ node operator-services/scripts/local_record_known_root_v2.mjs \
   --min-anonymity-set "${MIN_ANONYMITY_SET}" \
   --state-dir "${STATE_DIR}"
 
+run_asp_refresh_if_needed "${ASP_NEW_DEPOSIT_COUNT}"
+
 echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: publish tree"
 mv "${STAGED_TREE_JSON}" "${TREE_JSON}.tmp"
 mv "${TREE_JSON}.tmp" "${TREE_JSON}"
 if [ -f "${STAGED_LEANIMT_JSON}" ]; then
   mv "${STAGED_LEANIMT_JSON}" "${LEANIMT_JSON}.tmp"
   mv "${LEANIMT_JSON}.tmp" "${LEANIMT_JSON}"
+fi
+if [ -f "${STAGED_ASP_SET_JSON}" ]; then
+  mv "${STAGED_ASP_SET_JSON}" "${ASP_SET_JSON}.tmp"
+  mv "${ASP_SET_JSON}.tmp" "${ASP_SET_JSON}"
 fi
 rm -rf "${STAGING_DIR}"
 

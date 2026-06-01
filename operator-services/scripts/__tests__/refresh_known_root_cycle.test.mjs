@@ -84,7 +84,7 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(result.stdout).toContain("record known root");
     expect(result.stdout).toContain("publish tree");
     expect(result.stdout).toContain("done");
-    expect(readOps()).toEqual(["normalize", "build", "rollover", "normalize", "record"]);
+    expect(readOps()).toEqual(["normalize", "build", "rollover", "normalize", "record", "asp"]);
   });
 
   it("skips rollover for a root with an existing sidecar and still finishes cleanly", () => {
@@ -97,7 +97,7 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(readTree().latestRootHex).toBe(NEW_ROOT);
     expect(result.stdout).toContain("already has side-car; skipping rollover");
     expect(result.stdout).toContain("publish tree");
-    expect(readOps()).toEqual(["normalize", "build", "record"]);
+    expect(readOps()).toEqual(["normalize", "build", "record", "asp"]);
   });
 
   it("uses an extra observed deposit hash when the indexer fetch has not listed it yet", () => {
@@ -115,7 +115,7 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(readTree().latestRootHex).toBe(NEW_ROOT);
     expect(readTxHashes()).toBe(EXTRA_TX);
     expect(readQueue()).toBe("");
-    expect(readOps()).toEqual(["normalize", "build", "rollover", "normalize", "record"]);
+    expect(readOps()).toEqual(["normalize", "build", "rollover", "normalize", "record", "asp"]);
   });
 
   it("deduplicates extra observed hashes before building the staged tree", () => {
@@ -191,6 +191,7 @@ function runWrapper(env = {}) {
       BRIDGE_VAULT_ADDRESS: `0x${"b".repeat(64)}`,
       BRIDGE_ASSET_TYPE: "0xa",
       EUNOMA_MIN_ANONYMITY_SET: "8",
+      CHAINALYSIS_API_KEY: "fake-test-key",
       ...env,
     },
   });
@@ -281,6 +282,7 @@ if (script.endsWith("local_build_commitment_tree.mjs")) {
         depositMeta: leaves.map((commitmentHex, i) => ({
           depositTxHash: txHashes[i] ?? "0x" + String(i + 1).padStart(64, "a"),
           commitmentHex,
+          sender: "0x" + String(i + 1).padStart(64, "b"),
         })),
         transcriptHash: "0x" + "44".repeat(32),
       },
@@ -302,6 +304,7 @@ if (script.endsWith("local_build_commitment_tree.mjs")) {
         depositMeta: leaves.map((commitmentHex, i) => ({
           commitmentHex,
           depositTxHash: txHashes[i] ?? "0x" + String(i + 1).padStart(64, "a"),
+          sender: "0x" + String(i + 1).padStart(64, "b"),
         })),
         transcriptHash: "0x" + "55".repeat(32),
       },
@@ -322,6 +325,28 @@ if (script.endsWith("local_record_known_root_v2.mjs")) {
     process.exit(31);
   }
   process.stdout.write(JSON.stringify({ ok: true, status: process.env.FAKE_RECORD_STATUS ?? "recorded" }) + "\\n");
+  process.exit(0);
+}
+if (script.endsWith("local_run_asp_cycle.mjs")) {
+  append("asp");
+  const aspSetOut = valueOf("--asp-set-out");
+  if (aspSetOut) {
+    writeFileSync(
+      aspSetOut,
+      JSON.stringify(
+        {
+          scheme: "eunoma_asp_set_v1",
+          rootHex: process.env.FAKE_ASP_ROOT ?? process.env.FAKE_TREE_ROOT,
+          treeDepth: 4,
+          commitments: [],
+          ipfsCid: "local-test-cid",
+        },
+        null,
+        2,
+      ) + "\\n",
+    );
+  }
+  process.stdout.write(JSON.stringify({ ok: true, rootHex: process.env.FAKE_ASP_ROOT ?? process.env.FAKE_TREE_ROOT }) + "\\n");
   process.exit(0);
 }
 
