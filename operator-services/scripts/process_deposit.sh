@@ -42,9 +42,12 @@
 # =============================================================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd -- "${SERVICE_ROOT}/.." && pwd)"
+EUNOMA_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd)"
+
 # ---- fresh ASP deploy constants -------------------------------------------------------------
-SERVICE_ROOT="/Users/isaaczhang/Desktop/AGENT/Projects/Eunoma/backend-deoperator-research/operator-services"
-REPO_ROOT="/Users/isaaczhang/Desktop/AGENT/Projects/Eunoma/backend-deoperator-research"
 STATE_ROOT="${SERVICE_ROOT}/.agent-local/eunoma-v2-asp"
 COORD_DIR="${STATE_ROOT}/coordinator"
 
@@ -55,8 +58,16 @@ ADMIN_PROFILE="testnet-asp-admin"
 ASP_RECORDER_PROFILE="testnet-asp-admin"   # ASPRecorderDelegate.addr == admin on this deploy
 APTOS_NODE_URL="${APTOS_NODE_URL:-https://fullnode.testnet.aptoslabs.com/v1}"
 COORDINATOR_URL="${COORDINATOR_URL:-http://127.0.0.1:4200}"
-FRONTEND_ENV="/Users/isaaczhang/Desktop/AGENT/Projects/Eunoma/frontend-deoperator-research/.env.local"
-CA_DKG_V2_ROSTER_JSON_PATH="${CA_DKG_V2_ROSTER_JSON_PATH:-${STATE_ROOT}/cluster/ca-dkg-v2-roster.json}"
+FRONTEND_ENV="${FRONTEND_ENV:-${EUNOMA_ROOT}/frontend-deoperator-research/.env.local}"
+case "${APTOS_NODE_URL}" in
+  */v1) ;;
+  *) APTOS_NODE_URL="${APTOS_NODE_URL%/}/v1" ;;
+esac
+DEFAULT_CA_DKG_V2_ROSTER_JSON_PATH="${STATE_ROOT}/cluster/ca-dkg-v2-roster.json"
+CA_DKG_V2_ROSTER_JSON_PATH="${CA_DKG_V2_ROSTER_JSON_PATH:-${DEFAULT_CA_DKG_V2_ROSTER_JSON_PATH}}"
+if [[ ! -f "${CA_DKG_V2_ROSTER_JSON_PATH}" && -f "${DEFAULT_CA_DKG_V2_ROSTER_JSON_PATH}" ]]; then
+  CA_DKG_V2_ROSTER_JSON_PATH="${DEFAULT_CA_DKG_V2_ROSTER_JSON_PATH}"
+fi
 if [[ -z "${COORDINATOR_BEARER_TOKEN:-}" && -f "${FRONTEND_ENV}" ]]; then
   COORDINATOR_BEARER_TOKEN="$(awk -F= '$1=="EUNOMA_V2_BEARER_TOKEN"{print substr($0, index($0,$2)); exit}' "${FRONTEND_ENV}")"
 fi
