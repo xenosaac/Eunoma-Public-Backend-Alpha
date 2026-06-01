@@ -9,8 +9,10 @@
 #   4. records the staged root in known_roots; and only then
 #   5. atomically publishes the staged tree as commitment_tree_v2.json.
 #
-# Delegate paths sign with testnet-relayer; admin previously delegated via
-# admin_set_recorder_delegate.
+# Signing path is configurable. Alpha defaults to the admin profile because the
+# ASP bridge has not delegated recorder/rollover authority to testnet-relayer.
+# Set EUNOMA_REFRESH_SIGNER_MODE=delegate after admin_set_recorder_delegate is
+# configured on-chain.
 #
 # Invoked by systemd unit eunoma-record-known-root.service (Type=oneshot).
 # Idempotent:
@@ -49,6 +51,26 @@ STAGED_LEANIMT_JSON=${STAGING_DIR}/state_leanimt_tree.json
 OBSERVED_QUEUE=${EUNOMA_OBSERVED_DEPOSIT_QUEUE:-${STATE_DIR}/observed_deposit_tx_hashes.queue}
 MIN_ANONYMITY_SET=${EUNOMA_MIN_ANONYMITY_SET:-8}
 FETCH_DEPOSIT_TX_HASHES_SCRIPT=${EUNOMA_FETCH_DEPOSIT_TX_HASHES_SCRIPT:-${REPO_ROOT}/ops/scripts/fetch_deposit_tx_hashes.sh}
+SIGNER_MODE=${EUNOMA_REFRESH_SIGNER_MODE:-admin}
+ADMIN_PROFILE=${EUNOMA_REFRESH_ADMIN_PROFILE:-${ADMIN_PROFILE:-testnet-admin}}
+DELEGATE_PROFILE=${EUNOMA_REFRESH_DELEGATE_PROFILE:-${DELEGATE_PROFILE:-testnet-relayer}}
+
+case "${SIGNER_MODE}" in
+  admin)
+    NORMALIZE_SIGNER_ARGS=(--admin-profile "${ADMIN_PROFILE}")
+    ROLLOVER_SIGNER_ARGS=(--admin-profile "${ADMIN_PROFILE}")
+    RECORD_SIGNER_ARGS=(--admin-profile "${ADMIN_PROFILE}")
+    ;;
+  delegate)
+    NORMALIZE_SIGNER_ARGS=(--via-delegate --delegate-profile "${DELEGATE_PROFILE}")
+    ROLLOVER_SIGNER_ARGS=(--via-delegate --delegate-profile "${DELEGATE_PROFILE}")
+    RECORD_SIGNER_ARGS=(--via-delegate --delegate-profile "${DELEGATE_PROFILE}")
+    ;;
+  *)
+    echo "invalid EUNOMA_REFRESH_SIGNER_MODE=${SIGNER_MODE}; expected admin or delegate" >&2
+    exit 2
+    ;;
+esac
 
 normalize_tx_hashes() {
   awk 'BEGIN{RS="[,\n\r\t ]+"; ORS=""}
@@ -127,7 +149,7 @@ normalize_if_needed() {
        --bridge-package-address "${BRIDGE}" \
        --vault-address "${VAULT}" \
        --asset-type "${ASSET}" \
-       --via-delegate --delegate-profile testnet-relayer \
+       "${NORMALIZE_SIGNER_ARGS[@]}" \
        --aptos-node-url "${APTOS_NODE_URL:-https://fullnode.testnet.aptoslabs.com}"
 }
 
@@ -188,7 +210,7 @@ if [ -n "${LATEST_ROOT}" ]; then
     echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: rollover"
     node operator-services/scripts/local_rollover_vault_pending.mjs \
            --bridge-package-address "${BRIDGE}" \
-           --via-delegate --delegate-profile testnet-relayer
+           "${ROLLOVER_SIGNER_ARGS[@]}"
 
     normalize_if_needed "after rollover"
   fi
@@ -201,7 +223,7 @@ echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: record known root"
 node operator-services/scripts/local_record_known_root_v2.mjs \
   --commitment-tree "${STAGED_LEANIMT_JSON}" \
   --bridge-package-address "${BRIDGE}" \
-  --via-delegate --delegate-profile testnet-relayer \
+  "${RECORD_SIGNER_ARGS[@]}" \
   --min-anonymity-set "${MIN_ANONYMITY_SET}" \
   --state-dir "${STATE_DIR}"
 
