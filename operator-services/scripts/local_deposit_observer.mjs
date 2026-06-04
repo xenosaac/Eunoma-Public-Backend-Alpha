@@ -58,6 +58,8 @@ let maxIterations; // optional u64 — process at most this many events in one r
 let bearerToken;
 let caDkgTranscriptHash;
 let depositTxHash; // PRIMARY mode (2026-05-22+): fetch events via REST tx-by-hash.
+let eventVersion = "v2";
+let targetLeafIndex;
 
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i];
@@ -107,6 +109,12 @@ for (let i = 0; i < args.length; i += 1) {
     case "--deposit-tx-hash":
       depositTxHash = args[++i];
       break;
+    case "--event-version":
+      eventVersion = String(args[++i] ?? "").toLowerCase();
+      break;
+    case "--target-leaf-index":
+      targetLeafIndex = args[++i];
+      break;
     case "--help":
     case "-h":
       console.log(
@@ -115,14 +123,16 @@ for (let i = 0; i < args.length; i += 1) {
           "                              --sender-address HEX --asset-type HEX --chain-id N\n" +
           "                              --ca-dkg-transcript-hash HEX\n" +
           "                              (--deposit-tx-hash HEX  |  --events-url URL)\n" +
+          "                              [--event-version v2|v4] [--target-leaf-index N]\n" +
           "                              [--start-sequence N] [--limit N]\n" +
           "                              [--max-iterations N] [--bearer-token TOKEN]\n" +
           "\n" +
-          "Single-shot observer for DepositConfirmedV2 events.\n" +
+          "Single-shot observer for route leaf events.\n" +
           "\n" +
           "PRIMARY MODE — --deposit-tx-hash <hex> (RECOMMENDED, 2026-05-22+):\n" +
           "  Fetch the single deposit tx via REST `/v1/transactions/by_hash/<hash>` and observe\n" +
-          "  every DepositConfirmedV2 event in its events[]. Modern, long-term-stable Aptos\n" +
+          "  every route leaf event in its events[]. V2 observes DepositConfirmedV2; V4 observes\n" +
+          "  DepositConfirmedV2/DepositConfirmedV4 plus ChangeNoteAppendedV4. Modern, stable Aptos\n" +
           "  REST API. Pairs with the frontend's auto-observe-on-deposit flow (BFF route\n" +
           "  /api/eunoma/v2/observe-deposit-by-tx posts the just-confirmed tx hash here).\n" +
           "\n" +
@@ -178,6 +188,14 @@ if (!caDkgTranscriptHash) {
   console.error("--ca-dkg-transcript-hash is required (the coordinator validates this against the persisted Phase 2 transcript)");
   process.exit(EXIT_USAGE_ERROR);
 }
+if (eventVersion !== "v2" && eventVersion !== "v4") {
+  console.error("--event-version must be v2 or v4");
+  process.exit(EXIT_USAGE_ERROR);
+}
+if (targetLeafIndex !== undefined && !/^[0-9]+$/.test(targetLeafIndex)) {
+  console.error("--target-leaf-index must be a decimal string when supplied");
+  process.exit(EXIT_USAGE_ERROR);
+}
 const chainIdNum = Number.parseInt(chainId, 10);
 if (!Number.isInteger(chainIdNum) || chainIdNum < 0 || chainIdNum > 255) {
   console.error("--chain-id must be a u8 integer (0..255)");
@@ -205,6 +223,82 @@ if (!coordinatorUrl) {
 const normalizedBridge = bridgeAddress.startsWith("0x")
   ? bridgeAddress
   : `0x${bridgeAddress}`;
+const stripHex = (h) =>
+  typeof h === "string" && h.startsWith("0x") ? h.slice(2) : h;
+// Chain emits short hex (e.g. "0xa" for APT asset_type); coordinator + observed artifacts
+// use 64-char zero-padded form. Compare and send in padded form to avoid false mismatch.
+const normalizeHex64 = (h) =>
+  typeof h === "string" ? stripHex(h).toLowerCase().padStart(64, "0") : h;
+const parseAssetType = (raw) => {
+  if (typeof raw === "object" && raw !== null && typeof raw.inner === "string") {
+    return normalizeHex64(raw.inner);
+  }
+  if (typeof raw === "string") {
+    return normalizeHex64(raw);
+  }
+  return raw;
+};
+const ZERO_HEX32 = "0".repeat(64);
+const aptosV1Base = aptosNodeUrl.replace(/\/+$/, "").replace(/\/v1$/i, "");
+const leafIndexForEvent = (event, kind) => {
+  if (eventVersion === "v4") {
+    const raw = kind === "change" ? event.data?.leaf_index : (event.data?.leaf_index ?? event.data?.deposit_count);
+    return raw === undefined ? undefined : String(raw);
+  }
+  const raw = event.data?.deposit_count;
+  return raw === undefined ? undefined : String(raw);
+};
+const isStaleObserveFailure = (body) => JSON.stringify(body).includes("stale_deposit_count");
+const eventKindForType = (type) => {
+  if (type === `${normalizedBridge}::eunoma_bridge::DepositConfirmedV2`) return "deposit";
+  if (eventVersion === "v4" && type === `${normalizedBridge}::eunoma_bridge::DepositConfirmedV4`) return "deposit";
+  if (eventVersion === "v4" && type === `${normalizedBridge}::eunoma_bridge::ChangeNoteAppendedV4`) return "change";
+  return null;
+};
+
+const parsePositiveIntEnv = (name, fallback) => {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+const fetchRetryAttempts = parsePositiveIntEnv("EUNOMA_APTOS_FETCH_RETRY_ATTEMPTS", 8);
+const fetchRetryDelayMs = parsePositiveIntEnv("EUNOMA_APTOS_FETCH_RETRY_DELAY_MS", 15_000);
+const fetchRetryMaxDelayMs = parsePositiveIntEnv("EUNOMA_APTOS_FETCH_RETRY_MAX_DELAY_MS", 60_000);
+const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+const isRetryableFullnodeStatus = (status) => status === 429 || (status >= 500 && status <= 599);
+
+async function fetchTextWithRetry(url, label) {
+  let nextDelayMs = fetchRetryDelayMs;
+  for (let attempt = 1; attempt <= fetchRetryAttempts; attempt += 1) {
+    try {
+      const response = await fetch(url);
+      const text = await response.text();
+      if (
+        response.ok ||
+        !isRetryableFullnodeStatus(response.status) ||
+        attempt === fetchRetryAttempts
+      ) {
+        return { ok: response.ok, status: response.status, text };
+      }
+      console.error(
+        `[fullnode] ${label} returned ${response.status}; retrying in ${nextDelayMs}ms ` +
+          `(attempt ${attempt}/${fetchRetryAttempts})`,
+      );
+    } catch (err) {
+      if (attempt === fetchRetryAttempts) {
+        throw err;
+      }
+      console.error(
+        `[fullnode] ${label} request failed: ${err?.message ?? err}; retrying in ${nextDelayMs}ms ` +
+          `(attempt ${attempt}/${fetchRetryAttempts})`,
+      );
+    }
+    await sleep(nextDelayMs);
+    nextDelayMs = Math.min(Math.ceil(nextDelayMs * 1.5), fetchRetryMaxDelayMs);
+  }
+  throw new Error(`unreachable_fetch_retry_exhausted:${label}`);
+}
 
 // =============================================================================================
 // Events fetch — two modes (2026-05-22 rewrite):
@@ -222,27 +316,26 @@ const normalizedBridge = bridgeAddress.startsWith("0x")
 //   escape hatch for non-standard indexers; do NOT rely on it against current testnet/mainnet
 //   fullnodes that have retired the events-by-struct accessor for module events.
 // =============================================================================================
-const eventTypeStr = `${normalizedBridge}::eunoma_bridge::DepositConfirmedV2`;
 let events;
 let txVersionFromTx; // populated only in tx-by-hash mode (all events share the same tx version)
+let txSenderFromTx;
 
 if (depositTxHash) {
-  const txUrl = `${aptosNodeUrl.replace(/\/+$/, "")}/v1/transactions/by_hash/${depositTxHash}`;
+  const txUrl = `${aptosV1Base}/v1/transactions/by_hash/${depositTxHash}`;
   let txRes;
   try {
-    txRes = await fetch(txUrl);
+    txRes = await fetchTextWithRetry(txUrl, `tx ${depositTxHash}`);
   } catch (err) {
     console.error(`fullnode request (by_hash) failed: ${err?.message ?? err}`);
     process.exit(EXIT_GENERIC_FAILURE);
   }
   if (!txRes.ok) {
-    const text = await txRes.text();
-    console.error(`fullnode returned ${txRes.status} for tx ${depositTxHash}: ${text}`);
+    console.error(`fullnode returned ${txRes.status} for tx ${depositTxHash}: ${txRes.text}`);
     process.exit(EXIT_GENERIC_FAILURE);
   }
   let txData;
   try {
-    txData = await txRes.json();
+    txData = JSON.parse(txRes.text);
   } catch (err) {
     console.error(`fullnode returned non-JSON for tx: ${err?.message ?? err}`);
     process.exit(EXIT_GENERIC_FAILURE);
@@ -254,11 +347,20 @@ if (depositTxHash) {
     process.exit(EXIT_GENERIC_FAILURE);
   }
   if (typeof txData?.version === "string") txVersionFromTx = txData.version;
+  if (typeof txData?.sender === "string") txSenderFromTx = normalizeHex64(txData.sender);
   const allEvents = Array.isArray(txData?.events) ? txData.events : [];
-  events = allEvents.filter((e) => e?.type === eventTypeStr);
+  events = allEvents
+    .filter((e) => eventKindForType(e?.type))
+    .filter((e) => {
+      if (targetLeafIndex === undefined) return true;
+      const kind = eventKindForType(e?.type);
+      if (!kind) return false;
+      return leafIndexForEvent(e, kind) === targetLeafIndex;
+    });
   if (events.length === 0) {
     console.error(
-      `tx ${depositTxHash} has no DepositConfirmedV2 event matching ${eventTypeStr}; not a deposit tx for this bridge`,
+      `tx ${depositTxHash} has no ${eventVersion} route leaf event for bridge ${normalizedBridge}` +
+        (targetLeafIndex ? ` at leaf ${targetLeafIndex}` : ""),
     );
     process.exit(EXIT_GENERIC_FAILURE);
   }
@@ -278,18 +380,17 @@ if (depositTxHash) {
   const fetchUrl = queryParams.toString() ? `${eventsUrl}?${queryParams}` : eventsUrl;
   let eventsRes;
   try {
-    eventsRes = await fetch(fetchUrl);
+    eventsRes = await fetchTextWithRetry(fetchUrl, "events");
   } catch (err) {
     console.error(`fullnode request failed: ${err?.message ?? err}`);
     process.exit(EXIT_GENERIC_FAILURE);
   }
   if (!eventsRes.ok) {
-    const text = await eventsRes.text();
-    console.error(`fullnode returned ${eventsRes.status}: ${text}`);
+    console.error(`fullnode returned ${eventsRes.status}: ${eventsRes.text}`);
     process.exit(EXIT_GENERIC_FAILURE);
   }
   try {
-    events = await eventsRes.json();
+    events = JSON.parse(eventsRes.text);
   } catch (err) {
     console.error(`fullnode returned non-JSON: ${err?.message ?? err}`);
     process.exit(EXIT_GENERIC_FAILURE);
@@ -324,29 +425,36 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
     console.error(`malformed event at index ${i}: ${JSON.stringify(event)}`);
     process.exit(EXIT_GENERIC_FAILURE);
   }
+  const kind = eventKindForType(event.type);
+  if (!kind) {
+    console.error(`event ${event.sequence_number} is not an in-scope route leaf event: ${event.type}`);
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
   const {
-    commitment,
-    amount_tag,
-    ca_payload_hash,
-    deposit_nonce,
     deposit_count: onChainDepositCount,
     vault_addr: eventVaultAddr,
     asset_type: eventAssetType,
   } = event.data;
-  // Each event field is a `vector<u8>` on-chain; Aptos serialises this as a 0x-prefixed hex
-  // string in the JSON response. Strip the prefix to align with our 32-byte hex format.
-  const stripHex = (h) =>
-    typeof h === "string" && h.startsWith("0x") ? h.slice(2) : h;
-  // Chain emits short hex (e.g. "0xa" for APT asset_type); coordinator + observed artifacts
-  // use 64-char zero-padded form. Compare and send in padded form to avoid false mismatch.
-  const normalizeHex64 = (h) =>
-    typeof h === "string" ? stripHex(h).toLowerCase().padStart(64, "0") : h;
+  const commitment = kind === "change" ? event.data.change_commitment : event.data.commitment;
+  const amount_tag = kind === "change" ? `0x${ZERO_HEX32}` : event.data.amount_tag;
+  const ca_payload_hash = kind === "change" ? `0x${ZERO_HEX32}` : event.data.ca_payload_hash;
+  const deposit_nonce = kind === "change" ? `0x${ZERO_HEX32}` : event.data.deposit_nonce;
   // Goal.md M3 defense-in-depth: when reading DepositConfirmedV2 (default), cross-check
   // event.asset_type matches the operator's expected asset_type. Mismatched asset → stale
   // or cross-vault event, fail closed.
-  if (eventAssetType !== undefined && normalizeHex64(eventAssetType) !== normalizeHex64(assetType)) {
+  if (eventAssetType !== undefined && parseAssetType(eventAssetType) !== normalizeHex64(assetType)) {
     console.error(
       `event ${event.sequence_number} asset_type=${eventAssetType} does not match operator expected ${assetType} — stale or cross-vault event, refusing to advance cursor`,
+    );
+    process.exit(EXIT_GENERIC_FAILURE);
+  }
+  if (
+    eventVaultAddr !== undefined &&
+    process.env.BRIDGE_VAULT_ADDRESS &&
+    normalizeHex64(eventVaultAddr) !== normalizeHex64(process.env.BRIDGE_VAULT_ADDRESS)
+  ) {
+    console.error(
+      `event ${event.sequence_number} vault_addr=${eventVaultAddr} does not match expected vault ${process.env.BRIDGE_VAULT_ADDRESS}`,
     );
     process.exit(EXIT_GENERIC_FAILURE);
   }
@@ -369,10 +477,18 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
   // state shares only via the confirmed deposit_count emitted by the chain", so the
   // operator should be reading DepositConfirmedV2 (default since this commit).
   let depositCount;
-  if (onChainDepositCount !== undefined) {
+  if (eventVersion === "v4" && kind === "change") {
+    depositCount = leafIndexForEvent(event, kind);
+  } else if (eventVersion === "v4" && event.data.leaf_index !== undefined) {
+    depositCount = String(event.data.leaf_index);
+  } else if (onChainDepositCount !== undefined) {
     depositCount = String(onChainDepositCount);
   } else {
     depositCount = (BigInt(sequenceNumber) + 1n).toString();
+  }
+  if (!depositCount || !/^[0-9]+$/.test(depositCount)) {
+    console.error(`event ${event.sequence_number} has no valid route leaf index/deposit_count`);
+    process.exit(EXIT_GENERIC_FAILURE);
   }
   if (BigInt(depositCount) > BigInt(Number.MAX_SAFE_INTEGER)) {
     console.error(
@@ -410,6 +526,9 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
     dkgEpoch,
     vaultEk,
     senderAddress,
+    vaultStateSenderAddress: senderAddress,
+    depositSenderAddress: txSenderFromTx ?? senderAddress,
+    eventKind: kind,
     assetType: normalizeHex64(assetType),
     chainId: chainIdNum,
     depositCount: Number(depositCount),
@@ -421,7 +540,7 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
     txVersion,
     eventGuid,
   };
-  if (caDkgTranscriptHash) payload.caDkgTranscriptHash = caDkgTranscriptHash;
+  if (caDkgTranscriptHash) payload.caDkgTranscriptHash = stripHex(caDkgTranscriptHash);
 
   const headers = { "content-type": "application/json" };
   if (bearerToken) headers.authorization = `Bearer ${bearerToken}`;
@@ -459,6 +578,14 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
     process.stdout.write(`${JSON.stringify(body, null, 2)}\n`);
     process.exit(EXIT_CURSOR_DIVERGENCE);
   }
+  if (!res.ok && isStaleObserveFailure(body)) {
+    processed.push({
+      sequenceNumber,
+      depositCount: Number(depositCount),
+      status: "already_observed",
+    });
+    continue;
+  }
   if (!res.ok) {
     console.error(
       `coordinator returned ${res.status} for depositCount=${depositCount}: ${JSON.stringify(body)}`,
@@ -467,6 +594,7 @@ for (let i = 0; i < events.length && i < maxIters; i += 1) {
   }
   processed.push({
     sequenceNumber,
+    kind,
     depositCount: body.depositCount,
     transcriptHash: body.transcriptHash,
     transcriptPath: body.transcriptPath,

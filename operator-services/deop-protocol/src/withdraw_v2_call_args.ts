@@ -54,6 +54,10 @@ export const EUNOMA_WITHDRAW_V2_DOMAIN = "EUNOMA_WITHDRAW_V2_CALL_ARGS_V1";
  * operator-services/relayer/tests/server.test.ts.
  */
 export const WITHDRAW_V2_CALL_ARGS_ORDER = [
+  // V4 (CP5 RC1): asset_addr is the explicit +1 positional routing key, FIRST
+  // arg after the implicit `_relayer: &signer` — mirroring
+  // eunoma_bridge.move:withdraw_to_recipient_v2 (asset_addr: address).
+  "assetAddr",
   "root",
   "nullifierHash",
   "recipient",
@@ -64,6 +68,19 @@ export const WITHDRAW_V2_CALL_ARGS_ORDER = [
   "aspRoot",
   "stateTreeDepth",
   "aspTreeDepth",
+  // V4 (CP2 CP1): change_commitment is public[12] — the partial-withdraw
+  // remainder note's commitment (32 zero bytes = a FULL withdraw). It sits
+  // BETWEEN aspTreeDepth and vaultSequence, mirroring the Move signature
+  // eunoma_bridge.move:withdraw_to_recipient_v2 / prepare_withdraw_proof_v3
+  // exactly (state_tree_depth, asp_tree_depth, change_commitment, vault_sequence).
+  "changeCommitment",
+  // V4 B-prime partial withdraw: split the old-note binding from the actual CA
+  // transfer payload. amountPDigest/amountPOld are the spent note (A_old);
+  // amountP remains the withdrawn leg (W); amountPRem is the change leg (A_rem).
+  // These are public Pedersen points/digests, not plaintext amounts.
+  "amountPDigest",
+  "amountPOld",
+  "amountPRem",
   "vaultSequence",
   "withdrawProof",
   "expirySecs",
@@ -89,11 +106,61 @@ export const WITHDRAW_V2_CALL_ARGS_ORDER = [
 export type WithdrawV2CallArgsKey = (typeof WITHDRAW_V2_CALL_ARGS_ORDER)[number];
 
 /**
+ * Legacy monolith ABI order for `withdraw_to_recipient_v2`. The HTTP schema and
+ * split-v3/V4 submitter carry the three conservation fields above, but the
+ * monolith Move entry still has the original 32 positional args. Keep this
+ * separate so the retired monolith path cannot silently drift into an invalid
+ * 35-arg CLI call.
+ */
+export const WITHDRAW_V2_MONOLITH_CALL_ARGS_ORDER = [
+  "assetAddr",
+  "root",
+  "nullifierHash",
+  "recipient",
+  "recipientHash",
+  "amountTag",
+  "caPayloadHash",
+  "requestHash",
+  "aspRoot",
+  "stateTreeDepth",
+  "aspTreeDepth",
+  "changeCommitment",
+  "vaultSequence",
+  "withdrawProof",
+  "expirySecs",
+  "groupSignature",
+  "fallbackBitmap",
+  "fallbackSignatures",
+  "newBalanceP",
+  "newBalanceR",
+  "newBalanceREffAud",
+  "amountP",
+  "amountRSender",
+  "amountRRecip",
+  "amountREffAud",
+  "ekVolunAuds",
+  "amountRVolunAuds",
+  "zkrpNewBalance",
+  "zkrpAmount",
+  "sigmaProtoComm",
+  "sigmaProtoResp",
+  "memo",
+] as const satisfies ReadonlyArray<WithdrawV2CallArgsKey>;
+
+/**
  * Strictly-typed positional argument bundle for
  * `eunoma_bridge::withdraw_to_recipient_v2`. Field order in this interface
  * mirrors the Move signature: do NOT reorder.
  */
 export interface WithdrawV2CallArgs {
+  /**
+   * 32-byte Aptos address. Move: `asset_addr: address` — the V4 (CP5 RC1)
+   * explicit +1 positional routing key. PUBLIC routing field (NOT a witness):
+   * the on-chain entry resolves the registry row by this attacker-chosen
+   * asset_addr, status-gates it ACTIVE, and Poseidon-links it to the proof
+   * (derive_asset_id(st.asset_type) == proven_asset_id). Encoded `address:0x...`.
+   */
+  assetAddr: HexString;
   /** 32-byte Fr hash. Move: `root: vector<u8>` + `assert_hash`. */
   root: HexString;
   /** 32-byte Fr hash. Move: `nullifier_hash: vector<u8>` + `assert_hash`. */
@@ -114,6 +181,31 @@ export interface WithdrawV2CallArgs {
   stateTreeDepth: string;
   /** Decimal string. Move: `asp_tree_depth: u64` (ASP LeanIMT depth). ASP. */
   aspTreeDepth: string;
+  /**
+   * 32-byte Fr hash. Move: `change_commitment: vector<u8>` + `assert_hash` —
+   * the V4 (CP2 CP1) public[12] partial-withdraw remainder-note commitment.
+   * EMPTY = 32 zero bytes signals a FULL withdraw (no remainder leaf). PUBLIC
+   * field (the remainder's amount_p_digest stays in-circuit — this is only the
+   * commitment hash, NOT a plaintext amount). Encoded `hex:` like `root`.
+   */
+  changeCommitment: HexString;
+  /**
+   * 32-byte Fr hash. Move: `amount_p_digest: vector<u8>` for
+   * `prepare_withdraw_conservation_v4`; it is Poseidon8(amountPOld), the spent
+   * note amount_p digest bound by the withdraw proof public[8].
+   */
+  amountPDigest: HexString;
+  /**
+   * Move: `amount_p_old: vector<vector<u8>>` for prepare-proof/conservation.
+   * Four 32-byte Ristretto compressed Pedersen points for the spent note amount.
+   */
+  amountPOld: HexString[];
+  /**
+   * Move: `amount_p_rem: vector<vector<u8>>` for conservation. Four 32-byte
+   * Pedersen points for the change/remainder amount; all-zero points are used
+   * only when there is no change.
+   */
+  amountPRem: HexString[];
   /** Decimal string. Move: `vault_sequence: u64`. */
   vaultSequence: string;
   /** Variable-length Groth16 proof bytes. Move: `withdraw_proof: vector<u8>`. */
@@ -174,6 +266,10 @@ export function parseWithdrawV2CallArgs(raw: unknown): WithdrawV2CallArgs {
   }
   const obj = raw as Record<string, unknown>;
   const parsed: WithdrawV2CallArgs = {
+    // V4 (CP5 RC1): asset_addr is a 32-byte Aptos address (same shape as
+    // recipient). Validated as ≤32-byte hex; encoded `address:0x...` by the
+    // relayer's encodeField, NOT `hex:`/`vector<u8>`.
+    assetAddr: hexField(obj, "assetAddr", 32),
     root: hexField(obj, "root", FR_BYTES),
     nullifierHash: hexField(obj, "nullifierHash", FR_BYTES),
     recipient: hexField(obj, "recipient", 32),
@@ -184,6 +280,12 @@ export function parseWithdrawV2CallArgs(raw: unknown): WithdrawV2CallArgs {
     aspRoot: hexField(obj, "aspRoot", FR_BYTES),
     stateTreeDepth: decimalU64Field(obj, "stateTreeDepth"),
     aspTreeDepth: decimalU64Field(obj, "aspTreeDepth"),
+    // V4 (CP2 CP1): change_commitment public[12], a 32-byte Fr (EMPTY = 32 zero
+    // bytes = full withdraw). Validated identically to root via assert_hash.
+    changeCommitment: hexField(obj, "changeCommitment", FR_BYTES),
+    amountPDigest: hexField(obj, "amountPDigest", FR_BYTES),
+    amountPOld: hexArrayField(obj, "amountPOld", { allowEmpty: false }),
+    amountPRem: hexArrayField(obj, "amountPRem", { allowEmpty: false }),
     vaultSequence: decimalU64Field(obj, "vaultSequence"),
     withdrawProof: hexField(obj, "withdrawProof", undefined, { allowEmpty: true }),
     expirySecs: decimalU64Field(obj, "expirySecs"),

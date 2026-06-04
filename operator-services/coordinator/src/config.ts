@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   assertProductionCaDkgScheme,
   parseCaDkgV2Roster,
@@ -7,6 +9,80 @@ import {
   type DeoperatorRoster,
   type FrostDkgV2Roster,
 } from "@eunoma/deop-protocol";
+
+/**
+ * CP5 RC2: a single per-asset registry row as persisted by the init_v4 artifact
+ * <stateRoot>/coordinator/asset_registry.json. The `/v2/assets` endpoint serves these (mapped
+ * to the frontend `AssetEntry`); `configFromEnv` reads the same artifact to derive the single
+ * ACTIVE asset for the legacy `bridgeAssetType` (vault,asset) decrypt gate. Public routing
+ * fields only — no secrets.
+ */
+export interface AssetRegistryEntry {
+  metadata: string; // FA Metadata object-address (asset_addr / on-chain registry key)
+  assetType?: string; // fully-qualified asset type tag (when the artifact records it)
+  status: "DORMANT" | "ACTIVE" | "PAUSED";
+}
+
+/**
+ * CP5 RC2: load + minimally validate the init_v4 asset registry from `stateRoot`. Returns the
+ * rows, or `undefined` when stateRoot is unset / the artifact is missing / unreadable /
+ * malformed (callers then fall back to env, never crash). This is the canonical replacement for
+ * the singleton `BRIDGE_ASSET_TYPE` env — the registry is the source of truth for asset identity.
+ */
+export function assetRegistryFromStateRoot(
+  stateRoot: string | undefined,
+): AssetRegistryEntry[] | undefined {
+  if (!stateRoot) return undefined;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(join(stateRoot, "coordinator", "asset_registry.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+  const rows = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" && Array.isArray((raw as { assets?: unknown }).assets)
+      ? (raw as { assets: unknown[] }).assets
+      : undefined;
+  if (!rows) return undefined;
+  const out: AssetRegistryEntry[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return undefined;
+    const r = row as Record<string, unknown>;
+    const status = r.status;
+    const statusName =
+      status === 1 || status === "ACTIVE"
+        ? "ACTIVE"
+        : status === 0 || status === "DORMANT"
+          ? "DORMANT"
+          : status === 2 || status === "PAUSED"
+            ? "PAUSED"
+            : undefined;
+    if (typeof r.metadata !== "string" || statusName === undefined) return undefined;
+    out.push({
+      metadata: r.metadata,
+      ...(typeof r.assetType === "string" ? { assetType: r.assetType } : {}),
+      status: statusName,
+    });
+  }
+  return out;
+}
+
+/**
+ * CP5 RC2: derive the single ACTIVE asset's type tag from the registry, for the legacy
+ * `bridgeAssetType` (vault,asset) decrypt gate. Returns `undefined` when the registry is absent,
+ * has no ACTIVE asset, the ACTIVE asset records no `assetType`, or — defensively — when MORE than
+ * one asset is ACTIVE (the launch invariant is exactly one ACTIVE asset = APT; an ambiguous gate
+ * must fail closed to env rather than silently pin the wrong asset).
+ */
+export function deriveBridgeAssetTypeFromRegistry(
+  registry: AssetRegistryEntry[] | undefined,
+): string | undefined {
+  if (!registry) return undefined;
+  const active = registry.filter((a) => a.status === "ACTIVE");
+  if (active.length !== 1) return undefined;
+  return active[0].assetType;
+}
 
 export interface CoordinatorConfig {
   host: string;
@@ -58,6 +134,15 @@ export interface CoordinatorConfig {
    * M10-l (codex iter-6 P1-13): the bridge's confidential-asset type tag
    * (e.g. `0x1::aptos_coin::AptosCoin`). Sourced from `BRIDGE_ASSET_TYPE`.
    * Required by `/v2/balance/decrypt` for the same chosen-balance-target reason.
+   *
+   * CP5 RC2 (multi-asset): the single-asset env `BRIDGE_ASSET_TYPE` is no longer the
+   * source of truth — the per-asset registry (`<stateRoot>/coordinator/asset_registry.json`,
+   * the init_v4 artifact) is. When `BRIDGE_ASSET_TYPE` is unset, `configFromEnv` derives
+   * this from the registry's single ACTIVE asset (the launch invariant: only APT is ACTIVE,
+   * stablecoins ship DORMANT — so the derived value is unambiguous). The `/v2/balance/decrypt`
+   * (vault,asset) gate is preserved verbatim; it now reads the registry-derived asset rather
+   * than a hand-edited env. An explicit `BRIDGE_ASSET_TYPE` still overrides (test / staged
+   * cutover). See `assetRegistryFromStateRoot`.
    */
   bridgeAssetType?: string;
   /**
@@ -68,6 +153,14 @@ export interface CoordinatorConfig {
    * which the submitter surfaces as a `relayer_self_submit:<reason>` error for the client fallback.
    */
   relayerUseV3?: boolean;
+  /**
+   * CP5 RC6(A): the ASP-root TTL window (seconds) the historical-root endpoint
+   * GET /v2/asp-set/at/:rootHex honors before returning 410 Gone. Sourced from
+   * `EUNOMA_ASP_ROOT_TTL_SECS` (positive decimal seconds). Unset → the server default (~6h),
+   * which should track the on-chain ASP_ROOT_TTL constant so the off-chain window matches the
+   * chain's E_INVALID_ASP_ROOT cutoff.
+   */
+  aspRootTtlSecs?: number;
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): CoordinatorConfig {
@@ -100,6 +193,22 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Coordinator
     }
     chainConfirmationTimeoutMs = Number.parseInt(chainConfirmationTimeoutMsRaw, 10);
   }
+  const stateRoot = env.EUNOMA_STATE_ROOT || undefined;
+  // CP5 RC6(A): optional ASP-root TTL override (positive decimal seconds). Unset → server default.
+  const aspRootTtlSecsRaw = env.EUNOMA_ASP_ROOT_TTL_SECS;
+  let aspRootTtlSecs: number | undefined;
+  if (aspRootTtlSecsRaw !== undefined && aspRootTtlSecsRaw !== "") {
+    if (!/^[1-9][0-9]*$/.test(aspRootTtlSecsRaw)) {
+      throw new Error("EUNOMA_ASP_ROOT_TTL_SECS must be a positive decimal integer (seconds)");
+    }
+    aspRootTtlSecs = Number.parseInt(aspRootTtlSecsRaw, 10);
+  }
+  // CP5 RC2: the per-asset registry (init_v4 artifact) is the source of truth for asset identity.
+  // An explicit BRIDGE_ASSET_TYPE still wins (test / staged cutover); otherwise derive the single
+  // ACTIVE asset from the registry so the (vault,asset) decrypt gate is registry-driven, not env.
+  const bridgeAssetType =
+    (env.BRIDGE_ASSET_TYPE || undefined) ??
+    deriveBridgeAssetTypeFromRegistry(assetRegistryFromStateRoot(stateRoot));
   return {
     host: env.COORDINATOR_HOST ?? "127.0.0.1",
     port: Number.parseInt(env.COORDINATOR_PORT ?? "4200", 10),
@@ -108,14 +217,15 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Coordinator
     caDkgV2Roster,
     frostDkgV2Roster,
     nodeBearerTokens: parseNodeBearerTokens(env.DEOPERATOR_NODE_BEARER_TOKENS_JSON),
-    stateRoot: env.EUNOMA_STATE_ROOT || undefined,
+    stateRoot,
     relayerUrl: env.RELAYER_URL || undefined,
     relayerBearerToken: env.RELAYER_BEARER_TOKEN || undefined,
     chainNodeUrl: env.APTOS_NODE_URL || undefined,
     ...(chainConfirmationTimeoutMs !== undefined ? { chainConfirmationTimeoutMs } : {}),
     bridgeVaultAddress: env.BRIDGE_VAULT_ADDRESS || undefined,
-    bridgeAssetType: env.BRIDGE_ASSET_TYPE || undefined,
+    bridgeAssetType,
     relayerUseV3: env.RELAYER_USE_V3 === "1",
+    ...(aspRootTtlSecs !== undefined ? { aspRootTtlSecs } : {}),
   };
 }
 
@@ -158,9 +268,13 @@ export function buildDefaultRelayerSubmitter(
     if (!res.ok) {
       const errCode =
         body && typeof body.error === "string" ? body.error : `http_${res.status}`;
+      const detailCode =
+        body && typeof body.code === "string" ? body.code : "";
       const errMsg =
         body && typeof body.message === "string" ? body.message : "unknown";
-      throw new Error(`relayer responded ${res.status} (${errCode}): ${errMsg}`);
+      throw new Error(
+        `relayer responded ${res.status} (${errCode}${detailCode ? `/${detailCode}` : ""}): ${errMsg}`,
+      );
     }
     if (useV3) {
       // The /v3 route returns a 200 `{ action: "self_submit", reason }` when the gas breaker is

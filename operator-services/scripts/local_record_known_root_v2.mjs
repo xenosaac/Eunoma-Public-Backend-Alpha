@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // =============================================================================================
-// V2 admin CLI — submit `record_known_root_v2(admin, root)` against Aptos testnet.
+// V2/V4 admin CLI — submit `record_known_root_v2` or `record_known_root_v4` against Aptos testnet.
 //
 // Goal:
 //   The on-chain bridge stores a Move Table<vector<u8>, bool> of "known" Merkle roots that the
@@ -29,6 +29,7 @@
 //                                    side-car artifact written here on success.
 //   --dry-run                        compute root + exit 0 without submitting
 //   --root-override HEX              override computed root (negative tests only)
+//   --v4                             use BridgeTablesV4 + record_known_root_v4 selectors
 //
 // Output: JSON to stdout
 //   { ok, root, depositCommitment, txHash?, status: "recorded" | "already_recorded" | "dry_run",
@@ -48,7 +49,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { runAptosCliWithRetry } from "./_lib/aptos_cli_retry.mjs";
 
 const EXIT_SUCCESS = 0;
 const EXIT_GENERIC_FAILURE = 1;
@@ -63,6 +64,7 @@ const EXIT_EVENT_MISSING = 33;
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const serviceRoot = resolve(scriptDir, "..");
 const repoRoot = resolve(serviceRoot, "..");
+const aptosCliCwd = process.env.APTOS_CLI_CWD ? resolve(process.env.APTOS_CLI_CWD) : serviceRoot;
 
 const args = process.argv.slice(2);
 let depositWitnessPath;
@@ -77,6 +79,9 @@ let minAnonymitySetStr =
   process.env.EUNOMA_MIN_ANONYMITY_SET ?? "8";
 let allowLocalSmokeAnonymity = false;
 let stateDir = join(serviceRoot, ".agent-local", "eunoma-v2", "coordinator");
+let useV4 = process.env.EUNOMA_RECORD_KNOWN_ROOT_V4 === "1";
+const submitOnPrecheckFailure =
+  process.env.EUNOMA_RECORD_KNOWN_ROOT_SUBMIT_ON_PRECHECK_FAILURE === "1";
 // R7-OPS-1: --via-delegate switches function-id to record_known_root_v2_via_delegate
 // (signed by delegate, not admin). --delegate-profile selects the Aptos CLI profile.
 // Both flags must be present together; otherwise script uses legacy admin path.
@@ -119,6 +124,9 @@ for (let i = 0; i < args.length; ++i) {
     case "--state-dir":
       stateDir = args[++i];
       break;
+    case "--v4":
+      useV4 = true;
+      break;
     case "--dry-run":
       dryRun = true;
       break;
@@ -136,7 +144,7 @@ for (let i = 0; i < args.length; ++i) {
           "                                  [--min-anonymity-set N=$EUNOMA_MIN_ANONYMITY_SET|8] \\\n" +
           "                                  [--allow-local-smoke-anonymity (needs EUNOMA_LOCAL_SMOKE=1)] \\\n" +
           "                                  [--state-dir PATH] \\\n" +
-          "                                  [--dry-run] [--root-override HEX]",
+          "                                  [--dry-run] [--root-override HEX] [--v4]",
       );
       process.exit(EXIT_SUCCESS);
     default:
@@ -355,7 +363,7 @@ if (dryRun) {
   process.exit(EXIT_SUCCESS);
 }
 
-// Check whether the root is already on chain via the BridgeVaultTablesV2.known_roots table.
+// Check whether the root is already on chain via the selected known_roots table.
 async function fetchWithRetry(url, init, attempts = 3, backoffMs = 500) {
   let lastErr;
   for (let i = 0; i < attempts; ++i) {
@@ -374,20 +382,30 @@ async function fetchWithRetry(url, init, attempts = 3, backoffMs = 500) {
   throw lastErr ?? new Error("fetch_failed");
 }
 
+function failKnownRootPrecheck(message) {
+  if (submitOnPrecheckFailure) {
+    console.error(`[warn] ${message}; submitting anyway because EUNOMA_RECORD_KNOWN_ROOT_SUBMIT_ON_PRECHECK_FAILURE=1`);
+    return;
+  }
+  console.error(`[defer] ${message}; not submitting duplicate-prone record_known_root tx`);
+  process.exit(EXIT_FULLNODE_UNREACHABLE);
+}
+
 let knownRootsHandle = null;
 try {
+  const tablesStruct = useV4 ? "BridgeTablesV4" : "BridgeVaultTablesV2";
   const tablesUrl = `${aptosNodeUrl}/accounts/${bridgePackageAddress}/resource/${encodeURIComponent(
-    `${bridgePackageAddress}::eunoma_bridge::BridgeVaultTablesV2`,
+    `${bridgePackageAddress}::eunoma_bridge::${tablesStruct}`,
   )}`;
   const res = await fetchWithRetry(tablesUrl, { method: "GET", headers: { accept: "application/json" } });
   if (res.ok) {
     const body = await res.json();
     knownRootsHandle = body?.data?.known_roots?.handle ?? null;
   } else if (res.status !== 404) {
-    console.error(`[warn] BridgeVaultTablesV2 GET returned ${res.status}; continuing without membership pre-check`);
+    failKnownRootPrecheck(`${tablesStruct} GET returned ${res.status}`);
   }
 } catch (err) {
-  console.error(`[warn] failed to read BridgeVaultTablesV2 for membership pre-check: ${err?.message ?? err}`);
+  failKnownRootPrecheck(`failed to read known roots table for membership pre-check: ${err?.message ?? err}`);
 }
 
 if (knownRootsHandle) {
@@ -436,10 +454,10 @@ if (knownRootsHandle) {
     } else if (res.status === 404) {
       // Not in table — we need to submit. Fall through.
     } else {
-      console.error(`[warn] known_roots table item GET returned ${res.status}; submitting anyway`);
+      failKnownRootPrecheck(`known_roots table item GET returned ${res.status}`);
     }
   } catch (err) {
-    console.error(`[warn] known_roots membership probe failed: ${err?.message ?? err}; submitting anyway`);
+    failKnownRootPrecheck(`known_roots membership probe failed: ${err?.message ?? err}`);
   }
 }
 
@@ -454,10 +472,10 @@ if (viaDelegate) {
     console.error("--via-delegate requires --delegate-profile NAME");
     process.exit(EXIT_USAGE);
   }
-  functionId = `${bridgePackageAddress}::eunoma_bridge::record_known_root_v2_via_delegate`;
+  functionId = `${bridgePackageAddress}::eunoma_bridge::${useV4 ? "record_known_root_v4_via_delegate" : "record_known_root_v2_via_delegate"}`;
   signerProfile = delegateProfile;
 } else {
-  functionId = `${bridgePackageAddress}::eunoma_bridge::record_known_root_v2`;
+  functionId = `${bridgePackageAddress}::eunoma_bridge::${useV4 ? "record_known_root_v4" : "record_known_root_v2"}`;
   signerProfile = adminProfile;
 }
 const cliArgs = [
@@ -478,31 +496,24 @@ const cliArgs = [
   "100",
 ];
 console.error(`aptos ${cliArgs.join(" ")}`);
-const run = spawnSync("aptos", cliArgs, {
-  cwd: serviceRoot,
-  encoding: "utf8",
-  maxBuffer: 10 * 1024 * 1024,
+const { run, stderrText, stdoutText, txHash } = await runAptosCliWithRetry(cliArgs, {
+  cwd: aptosCliCwd,
   env: process.env,
+  label: "record-known-root",
 });
 if (run.error) {
   console.error(`failed to spawn aptos CLI: ${run.error.message}`);
   process.exit(EXIT_APTOS_SPAWN);
 }
-process.stderr.write(run.stderr || "");
+process.stderr.write(stderrText || "");
 if (run.status !== 0) {
   console.error(`aptos CLI exited with status ${run.status}`);
-  process.stdout.write(run.stdout || "");
+  process.stdout.write(stdoutText || "");
   process.exit(EXIT_APTOS_SPAWN);
 }
-
-function extractTxHash(text) {
-  const m = text.match(/"transaction_hash"\s*:\s*"(0x[0-9a-fA-F]+)"/);
-  return m ? m[1] : null;
-}
-const txHash = extractTxHash(run.stdout || "");
 if (!txHash) {
   console.error("could not parse transaction_hash from aptos CLI output");
-  process.stdout.write(run.stdout || "");
+  process.stdout.write(stdoutText || "");
   process.exit(EXIT_APTOS_SPAWN);
 }
 console.error(`submitted tx ${txHash}; polling for chain confirmation`);

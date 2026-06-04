@@ -6905,6 +6905,147 @@ pub mod vault_state_v2 {
         })
     }
 
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VaultSequenceSyncRequest {
+        pub dkg_epoch: String,
+        pub request_id: String,
+        /// Cross-checked vs trusted package. The worker reads the chain resource
+        /// from trusted_bridge_package, not from this caller-supplied value.
+        pub bridge_package: String,
+        /// Cross-checked vs trusted `BRIDGE_VAULT_ADDRESS`.
+        pub vault: String,
+        /// Cross-checked vs trusted `BRIDGE_ASSET_TYPE`.
+        pub asset_type: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VaultSequenceSyncResponse {
+        pub vault_sequence: u64,
+        pub chain_vault_sequence: u64,
+        pub previous_vault_sequence: u64,
+        pub updated_at_ms: u64,
+        pub idempotent: bool,
+    }
+
+    /// Generic sequence catch-up for entrypoints such as ragequit that advance
+    /// VaultCoreV4.vault_sequence but do not emit the older WithdrawEventV2/V3
+    /// sequence-binding fields. The worker fetches the current chain resource
+    /// from its trusted Aptos node and only moves monotonically to that value.
+    pub async fn run_vault_sequence_sync_v2(
+        state_dir: &Path,
+        trusted_aptos_node_url: &str,
+        trusted_bridge_package: &str,
+        trusted_bridge_vault: &str,
+        trusted_bridge_asset: &str,
+        req: &VaultSequenceSyncRequest,
+        chain_sequence_override: Option<Result<u64, String>>,
+    ) -> Result<VaultSequenceSyncResponse, VaultResyncError> {
+        use VaultResyncError as E;
+
+        if req.dkg_epoch.is_empty() || req.request_id.is_empty() {
+            return Err(E::BadRequest("dkg_epoch_and_request_id_required".to_string()));
+        }
+        if trusted_aptos_node_url.is_empty()
+            || trusted_bridge_package.is_empty()
+            || trusted_bridge_vault.is_empty()
+            || trusted_bridge_asset.is_empty()
+        {
+            return Err(E::Config("worker_missing_bridge_config".to_string()));
+        }
+        let want_pkg = vault_resync_norm_addr(trusted_bridge_package)
+            .ok_or_else(|| E::Config("worker_bridge_package_config_invalid".to_string()))?;
+        if vault_resync_norm_addr(&req.bridge_package).as_deref() != Some(want_pkg.as_str()) {
+            return Err(E::BadRequest("wrong_package".to_string()));
+        }
+        let want_vault = vault_resync_norm_addr(trusted_bridge_vault)
+            .ok_or_else(|| E::Config("worker_bridge_vault_config_invalid".to_string()))?;
+        if vault_resync_norm_addr(&req.vault).as_deref() != Some(want_vault.as_str()) {
+            return Err(E::BadRequest("wrong_vault".to_string()));
+        }
+        let asset_ok = match (
+            vault_resync_norm_addr(trusted_bridge_asset),
+            vault_resync_norm_addr(&req.asset_type),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => vault_resync_norm_hex(trusted_bridge_asset) == vault_resync_norm_hex(&req.asset_type),
+        };
+        if !asset_ok {
+            return Err(E::BadRequest("wrong_asset".to_string()));
+        }
+
+        let existing = load_vault_state_v2(state_dir)
+            .map_err(|e| E::Internal(format!("load_vault_state:{e:?}")))?
+            .ok_or_else(|| E::NotFound("vault_state_not_found".to_string()))?;
+        if existing.dkg_epoch != req.dkg_epoch {
+            return Err(E::BadRequest("stale_dkg_epoch".to_string()));
+        }
+        let previous_seq = existing.vault_sequence;
+        let chain_seq = match chain_sequence_override {
+            Some(Ok(seq)) => seq,
+            Some(Err(e)) => return Err(E::ChainFetch(format!("chain_fetch_failed:{e}"))),
+            None => crate::chain_fetch::fetch_vault_core_sequence_from_chain(
+                trusted_bridge_package,
+                trusted_aptos_node_url,
+            )
+            .await
+            .map_err(|e| E::ChainFetch(format!("chain_fetch_failed:{e}")))?,
+        };
+        if chain_seq < previous_seq {
+            return Err(E::BadRequest("chain_sequence_behind_worker".to_string()));
+        }
+        let now = vault_resync_now_ms();
+        if chain_seq == previous_seq {
+            return Ok(VaultSequenceSyncResponse {
+                vault_sequence: previous_seq,
+                chain_vault_sequence: chain_seq,
+                previous_vault_sequence: previous_seq,
+                updated_at_ms: now,
+                idempotent: true,
+            });
+        }
+
+        let updated = VaultStateFile {
+            vault_sequence: chain_seq,
+            last_resync_at: Some(now),
+            scheme: existing.scheme.clone(),
+            slot: existing.slot,
+            player_id: existing.player_id,
+            dkg_epoch: existing.dkg_epoch.clone(),
+            ca_dkg_transcript_hash: existing.ca_dkg_transcript_hash.clone(),
+            vault_ek_transcript_hash: existing.vault_ek_transcript_hash.clone(),
+            registration_transcript_hash: existing.registration_transcript_hash.clone(),
+            roster_hash: existing.roster_hash.clone(),
+            selected_slots: existing.selected_slots.clone(),
+            vault_ek_hex: existing.vault_ek_hex.clone(),
+            sender_address: existing.sender_address.clone(),
+            asset_type: existing.asset_type.clone(),
+            chain_id: existing.chain_id,
+            aggregate_commitment: existing.aggregate_commitment.clone(),
+            aggregate_response: existing.aggregate_response.clone(),
+            challenge: existing.challenge.clone(),
+            deposit_count_observed: existing.deposit_count_observed,
+            created_at_unix_ms: existing.created_at_unix_ms,
+            worker_transcript_hash: existing.worker_transcript_hash.clone(),
+            init_transcript_hash: existing.init_transcript_hash.clone(),
+            last_bound_tx_hash: existing.last_bound_tx_hash.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&updated)
+            .map_err(|e| E::Internal(format!("encode vault_state_v2:{e}")))?;
+        let file_path = vault_state_file_path(state_dir);
+        write_secret_file_replace(&file_path, &bytes)
+            .map_err(|e| E::Internal(format!("write vault_state_v2:{e:?}")))?;
+
+        Ok(VaultSequenceSyncResponse {
+            vault_sequence: chain_seq,
+            chain_vault_sequence: chain_seq,
+            previous_vault_sequence: previous_seq,
+            updated_at_ms: now,
+            idempotent: false,
+        })
+    }
+
     /// Pure helper: read + parse the on-disk vault-state file for the given state_dir. Returns
     /// `Ok(None)` if the file does not exist; `Err` on any parse/IO failure. Used by 2b's
     /// observer to read the cursor without going through the HTTP endpoint.

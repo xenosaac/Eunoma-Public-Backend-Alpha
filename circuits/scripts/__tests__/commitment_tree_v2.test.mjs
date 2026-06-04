@@ -122,12 +122,12 @@ describe("CommitmentTreeV2 — algebra", () => {
     await assert.rejects(() => t.pathForCommitment(Other.big), /commitment_not_in_tree/);
   });
 
-  it("append rejects deposit_count gap", async () => {
+  it("append rejects leaf_index gap", async () => {
     const t = new CommitmentTreeV2(20);
     const L0 = leafFromIndex(0);
     const L2 = leafFromIndex(2);
     t.append(L0.big, meta(1, { commitmentHex: L0.hex }));
-    assert.throws(() => t.append(L2.big, meta(3, { commitmentHex: L2.hex })), /deposit_count_gap/);
+    assert.throws(() => t.append(L2.big, meta(3, { commitmentHex: L2.hex })), /leaf_index_gap/);
   });
 
   it("append rejects commitmentHex/commitmentBig mismatch", async () => {

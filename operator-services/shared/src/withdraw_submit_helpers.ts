@@ -185,6 +185,13 @@ export interface WithdrawFinalizeAttestationConfig {
  * vaultSequence → withdrawProof → expirySecs).
  */
 export interface FinalizeWithdrawV2CallArgsFields {
+  // V4 (CP5 RC1): asset_addr is the explicit +1 positional routing key, FIRST arg after the
+  // implicit `_relayer: &signer` — mirroring eunoma_bridge.move::withdraw_to_recipient_v2
+  // (`asset_addr: address`). 32-byte Aptos address. The Move entry resolves the registry row
+  // by this asset_addr, status-gates it ACTIVE, and Poseidon-links it to the proof (MA-1).
+  // Field order MUST mirror @eunoma/deop-protocol::WITHDRAW_V2_CALL_ARGS_ORDER byte-for-byte,
+  // which puts `assetAddr` first.
+  assetAddr: HexString;
   // 7 single-32-byte hash/address fields:
   root: HexString;
   nullifierHash: HexString;
@@ -198,6 +205,16 @@ export interface FinalizeWithdrawV2CallArgsFields {
   aspRoot: HexString;
   stateTreeDepth: string;
   aspTreeDepth: string;
+  // V4 (CP2 CP1): change_commitment public[12] — the partial-withdraw remainder-note commitment
+  // (32 zero bytes = full withdraw). Inserted AFTER aspTreeDepth / BEFORE vaultSequence, matching
+  // the withdraw circuit publics + WITHDRAW_V2_CALL_ARGS_ORDER + the Move signature exactly.
+  changeCommitment: HexString;
+  // V4 B-prime partial withdraw: explicit old/withdraw/remainder Pedersen split.
+  // amountPDigest/amountPOld are the spent note (A_old); amountP below remains the
+  // actual CA transfer amount (W); amountPRem is the change leg (A_rem).
+  amountPDigest: HexString;
+  amountPOld: HexString[];
+  amountPRem: HexString[];
   // u64 vaultSequence, then variable-length proof, then u64 expirySecs (matches Move
   // signature and WITHDRAW_V2_CALL_ARGS_ORDER):
   vaultSequence: string;
@@ -656,6 +673,9 @@ export function assembleWithdrawV2CallArgs(
   }
   // Defensive shape validation. Mirrors @eunoma/deop-protocol::parseWithdrawV2CallArgs but
   // operates directly on the strongly-typed projection (no need to recurse from JSON).
+  // V4 (CP5 RC1): asset_addr is a 32-byte Aptos address, validated FIRST (it is the leading
+  // positional call-arg per WITHDRAW_V2_CALL_ARGS_ORDER + the Move signature).
+  hex32("assetAddr", fields.assetAddr);
   hex32("root", fields.root);
   hex32("nullifierHash", fields.nullifierHash);
   hex32("recipient", fields.recipient);
@@ -667,6 +687,11 @@ export function assembleWithdrawV2CallArgs(
   hex32("aspRoot", fields.aspRoot);
   decimalU64("stateTreeDepth", fields.stateTreeDepth);
   decimalU64("aspTreeDepth", fields.aspTreeDepth);
+  // V4 (CP2 CP1): change_commitment public[12], a 32-byte Fr (32 zero bytes = full withdraw).
+  hex32("changeCommitment", fields.changeCommitment);
+  hex32("amountPDigest", fields.amountPDigest);
+  hexArray("amountPOld", fields.amountPOld, { allowEmpty: false });
+  hexArray("amountPRem", fields.amountPRem, { allowEmpty: false });
   // Codex M5b P3: WITHDRAW_V2_CALL_ARGS_ORDER puts withdrawProof BEFORE expirySecs.
   decimalU64("vaultSequence", fields.vaultSequence);
   // Stage 4 A6 split withdraw: "0x" is valid only after prepare_withdraw_proof_v2
@@ -698,6 +723,8 @@ export function assembleWithdrawV2CallArgs(
   // a 28th field to FinalizeWithdrawV2CallArgsFields breaks the keyof exhaustiveness
   // check above; reordering breaks the `expectFieldOrderMatches` killer test.
   return {
+    // V4 (CP5 RC1): assetAddr FIRST — matches WITHDRAW_V2_CALL_ARGS_ORDER + the Move signature.
+    assetAddr: fields.assetAddr,
     root: fields.root,
     nullifierHash: fields.nullifierHash,
     recipient: fields.recipient,
@@ -708,6 +735,10 @@ export function assembleWithdrawV2CallArgs(
     aspRoot: fields.aspRoot,
     stateTreeDepth: fields.stateTreeDepth,
     aspTreeDepth: fields.aspTreeDepth,
+    changeCommitment: fields.changeCommitment,
+    amountPDigest: fields.amountPDigest,
+    amountPOld: fields.amountPOld,
+    amountPRem: fields.amountPRem,
     vaultSequence: fields.vaultSequence,
     withdrawProof: fields.withdrawProof,
     expirySecs: fields.expirySecs,

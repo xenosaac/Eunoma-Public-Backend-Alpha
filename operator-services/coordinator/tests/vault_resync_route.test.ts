@@ -103,12 +103,16 @@ function makeForwarder(opts: {
       };
     }
     const b = body as Record<string, unknown>;
+    const vaultSequence =
+      typeof b.expectedNextSequence === "number" ? b.expectedNextSequence : 2;
     return {
       slot,
       ok: true,
       statusCode: 200,
       body: {
-        vaultSequence: b.expectedNextSequence,
+        vaultSequence,
+        chainVaultSequence: vaultSequence,
+        previousVaultSequence: Math.max(0, vaultSequence - 1),
         updatedAtMs: 1,
         idempotent: false,
         legacyBackfill: false,
@@ -254,6 +258,67 @@ describe("M11 — POST /v2/vault/resync_*", () => {
     expect(res.statusCode).toBe(200);
   });
 
+  it("sync_sequence: 7-of-7 fan-out uses generic sequence-sync worker path", async () => {
+    const calls: Array<{ path: string; slot: number; body: unknown }> = [];
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster: dkgRoster(),
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
+      singleNodeForwarder: makeForwarder({ recordCalls: calls }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault/sync_sequence",
+      payload: {
+        dkgEpoch: "1",
+        requestId: "m11-seq-test",
+        bridgePackage: TEST_PKG,
+        vault: TEST_BRIDGE_VAULT_ADDRESS,
+        assetType: TEST_BRIDGE_ASSET_TYPE,
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.ok).toBe(true);
+    expect(body.trigger).toBe("sync_sequence");
+    expect(body.summary.okSlots).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(new Set(calls.map((c) => c.path))).toEqual(new Set(["/v2/vault/sync_sequence"]));
+    for (const c of calls) {
+      expect(c.body).toMatchObject({
+        dkgEpoch: "1",
+        requestId: "m11-seq-test",
+        bridgePackage: TEST_PKG,
+        vault: TEST_BRIDGE_VAULT_ADDRESS,
+        assetType: TEST_BRIDGE_ASSET_TYPE,
+      });
+      expect(c.body).not.toHaveProperty("txHash");
+      expect(c.body).not.toHaveProperty("trigger");
+    }
+  });
+
+  it("sync_sequence: sub-threshold worker sync returns 502", async () => {
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster: dkgRoster(),
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
+      singleNodeForwarder: makeForwarder({ failSlots: [4, 5, 6] }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault/sync_sequence",
+      payload: {
+        dkgEpoch: "1",
+        requestId: "m11-seq-subthreshold",
+        bridgePackage: TEST_PKG,
+        vault: TEST_BRIDGE_VAULT_ADDRESS,
+        assetType: TEST_BRIDGE_ASSET_TYPE,
+      },
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().summary.okSlots).toEqual([0, 1, 2, 3]);
+  });
+
   it("rejects body with caDkgV2Roster (SSRF defense)", async () => {
     const { server } = buildCoordinatorServer({
       caDkgV2Roster: dkgRoster(),
@@ -291,6 +356,38 @@ describe("M11 — POST /v2/vault/resync_*", () => {
     expect(t.trigger).toBe("after_withdraw");
     expect(t.summary.okSlots).toEqual([0, 1, 2, 3, 4, 5, 6]);
     // Transcript must carry public hashes only — no forbidden plaintext keys.
+    const flat = JSON.stringify(t);
+    for (const tok of ['"amount"', '"secret"', '"nullifier"', '"dk"', '"blind', "leafIndex"]) {
+      expect(flat.includes(tok)).toBe(false);
+    }
+  });
+
+  it("sync_sequence persists an audit transcript under stateRoot/coordinator/vault_sequence_sync", async () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "eunoma-seq-sync-"));
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster: dkgRoster(),
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
+      stateRoot,
+      singleNodeForwarder: makeForwarder(),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/vault/sync_sequence",
+      payload: {
+        dkgEpoch: "1",
+        requestId: "m11-seq-persist",
+        bridgePackage: TEST_PKG,
+        vault: TEST_BRIDGE_VAULT_ADDRESS,
+        assetType: TEST_BRIDGE_ASSET_TYPE,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const path = join(stateRoot, "coordinator", "vault_sequence_sync", "1__m11-seq-persist.json");
+    expect(existsSync(path)).toBe(true);
+    const t = JSON.parse(readFileSync(path, "utf8"));
+    expect(t.trigger).toBe("sync_sequence");
+    expect(t.summary.okSlots).toEqual([0, 1, 2, 3, 4, 5, 6]);
     const flat = JSON.stringify(t);
     for (const tok of ['"amount"', '"secret"', '"nullifier"', '"dk"', '"blind', "leafIndex"]) {
       expect(flat.includes(tok)).toBe(false);

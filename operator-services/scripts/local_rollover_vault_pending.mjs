@@ -29,15 +29,17 @@
 //   31  aptos CLI spawn or non-zero exit
 //   32  fullnode unreachable
 // =============================================================================================
-import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runAptosCliWithRetry } from "./_lib/aptos_cli_retry.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 // Mirrors local_record_known_root_v2.mjs: aptos CLI requires .aptos/config.yaml
 // in cwd. operator-services/.aptos/config.yaml holds the testnet-* profiles on
-// alpha box, so spawn the CLI from there regardless of the wrapper's cwd.
+// alpha box, so default there. Local cluster envs may point APTOS_CLI_CWD at the
+// repo root when that is where the usable .aptos/config.yaml lives.
 const serviceRoot = resolve(scriptDir, "..");
+const aptosCliCwd = process.env.APTOS_CLI_CWD ? resolve(process.env.APTOS_CLI_CWD) : serviceRoot;
 
 const EXIT_SUCCESS = 0;
 const EXIT_USAGE = 2;
@@ -143,26 +145,16 @@ const cliArgs = [
   gasUnitPrice,
 ];
 console.error(`aptos ${cliArgs.join(" ")}`);
-const run = spawnSync("aptos", cliArgs, {
-  cwd: serviceRoot,
-  encoding: "utf8",
-  maxBuffer: 10 * 1024 * 1024,
+const { run, stderrText, stdoutText, combinedOutput, txHash } = await runAptosCliWithRetry(cliArgs, {
+  cwd: aptosCliCwd,
   env: process.env,
+  label: "rollover",
 });
 if (run.error) {
   console.error(`failed to spawn aptos CLI: ${run.error.message}`);
   process.exit(EXIT_APTOS_SPAWN);
 }
-process.stderr.write(run.stderr || "");
-
-function extractTxHash(text) {
-  const m =
-    text.match(/"transaction_hash"\s*:\s*"(0x[0-9a-fA-F]+)"/) ??
-    text.match(/\/txn\/(0x[0-9a-fA-F]+)(?:\?|$)/);
-  return m ? m[1] : null;
-}
-const combinedOutput = `${run.stdout || ""}\n${run.stderr || ""}`;
-const txHash = extractTxHash(combinedOutput);
+process.stderr.write(stderrText || "");
 if (run.status !== 0) {
   if (/E_NOTHING_TO_ROLLOVER|There are no pending transfers to roll over/i.test(combinedOutput)) {
     console.log(
@@ -180,12 +172,12 @@ if (run.status !== 0) {
     process.exit(EXIT_SUCCESS);
   }
   console.error(`aptos CLI exited with status ${run.status}`);
-  process.stdout.write(run.stdout || "");
+  process.stdout.write(stdoutText || "");
   process.exit(EXIT_APTOS_SPAWN);
 }
 if (!txHash) {
   console.error("could not parse transaction_hash from aptos CLI output");
-  process.stdout.write(run.stdout || "");
+  process.stdout.write(stdoutText || "");
   process.exit(EXIT_APTOS_SPAWN);
 }
 console.error(`submitted tx ${txHash}; polling for chain confirmation`);
@@ -240,6 +232,24 @@ if (!tx) {
   process.exit(EXIT_FULLNODE_UNREACHABLE);
 }
 if (tx.success !== true || (tx.vm_status && tx.vm_status !== "Executed successfully")) {
+  if (/E_NOTHING_TO_ROLLOVER|There are no pending transfers to roll over/i.test(String(tx.vm_status ?? ""))) {
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          status: "nothing_to_rollover",
+          txHash,
+          version: tx.version,
+          gasUsed: tx.gas_used,
+          vmStatus: tx.vm_status,
+          functionId,
+        },
+        null,
+        2,
+      ),
+    );
+    process.exit(EXIT_SUCCESS);
+  }
   console.error(
     `tx ${txHash} reverted on chain: success=${tx.success} vm_status=${tx.vm_status}`,
   );

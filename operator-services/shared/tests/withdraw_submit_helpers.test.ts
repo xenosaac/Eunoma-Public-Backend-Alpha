@@ -20,6 +20,8 @@ const HEXN = (n: number, seed: number): string =>
 
 function validCallArgsFields(): FinalizeWithdrawV2CallArgsFields {
   return {
+    // V4 (CP5 RC1): assetAddr is the leading positional call-arg (32-byte Aptos address).
+    assetAddr: HEX32(0x0a),
     root: HEX32(0x10),
     nullifierHash: HEX32(0x11),
     recipient: HEX32(0x12),
@@ -30,6 +32,10 @@ function validCallArgsFields(): FinalizeWithdrawV2CallArgsFields {
     aspRoot: HEX32(0x17),
     stateTreeDepth: "4",
     aspTreeDepth: "3",
+    changeCommitment: HEX32(0x18), // V4 (CP2 CP1) public[12]; 32 zero bytes = full withdraw
+    amountPDigest: HEX32(0x19),
+    amountPOld: Array.from({ length: 4 }, (_, i) => HEX32(0x1a + i)),
+    amountPRem: Array.from({ length: 4 }, (_, i) => HEX32(0x1e + i)),
     vaultSequence: "42",
     expirySecs: "1800000000",
     withdrawProof: HEXN(192, 0x20),
@@ -250,7 +256,7 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
     }
   });
 
-  it("assembles a 30-field WithdrawV2CallArgs from a complete finalize transcript", () => {
+  it("assembles a 32-field WithdrawV2CallArgs from a complete finalize transcript", () => {
     const finalize: FinalizeTranscript = {
       scheme: "mpcca_withdraw_v2_finalize",
       dkgEpoch: "1",
@@ -260,8 +266,11 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
     const result = assembleWithdrawV2CallArgs(finalize);
     expect(isNotImplementedPhasePassthrough(result)).toBe(false);
     if (!isNotImplementedPhasePassthrough(result)) {
-      // 30-field projection — assert ALL keys are present.
+      // 32-field projection (V4 CP5 RC1: +assetAddr; V4 CP2 CP1: +changeCommitment) — assert ALL
+      // keys are present.
       const keys = Object.keys(result);
+      expect(keys).toContain("assetAddr");
+      expect(keys[0]).toBe("assetAddr"); // leading positional routing key
       expect(keys).toContain("root");
       expect(keys).toContain("nullifierHash");
       expect(keys).toContain("recipient");
@@ -272,6 +281,10 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
       expect(keys).toContain("aspRoot");
       expect(keys).toContain("stateTreeDepth");
       expect(keys).toContain("aspTreeDepth");
+      expect(keys).toContain("changeCommitment");
+      expect(keys).toContain("amountPDigest");
+      expect(keys).toContain("amountPOld");
+      expect(keys).toContain("amountPRem");
       expect(keys).toContain("vaultSequence");
       expect(keys).toContain("withdrawProof");
       expect(keys).toContain("expirySecs");
@@ -292,7 +305,7 @@ describe("assembleWithdrawV2CallArgs — NotImplemented passthrough vs full asse
       expect(keys).toContain("sigmaProtoComm");
       expect(keys).toContain("sigmaProtoResp");
       expect(keys).toContain("memo");
-      expect(keys.length).toBe(30);
+      expect(keys.length).toBe(35);
     }
   });
 

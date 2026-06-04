@@ -2426,6 +2426,11 @@ export interface MpccaWithdrawFrostAttestStartRequest extends MpccaWithdrawBaseR
   aspRoot: HexString;
   stateTreeDepth: number;
   aspTreeDepth: number;
+  /** V4 B-prime: change commitment plus spent-note/remainder conservation publics. */
+  changeCommitment: HexString;
+  amountPDigest: HexString;
+  amountPOld: HexString[];
+  amountPRem: HexString[];
 }
 
 /**
@@ -2506,6 +2511,22 @@ export function parseMpccaWithdrawFrostAttestStartRequest(
   }
   // ASP: asp_root (32B Fr) + the 2 LeanIMT depths (1..32). Public inputs of the withdraw proof.
   const aspRoot = requireHex(obj, "aspRoot", 32);
+  const changeCommitment = requireHex(obj, "changeCommitment", 32);
+  const amountPDigest = requireHex(obj, "amountPDigest", 32);
+  const amountPOld = requireFixedLengthHexVec(
+    obj,
+    "amountPOld",
+    4,
+    32,
+    "INVALID_WITHDRAW_FIELD_SHAPE",
+  );
+  const amountPRem = requireFixedLengthHexVec(
+    obj,
+    "amountPRem",
+    4,
+    32,
+    "INVALID_WITHDRAW_FIELD_SHAPE",
+  );
   const stateTreeDepthRaw = obj.stateTreeDepth;
   const aspTreeDepthRaw = obj.aspTreeDepth;
   if (
@@ -2524,6 +2545,10 @@ export function parseMpccaWithdrawFrostAttestStartRequest(
     aspRoot,
     stateTreeDepth: stateTreeDepthRaw,
     aspTreeDepth: aspTreeDepthRaw,
+    changeCommitment,
+    amountPDigest,
+    amountPOld,
+    amountPRem,
     attestationConfig: {
       bridge,
       vault,

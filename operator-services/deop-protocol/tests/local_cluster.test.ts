@@ -57,6 +57,56 @@ describe("local cluster planning", () => {
     }
   });
 
+  it("propagates bridge vault and asset config to coordinator and workers", () => {
+    const bridgeVaultAddress = `0x${"9415c478".repeat(8)}`;
+    const bridgeAssetType = "0xa";
+    const plan = buildLocalClusterPlan({
+      vaultEk: h32("a"),
+      bridgeVaultAddress,
+      bridgeAssetType,
+      frost: {
+        groupPublicKey: h32("b"),
+        verifyingShares: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({
+          slot,
+          frostVerifyingShare: String(slot + 1).repeat(64),
+        })),
+      },
+      randomHex: deterministicHex(),
+    });
+
+    expect(plan.coordinator.env.BRIDGE_VAULT_ADDRESS).toBe(bridgeVaultAddress);
+    expect(plan.coordinator.env.BRIDGE_ASSET_TYPE).toBe(bridgeAssetType);
+    for (const worker of plan.workers) {
+      expect(worker.env.BRIDGE_VAULT_ADDRESS).toBe(bridgeVaultAddress);
+      expect(worker.env.BRIDGE_ASSET_TYPE).toBe(bridgeAssetType);
+    }
+  });
+
+  it("propagates local cluster signer profiles for route refresh and relayer submit", () => {
+    const plan = buildLocalClusterPlan({
+      vaultEk: h32("a"),
+      adminProfile: "bridge-user",
+      relayerProfile: "testnet-asp-relayer",
+      refreshSignerMode: "admin",
+      refreshAdminProfile: "bridge-user",
+      refreshAspRecorderProfile: "bridge-user",
+      frost: {
+        groupPublicKey: h32("b"),
+        verifyingShares: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({
+          slot,
+          frostVerifyingShare: String(slot + 1).repeat(64),
+        })),
+      },
+      randomHex: deterministicHex(),
+    });
+
+    expect(plan.coordinator.env.ADMIN_PROFILE).toBe("bridge-user");
+    expect(plan.coordinator.env.EUNOMA_REFRESH_SIGNER_MODE).toBe("admin");
+    expect(plan.coordinator.env.EUNOMA_REFRESH_ADMIN_PROFILE).toBe("bridge-user");
+    expect(plan.coordinator.env.EUNOMA_REFRESH_ASP_RECORDER_PROFILE).toBe("bridge-user");
+    expect(plan.relayer.env.RELAYER_PROFILE).toBe("testnet-asp-relayer");
+  });
+
   it("keeps bearer tokens out of the public roster", () => {
     const plan = buildLocalClusterPlan({
       vaultEk: h32("a"),
@@ -117,6 +167,9 @@ describe("local cluster planning", () => {
     }
     expect(plan.frostDkgV2RosterHash).toBeDefined();
     expect(plan.frostDkgV2RosterHash).not.toBe(plan.caDkgV2RosterHash);
+    expect(plan.coordinator.env.CA_DKG_V2_ROSTER_JSON_PATH).toBe(
+      ".agent-local/eunoma-v2/cluster/ca-dkg-v2-roster.json",
+    );
     expect(plan.coordinator.env.FROST_DKG_V2_ROSTER_JSON).toBeDefined();
     for (const node of plan.nodes) {
       expect(node.env.FROST_DKG_V2_ROSTER_JSON).toBeDefined();

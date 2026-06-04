@@ -68,6 +68,84 @@ template Compose8() {
     out <== top.out;
 }
 
+// =============================================================================================
+// DepositLabel — V4 0xbow STABLE-LABEL gadget (D6, 2026-06-01).
+//
+// LOCKED SPEC — deposit_binding.circom + ragequit.circom MUST instantiate this template with the
+// SAME signal wiring, and the off-chain ASP builder + Move recompute MUST replicate it byte-for-byte
+// (Poseidon hash_3 then hash_2 ONLY — uses the existing circomlib Poseidon(3)/Poseidon(2) gadgets;
+// NO keccak in-circuit). Move side mirrors via eunoma_pool::poseidon_bn254::{hash_3,hash_2}, which
+// are Poseidon([0,a,b,c]) / Poseidon([0,a,b]) — byte-identical to circomlib Poseidon(3)/Poseidon(2).
+//
+//   label = hash_2( hash_3(label_scope0, label_scope1, label_scope2), label_nonce )
+//
+//   - The inner Poseidon(3) hashes a 3-element DEPOSIT-SCOPE tuple
+//     (label_scope0, label_scope1, label_scope2). The scope identifies the pool/epoch/domain
+//     under which the deposit was approved (0xbow "pool_scope"); it is the same for every deposit
+//     curated under one ASP scope.
+//   - The outer Poseidon(2) folds in label_nonce — the per-DEPOSIT nonce that makes each deposit's
+//     label unique and unlinkable. Fixed once at deposit time; every descendant (change note) of a
+//     deposit shares ONE label so a still-approved label is re-listed in every fresh ASP set
+//     (honest users never age out) and revocation = OMIT the label (descendants die automatically).
+//
+// FOLD RULE (how `label` enters the commitment so the V4 commitment preimage breaks
+// label≡commitment while keeping the withdraw circuit's Compose5 BYTE-IDENTICAL):
+//
+//   secret_bound = hash_2(secret_raw, label)              // bind the label into the secret slot
+//   commitment   = Compose5(nullifier, secret_bound, asset_id, amount_p_digest, POOL_ID)
+//
+//   * The depositor PERSISTS `secret_bound` as the note's `secret` field. WITHDRAW then feeds
+//     `secret_bound` directly into its UNCHANGED Compose5 (no label gadget, no label recompute in
+//     withdraw → label stays PRIVATE and zero-cost in withdraw, matching CP0). DEPOSIT and RAGEQUIT
+//     both instantiate BindSecretWithLabel from raw (secret_raw, label_scope[3], label_nonce) so
+//     their commitment recompute matches the deposit leaf byte-for-byte.
+//   * `label` is a deposit-scoped PRIVATE input in deposit + ragequit (deposit publics stay 5 / IC 6;
+//     ragequit publics stay 4 / IC 5). The ASP builder recomputes each per-deposit label off-chain
+//     from (label_scope, label_nonce) to populate the ASP set leaves.
+//
+// CONSTRAINT COST: one Poseidon(3) + one Poseidon(2) for the label, plus one Poseidon(2) for the
+// secret fold. Measured upper-bound delta (CP0 deposit_label probe) = +1,122 over base Compose5.
+template DepositLabel() {
+    signal input label_scope[3];
+    signal input label_nonce;
+    signal output label;
+
+    component inner = Poseidon(3);   // hash_3 over the deposit-scope tuple
+    inner.inputs[0] <== label_scope[0];
+    inner.inputs[1] <== label_scope[1];
+    inner.inputs[2] <== label_scope[2];
+
+    component outer = Poseidon(2);   // hash_2 folding in the per-deposit nonce
+    outer.inputs[0] <== inner.out;
+    outer.inputs[1] <== label_nonce;
+
+    label <== outer.out;
+}
+
+// BindSecretWithLabel — folds the stable label into the secret slot of the Compose5 commitment
+// preimage. `secret_bound` is what the depositor persists as the note secret; the withdraw circuit
+// consumes it directly. deposit_binding.circom + ragequit.circom instantiate this; the witness
+// builders (CP3) mirror `hash_2(secret_raw, hash_2(hash_3(scope), nonce))` byte-for-byte.
+template BindSecretWithLabel() {
+    signal input secret_raw;
+    signal input label_scope[3];
+    signal input label_nonce;
+    signal output secret_bound;
+    signal output label;
+
+    component lbl = DepositLabel();
+    lbl.label_scope[0] <== label_scope[0];
+    lbl.label_scope[1] <== label_scope[1];
+    lbl.label_scope[2] <== label_scope[2];
+    lbl.label_nonce <== label_nonce;
+    label <== lbl.label;
+
+    component fold = Poseidon(2);   // hash_2(secret_raw, label)
+    fold.inputs[0] <== secret_raw;
+    fold.inputs[1] <== lbl.label;
+    secret_bound <== fold.out;
+}
+
 // Hardened LeanIMT inclusion (dynamic depth, Poseidon hash_2 nodes).
 //
 // LeanIMT semantics: a node whose sibling is empty (==0) propagates up unchanged; a node

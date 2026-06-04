@@ -106,6 +106,50 @@ template Compose8() {
     out <== top.out;
 }
 
+// V4 0xbow STABLE-LABEL (D6, 2026-06-01). KEEP BYTE-IDENTICAL to eunoma_templates.circom
+// DepositLabel + BindSecretWithLabel (this circuit does not `include` the shared templates).
+//   label        = hash_2(hash_3(label_scope0,label_scope1,label_scope2), label_nonce)
+//   secret_bound = hash_2(secret_raw, label)
+// The depositor persists `secret_bound` as the note secret; the withdraw circuit feeds it directly
+// (label PRIVATE + zero-cost in withdraw). Ragequit recomputes the same secret_bound from raw
+// inputs so its commitment matches this deposit leaf byte-for-byte. Move mirrors via hash_3/hash_2.
+template DepositLabel() {
+    signal input label_scope[3];
+    signal input label_nonce;
+    signal output label;
+
+    component inner = Poseidon(3);
+    inner.inputs[0] <== label_scope[0];
+    inner.inputs[1] <== label_scope[1];
+    inner.inputs[2] <== label_scope[2];
+
+    component outer = Poseidon(2);
+    outer.inputs[0] <== inner.out;
+    outer.inputs[1] <== label_nonce;
+
+    label <== outer.out;
+}
+
+template BindSecretWithLabel() {
+    signal input secret_raw;
+    signal input label_scope[3];
+    signal input label_nonce;
+    signal output secret_bound;
+    signal output label;
+
+    component lbl = DepositLabel();
+    lbl.label_scope[0] <== label_scope[0];
+    lbl.label_scope[1] <== label_scope[1];
+    lbl.label_scope[2] <== label_scope[2];
+    lbl.label_nonce <== label_nonce;
+    label <== lbl.label;
+
+    component fold = Poseidon(2);
+    fold.inputs[0] <== secret_raw;
+    fold.inputs[1] <== lbl.label;
+    secret_bound <== fold.out;
+}
+
 template DepositBinding() {
     // Phase F W3 — hardcoded chain_id + pool_id (testnet variant).
     var CHAIN_ID = 2;
@@ -120,11 +164,15 @@ template DepositBinding() {
 
     // -------- private inputs --------
     signal input nullifier;
-    signal input secret;
+    signal input secret;             // RAW secret entropy; the persisted note secret is secret_bound below.
     signal input deposit_blind;
     // 4 × 32B compressed Ristretto amount_p split into 2 × 128-bit LE limbs each.
     // Index order MUST match Move-side compute_amount_p_digest (file:line tbd in Stage 3).
     signal input amount_p_limbs[8];
+    // V4 0xbow STABLE-LABEL inputs (PRIVATE — deposit publics stay 5, IC stays 6). The ASP builder
+    // recomputes each per-deposit label off-chain from (label_scope, label_nonce).
+    signal input label_scope[3];
+    signal input label_nonce;
 
     // 1. Range-check each limb fits in 128 bits (compressed Ristretto byte halves).
     component limb_bits[8];
@@ -141,10 +189,20 @@ template DepositBinding() {
     }
     digest.out === amount_p_digest;
 
-    // 3. commitment = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID).
+    // 3a. V4 D6: derive the stable label + fold it into the secret slot.
+    //     secret_bound = hash_2(secret, label); label = hash_2(hash_3(label_scope), label_nonce).
+    component bind = BindSecretWithLabel();
+    bind.secret_raw <== secret;
+    bind.label_scope[0] <== label_scope[0];
+    bind.label_scope[1] <== label_scope[1];
+    bind.label_scope[2] <== label_scope[2];
+    bind.label_nonce <== label_nonce;
+
+    // 3b. commitment = Compose5(nullifier, secret_bound, asset_id, amount_p_digest, POOL_ID).
+    //     V4: the 2nd slot is the LABEL-BOUND secret (breaks the old label≡commitment invariant).
     component cmt = Compose5();
     cmt.in[0] <== nullifier;
-    cmt.in[1] <== secret;
+    cmt.in[1] <== bind.secret_bound;
     cmt.in[2] <== asset_id;
     cmt.in[3] <== amount_p_digest;
     cmt.in[4] <== POOL_ID;

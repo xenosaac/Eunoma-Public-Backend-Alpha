@@ -13,16 +13,14 @@
  * cheap when there's no work to do. The public `commitment_tree_v2.json` is replaced only
  * after the staged root is route-ready; on failure the old public root remains visible.
  *
- * Concurrency model: **coalesce-on-contention**. If a previous deposit's pipeline is still
- * running when a new deposit arrives, `triggerBridgeMaintenance` is a no-op for the new
- * deposit. Rationale: the wrapper durably queues concrete observed tx hashes before it
- * stages the tree, and the GraphQL fetch remains a backfill source. Worst case a deposit
- * that arrives after both the most recent triggered pipeline started AND the most recent
- * commitment-tree build completed is picked up by the next trigger or timer cycle.
+ * Concurrency model: **single-flight with queued rerun**. If a previous deposit's pipeline is
+ * still running when a new deposit arrives, the new trigger is coalesced into one pending rerun
+ * instead of starting a second concurrent shell script. The active run finishes, then the pending
+ * rerun starts immediately and picks up any leaves observed after the active run staged its tree.
  *
  * Error handling: this runs after the HTTP reply has flushed, so there is
  * no caller to bubble errors to. ALL failure modes are caught and logged; the function NEVER
- * throws. The next pipeline trigger (or the systemd timer) is the retry mechanism.
+ * throws. A queued rerun, the next pipeline trigger, or the systemd timer is the retry mechanism.
  *
  * The triggering deposit tx hash is forwarded into the wrapper when available. This closes
  * the REST-vs-indexer race: observe_deposit proves the concrete tx by REST before GraphQL
@@ -30,8 +28,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 
 export interface BridgeMaintenanceContext {
@@ -53,30 +51,90 @@ export interface BridgeMaintenanceContext {
    * the just-confirmed deposit while waiting for indexer catch-up.
    */
   extraDepositTxHashes?: string[];
+  /**
+   * CP5 RC4: state root holding the init_v4 asset registry
+   * (`<stateRoot>/coordinator/asset_registry.json`). The rollover/normalize loop filters this
+   * registry to `status==ACTIVE` so a DORMANT stablecoin can never abort the batch. Defaults to
+   * `EUNOMA_STATE_ROOT` when omitted (production wiring); tests inject an explicit path.
+   */
+  stateRoot?: string;
 }
 
 /**
- * In-flight tracker for coalesce-on-contention semantics. A single Promise per server
- * instance — if a pipeline is already running, new triggers no-op.
+ * CP5 RC4: one registry row as persisted by the init_v4 artifact. Only the routing fields the
+ * rollover/normalize loop needs (asset_addr + lifecycle status); no secrets.
  */
-let pipelineInFlight: Promise<void> | null = null;
+interface MaintenanceAssetRow {
+  metadata: string; // asset_addr (FA Metadata object-address)
+  status: "DORMANT" | "ACTIVE" | "PAUSED";
+}
 
 /**
- * Trigger the bridge maintenance pipeline asynchronously. Returns immediately. If a pipeline
- * is already in flight, the call is a no-op (coalesce-on-contention).
+ * CP5 RC4: load the init_v4 asset registry and return ONLY the ACTIVE asset addresses. Returns:
+ *   - `string[]` (possibly empty) when the registry artifact is present + parseable;
+ *   - `null` when the registry is absent / unreadable / malformed (caller falls back to the
+ *     legacy single-asset behavior — spawn the wrapper without an ACTIVE-asset filter — so a
+ *     not-yet-seeded registry never bricks maintenance).
+ *
+ * The filter is the load-bearing RC4 invariant: a DORMANT (or PAUSED) stablecoin is dropped from
+ * the rollover/normalize batch, so its un-activated CA store can't make the whole cycle abort.
+ */
+export function loadActiveAssetAddrs(stateRoot: string | undefined): string[] | null {
+  if (!stateRoot) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(join(stateRoot, "coordinator", "asset_registry.json"), "utf8"));
+  } catch {
+    return null;
+  }
+  const rows = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" && Array.isArray((raw as { assets?: unknown }).assets)
+      ? (raw as { assets: unknown[] }).assets
+      : null;
+  if (!rows) return null;
+  const active: string[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+    const r = row as Record<string, unknown>;
+    if (typeof r.metadata !== "string") return null;
+    const s = r.status;
+    // Early-return-on-non-ACTIVE: only status===ACTIVE (1 / "ACTIVE") rows enter the batch.
+    if (s === 1 || s === "ACTIVE") active.push(r.metadata);
+  }
+  return active;
+}
+
+/**
+ * In-flight tracker for single-flight semantics. A single Promise per server instance prevents
+ * concurrent shell-script runs. New triggers received while the script is active are merged into
+ * `pipelineRerunPending` and drained after the active run exits.
+ */
+let pipelineInFlight: Promise<void> | null = null;
+let pipelineRerunPending: BridgeMaintenanceContext | null = null;
+
+/**
+ * Trigger the bridge maintenance pipeline asynchronously. Returns immediately. If a pipeline is
+ * already in flight, the call schedules one follow-up rerun instead of starting a concurrent job.
  *
  * Safe to call from a response `finish` handler — never throws, never blocks,
  * always logs.
  */
 export function triggerBridgeMaintenance(ctx: BridgeMaintenanceContext): void {
   if (pipelineInFlight) {
+    pipelineRerunPending = mergeRerunContext(pipelineRerunPending, ctx);
     ctx.logger.info(
-      { module: "bridge_maintenance_pipeline" },
-      "bridge maintenance pipeline already in flight — coalescing trigger (no-op)",
+      {
+        module: "bridge_maintenance_pipeline",
+        pendingExtraDepositTxHashCount: normalizeTxHashes(
+          pipelineRerunPending.extraDepositTxHashes ?? [],
+        ).length,
+      },
+      "bridge maintenance pipeline already in flight — queued rerun",
     );
     return;
   }
-  pipelineInFlight = runPipeline(ctx)
+  pipelineInFlight = drainPipelineRuns(ctx)
     .catch((err) => {
       // Defense in depth — `runPipeline` should never reject because it catches its own
       // errors and logs them, but an async response-finish trigger can still surface
@@ -88,6 +146,7 @@ export function triggerBridgeMaintenance(ctx: BridgeMaintenanceContext): void {
     })
     .finally(() => {
       pipelineInFlight = null;
+      pipelineRerunPending = null;
     });
 }
 
@@ -97,6 +156,52 @@ export function triggerBridgeMaintenance(ctx: BridgeMaintenanceContext): void {
  */
 export function __resetPipelineInFlightForTests(): void {
   pipelineInFlight = null;
+  pipelineRerunPending = null;
+}
+
+async function drainPipelineRuns(initialCtx: BridgeMaintenanceContext): Promise<void> {
+  let nextCtx: BridgeMaintenanceContext | null = initialCtx;
+  while (nextCtx) {
+    const currentCtx = nextCtx;
+    pipelineRerunPending = null;
+    await runPipeline(currentCtx);
+    const pendingCtx = consumePendingRerun();
+    if (pendingCtx) {
+      pendingCtx.logger.info(
+        {
+          module: "bridge_maintenance_pipeline",
+          extraDepositTxHashCount: normalizeTxHashes(
+            pendingCtx.extraDepositTxHashes ?? [],
+          ).length,
+        },
+        "bridge maintenance pipeline draining queued rerun",
+      );
+    }
+    nextCtx = pendingCtx;
+  }
+}
+
+function consumePendingRerun(): BridgeMaintenanceContext | null {
+  const pendingCtx = pipelineRerunPending;
+  pipelineRerunPending = null;
+  return pendingCtx;
+}
+
+function mergeRerunContext(
+  existing: BridgeMaintenanceContext | null,
+  incoming: BridgeMaintenanceContext,
+): BridgeMaintenanceContext {
+  if (!existing) return incoming;
+  return {
+    ...existing,
+    repoRoot: incoming.repoRoot || existing.repoRoot,
+    logger: incoming.logger,
+    stateRoot: incoming.stateRoot ?? existing.stateRoot,
+    extraDepositTxHashes: normalizeTxHashes([
+      ...(existing.extraDepositTxHashes ?? []),
+      ...(incoming.extraDepositTxHashes ?? []),
+    ]),
+  };
 }
 
 /**
@@ -109,10 +214,34 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
   const absoluteScriptPath = resolve(repoRoot, scriptPath);
   const logger = ctx.logger;
   const extraDepositTxHashes = normalizeTxHashes(ctx.extraDepositTxHashes ?? []);
+
+  // CP5 RC4: filter the asset registry to status==ACTIVE BEFORE spawning the rollover/normalize
+  // wrapper. A DORMANT (or PAUSED) stablecoin must NOT be able to abort the batch — only ACTIVE
+  // assets enter the loop. Three cases:
+  //   - registry present + has ACTIVE assets → forward EUNOMA_ACTIVE_ASSET_ADDRS to the wrapper.
+  //   - registry present + ZERO ACTIVE assets → EARLY-RETURN (nothing to roll over; skip spawn).
+  //   - registry absent/malformed (null) → legacy single-asset behavior: spawn without the filter
+  //     (a not-yet-seeded registry must never brick maintenance).
+  const stateRoot = ctx.stateRoot ?? process.env.EUNOMA_STATE_ROOT ?? undefined;
+  const activeAssetAddrs = loadActiveAssetAddrs(stateRoot);
+  if (activeAssetAddrs !== null && activeAssetAddrs.length === 0) {
+    emitJournalLine(
+      "bridge maintenance pipeline skipped — registry has no ACTIVE assets (early-return)",
+      { stateRoot },
+    );
+    logger.info(
+      { module: "bridge_maintenance_pipeline", stateRoot },
+      "bridge maintenance pipeline skipped — registry has no ACTIVE assets (early-return)",
+    );
+    return;
+  }
+  const activeAssetCount = activeAssetAddrs?.length ?? null;
+
   emitJournalLine("bridge maintenance pipeline spawning refresh_known_root_cycle.sh", {
     scriptPath: absoluteScriptPath,
     cwd: repoRoot,
     extraDepositTxHashCount: extraDepositTxHashes.length,
+    activeAssetCount,
   });
   logger.info(
     {
@@ -120,6 +249,7 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
       scriptPath: absoluteScriptPath,
       cwd: repoRoot,
       extraDepositTxHashCount: extraDepositTxHashes.length,
+      activeAssetCount,
     },
     "bridge maintenance pipeline spawning refresh_known_root_cycle.sh",
   );
@@ -135,6 +265,11 @@ async function runPipeline(ctx: BridgeMaintenanceContext): Promise<void> {
           EUNOMA_REPO_ROOT: repoRoot,
           ...(extraDepositTxHashes.length > 0
             ? { EUNOMA_EXTRA_DEPOSIT_TX_HASHES: extraDepositTxHashes.join(",") }
+            : {}),
+          // CP5 RC4: the ACTIVE-only asset routing keys the rollover/normalize loop must iterate.
+          // Empty/absent only when the registry is missing (legacy single-asset fallback above).
+          ...(activeAssetAddrs && activeAssetAddrs.length > 0
+            ? { EUNOMA_ACTIVE_ASSET_ADDRS: activeAssetAddrs.join(",") }
             : {}),
         },
         stdio: ["ignore", "pipe", "pipe"],

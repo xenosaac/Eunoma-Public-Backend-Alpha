@@ -70,6 +70,27 @@ function txFor({ depositCount, commitmentHex, sender, txHash, version, sequenceN
   };
 }
 
+function txWithoutLeaf({ sender, txHash, version, sequenceNumber }) {
+  return {
+    type: "user_transaction",
+    success: true,
+    vm_status: "Executed successfully",
+    hash: txHash,
+    version: String(version),
+    sender,
+    events: [
+      {
+        type: `${BRIDGE}::eunoma_bridge::WithdrawEventV3`,
+        sequence_number: String(sequenceNumber),
+        data: {
+          vault_addr: VAULT,
+          nullifier: "0x" + "9".repeat(64),
+        },
+      },
+    ],
+  };
+}
+
 function makeFetchStub(txByHash) {
   return vi.fn(async (urlOrReq) => {
     const url = typeof urlOrReq === "string" ? urlOrReq : urlOrReq.url;
@@ -148,6 +169,51 @@ describe("local_build_commitment_tree.mjs — happy path", () => {
     expect(out.depositMeta.map((m) => m.commitmentHex.toLowerCase())).toEqual(commits.map((c) => c.toLowerCase()));
     expect(out.depositMeta.map((m) => m.sender)).toEqual([senderHex(1), senderHex(2), senderHex(3)]);
     expect(new Set(out.depositMeta.map((m) => m.sender)).size).toBe(3);
+  });
+
+  it("retries transient Aptos by_hash rate limits before ingesting a confirmed tx", async () => {
+    const tx = {
+      txHash: "0x" + "9".repeat(64),
+      depositCount: 1,
+      commitmentHex: leafHex("retry-429"),
+      sender: senderHex(9),
+      version: 9001,
+      sequenceNumber: 0,
+    };
+    const byHash = { [tx.txHash.toLowerCase()]: txFor(tx) };
+    let byHashCalls = 0;
+    globalThis.fetch = vi.fn(async (urlOrReq) => {
+      const url = typeof urlOrReq === "string" ? urlOrReq : urlOrReq.url;
+      const m = url.match(/\/transactions\/by_hash\/(0x[0-9a-fA-F]+)/);
+      if (m) {
+        byHashCalls += 1;
+        if (byHashCalls < 4) {
+          return new Response("Per anonymous IP rate limit exceeded.", { status: 429 });
+        }
+        return new Response(JSON.stringify(byHash[m[1].toLowerCase()]), { status: 200 });
+      }
+      return new Response(JSON.stringify({ message: "unmocked" }), { status: 500 });
+    });
+    writeWitness(witnessDir, tx);
+
+    const oldAttempts = process.env.EUNOMA_APTOS_REST_RETRY_ATTEMPTS;
+    const oldDelay = process.env.EUNOMA_APTOS_REST_RETRY_DELAY_MS;
+    process.env.EUNOMA_APTOS_REST_RETRY_ATTEMPTS = "4";
+    process.env.EUNOMA_APTOS_REST_RETRY_DELAY_MS = "0";
+    try {
+      const code = await ingest({ argv: baseArgs() });
+      expect(code).toBe(0);
+    } finally {
+      if (oldAttempts === undefined) delete process.env.EUNOMA_APTOS_REST_RETRY_ATTEMPTS;
+      else process.env.EUNOMA_APTOS_REST_RETRY_ATTEMPTS = oldAttempts;
+      if (oldDelay === undefined) delete process.env.EUNOMA_APTOS_REST_RETRY_DELAY_MS;
+      else process.env.EUNOMA_APTOS_REST_RETRY_DELAY_MS = oldDelay;
+    }
+
+    expect(byHashCalls).toBe(4);
+    const out = JSON.parse(readFileSync(join(stateDir, "commitment_tree_v2.json"), "utf8"));
+    expect(out.leafCount).toBe(1);
+    expect(out.depositMeta[0].depositTxHash).toBe(tx.txHash);
   });
 });
 
@@ -258,6 +324,26 @@ describe("local_build_commitment_tree.mjs — negative cases", () => {
     globalThis.fetch = makeFetchStub({ [tx.hash.toLowerCase()]: tx });
     writeWitness(witnessDir, { txHash: tx.hash, commitmentHex: leafHex("me"), depositCount: 1 });
     await expect(ingest({ argv: baseArgs() })).rejects.toThrow(/no_deposit_event/);
+  });
+
+  it("does not treat a successful no-leaf tx as a V4 route leaf", async () => {
+    const txHash = "0x" + "9".repeat(64);
+    const tx = txWithoutLeaf({
+      txHash,
+      sender: senderHex(9),
+      version: 9,
+      sequenceNumber: 0,
+    });
+    globalThis.fetch = makeFetchStub({ [txHash]: tx });
+
+    const result = await fetchDepositEventByTxHash({
+      aptosNodeUrl: "https://stub/v1",
+      txHash,
+      bridgePackageAddress: BRIDGE,
+      eventVersion: "v4",
+    });
+    expect(result.leafEvents).toEqual([]);
+    expect(result.skippedNoLeafEvent).toBe(true);
   });
 
   it("rejects replay (same tx-hash present in primary set + existing tree state)", async () => {
@@ -388,6 +474,53 @@ describe("local_build_commitment_tree.mjs — ordering and idempotency", () => {
     const out = JSON.parse(readFileSync(join(stateDir, "commitment_tree_v2.json"), "utf8"));
     expect(out.leafCount).toBe(1);
     expect(out.depositMeta.map((m) => m.depositCount)).toEqual([1]);
+  });
+
+  it("V4 ingest skips successful txs that do not append a route leaf", async () => {
+    const tx1 = {
+      txHash: "0x" + "a1".padEnd(64, "0"),
+      depositCount: 1,
+      commitmentHex: leafHex("v4skip1"),
+      sender: senderHex(1),
+      version: 100,
+      sequenceNumber: 0,
+    };
+    const noLeaf = {
+      txHash: "0x" + "aa".padEnd(64, "1"),
+      sender: senderHex(2),
+      version: 101,
+      sequenceNumber: 0,
+    };
+    const tx2 = {
+      txHash: "0x" + "a2".padEnd(64, "0"),
+      depositCount: 2,
+      commitmentHex: leafHex("v4skip2"),
+      sender: senderHex(3),
+      version: 102,
+      sequenceNumber: 0,
+    };
+    globalThis.fetch = makeFetchStub({
+      [tx1.txHash.toLowerCase()]: txFor(tx1),
+      [noLeaf.txHash.toLowerCase()]: txWithoutLeaf(noLeaf),
+      [tx2.txHash.toLowerCase()]: txFor(tx2),
+    });
+
+    const code = await ingest({
+      argv: [
+        ...baseArgs(),
+        "--event-version", "v4",
+        "--asset-allowlist", `${ASSET}=${VAULT}`,
+        "--tx-hashes", `${tx1.txHash},${noLeaf.txHash},${tx2.txHash}`,
+      ],
+    });
+    expect(code).toBe(0);
+
+    const out = JSON.parse(readFileSync(join(stateDir, "commitment_tree_v2.json"), "utf8"));
+    expect(out.leafCount).toBe(2);
+    expect(out.depositMeta.map((m) => m.depositTxHash)).toEqual([
+      tx1.txHash.toLowerCase(),
+      tx2.txHash.toLowerCase(),
+    ]);
   });
 });
 

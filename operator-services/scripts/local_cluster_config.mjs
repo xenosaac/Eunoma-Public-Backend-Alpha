@@ -26,10 +26,22 @@ const plan = buildLocalClusterPlan({
   stateRoot,
   vaultEk: ca.vault_ek,
   aptosNodeUrl: process.env.APTOS_NODE_URL,
+  bridgeVaultAddress: process.env.BRIDGE_VAULT_ADDRESS,
+  bridgeAssetType: process.env.BRIDGE_ASSET_TYPE,
   // M11: thread BRIDGE_PACKAGE_ADDRESS into the generated worker env so the
   // /v2/vault/resync handler has its trusted package without a separate shell
   // export. Optional — undefined just omits it (resync still fails closed if absent).
   bridgePackageAddress: process.env.BRIDGE_PACKAGE_ADDRESS,
+  adminProfile: process.env.ADMIN_PROFILE,
+  relayerProfile: process.env.RELAYER_PROFILE,
+  refreshSignerMode: process.env.EUNOMA_REFRESH_SIGNER_MODE,
+  refreshAdminProfile: process.env.EUNOMA_REFRESH_ADMIN_PROFILE ?? process.env.ADMIN_PROFILE,
+  refreshDelegateProfile: process.env.EUNOMA_REFRESH_DELEGATE_PROFILE ?? process.env.DELEGATE_PROFILE,
+  refreshAspRecorderProfile:
+    process.env.EUNOMA_REFRESH_ASP_RECORDER_PROFILE ??
+    process.env.ASP_RECORDER_PROFILE ??
+    process.env.EUNOMA_REFRESH_ADMIN_PROFILE ??
+    process.env.ADMIN_PROFILE,
   dkgEpoch: ca.dkg_epoch,
   caDkgScheme,
   frost: {

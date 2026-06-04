@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import {
   assembleCaRegistrationV2Transcript,
   assembleVaultEkTranscript,
@@ -124,9 +124,12 @@ import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { InMemoryCoordinatorStore, type CoordinatorStore } from "./store.js";
 import { registerBalanceDecryptRoute } from "./routes/balance_decrypt.js";
-import { registerVaultResyncRoute } from "./routes/vault_resync.js";
+import { registerVaultResyncRoute, registerVaultSequenceSyncRoute } from "./routes/vault_resync.js";
 import { registerNormalizeSigmaS0Route } from "./routes/normalize_sigma_s0.js";
-import { triggerBridgeMaintenance } from "./bridge_maintenance_pipeline.js";
+import {
+  triggerBridgeMaintenance,
+  type BridgeMaintenanceContext,
+} from "./bridge_maintenance_pipeline.js";
 
 /**
  * Codex M2a P2 #3: safe-id sanitiser for caller-supplied identifiers that the coordinator
@@ -164,12 +167,20 @@ export function isSafeId(s: string): boolean {
 /**
  * Validated public ASP-set artifact shape (subset the coordinator serves). Written by
  * scripts/local_run_asp_cycle.mjs (makeAspSetArtifact). Public commitments only — no secrets.
+ *
+ * CP5 RC6(A): `updatedAtUnix` is the ASP-root RECORD TIME — the wall-clock second the set was
+ * forked/published (AssociationSetData.timestamp on-chain). The on-chain ASP_ROOT_TTL_SECS window
+ * is measured against this value (the RF2 time-window that replaced the count-K window). It is
+ * surfaced verbatim so a client can tell HOW OLD the current curated set is, and the
+ * `/v2/asp-set/at/:rootHex` historical lookup can decide 200 (in window) vs 410 (aged out).
  */
 interface AspSetArtifact {
   rootHex: string;
   treeDepth: number;
   ipfsCid?: string | null;
   commitments: string[];
+  /** ASP-root record time (epoch seconds). null when a legacy artifact omitted it. */
+  updatedAtUnix: number | null;
 }
 
 /**
@@ -179,12 +190,21 @@ interface AspSetArtifact {
  */
 async function readAspSetArtifact(stateRoot: string | undefined): Promise<AspSetArtifact | null> {
   if (!stateRoot) return null;
-  const aspPath = join(stateRoot, "coordinator", "asp_set.json");
+  return parseAspSetArtifactFile(join(stateRoot, "coordinator", "asp_set.json"));
+}
+
+/**
+ * Parse + validate ONE asp-set artifact JSON file (the current `asp_set.json` or a historical
+ * snapshot under `asp_set_history/<rootHex>.json`). Returns null on missing/malformed (callers map
+ * to 503/404). CP5 RC6(A): `updatedAtUnix` is carried through as the ASP-root record time.
+ */
+async function parseAspSetArtifactFile(aspPath: string): Promise<AspSetArtifact | null> {
   let raw: {
     rootHex?: unknown;
     treeDepth?: unknown;
     ipfsCid?: unknown;
     commitments?: unknown;
+    updatedAtUnix?: unknown;
   };
   try {
     raw = JSON.parse(await readFile(aspPath, "utf8")) as typeof raw;
@@ -204,7 +224,139 @@ async function readAspSetArtifact(stateRoot: string | undefined): Promise<AspSet
     treeDepth: raw.treeDepth,
     ipfsCid: typeof raw.ipfsCid === "string" ? raw.ipfsCid : null,
     commitments: raw.commitments as string[],
+    updatedAtUnix:
+      typeof raw.updatedAtUnix === "number" && Number.isFinite(raw.updatedAtUnix)
+        ? raw.updatedAtUnix
+        : null,
   };
+}
+
+/**
+ * CP5 RC6(A): the on-chain ASP_ROOT_TTL window (seconds) a historical ASP root stays redeemable.
+ * A withdraw proof bound to a root older than this is rejected on-chain (E_INVALID_ASP_ROOT), so
+ * `/v2/asp-set/at/:rootHex` returns 410 Gone once `now - updatedAtUnix > ttl`. Default ~6h mirrors
+ * the dormant-lifecycle plan default (admin-settable on-chain; overridable via the
+ * `aspRootTtlSecs` server option / EUNOMA_ASP_ROOT_TTL_SECS env so the coordinator window tracks
+ * the chain constant). A record with no `updatedAtUnix` is treated as ALWAYS-in-window (cannot
+ * compute age → fail open to 200, never silently 410 a still-valid root).
+ */
+const DEFAULT_ASP_ROOT_TTL_SECS = 6 * 60 * 60;
+
+/** Sanitize a `:rootHex` path param to a bare lowercase 64-hex string, or null when malformed. */
+function normalizeAspRootHexParam(raw: string): string | null {
+  const clean = raw.replace(/^0x/i, "").toLowerCase();
+  return /^[0-9a-f]{64}$/.test(clean) ? clean : null;
+}
+
+/**
+ * CP5 RC2: one per-asset registry row served by GET /v2/assets. Sourced from the init_v4
+ * artifact <stateRoot>/coordinator/asset_registry.json (NOT hand-edited env). Mirrors the
+ * frontend `AssetEntry` (design §12) minus `priceId`, plus the on-chain lifecycle `status`.
+ *
+ * PRIVACY: this is the PUBLIC routing surface (asset_addr / asset_id_fr / decimals / vault /
+ * vault_ek public point / status are all public). It carries NO secret/dk/share material — the
+ * reader allow-lists exactly these keys, so a registry file that accidentally grows a
+ * `*_decryption_key_*` / `*_secret*` / share field can never leak through this endpoint.
+ *
+ * decimals is per-asset and registry-sourced (8 APT / 6 cUSDC,cUSDT). A 6-decimal stablecoin
+ * scaled through an 8-decimal path mis-scales funds 100x — the frontend reads this value, it is
+ * NEVER hardcoded downstream.
+ */
+interface AssetEntry {
+  symbol: string; // "ConfidentialAPT" | "cUSDC" | "cUSDT"
+  plainSymbol: string; // "APT" | "USDC" | "USDT"
+  metadata: string; // FA Metadata object-address (asset_addr / on-chain registry key)
+  assetIdFr: string; // derive_asset_id(asset_type) — circuit public[2], on-chain-derived
+  vaultAddrHashFr?: string; // per-asset AssetVaultStateV4.vault_addr_hash_fr — circuit public[3]
+  decimals: number; // 8 APT / 6 cUSDC,cUSDT — IMMUTABLE per-asset, registry-sourced
+  vault: string; // shared resource-account vault address (T1: one vault across all assets)
+  vaultEkHex: string; // the ONE shared threshold CA encryption key (public ed25519 point)
+  poolId: string; // "0" — single frozen pool (Compose5 5th leaf)
+  status: "DORMANT" | "ACTIVE" | "PAUSED"; // AssetVaultStateV4.status lifecycle
+}
+
+const ASSET_STATUS_BY_CODE: Record<number, AssetEntry["status"]> = {
+  0: "DORMANT",
+  1: "ACTIVE",
+  2: "PAUSED",
+};
+const ASSET_STATUS_NAMES = new Set<AssetEntry["status"]>(["DORMANT", "ACTIVE", "PAUSED"]);
+
+/**
+ * Read + validate <stateRoot>/coordinator/asset_registry.json (init_v4 artifact). Returns the
+ * allow-listed AssetEntry[], or null when stateRoot is unconfigured / the file is missing /
+ * unreadable / malformed (callers map null to a 503, mirroring /v2/pool/state). Each row is
+ * RE-PROJECTED onto exactly the AssetEntry keys, so no extra (potentially secret) field on disk
+ * is ever forwarded.
+ *
+ * `status` accepts either the lifecycle name ("DORMANT"/"ACTIVE"/"PAUSED") or the on-chain u8
+ * code (0/1/2 — matching AssetVaultStateV4.status), normalizing both to the name.
+ */
+async function readAssetRegistryArtifact(
+  stateRoot: string | undefined,
+): Promise<AssetEntry[] | null> {
+  if (!stateRoot) return null;
+  const registryPath = join(stateRoot, "coordinator", "asset_registry.json");
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(registryPath, "utf8"));
+  } catch {
+    return null;
+  }
+  // Accept either a bare array or an envelope `{ assets: [...] }` (whichever init_v4 emits).
+  const rows = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" && Array.isArray((raw as { assets?: unknown }).assets)
+      ? (raw as { assets: unknown[] }).assets
+      : null;
+  if (!rows) return null;
+  const out: AssetEntry[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+    const r = row as Record<string, unknown>;
+    const status = normalizeAssetStatus(r.status);
+    if (
+      typeof r.symbol !== "string" ||
+      typeof r.plainSymbol !== "string" ||
+      typeof r.metadata !== "string" ||
+      typeof r.assetIdFr !== "string" ||
+      typeof r.decimals !== "number" ||
+      !Number.isInteger(r.decimals) ||
+      r.decimals < 0 ||
+      r.decimals > 255 ||
+      typeof r.vault !== "string" ||
+      typeof r.vaultEkHex !== "string" ||
+      typeof r.poolId !== "string" ||
+      status === null
+    ) {
+      return null;
+    }
+    // Re-project onto exactly the AssetEntry keys — drops any extra on-disk field (no leak).
+    out.push({
+      symbol: r.symbol,
+      plainSymbol: r.plainSymbol,
+      metadata: r.metadata,
+      assetIdFr: r.assetIdFr,
+      ...(typeof r.vaultAddrHashFr === "string" ? { vaultAddrHashFr: r.vaultAddrHashFr } : {}),
+      decimals: r.decimals,
+      vault: r.vault,
+      vaultEkHex: r.vaultEkHex,
+      poolId: r.poolId,
+      status,
+    });
+  }
+  return out;
+}
+
+function normalizeAssetStatus(value: unknown): AssetEntry["status"] | null {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return ASSET_STATUS_BY_CODE[value] ?? null;
+  }
+  if (typeof value === "string") {
+    const upper = value.toUpperCase() as AssetEntry["status"];
+    return ASSET_STATUS_NAMES.has(upper) ? upper : null;
+  }
+  return null;
 }
 
 function normalizeEventAddr(value: string | undefined): string | null {
@@ -268,6 +420,26 @@ function parseWithdrawEventForSubmitResync(tx: unknown, bridgePackage: string) {
   }
 
   throw new Error("withdraw_resync_event_not_found");
+}
+
+function eventsContainRouteLeaf(events: unknown[] | undefined, bridgePackage: string | undefined): boolean {
+  const wantBridge = normalizeEventAddr(bridgePackage);
+  if (!wantBridge || !Array.isArray(events)) return false;
+  for (const event of events) {
+    if (event === null || typeof event !== "object" || Array.isArray(event)) continue;
+    const record = event as Record<string, unknown>;
+    const type = typeof record.type === "string" ? record.type : "";
+    const [addr, moduleName, eventName] = type.split("::");
+    if (normalizeEventAddr(addr) !== wantBridge || moduleName !== "eunoma_bridge") continue;
+    if (
+      eventName === "DepositConfirmedV2" ||
+      eventName === "DepositConfirmedV4" ||
+      eventName === "ChangeNoteAppendedV4"
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function fetchAptosTransactionByHash(
@@ -341,6 +513,12 @@ export interface CoordinatorServerOptions {
   singleNodeForwarder?: SingleNodeForwarder;
   stateRoot?: string;
   /**
+   * CP5 RC6(A): the ASP-root TTL window (seconds) the historical-root endpoint
+   * GET /v2/asp-set/at/:rootHex honors. Defaults to DEFAULT_ASP_ROOT_TTL_SECS (~6h, mirroring the
+   * on-chain ASP_ROOT_TTL constant). A historical root older than this returns 410 Gone.
+   */
+  aspRootTtlSecs?: number;
+  /**
    * Milestone 5b: optional relayer submitter for POST /v2/withdraw/mpcca/submit. If absent,
    * the route returns 502 relayer_unreachable when invoked. Tests inject mocks.
    */
@@ -390,6 +568,12 @@ export interface CoordinatorServerOptions {
    * to a single (vault, asset) pair.
    */
   bridgeAssetType?: string;
+  /**
+   * Test seam for the asynchronous route-maintenance trigger. Production uses the shell-backed
+   * `triggerBridgeMaintenance`; tests inject a recorder so submit-route edge cases can be
+   * asserted without spawning the maintenance wrapper.
+   */
+  bridgeMaintenanceTrigger?: (ctx: BridgeMaintenanceContext) => void;
 }
 
 export function buildCoordinatorServer(
@@ -400,6 +584,24 @@ export function buildCoordinatorServer(
   if (opts.frostDkgV2Roster) validateFrostDkgV2Roster(opts.frostDkgV2Roster);
   if (!opts.roster && !opts.caDkgV2Roster) {
     throw new Error("coordinator requires DEOPERATOR_ROSTER_JSON or CA_DKG_V2_ROSTER_JSON");
+  }
+  const bridgeMaintenanceTrigger = opts.bridgeMaintenanceTrigger ?? triggerBridgeMaintenance;
+  function scheduleBridgeMaintenance(
+    reply: FastifyReply,
+    req: FastifyRequest,
+    extraDepositTxHashes?: string[],
+  ): void {
+    reply.raw.once("finish", () => {
+      bridgeMaintenanceTrigger({
+        repoRoot: process.env.EUNOMA_REPO_ROOT || process.cwd(),
+        logger: req.log,
+        extraDepositTxHashes:
+          extraDepositTxHashes && extraDepositTxHashes.length > 0
+            ? extraDepositTxHashes
+            : undefined,
+        stateRoot: opts.stateRoot,
+      });
+    });
   }
 
   // Process-wide async lock for /v2/derive/vault_ek/start. The current MASCOT runtime uses a
@@ -651,7 +853,12 @@ export function buildCoordinatorServer(
         req.url === "/v2/pool/state" ||
         req.url === "/v2/state-tree" ||
         req.url === "/v2/asp-set" ||
-        req.url === "/v2/asp-root-current")
+        req.url === "/v2/asp-root-current" ||
+        // CP5 RC6(A): the historical ASP-set lookup is the same PUBLIC commitments-only class as
+        // /v2/asp-set (no secrets), so it is reachable without a bearer. The path carries the
+        // attacker-supplied :rootHex (and may have a query string), so match by prefix.
+        req.url.startsWith("/v2/asp-set/at/") ||
+        req.url === "/v2/assets")
     ) {
       return;
     }
@@ -779,6 +986,9 @@ export function buildCoordinatorServer(
       aspRootHex: artifact.rootHex,
       aspTreeDepth: artifact.treeDepth,
       ipfsCid: artifact.ipfsCid ?? null,
+      // CP5 RC6(A): the ASP-root RECORD TIME (AssociationSetData.timestamp) the on-chain
+      // ASP_ROOT_TTL window is measured against — surfaced so clients can show set freshness.
+      updatedAtUnix: artifact.updatedAtUnix,
       commitments: artifact.commitments,
     };
   });
@@ -794,7 +1004,75 @@ export function buildCoordinatorServer(
       aspRootHex: artifact.rootHex,
       aspTreeDepth: artifact.treeDepth,
       ipfsCid: artifact.ipfsCid ?? null,
+      // CP5 RC6(A): ASP-root record time (epoch seconds) for the TTL window.
+      updatedAtUnix: artifact.updatedAtUnix,
     };
+  });
+
+  // CP5 RC6(A): short-window HISTORICAL ASP-set lookup by root hex. A change note minted in epoch N
+  // is owned immediately but only WITHDRAWABLE after the next ASP epoch re-lists it; meanwhile an
+  // in-flight withdraw may still reference a recently-superseded root. This serves a past root's
+  // committed set from <stateRoot>/coordinator/asp_set_history/<rootHex>.json so the witness builder
+  // can rebuild that exact tree.
+  //   200 — root found AND within the ASP_ROOT_TTL window (now - updatedAtUnix <= ttl).
+  //   404 — never recorded (no history snapshot for this root) OR stateRoot unconfigured.
+  //   410 — recorded but AGED OUT of the TTL window (the on-chain withdraw would now revert
+  //         E_INVALID_ASP_ROOT, so the client must re-derive against the current root).
+  // A snapshot with no updatedAtUnix is treated as in-window (cannot compute age → fail open to 200).
+  server.get("/v2/asp-set/at/:rootHex", async (req, reply) => {
+    const params = req.params as { rootHex: string };
+    const rootHex = normalizeAspRootHexParam(params.rootHex);
+    if (!rootHex) {
+      return reply.code(400).send({ error: "invalid_root_hex" });
+    }
+    if (!opts.stateRoot) {
+      return reply.code(404).send({ error: "asp_root_not_found" });
+    }
+    const artifact = await parseAspSetArtifactFile(
+      join(opts.stateRoot, "coordinator", "asp_set_history", `${rootHex}.json`),
+    );
+    if (!artifact) {
+      return reply.code(404).send({ error: "asp_root_not_found" });
+    }
+    const ttl =
+      typeof opts.aspRootTtlSecs === "number" && opts.aspRootTtlSecs > 0
+        ? opts.aspRootTtlSecs
+        : DEFAULT_ASP_ROOT_TTL_SECS;
+    const nowUnix = Math.floor(Date.now() / 1000);
+    if (artifact.updatedAtUnix !== null && nowUnix - artifact.updatedAtUnix > ttl) {
+      // Aged out: still a real past root, but no longer redeemable on-chain.
+      return reply.code(410).send({
+        error: "asp_root_aged_out",
+        aspRootHex: artifact.rootHex,
+        updatedAtUnix: artifact.updatedAtUnix,
+        ttlSecs: ttl,
+        ageSecs: nowUnix - artifact.updatedAtUnix,
+      });
+    }
+    return {
+      aspRootHex: artifact.rootHex,
+      aspTreeDepth: artifact.treeDepth,
+      ipfsCid: artifact.ipfsCid ?? null,
+      updatedAtUnix: artifact.updatedAtUnix,
+      ttlSecs: ttl,
+      commitments: artifact.commitments,
+    };
+  });
+
+  // CP5 RC2: the PUBLIC per-asset registry for the browser deposit/withdraw/swap flows. Returns
+  // AssetEntry[] sourced from the init_v4 artifact <stateRoot>/coordinator/asset_registry.json —
+  // the single source of truth replacing every hardcoded asset_addr / APT_DECIMALS on the
+  // frontend. Public routing fields only (asset_addr/asset_id_fr/decimals/vault/vault_ek public
+  // point/status); no secret/dk/share material (the reader allow-lists exactly the AssetEntry
+  // keys). Mirrors /v2/pool/state's 503-on-missing behavior: a missing/malformed registry
+  // artifact returns 503 rather than an empty or partial list (fail closed — the frontend must
+  // not silently fall back to a single hardcoded asset).
+  server.get("/v2/assets", async (_req, reply) => {
+    const assets = await readAssetRegistryArtifact(opts.stateRoot);
+    if (!assets) {
+      return reply.code(503).send({ error: "asset_registry_unavailable" });
+    }
+    return { assets };
   });
 
   server.get("/v2/status/:requestId", async (req) => {
@@ -1473,6 +1751,34 @@ export function buildCoordinatorServer(
           message: "senderAddress must be a 32-byte hex string",
         });
       }
+      const vaultStateSenderAddressRaw = raw.vaultStateSenderAddress;
+      if (
+        vaultStateSenderAddressRaw !== undefined &&
+        (typeof vaultStateSenderAddressRaw !== "string" ||
+          !/^(0x)?[0-9a-fA-F]{64}$/.test(vaultStateSenderAddressRaw))
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "vaultStateSenderAddress must be a 32-byte hex string when supplied",
+        });
+      }
+      const depositSenderAddressRaw = raw.depositSenderAddress;
+      if (
+        depositSenderAddressRaw !== undefined &&
+        (typeof depositSenderAddressRaw !== "string" ||
+          !/^(0x)?[0-9a-fA-F]{64}$/.test(depositSenderAddressRaw))
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "depositSenderAddress must be a 32-byte hex string when supplied",
+        });
+      }
+      const vaultStateSenderAddress =
+        typeof vaultStateSenderAddressRaw === "string" ? vaultStateSenderAddressRaw : senderAddress;
+      const depositSenderAddress =
+        typeof depositSenderAddressRaw === "string" ? depositSenderAddressRaw : senderAddress;
+      const leafEventKind =
+        raw.eventKind === "change" || raw.eventKind === "deposit" ? raw.eventKind : "deposit";
       const assetType = raw.assetType;
       if (typeof assetType !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(assetType)) {
         return reply.code(400).send({
@@ -2102,6 +2408,34 @@ export function buildCoordinatorServer(
           message: "senderAddress must be a 32-byte hex string",
         });
       }
+      const vaultStateSenderAddressRaw = raw.vaultStateSenderAddress;
+      if (
+        vaultStateSenderAddressRaw !== undefined &&
+        (typeof vaultStateSenderAddressRaw !== "string" ||
+          !/^(0x)?[0-9a-fA-F]{64}$/.test(vaultStateSenderAddressRaw))
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "vaultStateSenderAddress must be a 32-byte hex string when supplied",
+        });
+      }
+      const depositSenderAddressRaw = raw.depositSenderAddress;
+      if (
+        depositSenderAddressRaw !== undefined &&
+        (typeof depositSenderAddressRaw !== "string" ||
+          !/^(0x)?[0-9a-fA-F]{64}$/.test(depositSenderAddressRaw))
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "depositSenderAddress must be a 32-byte hex string when supplied",
+        });
+      }
+      const vaultStateSenderAddress =
+        typeof vaultStateSenderAddressRaw === "string" ? vaultStateSenderAddressRaw : senderAddress;
+      const depositSenderAddress =
+        typeof depositSenderAddressRaw === "string" ? depositSenderAddressRaw : senderAddress;
+      const leafEventKind =
+        raw.eventKind === "change" || raw.eventKind === "deposit" ? raw.eventKind : "deposit";
       const assetType = raw.assetType;
       if (typeof assetType !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(assetType)) {
         return reply.code(400).send({
@@ -2265,7 +2599,7 @@ export function buildCoordinatorServer(
           vaultEk,
           caDkgTranscriptHash: caDkgTranscriptHashInput,
           rosterHash: dkgRosterHash,
-          senderAddress,
+          senderAddress: vaultStateSenderAddress,
           assetType,
           chainId,
         });
@@ -2757,6 +3091,34 @@ export function buildCoordinatorServer(
           message: "senderAddress must be a 32-byte hex string",
         });
       }
+      const vaultStateSenderAddressRaw = raw.vaultStateSenderAddress;
+      if (
+        vaultStateSenderAddressRaw !== undefined &&
+        (typeof vaultStateSenderAddressRaw !== "string" ||
+          !/^(0x)?[0-9a-fA-F]{64}$/.test(vaultStateSenderAddressRaw))
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "vaultStateSenderAddress must be a 32-byte hex string when supplied",
+        });
+      }
+      const depositSenderAddressRaw = raw.depositSenderAddress;
+      if (
+        depositSenderAddressRaw !== undefined &&
+        (typeof depositSenderAddressRaw !== "string" ||
+          !/^(0x)?[0-9a-fA-F]{64}$/.test(depositSenderAddressRaw))
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          message: "depositSenderAddress must be a 32-byte hex string when supplied",
+        });
+      }
+      const vaultStateSenderAddress =
+        typeof vaultStateSenderAddressRaw === "string" ? vaultStateSenderAddressRaw : senderAddress;
+      const depositSenderAddress =
+        typeof depositSenderAddressRaw === "string" ? depositSenderAddressRaw : senderAddress;
+      const leafEventKind =
+        raw.eventKind === "change" || raw.eventKind === "deposit" ? raw.eventKind : "deposit";
       const assetType = raw.assetType;
       if (typeof assetType !== "string" || !/^(0x)?[0-9a-fA-F]{64}$/.test(assetType)) {
         return reply.code(400).send({
@@ -2885,7 +3247,7 @@ export function buildCoordinatorServer(
           vaultEk,
           caDkgTranscriptHash: caDkgTranscriptHashInput,
           rosterHash: dkgRosterHash,
-          senderAddress,
+          senderAddress: vaultStateSenderAddress,
           assetType,
           chainId,
         });
@@ -2895,7 +3257,7 @@ export function buildCoordinatorServer(
             requestId,
             message:
               "no persisted Milestone 2a vault_state_v2 init transcript matches the supplied " +
-              "(dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash, senderAddress, assetType, chainId). " +
+              "(dkgEpoch, vaultEk, caDkgTranscriptHash, rosterHash, vaultStateSenderAddress, assetType, chainId). " +
               "Run /v2/vault_state/init first.",
           });
         }
@@ -2979,7 +3341,7 @@ export function buildCoordinatorServer(
           selfSlot: slot,
           playerId: ordinalIndex,
           vaultEk,
-          senderAddress,
+          senderAddress: vaultStateSenderAddress,
           assetType,
           chainId,
           depositCount,
@@ -3058,7 +3420,7 @@ export function buildCoordinatorServer(
             vaultEkTranscriptHash,
             registrationTranscriptHash,
             vaultEk,
-            senderAddress,
+            senderAddress: vaultStateSenderAddress,
             assetType,
             chainId,
             depositCount,
@@ -3133,7 +3495,7 @@ export function buildCoordinatorServer(
           rosterHash: dkgRosterHash,
           selectedSlots: sortedSelectedSlots,
           vaultEk,
-          senderAddress,
+          senderAddress: vaultStateSenderAddress,
           assetType,
           chainId,
           depositCount,
@@ -3151,6 +3513,9 @@ export function buildCoordinatorServer(
         const transcriptArtifact = {
           ...transcript,
           initTranscriptPath,
+          leafEventKind,
+          vaultStateSenderAddress,
+          depositSenderAddress,
           observedAtUnixMs: Date.now(),
         };
 
@@ -3181,13 +3546,7 @@ export function buildCoordinatorServer(
         // refresh_known_root_cycle.sh wrapper after the HTTP response has flushed, so
         // the observe-deposit caller is not delayed by rollover/normalize/root work.
         // Coalesce-on-contention is handled inside the trigger.
-        reply.raw.once("finish", () => {
-          triggerBridgeMaintenance({
-            repoRoot: process.env.EUNOMA_REPO_ROOT || process.cwd(),
-            logger: req.log,
-            extraDepositTxHashes: depositTxHash ? [depositTxHash] : undefined,
-          });
-        });
+        scheduleBridgeMaintenance(reply, req, depositTxHash ? [depositTxHash] : undefined);
 
         return reply.code(200).send({
           accepted: true,
@@ -3198,7 +3557,10 @@ export function buildCoordinatorServer(
           vaultEk,
           vaultEkTranscriptHash,
           registrationTranscriptHash,
-          senderAddress,
+          senderAddress: vaultStateSenderAddress,
+          vaultStateSenderAddress,
+          depositSenderAddress,
+          leafEventKind,
           assetType,
           chainId,
           depositCount,
@@ -6032,6 +6394,7 @@ export function buildCoordinatorServer(
 
         // 12. Assemble 27-field withdrawV2CallArgsFields.
         const withdrawV2CallArgsFields = {
+          assetAddr: parsed.assetType,
           root: parsed.root,
           nullifierHash: parsed.nullifierHash,
           recipient: parsed.recipient,
@@ -6044,6 +6407,10 @@ export function buildCoordinatorServer(
           aspRoot: parsed.aspRoot,
           stateTreeDepth: String(parsed.stateTreeDepth),
           aspTreeDepth: String(parsed.aspTreeDepth),
+          changeCommitment: parsed.changeCommitment,
+          amountPDigest: parsed.amountPDigest,
+          amountPOld: parsed.amountPOld,
+          amountPRem: parsed.amountPRem,
           vaultSequence: String(parsed.vaultSequence),
           withdrawProof: parsed.withdrawProofHex,
           expirySecs: String(parsed.expirySecs),
@@ -6752,16 +7119,223 @@ export function buildCoordinatorServer(
           // NOT re-invoke the relayer (no rebroadcast). Status code mirrors the
           // original outcome: 202 for simulated, 200 for real-confirmed.
           const wasSimulated = existingSubmitArtifact.simulated === true;
+          const existingTxHash =
+            typeof existingSubmitArtifact.txHash === "string"
+              ? existingSubmitArtifact.txHash
+              : null;
+          const existingAttestationConfig =
+            existingSubmitArtifact.attestationConfig &&
+            typeof existingSubmitArtifact.attestationConfig === "object" &&
+            !Array.isArray(existingSubmitArtifact.attestationConfig)
+              ? (existingSubmitArtifact.attestationConfig as Record<string, unknown>)
+              : {};
+          const existingBridge =
+            typeof existingAttestationConfig.bridge === "string"
+              ? existingAttestationConfig.bridge
+              : undefined;
+          const existingEvents = Array.isArray(existingSubmitArtifact.events)
+            ? existingSubmitArtifact.events
+            : undefined;
+          if (
+            !wasSimulated &&
+            existingTxHash &&
+            eventsContainRouteLeaf(existingEvents, existingBridge)
+          ) {
+            scheduleBridgeMaintenance(reply, req, [existingTxHash]);
+          }
           return reply.code(wasSimulated ? 202 : 200).send({
             accepted: existingSubmitArtifact.accepted === true,
             requestId: parsed.requestId,
             dkgEpoch: parsed.dkgEpoch,
-            txHash: existingSubmitArtifact.txHash,
+            txHash: existingTxHash,
             simulated: wasSimulated,
             completed: true,
             transcriptHash: existingSubmitArtifact.transcriptHash,
             transcriptPath: submitTranscriptPath,
+            ...(Array.isArray(existingSubmitArtifact.events)
+              ? { events: existingSubmitArtifact.events }
+              : {}),
             idempotentReplay: true,
+          });
+        }
+
+        // V4 partial-withdraw safety: a relayer submit can make it on-chain while the
+        // coordinator's post-submit confirmation/events read is rate-limited and returns a
+        // retryable 502 to the browser. That browser still holds the not-yet-displayed change note;
+        // retrying the same requestId must recover the existing tx, not rebroadcast and trip
+        // E_NULLIFIER_ALREADY_SPENT. Treat an incomplete artifact with a concrete txHash as an
+        // in-flight committed candidate and first try to promote it to completed success.
+        if (
+          existingSubmitArtifact &&
+          existingSubmitArtifact.completed !== true &&
+          existingSubmitArtifact.simulated !== true &&
+          typeof existingSubmitArtifact.txHash === "string" &&
+          existingSubmitArtifact.txHash.length > 0 &&
+          opts.chainNodeUrl
+        ) {
+          const existingTxHash = existingSubmitArtifact.txHash;
+          const recordedInputHash = existingSubmitArtifact.submitInputHash;
+          if (typeof recordedInputHash === "string" && recordedInputHash !== submitInputHash) {
+            return reply.code(409).send({
+              error: "mpcca_withdraw_submit_already_attempted_with_different_inputs",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              transcriptPath: submitTranscriptPath,
+              txHash: existingTxHash,
+              message:
+                "a prior submit for this (dkgEpoch, requestId) already broadcast a tx with " +
+                "different assembled WithdrawV2CallArgs; refusing to retry or overwrite it.",
+            });
+          }
+
+          let replayConfirmation: { confirmed: boolean; success?: boolean; vmStatus?: string };
+          try {
+            replayConfirmation = await waitForTx(opts.chainNodeUrl, existingTxHash, {
+              timeoutMs: opts.chainConfirmationTimeoutMs,
+              fetchImpl: opts.chainFetch,
+            });
+          } catch (err) {
+            return reply.code(502).send({
+              error: "chain_confirmation_timeout",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              txHash: existingTxHash,
+              transcriptPath: submitTranscriptPath,
+              idempotentReplay: true,
+              message:
+                `existing tx confirmation polling failed: ${err instanceof Error ? err.message : "unknown"}`,
+            });
+          }
+          if (!replayConfirmation.confirmed) {
+            return reply.code(502).send({
+              error: "chain_confirmation_timeout",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              txHash: existingTxHash,
+              transcriptPath: submitTranscriptPath,
+              idempotentReplay: true,
+              message:
+                `existing tx ${existingTxHash} did not confirm within ${opts.chainConfirmationTimeoutMs ?? 30_000}ms`,
+            });
+          }
+          if (replayConfirmation.success === false) {
+            const transcriptHash = await persistSubmitTranscript({
+              completed: false,
+              simulated: false,
+              submitInputHash,
+              txHash: existingTxHash,
+              chainSuccess: false,
+              chainVmStatus: replayConfirmation.vmStatus,
+              chainConfirmationError: "chain_execution_failed",
+            });
+            return reply.code(502).send({
+              error: "chain_execution_failed",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              txHash: existingTxHash,
+              vmStatus: replayConfirmation.vmStatus,
+              transcriptHash,
+              transcriptPath: submitTranscriptPath,
+              idempotentReplay: true,
+              message:
+                `existing tx ${existingTxHash} confirmed on-chain with failed execution` +
+                (replayConfirmation.vmStatus ? ` (vmStatus=${replayConfirmation.vmStatus})` : ""),
+            });
+          }
+
+          let replayEvents: unknown[] | undefined;
+          let replayPostWithdrawResync: Record<string, unknown> | undefined;
+          try {
+            const attestationConfig = finalize!.attestationConfig;
+            if (!attestationConfig) {
+              throw new Error("withdraw_resync_attestation_config_missing");
+            }
+            const tx = await fetchAptosTransactionByHash(
+              opts.chainNodeUrl,
+              existingTxHash,
+              opts.chainFetch,
+            );
+            if (
+              tx &&
+              typeof tx === "object" &&
+              Array.isArray((tx as { events?: unknown }).events)
+            ) {
+              replayEvents = (tx as { events: unknown[] }).events;
+            }
+            const binding = parseWithdrawEventForSubmitResync(tx, attestationConfig.bridge);
+            const resyncRes = await server.inject({
+              method: "POST",
+              url: "/v2/vault/resync_after_withdraw",
+              headers: opts.bearerToken ? { authorization: `Bearer ${opts.bearerToken}` } : {},
+              payload: {
+                dkgEpoch: parsed.dkgEpoch,
+                requestId: parsed.requestId,
+                txHash: existingTxHash,
+                bridgePackage: attestationConfig.bridge,
+                vault: attestationConfig.vault,
+                assetType: attestationConfig.assetType,
+                root: binding.root,
+                nullifierHash: binding.nullifierHash,
+                recipientHash: binding.recipientHash,
+                requestHash: binding.requestHash,
+                eventVaultSequence: binding.eventVaultSequence,
+                expectedNextSequence: binding.eventVaultSequence + 1,
+                trigger: "after_withdraw",
+              },
+            });
+            let resyncBody: unknown = null;
+            try {
+              resyncBody = JSON.parse(resyncRes.payload);
+            } catch {
+              resyncBody = { raw: resyncRes.payload };
+            }
+            replayPostWithdrawResync = {
+              attempted: true,
+              statusCode: resyncRes.statusCode,
+              ok: resyncRes.statusCode >= 200 && resyncRes.statusCode < 300,
+              body: resyncBody,
+            };
+          } catch (err) {
+            replayPostWithdrawResync = {
+              attempted: true,
+              ok: false,
+              error: err instanceof Error ? err.message : "withdraw_resync_failed",
+            };
+          }
+
+          const replayTranscriptHash = await persistSubmitTranscript({
+            completed: true,
+            simulated: false,
+            accepted: true,
+            submitInputHash,
+            txHash: existingTxHash,
+            chainSuccess: replayConfirmation.success,
+            chainVmStatus: replayConfirmation.vmStatus,
+            ...(replayPostWithdrawResync ? { postWithdrawResync: replayPostWithdrawResync } : {}),
+            ...(replayEvents ? { events: replayEvents } : {}),
+          });
+          const refreshBridge =
+            finalize!.attestationConfig && typeof finalize!.attestationConfig.bridge === "string"
+              ? finalize!.attestationConfig.bridge
+              : undefined;
+          if (eventsContainRouteLeaf(replayEvents, refreshBridge)) {
+            scheduleBridgeMaintenance(reply, req, [existingTxHash]);
+          }
+          return reply.code(200).send({
+            accepted: true,
+            requestId: parsed.requestId,
+            dkgEpoch: parsed.dkgEpoch,
+            txHash: existingTxHash,
+            simulated: false,
+            completed: true,
+            transcriptHash: replayTranscriptHash,
+            transcriptPath: submitTranscriptPath,
+            ...(replayEvents ? { events: replayEvents } : {}),
+            ...(replayPostWithdrawResync
+              ? { postWithdrawResync: replayPostWithdrawResync }
+              : {}),
+            idempotentReplay: true,
+            recoveredIncompleteSubmit: true,
           });
         }
 
@@ -6806,11 +7380,20 @@ export function buildCoordinatorServer(
         try {
           relayerResult = await opts.relayerSubmitter(assembleResult);
         } catch (err) {
+          const message = err instanceof Error ? err.message : "unknown";
+          if (isNullifierAlreadySpentError(message)) {
+            return reply.code(409).send({
+              error: "nullifier_already_spent",
+              requestId: parsed.requestId,
+              dkgEpoch: parsed.dkgEpoch,
+              message: "This private note has already been spent.",
+            });
+          }
           return reply.code(502).send({
             error: "relayer_returned_error",
             requestId: parsed.requestId,
             dkgEpoch: parsed.dkgEpoch,
-            message: err instanceof Error ? err.message : "unknown",
+            message,
           });
         }
         // 8. Poll for chain confirmation. We poll only if (a) it's NOT a simulated submit
@@ -6843,6 +7426,7 @@ export function buildCoordinatorServer(
         let confirmation: { confirmed: boolean; success?: boolean; vmStatus?: string } | null =
           null;
         let postWithdrawResync: Record<string, unknown> | undefined;
+        let submitTxEvents: unknown[] | undefined;
         if (!relayerResult.simulated && opts.chainNodeUrl) {
           try {
             confirmation = await waitForTx(opts.chainNodeUrl, relayerResult.txHash, {
@@ -6852,13 +7436,17 @@ export function buildCoordinatorServer(
           } catch (err) {
             // waitForTx threw — either a 5xx from the chain node or unexpected transport
             // failure. Surface as 502 chain_confirmation_timeout so the operator sees the
-            // exact failure mode.
+            // exact failure mode. The relayer has still returned a concrete tx hash; queue it
+            // for the idempotent route-maintenance pipeline so a chain-success withdraw/change
+            // leaf is not stranded by a post-submit fullnode read failure.
             const transcriptHash = await persistSubmitTranscript({
               completed: false,
               simulated: false,
+              submitInputHash,
               txHash: relayerResult.txHash,
               chainConfirmationError: err instanceof Error ? err.message : "unknown",
             });
+            scheduleBridgeMaintenance(reply, req, [relayerResult.txHash]);
             return reply.code(502).send({
               error: "chain_confirmation_timeout",
               requestId: parsed.requestId,
@@ -6874,9 +7462,11 @@ export function buildCoordinatorServer(
             const transcriptHash = await persistSubmitTranscript({
               completed: false,
               simulated: false,
+              submitInputHash,
               txHash: relayerResult.txHash,
               chainConfirmationError: "timeout",
             });
+            scheduleBridgeMaintenance(reply, req, [relayerResult.txHash]);
             return reply.code(502).send({
               error: "chain_confirmation_timeout",
               requestId: parsed.requestId,
@@ -6897,6 +7487,7 @@ export function buildCoordinatorServer(
             const transcriptHash = await persistSubmitTranscript({
               completed: false,
               simulated: false,
+              submitInputHash,
               txHash: relayerResult.txHash,
               chainSuccess: false,
               chainVmStatus: confirmation.vmStatus,
@@ -6926,6 +7517,13 @@ export function buildCoordinatorServer(
               relayerResult.txHash,
               opts.chainFetch,
             );
+            if (
+              tx &&
+              typeof tx === "object" &&
+              Array.isArray((tx as { events?: unknown }).events)
+            ) {
+              submitTxEvents = (tx as { events: unknown[] }).events;
+            }
             const binding = parseWithdrawEventForSubmitResync(tx, attestationConfig.bridge);
             const resyncPayload = {
               dkgEpoch: parsed.dkgEpoch,
@@ -6994,6 +7592,7 @@ export function buildCoordinatorServer(
                   }
                 : {}),
               ...(postWithdrawResync ? { postWithdrawResync } : {}),
+              ...(submitTxEvents ? { events: submitTxEvents } : {}),
             },
             { noClobber: true },
           );
@@ -7019,6 +7618,16 @@ export function buildCoordinatorServer(
         }
         // 10. Return — 200 for real-chain confirmation, 202 for simulated.
         const statusCode = relayerResult.simulated ? 202 : 200;
+        const refreshBridge =
+          finalize!.attestationConfig && typeof finalize!.attestationConfig.bridge === "string"
+            ? finalize!.attestationConfig.bridge
+            : undefined;
+        if (
+          !relayerResult.simulated &&
+          eventsContainRouteLeaf(submitTxEvents, refreshBridge)
+        ) {
+          scheduleBridgeMaintenance(reply, req, [relayerResult.txHash]);
+        }
         return reply.code(statusCode).send({
           accepted: relayerResult.accepted,
           requestId: parsed.requestId,
@@ -7028,6 +7637,7 @@ export function buildCoordinatorServer(
           completed: true,
           transcriptHash: submitTranscriptHash,
           transcriptPath: submitTranscriptPath,
+          ...(submitTxEvents ? { events: submitTxEvents } : {}),
           ...(postWithdrawResync ? { postWithdrawResync } : {}),
         });
       } finally {
@@ -7592,6 +8202,7 @@ export function buildCoordinatorServer(
   };
   registerVaultResyncRoute(server, vaultResyncOpts, "/v2/vault/resync_after_withdraw", "after_withdraw");
   registerVaultResyncRoute(server, vaultResyncOpts, "/v2/vault/resync_before_round1", "before_round1");
+  registerVaultSequenceSyncRoute(server, vaultResyncOpts);
 
   // CP3 deposit-delegate: forward the assembled DepositV3DelegateArgs to the relayer's
   // /v3/relayer/submit/deposit (prepare_deposit_binding_v3 + deposit_step2a_v3). step2b stays
@@ -8651,4 +9262,9 @@ async function findVaultStateV2ObservedProvenance(
     observedDepositTranscriptHashes: orderedHashes,
     transcriptPaths: orderedPaths,
   };
+}
+
+function isNullifierAlreadySpentError(message: string): boolean {
+  const text = message.toLowerCase();
+  return text.includes("nullifier_already_spent") || text.includes("e_nullifier_already_spent");
 }

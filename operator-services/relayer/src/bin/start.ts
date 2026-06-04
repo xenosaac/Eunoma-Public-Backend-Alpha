@@ -95,6 +95,11 @@ function buildV3Options(
       maxGasPriceOctas: config.maxGasPriceOctas!,
       reserveMinBalanceOctas: config.reserveMinBalanceOctas!,
     }),
+    // CP5 RC5: ONE GLOBAL VaultSequencer, constructed exactly once and shared across every
+    // /v3/relayer/submit/withdraw request regardless of asset. `vault_sequence` is a single
+    // global counter on VaultCoreV4 (preserves withdraw public[7] FROST layout = 5-of-7), so
+    // all assets must serialize through this one instance. Per-asset sharding is FORBIDDEN
+    // (V4.1 deferral) — see vault_sequencer.ts header.
     sequencer: new VaultSequencer(),
     journal: new FileSubmitJournal({ filePath: journalPath }),
   };

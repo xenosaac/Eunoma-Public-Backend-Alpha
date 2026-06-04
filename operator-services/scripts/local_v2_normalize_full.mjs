@@ -68,15 +68,18 @@ import {
 } from "./_lib/normalize_proof_builder.mjs";
 import { verifyWithdrawSigmaProof } from "./_lib/withdraw_sigma_reference.mjs";
 import { aptosView } from "./_lib/aptos_view.mjs";
+import { runAptosCliWithRetry } from "./_lib/aptos_cli_retry.mjs";
 import { hexVectorArg, hexArg } from "./_lib/format_aptos_args.mjs";
 import { recoverBalanceChunks } from "../../circuits/scripts/recover_balance_chunks.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 // Mirrors local_rollover_vault_pending.mjs:36-40: aptos CLI requires
 // .aptos/config.yaml in cwd. operator-services/.aptos/config.yaml holds the
-// testnet-* profiles on alpha box, so spawn the CLI from there regardless of
-// the wrapper's cwd.
+// testnet-* profiles on alpha box, so default there. Local cluster envs may
+// point APTOS_CLI_CWD at the repo root when that is where the usable
+// .aptos/config.yaml lives.
 const serviceRoot = resolve(scriptDir, "..");
+const aptosCliCwd = process.env.APTOS_CLI_CWD ? resolve(process.env.APTOS_CLI_CWD) : serviceRoot;
 const HPKE_SEAL_BIN = resolve(serviceRoot, "crypto-worker-rust/target/release/hpke_seal_ingress");
 
 function fullnodeRestUrl(path) {
@@ -177,6 +180,9 @@ function bytesToBigLE(bytes) {
 
 const CHAIN_ID = Number(process.env.CHAIN_ID ?? "2");
 const debugBalance = process.env.EUNOMA_LOCAL_DEBUG_BALANCE === "1";
+const COORDINATOR_HTTP_RETRY_ATTEMPTS = positiveIntEnv("EUNOMA_COORDINATOR_HTTP_RETRY_ATTEMPTS", 5);
+const COORDINATOR_HTTP_RETRY_DELAY_MS = nonNegativeIntEnv("EUNOMA_COORDINATOR_HTTP_RETRY_DELAY_MS", 3_000);
+const COORDINATOR_HTTP_RETRY_MAX_DELAY_MS = positiveIntEnv("EUNOMA_COORDINATOR_HTTP_RETRY_MAX_DELAY_MS", 15_000);
 
 // Read CA DKG V2 roster to extract `dkgEpoch` for the coordinator routes. Mirrors
 // local_v2_withdraw_full.mjs:223+289-290 — the coordinator validates that the
@@ -206,6 +212,95 @@ function loadCaDkgRoster() {
 const caDkgRoster = loadCaDkgRoster();
 const dkgEpochStr = caDkgRoster.dkgEpoch;
 const caDkgRosterHash = normalizeHex(caDkgRoster.caDkgV2RosterHash ?? caDkgV2RosterHash(caDkgRoster));
+
+function positiveIntEnv(name, fallback) {
+  const parsed = Number.parseInt(String(process.env[name] ?? ""), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function nonNegativeIntEnv(name, fallback) {
+  const parsed = Number.parseInt(String(process.env[name] ?? ""), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelayForAttempt(attempt) {
+  return Math.min(COORDINATOR_HTTP_RETRY_DELAY_MS * attempt, COORDINATOR_HTTP_RETRY_MAX_DELAY_MS);
+}
+
+function isRetryableCoordinatorStatus(status) {
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+function isRetryableCoordinatorFetchError(err) {
+  const text = String(err?.message ?? err).toLowerCase();
+  return (
+    text.includes("fetch failed") ||
+    text.includes("econnreset") ||
+    text.includes("etimedout") ||
+    text.includes("socket") ||
+    text.includes("connection")
+  );
+}
+
+async function postCoordinatorJsonWithRetry(path, payload, label) {
+  let lastBody = "";
+  let lastStatus = 0;
+  let lastError = null;
+  for (let attempt = 1; attempt <= COORDINATOR_HTTP_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      const resp = await fetch(`${coordinatorUrl}${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${coordinatorBearerToken}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const body = await resp.text();
+      lastStatus = resp.status;
+      lastBody = body;
+      console.error(
+        `[normalize] coordinator ${path} status=${resp.status}` +
+          (attempt > 1 ? ` attempt=${attempt}/${COORDINATOR_HTTP_RETRY_ATTEMPTS}` : ""),
+      );
+      if (resp.ok) {
+        try {
+          return body.length > 0 ? JSON.parse(body) : {};
+        } catch (err) {
+          const parseErr = new Error(`${label}_response_non_json`);
+          parseErr.cause = err;
+          throw parseErr;
+        }
+      }
+      if (!isRetryableCoordinatorStatus(resp.status) || attempt >= COORDINATOR_HTTP_RETRY_ATTEMPTS) {
+        const err = new Error(`${label}_failed`);
+        err.status = resp.status;
+        err.body = body;
+        throw err;
+      }
+      const delayMs = retryDelayForAttempt(attempt);
+      console.error(`[normalize] ${label} retryable status=${resp.status}; retrying in ${delayMs}ms`);
+      await sleep(delayMs);
+    } catch (err) {
+      if (err?.status) throw err;
+      lastError = err;
+      if (!isRetryableCoordinatorFetchError(err) || attempt >= COORDINATOR_HTTP_RETRY_ATTEMPTS) {
+        throw err;
+      }
+      const delayMs = retryDelayForAttempt(attempt);
+      console.error(`[normalize] ${label} request failed: ${err?.message ?? err}; retrying in ${delayMs}ms`);
+      await sleep(delayMs);
+    }
+  }
+  const err = lastError ?? new Error(`${label}_failed`);
+  if (lastStatus) err.status = lastStatus;
+  if (lastBody) err.body = lastBody;
+  throw err;
+}
 
 // ---- Functional ID + signer profile -------------------------------------------------------
 let functionId;
@@ -285,31 +380,25 @@ console.error(`[normalize] fetched chain available_balance: chunkCount=${ell}`);
 // turning each `dk_share_i · D'` into a chosen-D threshold decryption oracle.
 let decryptJson;
 try {
-  const decryptResp = await fetch(`${coordinatorUrl}/v2/balance/decrypt`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${coordinatorBearerToken}`,
-    },
-    body: JSON.stringify({
+  decryptJson = await postCoordinatorJsonWithRetry(
+    "/v2/balance/decrypt",
+    {
       dkgEpoch: dkgEpochStr,
       vaultAddress: addr32(vaultAddress),
       assetType: addr32(assetType),
       oldBalanceDHex: oldBalanceCt.D.map((p) => bytesToHex(p.toRawBytes())),
       requestId,
-    }),
-  });
-  console.error(`[normalize] coordinator /v2/balance/decrypt status=${decryptResp.status}`);
-  if (!decryptResp.ok) {
-    const errBody = await decryptResp.text();
-    console.error(`[normalize] balance_decrypt_failed status=${decryptResp.status}`);
+    },
+    "balance_decrypt",
+  );
+} catch (err) {
+  if (err?.status) {
+    console.error(`[normalize] balance_decrypt_failed status=${err.status}`);
     // Avoid surfacing the raw stderr body — could contain caller-controlled
     // identifiers we don't want to plumb into operator log capture.
-    if (debugBalance) console.error(`[normalize] balance_decrypt_failed body=${errBody}`);
+    if (debugBalance) console.error(`[normalize] balance_decrypt_failed body=${err.body ?? ""}`);
     process.exit(EXIT_COORDINATOR_UNREACHABLE);
   }
-  decryptJson = await decryptResp.json();
-} catch (err) {
   console.error(`[normalize] coordinator decrypt unreachable: ${err?.message ?? err}`);
   process.exit(EXIT_COORDINATOR_UNREACHABLE);
 }
@@ -556,13 +645,9 @@ try {
 
 let s0Json;
 try {
-  const s0Resp = await fetch(`${coordinatorUrl}/v2/normalize/sigma/s0`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${coordinatorBearerToken}`,
-    },
-    body: JSON.stringify({
+  s0Json = await postCoordinatorJsonWithRetry(
+    "/v2/normalize/sigma/s0",
+    {
       dkgEpoch: dkgEpochStr,
       vaultAddress: addr32(vaultAddress),
       assetType: addr32(assetType),
@@ -571,17 +656,15 @@ try {
       selectedSlots,
       alphaShareEnvelopes,
       requestId,
-    }),
-  });
-  console.error(`[normalize] coordinator /v2/normalize/sigma/s0 status=${s0Resp.status}`);
-  if (!s0Resp.ok) {
-    const errBody = await s0Resp.text();
-    console.error(`[normalize] s0_failed status=${s0Resp.status}`);
-    if (debugBalance) console.error(`[normalize] s0_failed body=${errBody}`);
+    },
+    "s0",
+  );
+} catch (err) {
+  if (err?.status) {
+    console.error(`[normalize] s0_failed status=${err.status}`);
+    if (debugBalance) console.error(`[normalize] s0_failed body=${err.body ?? ""}`);
     process.exit(EXIT_COORDINATOR_UNREACHABLE);
   }
-  s0Json = await s0Resp.json();
-} catch (err) {
   console.error(`[normalize] coordinator s0 unreachable: ${err?.message ?? err}`);
   process.exit(EXIT_COORDINATOR_UNREACHABLE);
 }
@@ -696,32 +779,26 @@ const cliArgs = [
 // though the on-chain tx surfaces them anyway).
 console.error(`[normalize] aptos move run --function-id ${functionId} --profile ${signerProfile} --max-gas ${maxGas} --gas-unit-price ${gasUnitPrice}`);
 
-const run = spawnSync("aptos", cliArgs, {
-  cwd: serviceRoot,
-  encoding: "utf8",
-  maxBuffer: 10 * 1024 * 1024,
+const { run, stderrText, stdoutText, txHash } = await runAptosCliWithRetry(cliArgs, {
+  cwd: aptosCliCwd,
   env: process.env,
+  label: "normalize",
 });
 if (run.error) {
   console.error(`[normalize] failed to spawn aptos CLI: ${run.error.message}`);
   process.exit(EXIT_APTOS_SPAWN);
 }
 // stderr from aptos CLI is non-secret diagnostics about the submission flow.
-process.stderr.write(run.stderr || "");
+process.stderr.write(stderrText || "");
 if (run.status !== 0) {
   console.error(`[normalize] aptos CLI exited with status ${run.status}`);
-  process.stdout.write(run.stdout || "");
+  process.stdout.write(stdoutText || "");
   process.exit(EXIT_APTOS_SPAWN);
 }
 
-function extractTxHash(text) {
-  const m = text.match(/"transaction_hash"\s*:\s*"(0x[0-9a-fA-F]+)"/);
-  return m ? m[1] : null;
-}
-const txHash = extractTxHash(run.stdout || "");
 if (!txHash) {
   console.error(`[normalize] could not parse transaction_hash from aptos CLI output`);
-  process.stdout.write(run.stdout || "");
+  process.stdout.write(stdoutText || "");
   process.exit(EXIT_APTOS_SPAWN);
 }
 console.error(`[normalize] submitted tx ${txHash}; polling for chain confirmation`);

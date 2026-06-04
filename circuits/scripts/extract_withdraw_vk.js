@@ -23,8 +23,9 @@ function g2Uncompr(arr) {
 const vkPath = path.resolve(__dirname, '..', 'generated', 'withdrawal_proof_vk.json');
 const vk = JSON.parse(fs.readFileSync(vkPath, 'utf8'));
 if (vk.protocol !== 'groth16') throw new Error(`bad protocol: ${vk.protocol}`);
-if (vk.nPublic !== 12) throw new Error(`expected 12 publics, got ${vk.nPublic}`);
-if (vk.IC.length !== 13) throw new Error(`expected IC length 13, got ${vk.IC.length}`);
+// V4 pruned withdraw publics: 6 publics, IC length 7.
+if (vk.nPublic !== 6) throw new Error(`expected 6 publics, got ${vk.nPublic}`);
+if (vk.IC.length !== 7) throw new Error(`expected IC length 7, got ${vk.IC.length}`);
 
 const out = {
   alpha_g1: g1Uncompr(vk.vk_alpha_1),

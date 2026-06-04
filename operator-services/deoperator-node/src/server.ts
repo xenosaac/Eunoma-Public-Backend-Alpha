@@ -293,7 +293,8 @@ export function buildDeoperatorNodeServer(
       | "/worker/v2/frost/sign/aggregate"
       | "/worker/v2/normalize/sigma/s0_partial"
       | "/v2/balance/decrypt_partial"
-      | "/v2/vault/resync",
+      | "/v2/vault/resync"
+      | "/v2/vault/sync_sequence",
     body: unknown,
     reply: { code: (s: number) => { send: (body: unknown) => unknown } },
   ) => {
@@ -706,6 +707,18 @@ export function buildDeoperatorNodeServer(
       return sendError(reply, err);
     }
     return forwardToWorker("/v2/vault/resync", req.body, reply);
+  });
+
+  // Generic monotonic sequence sync. Same trust posture as /v2/vault/resync:
+  // deop-node guards against forbidden plaintext and the crypto worker verifies
+  // trusted bridge config + reads chain state from its own APTOS_NODE_URL.
+  server.post("/v2/vault/sync_sequence", async (req, reply) => {
+    try {
+      assertNoForbiddenPlaintextFields((req.body ?? {}) as Record<string, unknown>);
+    } catch (err) {
+      return sendError(reply, err);
+    }
+    return forwardToWorker("/v2/vault/sync_sequence", req.body, reply);
   });
 
   return { server, store };

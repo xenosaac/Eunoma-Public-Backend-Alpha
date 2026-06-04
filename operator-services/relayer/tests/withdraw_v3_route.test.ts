@@ -14,6 +14,7 @@ function validWithdrawV2Body(): Record<string, unknown> {
   const hexN = (n: number, seed: number): string =>
     Array.from({ length: n }, (_, i) => ((i + seed) & 0xff).toString(16).padStart(2, "0")).join("");
   return {
+    assetAddr: hex32(0x01),
     root: hex32(0x10),
     nullifierHash: hex32(0x11),
     recipient: hex32(0x12),
@@ -24,6 +25,10 @@ function validWithdrawV2Body(): Record<string, unknown> {
     aspRoot: hex32(0x17),
     stateTreeDepth: "4",
     aspTreeDepth: "3",
+    changeCommitment: hex32(0x18),
+    amountPDigest: hex32(0x19),
+    amountPOld: Array.from({ length: 4 }, (_, i) => hex32(0x1a + i)),
+    amountPRem: Array.from({ length: 4 }, (_, i) => hex32(0x1e + i)),
     vaultSequence: "42",
     withdrawProof: hexN(192, 0x20),
     expirySecs: "1800000000",
@@ -121,6 +126,54 @@ describe("relayer /v3/relayer/submit/withdraw", () => {
     expect(journal.lastCompletedStep(body.requestHash as string)).toBe(4);
   });
 
+  it("passes consecutive completed journal steps to the submitter for resume", async () => {
+    const body = validWithdrawV2Body();
+    const journal = new FileSubmitJournal({ now: () => 1 });
+    journal.recordIntent(body.requestHash as string, 0);
+    journal.recordCompleted(body.requestHash as string, 0, "0x" + "a".repeat(64));
+    journal.recordIntent(body.requestHash as string, 1);
+    journal.recordCompleted(body.requestHash as string, 1, "0x" + "b".repeat(64));
+    journal.recordIntent(body.requestHash as string, 3);
+    journal.recordCompleted(body.requestHash as string, 3, "0x" + "d".repeat(64));
+
+    let observed:
+      | {
+          completedTxHashes?: string[];
+          resumeAfterStep?: number;
+        }
+      | undefined;
+    const server = buildRelayerServer({
+      gasGuard: allowGuard,
+      journal,
+      withdrawV3Submitter: async (_args, hooks) => {
+        observed = {
+          completedTxHashes: hooks?.completedTxHashes,
+          resumeAfterStep: hooks?.resumeAfterStep,
+        };
+        hooks?.onStepStart?.(2, "fn2");
+        hooks?.onStepDone?.(2, "fn2", "0x" + "c".repeat(64));
+        return {
+          accepted: true,
+          simulated: false,
+          txHashes: [...(hooks?.completedTxHashes ?? []), "0x" + "c".repeat(64)],
+        };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v3/relayer/submit/withdraw",
+      payload: body,
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(observed).toEqual({
+      completedTxHashes: ["0x" + "a".repeat(64), "0x" + "b".repeat(64)],
+      resumeAfterStep: 1,
+    });
+    expect(journal.lastCompletedStep(body.requestHash as string)).toBe(3);
+  });
+
   it("rejects a forbidden plaintext field with 400", async () => {
     const server = buildRelayerServer({ withdrawV3Submitter: fiveStepSubmitter() });
     const body = validWithdrawV2Body();
@@ -149,5 +202,26 @@ describe("relayer /v3/relayer/submit/withdraw", () => {
     expect(res.statusCode).toBe(502);
     expect(res.json().error).toBe("submit_failed");
     expect(res.json().code).toBe("aptos_cli_error");
+  });
+
+  it("surfaces already-spent nullifiers as terminal 409 submit failures", async () => {
+    const server = buildRelayerServer({
+      gasGuard: allowGuard,
+      withdrawV3Submitter: async () => {
+        throw new RelayerSubmitterError(
+          "nullifier_already_spent",
+          "prepare_withdraw_proof_v4 failed because the note was already spent (E_NULLIFIER_ALREADY_SPENT)"
+        );
+      },
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v3/relayer/submit/withdraw",
+      payload: validWithdrawV2Body(),
+    });
+    expect(res.statusCode).toBe(409);
+    const body = res.json();
+    expect(body.error).toBe("submit_failed");
+    expect(body.code).toBe("nullifier_already_spent");
   });
 });

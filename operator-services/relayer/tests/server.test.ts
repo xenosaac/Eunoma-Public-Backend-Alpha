@@ -20,6 +20,7 @@ function validWithdrawV2Body(): Record<string, unknown> {
   const hexN = (n: number, seed: number): string =>
     Array.from({ length: n }, (_, i) => ((i + seed) & 0xff).toString(16).padStart(2, "0")).join("");
   return {
+    assetAddr: hex32(0x01),
     root: hex32(0x10),
     nullifierHash: hex32(0x11),
     recipient: hex32(0x12),
@@ -30,6 +31,10 @@ function validWithdrawV2Body(): Record<string, unknown> {
     aspRoot: hex32(0x17),
     stateTreeDepth: "4",
     aspTreeDepth: "3",
+    changeCommitment: hex32(0x18),
+    amountPDigest: hex32(0x19),
+    amountPOld: Array.from({ length: 4 }, (_, i) => hex32(0x1a + i)),
+    amountPRem: Array.from({ length: 4 }, (_, i) => hex32(0x1e + i)),
     vaultSequence: "42",
     withdrawProof: hexN(192, 0x20),
     expirySecs: "1800000000",
@@ -96,11 +101,14 @@ describe("relayer /v2/relayer/submit/withdraw — killer tests", () => {
     });
     expect(res.statusCode).toBe(202);
     expect(received).toBeDefined();
-    // LOAD-BEARING: assert the submitter's argument has the 27 fields in EXACT
-    // Move-signature order. If the parser or the manifest ever reorder, this
-    // test fails — which is the whole point of locking the order in.
+    // LOAD-BEARING: assert the submitter's argument has the 35 fields in EXACT
+    // V4 Move-signature order (CP5 RC1: assetAddr is the +1 routing key at
+    // index 0; CP2 CP1: changeCommitment public[12] is the +1 routing key
+    // between aspTreeDepth and vaultSequence). If the parser or the manifest
+    // ever reorder, this test fails — which is the whole point of locking the
+    // order in.
     expect(Object.keys(received!)).toEqual([...WITHDRAW_V2_CALL_ARGS_ORDER]);
-    expect(Object.keys(received!).length).toBe(30);
+    expect(Object.keys(received!).length).toBe(35);
     // Spot-check a few fields end-to-end.
     expect(received!.vaultSequence).toBe("42");
     expect(received!.expirySecs).toBe("1800000000");

@@ -36,6 +36,7 @@ let fakeBin;
 let fakeFetchScript;
 let opLogPath;
 let txHashLogPath;
+let allowlistLogPath;
 
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), "eunoma-refresh-cycle-"));
@@ -45,6 +46,7 @@ beforeEach(() => {
   fakeFetchScript = join(tmpRoot, "fetch_deposit_tx_hashes.sh");
   opLogPath = join(tmpRoot, "ops.log");
   txHashLogPath = join(tmpRoot, "tx-hashes.log");
+  allowlistLogPath = join(tmpRoot, "allowlist.log");
   mkdirSync(repoRoot, { recursive: true });
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(fakeBin, { recursive: true });
@@ -97,7 +99,8 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(readTree().latestRootHex).toBe(NEW_ROOT);
     expect(result.stdout).toContain("already has side-car; skipping rollover");
     expect(result.stdout).toContain("publish tree");
-    expect(readOps()).toEqual(["normalize", "build", "record", "asp"]);
+    expect(result.stdout).toContain("known root side-car present; skipping record known root");
+    expect(readOps()).toEqual(["normalize", "build", "asp"]);
   });
 
   it("uses an extra observed deposit hash when the indexer fetch has not listed it yet", () => {
@@ -156,6 +159,68 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(readQueue()).toBe("");
   });
 
+  it("prunes queued tx hashes that were positively classified as no-leaf events", () => {
+    writeFileSync(fakeFetchScript, "#!/usr/bin/env bash\nexit 0\n");
+    chmodSync(fakeFetchScript, 0o755);
+    writeFileSync(join(stateDir, "observed_deposit_tx_hashes.queue"), `${EXTRA_TX}\n`);
+
+    const result = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      FAKE_SKIPPED_NO_LEAF_TX: EXTRA_TX,
+    });
+
+    expect(result.status).toBe(0);
+    expect(readTxHashes()).toBe(EXTRA_TX);
+    expect(result.stdout).toContain("skippedNoLeaf=1");
+    expect(readQueue()).toBe("");
+  });
+
+  it("observes new V4 staged route leaves before publishing the public tree", () => {
+    writeObservedArtifacts(8);
+
+    const result = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      EUNOMA_TREE_EVENT_VERSION: "v4",
+      DKG_EPOCH: "1",
+      VAULT_EK: "0x" + "7".repeat(64),
+      CA_DKG_TRANSCRIPT_HASH: "0x" + "8".repeat(64),
+      COORDINATOR_BEARER_TOKEN: "fake-coordinator-token",
+      APTOS_NODE_URL: "https://fullnode.testnet.aptoslabs.com/v1",
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("observe staged route leaves");
+    expect(result.stdout).toContain("observe route leaf 9");
+    expect(result.stdout.indexOf("observe staged route leaves")).toBeLessThan(
+      result.stdout.indexOf("rollover"),
+    );
+    expect(readOps()).toEqual([
+      "normalize",
+      "build",
+      "observe:9",
+      "rollover",
+      "normalize",
+      "record",
+      "asp",
+    ]);
+    expect(readTree().latestRootHex).toBe(NEW_ROOT);
+  });
+
+  it("passes active asset allowlist into the V4 commitment tree builder", () => {
+    const result = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      EUNOMA_TREE_EVENT_VERSION: "v4",
+      EUNOMA_ACTIVE_ASSET_ADDRS: "0xa,0x1,0xa",
+      DKG_EPOCH: "1",
+      VAULT_EK: "0x" + "7".repeat(64),
+      CA_DKG_TRANSCRIPT_HASH: "0x" + "8".repeat(64),
+      COORDINATOR_BEARER_TOKEN: "fake-coordinator-token",
+    });
+
+    expect(result.status).toBe(0);
+    expect(readAllowlist()).toBe(`0xa=0x${"b".repeat(64)},0x1=0x${"b".repeat(64)}`);
+  });
+
   it("derives coordinator state dir from EUNOMA_STATE_ROOT when no explicit state dir is set", () => {
     const stateRoot = join(tmpRoot, "state-root");
     stateDir = join(stateRoot, "coordinator");
@@ -171,6 +236,47 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(result.status).toBe(0);
     expect(readTree().latestRootHex).toBe(NEW_ROOT);
   });
+
+  it("passes the local-smoke anonymity override only when explicitly enabled", () => {
+    const blocked = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      FAKE_TREE_LEAF_COUNT: "7",
+    });
+    expect(blocked.status).toBe(3);
+    expect(readTree().latestRootHex).toBe(OLD_ROOT);
+
+    const allowed = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      FAKE_TREE_LEAF_COUNT: "7",
+      EUNOMA_LOCAL_SMOKE: "1",
+    });
+    expect(allowed.status).toBe(0);
+    expect(readTree().latestRootHex).toBe(NEW_ROOT);
+  });
+
+  it("rebuilds ASP set when approved state and public ASP artifact diverge", () => {
+    writeApprovedState(9);
+    writeAspSet(8);
+
+    const result = runWrapper({ FAKE_TREE_ROOT: NEW_ROOT, FAKE_TREE_LEAF_COUNT: "9" });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("asp approved-state/public-set mismatch; rebuilding");
+    expect(readOps()).toEqual(["normalize", "build", "rollover", "normalize", "record", "asp"]);
+  });
+
+  it("re-records ASP root when approved state matches public set but record sidecar is missing", () => {
+    const rootPrefix = NEW_ROOT.replace(/^0x/, "").slice(0, 8);
+    writeFileSync(join(stateDir, `known_root_v2_${rootPrefix}.json`), "{}\n");
+    writeApprovedState(9);
+    writeAspSet(9);
+
+    const result = runWrapper({ FAKE_TREE_ROOT: NEW_ROOT, FAKE_TREE_LEAF_COUNT: "9" });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("asp root record side-car missing; re-recording public root");
+    expect(readOps()).toEqual(["normalize", "build", "asp"]);
+  });
 });
 
 function runWrapper(env = {}) {
@@ -183,6 +289,7 @@ function runWrapper(env = {}) {
       REAL_NODE_PATH: process.execPath,
       FAKE_OP_LOG: opLogPath,
       FAKE_TX_HASH_LOG: txHashLogPath,
+      FAKE_ALLOWLIST_LOG: allowlistLogPath,
       EUNOMA_REPO_ROOT: repoRoot,
       EUNOMA_COORDINATOR_STATE_DIR: stateDir,
       EUNOMA_FETCH_DEPOSIT_TX_HASHES_SCRIPT: fakeFetchScript,
@@ -234,10 +341,72 @@ function readTxHashes() {
   return readFileSync(txHashLogPath, "utf8").trim();
 }
 
+function readAllowlist() {
+  if (!existsSync(allowlistLogPath)) return "";
+  return readFileSync(allowlistLogPath, "utf8").trim();
+}
+
 function readQueue() {
   const p = join(stateDir, "observed_deposit_tx_hashes.queue");
   if (!existsSync(p)) return "";
   return readFileSync(p, "utf8").trim();
+}
+
+function fakeCommitment(i) {
+  return `0x${String(i + 1).padStart(64, "0")}`;
+}
+
+function writeApprovedState(count) {
+  writeFileSync(
+    join(stateDir, "asp_approved_state.json"),
+    JSON.stringify(
+      {
+        approved: Array.from({ length: count }, (_, i) => ({
+          commitment: fakeCommitment(i),
+          sender: `0x${String(i + 1).padStart(64, "b")}`,
+          label: fakeCommitment(i),
+        })),
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function writeAspSet(count) {
+  writeFileSync(
+    join(stateDir, "asp_set.json"),
+    JSON.stringify(
+      {
+        scheme: "eunoma_asp_set_v1",
+        rootHex: OLD_ROOT,
+        treeDepth: 4,
+        commitments: Array.from({ length: count }, (_, i) => fakeCommitment(i)),
+        ipfsCid: "local-test-cid",
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function writeObservedArtifacts(count) {
+  const dir = join(stateDir, "vault_state_v2_observed");
+  mkdirSync(dir, { recursive: true });
+  for (let i = 1; i <= count; i += 1) {
+    writeFileSync(
+      join(dir, `1__observe-${i}.json`),
+      JSON.stringify(
+        {
+          scheme: "vault_state_v2_observe_deposit",
+          dkgEpoch: "1",
+          depositCount: i,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+  }
 }
 
 function writeFakeNode() {
@@ -245,7 +414,7 @@ function writeFakeNode() {
   writeFileSync(
     implPath,
     `
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
 const script = args[0] ?? "";
@@ -266,6 +435,13 @@ if (script.endsWith("local_build_commitment_tree.mjs")) {
   append("build");
   const txHashes = (valueOf("--tx-hashes") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   writeFileSync(process.env.FAKE_TX_HASH_LOG, txHashes.join(",") + "\\n");
+  const allowlist = valueOf("--asset-allowlist");
+  if (allowlist && process.env.FAKE_ALLOWLIST_LOG) {
+    writeFileSync(process.env.FAKE_ALLOWLIST_LOG, allowlist + "\\n");
+  }
+  const skippedNoLeafTx = process.env.FAKE_SKIPPED_NO_LEAF_TX || "";
+  const txHashesForLeaves = txHashes.filter((h) => h.toLowerCase() !== skippedNoLeafTx.toLowerCase());
+  const eventFeedNotes = skippedNoLeafTx ? ["skipped_no_leaf_event:" + skippedNoLeafTx.toLowerCase()] : [];
   const stateDir = valueOf("--state-dir");
   mkdirSync(stateDir, { recursive: true });
   const leafCount = Number(process.env.FAKE_TREE_LEAF_COUNT ?? "9");
@@ -280,10 +456,11 @@ if (script.endsWith("local_build_commitment_tree.mjs")) {
         leafCount,
         leaves,
         depositMeta: leaves.map((commitmentHex, i) => ({
-          depositTxHash: txHashes[i] ?? "0x" + String(i + 1).padStart(64, "a"),
+          depositTxHash: txHashesForLeaves[i] ?? "0x" + String(i + 1).padStart(64, "a"),
           commitmentHex,
           sender: "0x" + String(i + 1).padStart(64, "b"),
         })),
+        eventFeedNotes,
         transcriptHash: "0x" + "44".repeat(32),
       },
       null,
@@ -303,9 +480,10 @@ if (script.endsWith("local_build_commitment_tree.mjs")) {
         leaves,
         depositMeta: leaves.map((commitmentHex, i) => ({
           commitmentHex,
-          depositTxHash: txHashes[i] ?? "0x" + String(i + 1).padStart(64, "a"),
+          depositTxHash: txHashesForLeaves[i] ?? "0x" + String(i + 1).padStart(64, "a"),
           sender: "0x" + String(i + 1).padStart(64, "b"),
         })),
+        eventFeedNotes,
         transcriptHash: "0x" + "55".repeat(32),
       },
       null,
@@ -323,6 +501,15 @@ if (script.endsWith("local_record_known_root_v2.mjs")) {
   if (process.env.FAKE_RECORD_FAIL === "1") {
     console.error("fake record_known_root failure");
     process.exit(31);
+  }
+  const treePath = valueOf("--commitment-tree");
+  const minAnonymitySet = Number(valueOf("--min-anonymity-set") ?? "8");
+  const allowLocalSmoke =
+    args.includes("--allow-local-smoke-anonymity") && process.env.EUNOMA_LOCAL_SMOKE === "1";
+  const tree = JSON.parse(readFileSync(treePath, "utf8"));
+  if (Number(tree.leafCount) < minAnonymitySet && !allowLocalSmoke) {
+    console.error("fake anonymity_set_too_small");
+    process.exit(3);
   }
   process.stdout.write(JSON.stringify({ ok: true, status: process.env.FAKE_RECORD_STATUS ?? "recorded" }) + "\\n");
   process.exit(0);
@@ -349,6 +536,11 @@ if (script.endsWith("local_run_asp_cycle.mjs")) {
   process.stdout.write(JSON.stringify({ ok: true, rootHex: process.env.FAKE_ASP_ROOT ?? process.env.FAKE_TREE_ROOT }) + "\\n");
   process.exit(0);
 }
+if (script.endsWith("local_deposit_observer.mjs")) {
+  append("observe:" + (valueOf("--target-leaf-index") ?? "all"));
+  process.stdout.write(JSON.stringify({ ok: true, processed: 1 }) + "\\n");
+  process.exit(0);
+}
 
 console.error("unexpected fake node command: " + args.join(" "));
 process.exit(97);
@@ -360,6 +552,9 @@ process.exit(97);
     fakeNodePath,
     `#!/usr/bin/env bash
 if [ "$1" = "-e" ]; then
+  exec "$REAL_NODE_PATH" "$@"
+fi
+if [ "$1" = "-" ]; then
   exec "$REAL_NODE_PATH" "$@"
 fi
 exec "$REAL_NODE_PATH" "${implPath}" "$@"

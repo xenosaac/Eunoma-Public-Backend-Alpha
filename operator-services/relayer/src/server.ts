@@ -21,7 +21,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   ForbiddenPlaintextFieldError,
-  WITHDRAW_V2_CALL_ARGS_ORDER,
+  WITHDRAW_V2_MONOLITH_CALL_ARGS_ORDER,
   WithdrawV2CallArgsError,
   type WithdrawV2CallArgs,
   parseWithdrawV2CallArgs,
@@ -47,8 +47,10 @@ import { DepositV3ArgsError, parseDepositV3DelegateArgs } from "./deposit_v3_arg
 export type WithdrawV3SubmitterFn = (
   args: WithdrawV2CallArgs,
   hooks?: {
+    completedTxHashes?: string[];
     onStepStart?: (step: number, fn: string) => void;
     onStepDone?: (step: number, fn: string, txHash: string) => void;
+    resumeAfterStep?: number;
   },
 ) => Promise<WithdrawV3SubmitResult>;
 
@@ -201,13 +203,16 @@ export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInst
 
     const journal = opts.journal;
     const requestHash = args.requestHash;
+    const resume = buildJournalResume(journal, requestHash);
     const run = (): Promise<WithdrawV3SubmitResult> =>
       opts.withdrawV3Submitter!(
         args,
         journal
           ? {
+              completedTxHashes: resume.completedTxHashes,
               onStepStart: (step) => journal.recordIntent(requestHash, step),
               onStepDone: (step, _fn, txHash) => journal.recordCompleted(requestHash, step, txHash),
+              resumeAfterStep: resume.resumeAfterStep,
             }
           : undefined,
       );
@@ -218,7 +223,8 @@ export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInst
       return reply.code(202).send(result);
     } catch (err) {
       if (err instanceof RelayerSubmitterError) {
-        return reply.code(502).send({ error: "submit_failed", code: err.code, message: err.message });
+        const status = terminalSubmitterErrorStatus(err);
+        return reply.code(status).send({ error: "submit_failed", code: err.code, message: err.message });
       }
       return reply.code(502).send({
         error: "submit_failed",
@@ -271,6 +277,34 @@ export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInst
   });
 
   return server;
+}
+
+function terminalSubmitterErrorStatus(err: RelayerSubmitterError): 409 | 502 {
+  if (err.code === "nullifier_already_spent") return 409;
+  return 502;
+}
+
+function buildJournalResume(
+  journal: SubmitJournal | undefined,
+  requestHash: string,
+): { completedTxHashes: string[]; resumeAfterStep: number } {
+  if (!journal) return { completedTxHashes: [], resumeAfterStep: -1 };
+  const completed = new Map<number, string>();
+  for (const entry of journal.entries(requestHash)) {
+    if (entry.phase === "completed" && entry.txHash) {
+      completed.set(entry.step, entry.txHash);
+    }
+  }
+  const completedTxHashes: string[] = [];
+  for (let step = 0; ; step += 1) {
+    const txHash = completed.get(step);
+    if (!txHash) break;
+    completedTxHashes.push(txHash);
+  }
+  return {
+    completedTxHashes,
+    resumeAfterStep: completedTxHashes.length - 1,
+  };
 }
 
 async function failClosedSubmitter(): Promise<RelayerSubmitResult> {
@@ -425,23 +459,25 @@ export function createAptosCliSubmitter(
  * parity with the Move signature.
  */
 export function encodeCallArgs(args: WithdrawV2CallArgs): string[] {
-  // Iterate over WITHDRAW_V2_CALL_ARGS_ORDER so the order ALWAYS matches the
-  // exported manifest. If the manifest drifts from the Move source, the
-  // parser test in deop-protocol catches it; if the encoder drifts from the
-  // manifest, the killer test in tests/server.test.ts catches it.
-  return WITHDRAW_V2_CALL_ARGS_ORDER.map((key) => encodeField(key, args[key]));
+  // Legacy monolith ABI order. The parsed HTTP body also carries V4 conservation
+  // fields used by the split submitter; `withdraw_to_recipient_v2` itself still
+  // accepts the original 32 positional args.
+  return WITHDRAW_V2_MONOLITH_CALL_ARGS_ORDER.map((key) => encodeField(key, args[key]));
 }
 
 export function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2CallArgs[keyof WithdrawV2CallArgs]): string {
   switch (key) {
+    case "assetAddr":
     case "recipient": {
       // Move param type is `address`, NOT `vector<u8>`. Aptos CLI args for an
       // address parameter must use the `address:0x...` prefix; `hex:0x...`
       // gets BCS-decoded as a `vector<u8>` (length-prefixed) and the on-chain
       // function deserialization rejects with FAILED_TO_DESERIALIZE_ARGUMENT.
+      // V4 (CP5 RC1): asset_addr is the same `address` shape as recipient — it
+      // is the registry routing key resolved on-chain, encoded identically.
       const clean = String(value).replace(/^0x/i, "").toLowerCase();
       if (!/^[0-9a-f]+$/.test(clean) || clean.length > 64) {
-        throw new Error(`recipient must be 0x-prefixed hex address (≤32 bytes): ${value}`);
+        throw new Error(`${key} must be 0x-prefixed hex address (≤32 bytes): ${value}`);
       }
       return `address:0x${clean.padStart(64, "0")}`;
     }
@@ -452,6 +488,10 @@ export function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2Call
     case "caPayloadHash":
     case "requestHash":
     case "aspRoot":
+    // V4 (CP2 CP1): change_commitment is a 32-byte Fr public[12], encoded `hex:`
+    // exactly like root (EMPTY = 32 zero bytes for a full withdraw).
+    case "changeCommitment":
+    case "amountPDigest":
     case "withdrawProof":
     case "groupSignature":
     case "zkrpNewBalance":
@@ -471,6 +511,8 @@ export function encodeField(key: keyof WithdrawV2CallArgs, value: WithdrawV2Call
     case "newBalanceR":
     case "newBalanceREffAud":
     case "amountP":
+    case "amountPOld":
+    case "amountPRem":
     case "amountRSender":
     case "amountRRecip":
     case "amountREffAud":
@@ -503,7 +545,10 @@ export function chunkToString(chunk: Buffer | string): string {
 }
 
 export const defaultSpawnAptos: SpawnAptosFn = (command, args) => {
-  const proc = nodeSpawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const proc = nodeSpawn(command, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    ...(process.env.APTOS_CLI_CWD ? { cwd: process.env.APTOS_CLI_CWD } : {}),
+  });
   const done = new Promise<number | null>((resolve, reject) => {
     proc.on("close", (code) => resolve(code));
     proc.on("error", (err) => reject(err));

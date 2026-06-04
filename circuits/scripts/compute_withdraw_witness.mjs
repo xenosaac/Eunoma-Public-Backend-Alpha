@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // =============================================================================================
-// V2 withdraw circuit witness builder — A6 amount_p binding (2026-05-23).
+// V4 withdraw circuit witness builder — ASP dual-LeanIMT + B′ partial-withdraw (2026-06-01).
 //
 // Reads the depositor's persisted withdraw witness JSON (output of
 // `operator-services/scripts/local_v2_deposit_submit.mjs`) + chain state (root, vault_sequence,
@@ -8,11 +8,12 @@
 // post-MPCCA-finalize) + amount_p (4 × 32B Ristretto compressed Pedersen, must byte-equal deposit
 // time's amount_p — depositor regenerates via SDK ConfidentialTransfer.create with deterministic
 // transferAmountRandomness = HKDF(secret)) and emits a circom witness JSON matching
-// `circuits/withdrawal_proof.circom` (A6: 9 publics, 51 privates).
+// `circuits/withdrawal_proof.circom` (V4: 9 publics incl. change_commitment[8], dual-LeanIMT
+// inclusion + B′ amount-conservation privates).
 //
-// Witness shape:
+// Witness shape (aspMode — the production V4 path):
 //   {
-//     // publics (9):
+//     // publics (13):
 //     "root":            "<decimal Fr>",
 //     "nullifier_hash":  "<decimal>",
 //     "asset_id":        "<decimal>",
@@ -21,25 +22,44 @@
 //     "ca_payload_hash": "<decimal>",
 //     "request_hash":    "<decimal>",
 //     "vault_sequence":  "<decimal>",
-//     "amount_p_digest": "<decimal>",
-//     // privates (51):
+//     "amount_p_digest": "<decimal>",            // the SPENT note's digest (= A_old)
+//     "asp_root":        "<decimal>",
+//     "state_tree_depth":"<decimal>",
+//     "asp_tree_depth":  "<decimal>",
+//     "change_commitment":"<decimal>",           // [12] 0 when full-spend; else fresh Compose5 (NEW V4)
+//     // privates:
 //     "nullifier":       "<decimal>",
-//     "secret":          "<decimal>",
+//     "secret":          "<decimal>",            // the deposit-time LABEL-BOUND secret (D6)
 //     "withdraw_blind":  "<decimal>",
-//     "merkle_path":     ["<decimal>", ...20],
-//     "merkle_indices":  ["<decimal>", ...20],
-//     "amount_p_limbs":  ["<decimal>", ...8]
+//     "amount_p_limbs":  ["<decimal>", ...8],
+//     "state_siblings":  ["<decimal>", ...32],   "state_leaf_index": "<decimal>",
+//     "asp_siblings":    ["<decimal>", ...32],   "asp_leaf_index":   "<decimal>",
+//     // V4 B′ partial-withdraw privates:
+//     "new_nullifier":      "<decimal>",         // fresh change-note nullifier (≠ parent)
+//     "new_secret":         "<decimal>",         // fresh change-note secret
+//     "wd_amount_p_limbs":  ["<decimal>", ...8], // limbs of the WITHDRAWN amount_p (W)
+//     "rem_amount_p_limbs": ["<decimal>", ...8], // limbs of the REMAINDER amount_p (A_rem)
+//     "old_amount_chunks":  ["<decimal>", ...4], // 4 × 16-bit base-2^16 chunks of A_old
+//     "wd_chunks":          ["<decimal>", ...4], // 4 × 16-bit base-2^16 chunks of W
+//     "rem_chunks":         ["<decimal>", ...4], // 4 × 16-bit base-2^16 chunks of A_rem
+//     "has_change":         "0" | "1"            // 0 ⇒ full spend; 1 ⇒ emit change note
 //   }
 //
 // Constraint identities (must equal what the circuit recomputes):
-//   amount_p_digest  = Poseidon8(amount_p_limbs[0..7])
+//   amount_p_digest  = Compose8(amount_p_limbs[0..7])
 //   commitment       = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID=0)
+//                      (`secret` here is the deposit-time label-bound secret; the withdraw circuit
+//                       does NOT recompute the label — label stays PRIVATE + zero-cost in withdraw)
 //   nullifier_hash   = Poseidon([nullifier])
 //   amount_tag       = Compose6(amount_p_digest, withdraw_blind, recipient_hash, asset_id, CHAIN_ID=2,
 //                               vault_sequence)
 //   request_hash     = Compose6(amount_tag, recipient_hash, ca_payload_hash, asset_id,
 //                               vault_sequence, CHAIN_ID=2)
-//   root             = Merkle inclusion of commitment at leaf in depth-20 Poseidon tree.
+//   root / asp_root  = dual hardened-LeanIMT inclusion of the SAME commitment (state + ASP trees).
+//   B′ conservation  = A_old === W + A_rem (16-bit chunks; 2× LessEqThan(64));
+//                      amount_p_digest_rem = Compose8(rem_amount_p_limbs);
+//                      change_commitment = has_change ? Compose5(new_nullifier, new_secret, asset_id,
+//                      amount_p_digest_rem, POOL_ID=0) : 0; full-spend forces W === A_old.
 //
 // recipient_hash derivation: Move's `derive_address_hash(recipient, "EUNOMA_RECIPIENT_V2")`
 //   addr_bytes = BCS(address)                  // 32 raw bytes
@@ -108,15 +128,31 @@ const rootArg = getArg("--root");
 const caPayloadHashArg = getArg("--ca-payload-hash");
 const amountPHexArg = getArg("--amount-p-hex", false);
 const commitmentTreeArg = getArg("--commitment-tree", false);
-// ASP (2026-05-31): the withdraw circuit is now 12-public dual-LeanIMT (state + ASP). The
-// production builder reads the LeanIMT state tree + the published ASP set and emits the
-// state_siblings/asp_siblings dual-inclusion witness. --commitment-tree (legacy depth-20) is
-// retained only for the dead 9-public path / negative tests.
+// ASP + V4 B′ (2026-06-02): the withdraw circuit is now 9-public dual-LeanIMT (state + ASP) with
+// change_commitment at public[8]. The production builder reads the LeanIMT state tree + the
+// published ASP set and emits the state_siblings/asp_siblings dual-inclusion witness plus the B′
+// partial-withdraw privates. --commitment-tree (legacy depth-20) is retained only for the dead
+// 9-public path / negative tests.
 const stateTreeArg = getArg("--state-tree", false);
 const aspSetArg = getArg("--asp-set", false);
 const testnetFlag = hasFlag("--testnet");
 const withdrawBlindArg = getArg("--withdraw-blind-hex", false);
 const outputArg = getArg("--output", false);
+
+// V4 B′ partial-withdraw inputs (all OPTIONAL; omitting them yields a FULL-SPEND witness):
+//   --note-amount N        A_old, the spent note's base-unit amount (decimal u64). Default 0.
+//   --withdraw-amount N     W, the withdrawn base-unit amount (decimal u64). Default = A_old (full spend).
+//   --new-nullifier-hex H   fresh change-note nullifier (32-byte hex). Auto-generated if omitted (partial).
+//   --new-secret-hex H      fresh change-note secret (32-byte hex). Auto-generated if omitted (partial).
+//   --rem-amount-p-hex H    128-byte hex (4 × 32B) of the REMAINDER amount_p. Required iff partial (has_change=1).
+//   --wd-amount-p-hex H      128-byte hex (4 × 32B) of the WITHDRAWN amount_p. Optional (defaults to all-zero limbs;
+//                            wd limbs are circuit-free — used only for off-chain audit / Move aggregate-Pedersen).
+const noteAmountArg = getArg("--note-amount", false);
+const withdrawAmountArg = getArg("--withdraw-amount", false);
+const newNullifierArg = getArg("--new-nullifier-hex", false);
+const newSecretArg = getArg("--new-secret-hex", false);
+const remAmountPHexArg = getArg("--rem-amount-p-hex", false);
+const wdAmountPHexArg = getArg("--wd-amount-p-hex", false);
 
 const aspMode = Boolean(stateTreeArg && aspSetArg);
 if (testnetFlag && !commitmentTreeArg && !aspMode) {
@@ -429,7 +465,7 @@ const { computeMerkleRootAndPathSingleLeaf, leBytesToBig, bigToLE32, le32ToHex: 
 
 const commitmentBig = leBytesToBig(commitmentLe);
 
-// ASP 12-public dual-LeanIMT fields (populated in aspMode).
+// ASP dual-LeanIMT route fields (populated in aspMode; pruned public vector has 9 entries).
 let aspRootBig = null;
 let stateDepthVal = null;
 let aspDepthVal = null;
@@ -600,10 +636,81 @@ if (!aspMode) {
   }
 }
 
+// ---- V4 B′ partial-withdraw private inputs -------------------------------------------------
+// Decompose a base-unit u64 amount into 4 × 16-bit little-endian base-2^16 chunks (matches the
+// circuit's `chunk[i] * 2^(16*i)` recompose). Each chunk is range-checked to [0, 2^16) in-circuit.
+function u64ToChunks16(decStr, label) {
+  let n = BigInt(decStr);
+  if (n < 0n || n >= 1n << 64n) {
+    console.error(`${label} must be a u64 (0 <= x < 2^64); got ${decStr}`);
+    process.exit(2);
+  }
+  const chunks = [];
+  for (let i = 0; i < 4; i += 1) {
+    chunks.push((n & 0xffffn).toString());
+    n >>= 16n;
+  }
+  return chunks;
+}
+
+const aOldAmount = noteAmountArg !== undefined ? BigInt(noteAmountArg) : 0n;
+const wAmount = withdrawAmountArg !== undefined ? BigInt(withdrawAmountArg) : aOldAmount;
+const aRemAmount = aOldAmount - wAmount;
+if (aRemAmount < 0n) {
+  console.error(`--withdraw-amount (${wAmount}) exceeds --note-amount (${aOldAmount}); W must be <= A_old`);
+  process.exit(2);
+}
+const hasChange = aRemAmount > 0n ? 1 : 0;
+
+const oldAmountChunks = u64ToChunks16(aOldAmount.toString(), "--note-amount (A_old)");
+const wdChunks = u64ToChunks16(wAmount.toString(), "--withdraw-amount (W)");
+const remChunks = u64ToChunks16(aRemAmount.toString(), "A_rem (A_old - W)");
+
+// Withdrawn amount_p limbs (circuit-free; off-chain audit / Move aggregate-Pedersen). Default zeros.
+const wdAmountPLimbsBig = wdAmountPHexArg
+  ? amountPHexToLimbs(require128ByteHex("--wd-amount-p-hex", wdAmountPHexArg))
+  : Array.from({ length: 8 }, () => 0n);
+
+// Remainder amount_p limbs + digest. For a partial spend these MUST be the real remainder amount_p
+// (so change_commitment binds the genuine remainder). For a full spend (has_change=0) they are
+// circuit-free; default to zeros.
+let remAmountPLimbsBig;
+if (hasChange) {
+  if (!remAmountPHexArg) {
+    console.error("partial withdraw (A_rem>0) requires --rem-amount-p-hex (128-byte hex of the remainder amount_p)");
+    process.exit(2);
+  }
+  remAmountPLimbsBig = amountPHexToLimbs(require128ByteHex("--rem-amount-p-hex", remAmountPHexArg));
+} else {
+  remAmountPLimbsBig = remAmountPHexArg
+    ? amountPHexToLimbs(require128ByteHex("--rem-amount-p-hex", remAmountPHexArg))
+    : Array.from({ length: 8 }, () => 0n);
+}
+const remAmountPLimbsLe = remAmountPLimbsBig.map(bigToLe32);
+const amountPDigestRemLe = compose8(remAmountPLimbsLe);
+
+// Fresh change-note nullifier/secret (must differ from the spent parent). Auto-generate if omitted.
+function freshFr(hexArg, fallbackTag) {
+  if (hexArg) return require32ByteHex(fallbackTag, hexArg);
+  const buf = randomBytes(32);
+  buf[31] &= 0x3f; // keep < BN254 Fr (clear top 2 bits of the MSB)
+  return Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+const newNullifierHex = freshFr(newNullifierArg, "--new-nullifier-hex");
+const newSecretHex = freshFr(newSecretArg, "--new-secret-hex");
+const newNullifierLe = hexToLe32(newNullifierHex);
+const newSecretLe = hexToLe32(newSecretHex);
+
+// change_commitment = has_change ? Compose5(new_nullifier, new_secret, asset_id, amount_p_digest_rem,
+//                     POOL_ID) : 0 (canonical empty value).
+const changeCommitmentLe = hasChange
+  ? compose5(newNullifierLe, newSecretLe, assetIdLe, amountPDigestRemLe, poolIdLe)
+  : new Uint8Array(32); // all-zero = EMPTY_CHANGE sentinel
+
 // ---- Build witness JSON --------------------------------------------------------------------
 const witnessJson = aspMode
   ? {
-      // publics (12, circuit declaration order — mirrors withdrawal_proof.circom main + build_asp_witness_test.mjs)
+      // publics (9, pruned to stay below Aptos execution limits)
       root: le32ToDec(rootLe),
       nullifier_hash: le32ToDec(nullifierHashLe),
       asset_id: le32ToDec(assetIdLe),
@@ -616,6 +723,7 @@ const witnessJson = aspMode
       asp_root: aspRootBig.toString(),
       state_tree_depth: String(stateDepthVal),
       asp_tree_depth: String(aspDepthVal),
+      change_commitment: le32ToDec(changeCommitmentLe), // [12] NEW V4 (append-only)
       // privates
       nullifier: le32ToDec(nullifierLe),
       secret: le32ToDec(secretLe),
@@ -625,6 +733,15 @@ const witnessJson = aspMode
       state_leaf_index: String(leafIndexResolved),
       asp_siblings: aspSiblingsBig.map((b) => b.toString()),
       asp_leaf_index: String(aspLeafIndexVal),
+      // V4 B′ partial-withdraw privates
+      new_nullifier: le32ToDec(newNullifierLe),
+      new_secret: le32ToDec(newSecretLe),
+      wd_amount_p_limbs: wdAmountPLimbsBig.map((b) => b.toString()),
+      rem_amount_p_limbs: remAmountPLimbsBig.map((b) => b.toString()),
+      old_amount_chunks: oldAmountChunks,
+      wd_chunks: wdChunks,
+      rem_chunks: remChunks,
+      has_change: String(hasChange),
     }
   : {
       // publics (declaration order) — legacy 9-public depth-20 path (dead for ASP circuit)

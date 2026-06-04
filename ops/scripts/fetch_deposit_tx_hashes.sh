@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# R7-OPS-1 helper: query Aptos Indexer GraphQL for all deposit txs ever sent
-# to the bridge package, resolve versions to tx hashes via REST, output
-# comma-separated hash list on stdout. Used by refresh_known_root_cycle.sh
-# to feed local_build_commitment_tree.mjs --tx-hashes.
+# R7-OPS-1 / V4 helper: query Aptos Indexer GraphQL for all route-leaf txs ever
+# sent to the bridge package, resolve versions to tx hashes via REST, output
+# comma-separated hash list on stdout. Used by refresh_known_root_cycle.sh to feed
+# local_build_commitment_tree.mjs --tx-hashes.
 #
 # Why: events v1 GraphQL table is deprecated (Sep 2025). account_transactions
 # table is the supported replacement. We filter by entry function name to find
-# every deposit_step2b_invoke_framework + deposit_with_commitment_v2 call ever
-# sent to the bridge package. This is only a retry/backfill feed; the route-ready
-# wrapper persists concrete observe_deposit tx hashes and the tree builder only
-# appends the next contiguous current-vault deposit counts.
+# every deposit_step2b_invoke_framework + deposit_with_commitment_v2 +
+# withdraw_step2b_invoke_framework call ever sent to the bridge package. V4
+# partial withdraws emit ChangeNoteAppendedV4 in withdraw_step2b, so the tree
+# cursor must ingest those txs too. This is only a retry/backfill feed; the
+# route-ready wrapper persists concrete observe tx hashes and the tree builder
+# only appends the next contiguous current-vault route leaves.
 #
 # Output: comma-separated hex tx hashes (e.g., 0x123...,0x456...). Empty string
 # if no txs found (caller should treat as no-op).
@@ -20,7 +22,7 @@ APTOS_NODE_URL=${APTOS_TESTNET_NODE_URL:-${APTOS_NODE_URL:-https://api.testnet.a
 LIMIT=${EUNOMA_TX_FETCH_LIMIT:-500}
 
 # Step 1: GraphQL — list all account_transactions for bridge package addr,
-# filter to deposit_step2b/deposit_with_commitment_v2 entry funs, get versions.
+# filter to route-leaf-producing entry functions, get versions.
 VERSIONS=$(curl -sS -X POST "${APTOS_NODE_URL%/v1}/v1/graphql" \
   -H 'Content-Type: application/json' \
   -d "{\"query\":\"query { account_transactions(where: {account_address: {_eq: \\\"${BRIDGE}\\\"}}, order_by: {transaction_version: desc}, limit: ${LIMIT}) { transaction_version user_transaction { entry_function_id_str } }}\"}" \
@@ -36,7 +38,12 @@ try:
     for t in txs:
         u = t.get('user_transaction', {}) or {}
         fn = (u.get('entry_function_id_str') or '').lower()
-        if 'deposit_step2b_invoke_framework' in fn or 'deposit_with_commitment_v2' in fn:
+        if (
+            'deposit_step2b_invoke_framework' in fn
+            or 'deposit_with_commitment_v2' in fn
+            or 'withdraw_step2b_invoke_framework' in fn
+            or 'withdraw_to_recipient_v2' in fn
+        ):
             versions.append(str(t['transaction_version']))
     # Print one per line for shell consumption
     for v in versions:
@@ -47,7 +54,7 @@ except Exception as e:
 ")
 
 if [ -z "$VERSIONS" ]; then
-  echo "" # No deposits found; caller no-ops
+  echo "" # No route-leaf txs found; caller no-ops
   exit 0
 fi
 

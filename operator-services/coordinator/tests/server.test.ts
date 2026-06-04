@@ -5495,6 +5495,10 @@ describe("coordinator", () => {
         aspRoot: h32("a"),
         stateTreeDepth: 4,
         aspTreeDepth: 3,
+        changeCommitment: h32("c"),
+        amountPDigest: h32("b"),
+        amountPOld: [genHex32("ba", 0), genHex32("ba", 1), genHex32("ba", 2), genHex32("ba", 3)],
+        amountPRem: [genHex32("bb", 0), genHex32("bb", 1), genHex32("bb", 2), genHex32("bb", 3)],
         depositCount: 1,
         attestationConfig: {
           bridge: "11".repeat(32),
@@ -5724,6 +5728,8 @@ describe("coordinator", () => {
           ((i + seed) & 0xff).toString(16).padStart(2, "0"),
         ).join("");
       const fields = {
+        // V4 (CP5 RC1): assetAddr is the leading positional call-arg (32-byte Aptos address).
+        assetAddr: hex32(0x0a),
         root: hex32(0x10),
         nullifierHash: hex32(0x11),
         recipient: hex32(0x12),
@@ -5734,6 +5740,10 @@ describe("coordinator", () => {
         aspRoot: hex32(0x17),
         stateTreeDepth: "4",
         aspTreeDepth: "3",
+        changeCommitment: hex32(0x18), // V4 (CP2 CP1) public[12]; 32 zero bytes = full withdraw
+        amountPDigest: hex32(0x19),
+        amountPOld: Array.from({ length: 4 }, (_, i) => hex32(0x1a + i)),
+        amountPRem: Array.from({ length: 4 }, (_, i) => hex32(0x1e + i)),
         vaultSequence: "42",
         expirySecs: "1800000000",
         withdrawProof: hexN(192, 0x20),
@@ -5884,9 +5894,16 @@ describe("coordinator", () => {
       expect(body.txHash).toBe("0x" + "ab".repeat(32));
       expect(body.transcriptHash).toMatch(/^[0-9a-f]{64}$/);
       expect(body.transcriptPath).toContain("mpcca_withdraw_submit");
-      // LOAD-BEARING: 30 fields handed to the relayer.
+      // LOAD-BEARING: 31 fields handed to the relayer (V4 CP5 RC1: +assetAddr, the leading
+      // positional routing key — matches WITHDRAW_V2_CALL_ARGS_ORDER length 31).
       expect(receivedArgs).toBeDefined();
-      expect(Object.keys(receivedArgs!).length).toBe(30);
+      // V4 B-prime adds amountPDigest/amountPOld/amountPRem for conservation.
+      expect(Object.keys(receivedArgs!).length).toBe(35);
+      expect(receivedArgs!.assetAddr).toBeDefined();
+      expect(receivedArgs!.changeCommitment).toBeDefined();
+      expect(receivedArgs!.amountPDigest).toBeDefined();
+      expect(receivedArgs!.amountPOld).toBeDefined();
+      expect(receivedArgs!.amountPRem).toBeDefined();
       expect(receivedArgs!.root).toBeDefined();
       expect(receivedArgs!.vaultSequence).toBe("42");
       expect(receivedArgs!.memo).toBe("");
@@ -5911,6 +5928,31 @@ describe("coordinator", () => {
       const body = res.json();
       expect(body.error).toBe("relayer_returned_error");
       expect(body.message).toContain("relayer is down");
+    });
+
+    it("mpcca_submit_surfaces_already_spent_nullifier_as_terminal", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-nullifier-spent-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-nullifier-spent");
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => {
+          throw new Error(
+            "relayer responded 409 (submit_failed/nullifier_already_spent): " +
+              "prepare_withdraw_proof_v4 failed because the note was already spent " +
+              "(E_NULLIFIER_ALREADY_SPENT)"
+          );
+        },
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-nullifier-spent" },
+      });
+      expect(res.statusCode).toBe(409);
+      const body = res.json();
+      expect(body.error).toBe("nullifier_already_spent");
+      expect(body.message).toBe("This private note has already been spent.");
     });
 
     it("mpcca_submit_returns_502_relayer_unreachable_when_no_submitter_configured", async () => {
@@ -6052,6 +6094,8 @@ describe("coordinator", () => {
         circuitVersionsHash: hex32(0x06),
       };
       const fields = {
+        // V4 (CP5 RC1): assetAddr is the leading positional call-arg (32-byte Aptos address).
+        assetAddr: hex32(0x0a),
         root: hex32(0x10),
         nullifierHash: hex32(0x11),
         recipient: hex32(0x12),
@@ -6062,6 +6106,10 @@ describe("coordinator", () => {
         aspRoot: hex32(0x17),
         stateTreeDepth: "4",
         aspTreeDepth: "3",
+        changeCommitment: hex32(0x18), // V4 (CP2 CP1) public[12]; 32 zero bytes = full withdraw
+        amountPDigest: hex32(0x19),
+        amountPOld: Array.from({ length: 4 }, (_, i) => hex32(0x1a + i)),
+        amountPRem: Array.from({ length: 4 }, (_, i) => hex32(0x1e + i)),
         vaultSequence: "42",
         expirySecs: "1800000000",
         withdrawProof: hexN(192, 0x20),
@@ -6109,11 +6157,17 @@ describe("coordinator", () => {
         payload: { dkgEpoch: "1", requestId: "withdraw-attest" },
       });
       expect(res.statusCode).toBe(202);
-      // Relayer must receive ONLY the 30 call-args fields; attestationConfig keys must
-      // NOT appear.
+      // Relayer must receive ONLY the 31 call-args fields (V4 CP5 RC1: +assetAddr);
+      // attestationConfig keys must NOT appear.
       expect(relayerArgs).toBeDefined();
       const relayerKeys = Object.keys(relayerArgs!);
-      expect(relayerKeys.length).toBe(30);
+      // V4 B-prime adds amountPDigest/amountPOld/amountPRem for conservation.
+      expect(relayerKeys.length).toBe(35);
+      expect(relayerKeys).toContain("assetAddr");
+      expect(relayerKeys).toContain("changeCommitment");
+      expect(relayerKeys).toContain("amountPDigest");
+      expect(relayerKeys).toContain("amountPOld");
+      expect(relayerKeys).toContain("amountPRem");
       for (const k of [
         "chainId",
         "bridge",
@@ -6248,6 +6302,163 @@ describe("coordinator", () => {
       );
     });
 
+    it("submit_route_queues_route_maintenance_when_chain_confirmation_fetch_is_rate_limited", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-confirmation-429-");
+      await writeFinalizeTranscriptComplete(stateRoot, "1", "withdraw-confirmation-429");
+      const txHash = "0x" + "cd".repeat(32);
+      const fakeChainFetch: typeof fetch = async () =>
+        new Response("Per anonymous IP rate limit exceeded", {
+          status: 429,
+          headers: { "content-type": "text/plain" },
+        });
+      const maintenanceCalls: Array<{
+        extraDepositTxHashes?: string[];
+        stateRoot?: string;
+      }> = [];
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => ({
+          accepted: true,
+          txHash,
+          simulated: false,
+        }),
+        chainNodeUrl: "http://127.0.0.1:8080",
+        chainFetch: fakeChainFetch,
+        chainConfirmationTimeoutMs: 1000,
+        bridgeMaintenanceTrigger: (ctx) => {
+          maintenanceCalls.push({
+            extraDepositTxHashes: ctx.extraDepositTxHashes,
+            stateRoot: ctx.stateRoot,
+          });
+        },
+      });
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-confirmation-429" },
+      });
+      expect(res.statusCode).toBe(502);
+      const body = res.json();
+      expect(body.error).toBe("chain_confirmation_timeout");
+      expect(body.txHash).toBe(txHash);
+      expect(body.message).toContain("429");
+
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(maintenanceCalls).toEqual([
+        { extraDepositTxHashes: [txHash], stateRoot },
+      ]);
+
+      const { readFile } = await import("node:fs/promises");
+      const artifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
+      expect(artifact.completed).toBe(false);
+      expect(artifact.chainConfirmationError).toContain("429");
+    });
+
+    it("submit_route_recovers_incomplete_txhash_artifact_without_rebroadcast", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-recover-incomplete-");
+      const bridge = h32("1");
+      await writeFinalizeTranscriptComplete(
+        stateRoot,
+        "1",
+        "withdraw-recover-incomplete",
+        {},
+        {
+          attestationConfig: {
+            chainId: 2,
+            bridge,
+            vault: h32("2"),
+            assetType: h32("3"),
+            operatorSetVersion: "1",
+            rosterHash: h32("4"),
+            frostGroupPubkey: h32("5"),
+            circuitVersionsHash: h32("6"),
+          },
+        },
+      );
+      const txHash = "0x" + "ef".repeat(32);
+      const txBody = {
+        type: "user_transaction",
+        success: true,
+        vm_status: "Executed successfully",
+        events: [
+          {
+            type: `0x${bridge}::eunoma_bridge::WithdrawEventV3`,
+            data: {
+              root: h32("a"),
+              nullifier_hash: h32("b"),
+              recipient_hash: h32("c"),
+              request_hash: h32("d"),
+              vault_sequence: "12",
+            },
+          },
+          {
+            type: `0x${bridge}::eunoma_bridge::ChangeNoteAppendedV4`,
+            data: {
+              leaf_index: "44",
+              commitment: "0x" + h32("e"),
+            },
+          },
+        ],
+      };
+      let chainFetchCount = 0;
+      const fakeChainFetch: typeof fetch = async () => {
+        chainFetchCount += 1;
+        if (chainFetchCount === 1) {
+          return new Response("Per anonymous IP rate limit exceeded", {
+            status: 429,
+            headers: { "content-type": "text/plain" },
+          });
+        }
+        return Response.json(txBody);
+      };
+      let submitterCallCount = 0;
+      const maintenanceCalls: Array<{ extraDepositTxHashes?: string[] }> = [];
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => {
+          submitterCallCount += 1;
+          return { accepted: true, txHash, simulated: false };
+        },
+        chainNodeUrl: "http://127.0.0.1:8080",
+        chainFetch: fakeChainFetch,
+        chainConfirmationTimeoutMs: 1000,
+        bridgeMaintenanceTrigger: (ctx) => {
+          maintenanceCalls.push({ extraDepositTxHashes: ctx.extraDepositTxHashes });
+        },
+      });
+
+      const first = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-recover-incomplete" },
+      });
+      expect(first.statusCode).toBe(502);
+      expect(first.json().txHash).toBe(txHash);
+      expect(submitterCallCount).toBe(1);
+
+      const second = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-recover-incomplete" },
+      });
+      expect(second.statusCode).toBe(200);
+      const secondBody = second.json();
+      expect(secondBody.txHash).toBe(txHash);
+      expect(secondBody.completed).toBe(true);
+      expect(secondBody.idempotentReplay).toBe(true);
+      expect(secondBody.recoveredIncompleteSubmit).toBe(true);
+      expect(Array.isArray(secondBody.events)).toBe(true);
+      expect(submitterCallCount).toBe(1);
+
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(maintenanceCalls.map((call) => call.extraDepositTxHashes)).toEqual([
+        [txHash],
+        [txHash],
+      ]);
+    });
+
     // KILLER (Codex M5b P1 #3): a confirmed-but-failed chain execution surfaces as 502
     // chain_execution_failed with vmStatus, NOT a 200 success. The submit artifact must
     // also record completed: false so P2 #1 retry idempotency does not short-circuit on
@@ -6361,6 +6572,8 @@ describe("coordinator", () => {
       expect(res.statusCode).toBe(200);
       const body = res.json();
       expect(body.completed).toBe(true);
+      expect(body.events).toHaveLength(1);
+      expect(body.events[0].type).toBe(`${attestationConfig.bridge}::eunoma_bridge::WithdrawEventV3`);
       expect(body.postWithdrawResync.ok).toBe(true);
       expect(body.postWithdrawResync.statusCode).toBe(200);
       expect(body.postWithdrawResync.body.summary.okSlots).toEqual([0, 1, 2, 3, 4, 5, 6]);
@@ -6388,6 +6601,7 @@ describe("coordinator", () => {
       expect(resyncArtifact.summary.thresholdMet).toBe(true);
       const submitArtifact = JSON.parse(await readFile(body.transcriptPath, "utf8"));
       expect(submitArtifact.postWithdrawResync.ok).toBe(true);
+      expect(submitArtifact.events).toHaveLength(1);
     });
 
     // KILLER (Codex M5b P1 #2): the loader enforces that the on-disk transcript's
@@ -6573,6 +6787,8 @@ describe("coordinator ASP / state-tree public endpoints", () => {
         aspRootHex: aspArtifact.rootHex,
         aspTreeDepth: aspArtifact.treeDepth,
         ipfsCid: aspArtifact.ipfsCid,
+        // CP5 RC6(A): ASP-root record time (AssociationSetData.timestamp) surfaced.
+        updatedAtUnix: aspArtifact.updatedAtUnix,
         commitments: aspArtifact.commitments,
       });
     });
@@ -6590,6 +6806,8 @@ describe("coordinator ASP / state-tree public endpoints", () => {
         aspRootHex: aspArtifact.rootHex,
         aspTreeDepth: aspArtifact.treeDepth,
         ipfsCid: aspArtifact.ipfsCid,
+        // CP5 RC6(A): ASP-root record time surfaced on the lightweight pointer too.
+        updatedAtUnix: aspArtifact.updatedAtUnix,
       });
     });
 
@@ -6614,6 +6832,237 @@ describe("coordinator ASP / state-tree public endpoints", () => {
         expect(res.statusCode, url).toBe(503);
         expect(res.json().error, url).toBe("asp_set_unavailable");
       }
+    });
+  });
+
+  // CP5 RC6(A): GET /v2/asp-set/at/:rootHex — short-window historical ASP-set lookup with the TTL.
+  describe("GET /v2/asp-set/at/:rootHex", () => {
+    const rootHexBare = "ab".repeat(32);
+    function snapshot(updatedAtUnix: number | null) {
+      return {
+        scheme: "eunoma_asp_set_v1",
+        version: 1,
+        treeDepth: 3,
+        leafCount: 2,
+        rootHex: `0x${rootHexBare}`,
+        commitments: [`0x${"11".repeat(32)}`, `0x${"22".repeat(32)}`],
+        ipfsCid: "bafytesthistorical",
+        updatedAtUnix,
+      };
+    }
+    async function writeHistory(coordinatorDir: string, body: unknown): Promise<void> {
+      const { writeFile, mkdir } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const histDir = join(coordinatorDir, "asp_set_history");
+      await mkdir(histDir, { recursive: true });
+      await writeFile(join(histDir, `${rootHexBare}.json`), JSON.stringify(body));
+    }
+
+    it("returns 200 + the committed set for a root within the TTL window", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      const now = Math.floor(Date.now() / 1000);
+      await writeHistory(coordinatorDir, snapshot(now - 60)); // 1 min ago, well within 6h
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: `/v2/asp-set/at/0x${rootHexBare}` });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.aspRootHex).toBe(`0x${rootHexBare}`);
+      expect(body.commitments).toHaveLength(2);
+      expect(body.updatedAtUnix).toBe(now - 60);
+      expect(typeof body.ttlSecs).toBe("number");
+    });
+
+    it("accepts the bare (no-0x) root hex param", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeHistory(coordinatorDir, snapshot(Math.floor(Date.now() / 1000)));
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: `/v2/asp-set/at/${rootHexBare}` });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("returns 410 Gone for a root AGED OUT of the TTL window", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      const now = Math.floor(Date.now() / 1000);
+      await writeHistory(coordinatorDir, snapshot(now - 10 * 3600)); // 10h ago > 6h default TTL
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: `/v2/asp-set/at/0x${rootHexBare}` });
+      expect(res.statusCode).toBe(410);
+      expect(res.json().error).toBe("asp_root_aged_out");
+      expect(res.json().ageSecs).toBeGreaterThan(res.json().ttlSecs);
+    });
+
+    it("honors an explicit aspRootTtlSecs override (tight window => 410)", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      const now = Math.floor(Date.now() / 1000);
+      await writeHistory(coordinatorDir, snapshot(now - 120)); // 2 min ago
+      const { server } = buildCoordinatorServer({
+        roster: roster(),
+        stateRoot,
+        aspRootTtlSecs: 60, // 1-min window => the 2-min-old root is aged out
+      });
+      const res = await server.inject({ method: "GET", url: `/v2/asp-set/at/0x${rootHexBare}` });
+      expect(res.statusCode).toBe(410);
+    });
+
+    it("returns 404 when no history snapshot exists for the root", async () => {
+      const { stateRoot } = await makeStateRoot();
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: `/v2/asp-set/at/0x${"cd".repeat(32)}` });
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error).toBe("asp_root_not_found");
+    });
+
+    it("returns 400 for a malformed root hex param", async () => {
+      const { stateRoot } = await makeStateRoot();
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/asp-set/at/not-hex" });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe("invalid_root_hex");
+    });
+
+    it("a snapshot with no updatedAtUnix fails OPEN (200, never silently 410)", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeHistory(coordinatorDir, snapshot(null));
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: `/v2/asp-set/at/0x${rootHexBare}` });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().updatedAtUnix).toBeNull();
+    });
+
+    it("is reachable WITHOUT a bearer token (public commitments-only class)", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeHistory(coordinatorDir, snapshot(Math.floor(Date.now() / 1000)));
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot, bearerToken: "secret" });
+      const res = await server.inject({ method: "GET", url: `/v2/asp-set/at/0x${rootHexBare}` });
+      expect(res.statusCode).toBe(200);
+    });
+  });
+
+  // CP5 RC2: GET /v2/assets — the per-asset registry served from the init_v4 artifact.
+  describe("GET /v2/assets", () => {
+    const aptRow = {
+      symbol: "ConfidentialAPT",
+      plainSymbol: "APT",
+      metadata: `0x${"0a".repeat(32)}`,
+      assetIdFr: `0x${"11".repeat(32)}`,
+      decimals: 8,
+      vault: `0x${"cc".repeat(32)}`,
+      vaultEkHex: `0x${"ee".repeat(32)}`,
+      poolId: "0",
+      status: "ACTIVE",
+    };
+    // cUSDC ships DORMANT with 6 decimals (the 100x-mis-scale guard: NOT 8).
+    const cusdcRow = {
+      symbol: "cUSDC",
+      plainSymbol: "USDC",
+      metadata: `0x${"0b".repeat(32)}`,
+      assetIdFr: `0x${"22".repeat(32)}`,
+      decimals: 6,
+      vault: `0x${"cc".repeat(32)}`,
+      vaultEkHex: `0x${"ee".repeat(32)}`,
+      poolId: "0",
+      status: 0, // numeric DORMANT code — normalized to "DORMANT"
+    };
+
+    async function writeRegistry(coordinatorDir: string, body: unknown): Promise<void> {
+      const { writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      await writeFile(join(coordinatorDir, "asset_registry.json"), JSON.stringify(body));
+    }
+
+    it("returns AssetEntry[] with APT ACTIVE + cUSDC DORMANT (per-asset decimals 8/6)", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeRegistry(coordinatorDir, [aptRow, cusdcRow]);
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/assets" });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(Array.isArray(body.assets)).toBe(true);
+      expect(body.assets).toHaveLength(2);
+      const [apt, cusdc] = body.assets;
+      expect(apt.symbol).toBe("ConfidentialAPT");
+      expect(apt.plainSymbol).toBe("APT");
+      expect(apt.decimals).toBe(8);
+      expect(apt.status).toBe("ACTIVE");
+      expect(cusdc.symbol).toBe("cUSDC");
+      expect(cusdc.decimals).toBe(6); // NOT 8 — registry-sourced per-asset decimals
+      expect(cusdc.status).toBe("DORMANT"); // numeric 0 normalized to the lifecycle name
+    });
+
+    it("accepts the `{ assets: [...] }` envelope shape too", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeRegistry(coordinatorDir, { assets: [aptRow] });
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/assets" });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().assets).toHaveLength(1);
+    });
+
+    it("leaks NO secret/dk/share field even if the artifact carries one (key allow-list)", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      // Adversarial artifact: a row with extra secret-shaped fields that MUST be dropped.
+      const dirty = {
+        ...aptRow,
+        vault_ek_decryption_key_hex: `0x${"de".repeat(32)}`,
+        operator_share_secret: `0x${"ad".repeat(32)}`,
+        private_key: `0x${"be".repeat(32)}`,
+      };
+      await writeRegistry(coordinatorDir, [dirty]);
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/assets" });
+      expect(res.statusCode).toBe(200);
+      const raw = res.payload;
+      expect(raw).not.toContain("decryption_key");
+      expect(raw).not.toContain("secret");
+      expect(raw).not.toContain("private_key");
+      const entry = res.json().assets[0];
+      expect(Object.keys(entry).sort()).toEqual(
+        [
+          "assetIdFr",
+          "decimals",
+          "metadata",
+          "plainSymbol",
+          "poolId",
+          "status",
+          "symbol",
+          "vault",
+          "vaultEkHex",
+        ].sort(),
+      );
+    });
+
+    it("is reachable WITHOUT a bearer token (public route)", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeRegistry(coordinatorDir, [aptRow]);
+      const { server } = buildCoordinatorServer({
+        roster: roster(),
+        stateRoot,
+        bearerToken: "secret",
+      });
+      const res = await server.inject({ method: "GET", url: "/v2/assets" });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("returns 503 when the registry artifact is missing (mirrors /v2/pool/state)", async () => {
+      const { stateRoot } = await makeStateRoot();
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/assets" });
+      expect(res.statusCode).toBe(503);
+      expect(res.json().error).toBe("asset_registry_unavailable");
+    });
+
+    it("returns 503 when stateRoot is unconfigured", async () => {
+      const { server } = buildCoordinatorServer({ roster: roster() });
+      const res = await server.inject({ method: "GET", url: "/v2/assets" });
+      expect(res.statusCode).toBe(503);
+    });
+
+    it("returns 503 (fail closed) when a row is malformed (bad decimals)", async () => {
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      await writeRegistry(coordinatorDir, [{ ...aptRow, decimals: "8" }]);
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/assets" });
+      expect(res.statusCode).toBe(503);
     });
   });
 });

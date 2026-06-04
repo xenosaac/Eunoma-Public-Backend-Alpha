@@ -164,6 +164,68 @@ pub async fn fetch_old_balance_d_from_chain(
     parse_view_response_d(&value).map_err(|e| format!("parse:{e}"))
 }
 
+/// Parse an Aptos account resource response containing a `vault_sequence` field
+/// under `data`. Aptos serializes u64 fields as strings on REST, but the parser
+/// also accepts JSON numbers for test fixtures.
+pub fn parse_vault_sequence_resource(value: &Value) -> Result<u64, String> {
+    let data = value
+        .get("data")
+        .ok_or_else(|| "resource missing data".to_string())?;
+    let seq = data
+        .get("vault_sequence")
+        .ok_or_else(|| "resource data.vault_sequence missing".to_string())?;
+    if let Some(s) = seq.as_str() {
+        return s
+            .parse::<u64>()
+            .map_err(|e| format!("vault_sequence parse: {e}"));
+    }
+    if let Some(n) = seq.as_u64() {
+        return Ok(n);
+    }
+    Err("resource data.vault_sequence neither string nor u64".to_string())
+}
+
+/// Fetch `<bridge>::eunoma_bridge::VaultCoreV4` and return its public
+/// `vault_sequence`. This is used by the generic sequence sync path after
+/// entrypoints such as ragequit that advance the global vault sequence without
+/// emitting the older WithdrawEventV2/V3 sequence binding.
+pub async fn fetch_vault_core_sequence_from_chain(
+    bridge_package: &str,
+    aptos_node_url: &str,
+) -> Result<u64, String> {
+    let bridge = bridge_package.trim();
+    if bridge.is_empty() {
+        return Err("bridge_package_required".to_string());
+    }
+    let resource_type = format!("{bridge}::eunoma_bridge::VaultCoreV4");
+    let url = format!(
+        "{}/v1/accounts/{}/resource/{}",
+        aptos_node_url.trim_end_matches('/'),
+        bridge,
+        resource_type
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("network:client_build:{e}"))?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            format!("timeout:{e}")
+        } else {
+            format!("network:{e}")
+        }
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("bad_status:{}", status.as_u16()));
+    }
+    let value: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("bad_json:{e}"))?;
+    parse_vault_sequence_resource(&value).map_err(|e| format!("parse:{e}"))
+}
+
 // ── M11: vault-state resync chain helper ──────────────────────────────────
 //
 // The worker's `/v2/vault/resync` endpoint re-fetches a withdraw transaction by

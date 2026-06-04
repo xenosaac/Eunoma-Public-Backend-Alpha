@@ -211,6 +211,18 @@ export function caRegistrationV2FinalTranscriptHash(input: {
  * Validate a coordinator-assembled V2 transcript artifact. Returns the normalized
  * artifact (lowercased hex everywhere, sorted selectedSlots). Throws if any required
  * field is missing or malformed.
+ *
+ * CP5 RC3 (multi-asset) invariant — PER-ASSET TRANSCRIPT, ONE SHARED vault_ek:
+ *   - `assetType` is a REAL per-asset arg: it is bound into the round1 / round2 / final
+ *     transcript hashes (so a sigma registration for cUSDC can never be replayed for APT, and
+ *     vice versa). Each ACTIVE asset gets its own CA-registration transcript keyed on its
+ *     assetType — there is no singleton asset assumption here.
+ *   - `vaultEk` is the ONE shared threshold CA encryption key (T1: one resource-account vault,
+ *     one vault_ek across all assets — see eunoma_bridge.move::activate_asset_ca_v4 asserting
+ *     `st.vault_ek == DeoperatorConfigV2.vault_ek`). This module NEVER derives a second vault_ek;
+ *     the caller passes the SAME provenance-verified vault_ek for every asset. Re-running
+ *     CA registration for a new assetType reuses that shared vault_ek — it does not, and must
+ *     not, trigger a fresh vault_ek DKG.
  */
 export function assembleCaRegistrationV2Transcript(input: {
   dkgEpoch: string;

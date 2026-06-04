@@ -76,6 +76,12 @@ export interface LocalClusterPlanOptions {
    * `worker_missing_bridge_config` and the coordinator fan-out never reaches quorum.
    */
   bridgePackageAddress?: string;
+  adminProfile?: string;
+  relayerProfile?: string;
+  refreshSignerMode?: "admin" | "delegate";
+  refreshAdminProfile?: string;
+  refreshDelegateProfile?: string;
+  refreshAspRecorderProfile?: string;
   randomHex?: (bytes: number, label: string) => string;
 }
 
@@ -179,6 +185,7 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
   const rosterJson = JSON.stringify(roster);
 
   const caDkgV2RosterJson = caDkgV2Roster ? JSON.stringify(caDkgV2Roster) : undefined;
+  const caDkgV2RosterPath = caDkgV2Roster ? `${stateRoot}/cluster/ca-dkg-v2-roster.json` : undefined;
   const frostDkgV2RosterJson = frostDkgV2Roster ? JSON.stringify(frostDkgV2Roster) : undefined;
   return {
     stateRoot,
@@ -198,6 +205,7 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         COORDINATOR_BEARER_TOKEN: coordinatorBearer,
         DEOPERATOR_ROSTER_JSON: rosterJson,
         ...(caDkgV2RosterJson ? { CA_DKG_V2_ROSTER_JSON: caDkgV2RosterJson } : {}),
+        ...(caDkgV2RosterPath ? { CA_DKG_V2_ROSTER_JSON_PATH: caDkgV2RosterPath } : {}),
         ...(frostDkgV2RosterJson ? { FROST_DKG_V2_ROSTER_JSON: frostDkgV2RosterJson } : {}),
         DEOPERATOR_NODE_BEARER_TOKENS_JSON: JSON.stringify(nodeBearerTokens),
         // M10-l (codex iter-7 P1-16): the /v2/balance/decrypt route needs
@@ -206,6 +214,13 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         APTOS_NODE_URL: opts.aptosNodeUrl ?? "https://fullnode.testnet.aptoslabs.com/v1",
         ...(opts.bridgeVaultAddress ? { BRIDGE_VAULT_ADDRESS: opts.bridgeVaultAddress } : {}),
         ...(opts.bridgeAssetType ? { BRIDGE_ASSET_TYPE: opts.bridgeAssetType } : {}),
+        ...(opts.adminProfile ? { ADMIN_PROFILE: opts.adminProfile } : {}),
+        ...(opts.refreshSignerMode ? { EUNOMA_REFRESH_SIGNER_MODE: opts.refreshSignerMode } : {}),
+        ...(opts.refreshAdminProfile ? { EUNOMA_REFRESH_ADMIN_PROFILE: opts.refreshAdminProfile } : {}),
+        ...(opts.refreshDelegateProfile ? { EUNOMA_REFRESH_DELEGATE_PROFILE: opts.refreshDelegateProfile } : {}),
+        ...(opts.refreshAspRecorderProfile
+          ? { EUNOMA_REFRESH_ASP_RECORDER_PROFILE: opts.refreshAspRecorderProfile }
+          : {}),
       },
     },
     relayer: {
@@ -216,6 +231,7 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         RELAYER_PORT: String(relayerPort),
         RELAYER_BEARER_TOKEN: relayerBearer,
         APTOS_NODE_URL: opts.aptosNodeUrl ?? "https://fullnode.testnet.aptoslabs.com/v1",
+        ...(opts.relayerProfile ? { RELAYER_PROFILE: opts.relayerProfile } : {}),
       },
     },
     nodes: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({

@@ -1,46 +1,71 @@
 #!/usr/bin/env node
 // =============================================================================================
-// V2 deposit-binding circuit witness builder — A6 amount_p binding (2026-05-23).
+// V4 deposit-binding circuit witness builder — A6 amount_p binding + D6 0xbow stable-label
+// (2026-05-23 A6; 2026-06-01 V4 D6 label fold).
 //
 // Reads raw depositor inputs + chain-derived public Fr values + amount_p (4 × 32B Ristretto
 // compressed Pedersen commitments of amount chunks, computed off-circuit by SDK with
 // deterministic HKDF(secret) randomness) and writes a circom witness JSON matching
-// `circuits/deposit_binding.circom` (A6: 5 publics, 11 privates).
+// `circuits/deposit_binding.circom` (V4: 5 publics, label PRIVATE).
+//
+// V4 D6 STABLE-LABEL: the deposit-scoped label is folded into the SECRET SLOT of the Compose5
+// commitment preimage (label stays PRIVATE → deposit publics stay 5 / IC 6; NEW deposit VK):
+//   label        = hash_2(hash_3(label_scope0, label_scope1, label_scope2), label_nonce)
+//   secret_bound = hash_2(secret_raw, label)
+//   commitment   = Compose5(nullifier, secret_bound, asset_id, amount_p_digest, POOL_ID)
+// The depositor PERSISTS `secret_bound` as the note's `secret` field (the withdraw witness builder
+// consumes it directly). RAGEQUIT recomputes the SAME secret_bound from raw (secret, label_scope,
+// label_nonce) so its commitment matches this deposit leaf BYTE-FOR-BYTE.
 //
 // Witness shape (matches input keys the circuit declares):
 //   {
 //     // publics (5, in declaration order):
-//     "commitment":      "<decimal Fr>",
+//     "commitment":      "<decimal Fr>",       // Compose5(nullifier, secret_bound, ...)
 //     "amount_tag":      "<decimal Fr>",
 //     "asset_id":        "<decimal Fr>",
 //     "vault_addr_hash": "<decimal Fr>",
 //     "amount_p_digest": "<decimal Fr>",
-//     // privates (11):
+//     // privates:
 //     "nullifier":       "<decimal Fr>",
-//     "secret":          "<decimal Fr>",
+//     "secret":          "<decimal Fr>",        // RAW secret entropy (the circuit folds the label in)
 //     "deposit_blind":   "<decimal Fr>",
-//     "amount_p_limbs":  ["<decimal>", ...8]   // 4 × 32B amount_p split into 2 × 16B LE limbs each
+//     "amount_p_limbs":  ["<decimal>", ...8],   // 4 × 32B amount_p split into 2 × 16B LE limbs each
+//     "label_scope":     ["<decimal>", "<decimal>", "<decimal>"],   // V4 D6 deposit-scope tuple (PRIVATE)
+//     "label_nonce":     "<decimal Fr>"         // V4 D6 per-deposit nonce (PRIVATE)
 //   }
 //
 // commitment + amount_tag are computed via the same Compose5() recipe the circuit uses:
 //   compose5(a,b,c,d,e) = hash_2(hash_3(a,b,c), hash_2(d,e))
-// commitment       = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID)
+// label            = hash_2(hash_3(label_scope0, label_scope1, label_scope2), label_nonce)
+// secret_bound     = hash_2(secret, label)
+// commitment       = Compose5(nullifier, secret_bound, asset_id, amount_p_digest, POOL_ID)
 // amount_tag       = Compose5(amount_p_digest, deposit_blind, asset_id, vault_addr_hash, CHAIN_ID)
 // amount_p_digest  = Poseidon8(amount_p_limbs[0..7])  where limbs are 2 × 128-bit halves of
 //                    each compressed Ristretto point (4 × 32B = 8 × 16B = 8 BN254 Fr safely).
 //
 // Args:
 //   --nullifier-hex      0x-prefixed 32-byte LE Fr
-//   --secret-hex         0x-prefixed 32-byte LE Fr
+//   --secret-hex         0x-prefixed 32-byte LE Fr (RAW secret entropy)
 //   --amount-p-hex       256 hex chars (4 × 32B amount_p compressed Ristretto, concatenated).
 //                        Caller (orchestrator) computes via SDK ConfidentialTransfer.create
 //                        with transferAmountRandomness = HKDF(secret).
 //   --deposit-blind-hex  0x-prefixed 32-byte LE Fr
-//   --asset-id-hex       0x-prefixed 32-byte LE Fr (VaultPublicInputsV2.asset_id_fr)
-//   --vault-addr-hash-hex 0x-prefixed 32-byte LE Fr (VaultPublicInputsV2.vault_addr_hash_fr)
+//   --asset-id-hex       0x-prefixed 32-byte LE Fr. V4 multi-asset: this is the PER-ASSET registry
+//                        value AssetVaultStateV4.asset_id_fr = derive_asset_id(asset_type) (NOT a
+//                        single-asset singleton). It is circuit public input [2] and the unified-tree
+//                        routing key — the caller threads it from the asset's registry entry.
+//   --vault-addr-hash-hex 0x-prefixed 32-byte LE Fr (per-asset AssetVaultStateV4.vault_addr_hash_fr;
+//                        constant across assets in topology T1 but stored/threaded per-asset).
+//
+//   NOTE on decimals: per-asset `decimals` (8 APT / 6 cUSDC,cUSDT) is a REGISTRY/frontend amount-
+//   scaling concern only. It is NEVER a circuit input — the commitment binds `amount_p_digest`
+//   (the CA ciphertext), not a decimal-scaled plaintext amount — so it is deliberately absent here.
+//   --label-scope-hex    3 × 32-byte hex (96 bytes, 192 hex chars; the deposit-scope tuple). The
+//                        ASP builder recomputes each per-deposit label off-chain from this + nonce.
+//   --label-nonce-hex    0x-prefixed 32-byte LE Fr (per-deposit nonce; D6)
 //   --output PATH        path to write witness JSON
 //
-// Emits commitment + amount_tag + amount_p_digest to stdout as JSON for the caller's audit.
+// Emits commitment + amount_tag + amount_p_digest + label + secret_bound to stdout as JSON.
 // =============================================================================================
 import { writeFileSync } from "node:fs";
 import { buildPoseidon } from "circomlibjs";
@@ -61,6 +86,9 @@ const amountPHex = arg("--amount-p-hex");
 const depositBlindHex = arg("--deposit-blind-hex");
 const assetIdHex = arg("--asset-id-hex");
 const vaultAddrHashHex = arg("--vault-addr-hash-hex");
+// V4 D6 stable-label inputs (PRIVATE). label_scope = 3 × 32B (96B / 192 hex). label_nonce = 32B.
+const labelScopeHex = arg("--label-scope-hex");
+const labelNonceHex = arg("--label-nonce-hex");
 const outputPath = arg("--output");
 
 const CHAIN_ID = 2;
@@ -136,6 +164,20 @@ function bigToLe32(value) {
   return out;
 }
 
+// V4 D6: parse 3 × 32B label_scope (192 hex chars) into 3 LE32 chunks (one Fr each).
+function labelScopeHexToLe(scopeHex) {
+  const clean = String(scopeHex).replace(/^0x/i, "").toLowerCase();
+  if (!/^[0-9a-f]+$/.test(clean) || clean.length !== 192) {
+    throw new Error(`--label-scope-hex must be 96-byte hex (192 chars; 3 × 32B scope tuple), got ${clean.length} chars`);
+  }
+  const out = [];
+  for (let i = 0; i < 3; i += 1) {
+    const chunk = clean.slice(i * 64, i * 64 + 64);
+    out.push(hexToLe32(chunk));
+  }
+  return out;
+}
+
 const poseidon = await buildPoseidon();
 const F = poseidon.F;
 
@@ -183,8 +225,18 @@ const amountPLimbsBig = amountPHexToLimbs(amountPHex);
 const amountPLimbsLe = amountPLimbsBig.map(bigToLe32);
 const amountPDigestLe = compose8(amountPLimbsLe);
 
-// commitment = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID)
-const commitmentLe = compose5(nullifierLe, secretLe, assetIdLe, amountPDigestLe, poolIdLe);
+// V4 D6: derive the deposit-scoped stable label + fold it into the secret slot.
+//   label        = hash_2(hash_3(label_scope0, label_scope1, label_scope2), label_nonce)  (DepositLabel)
+//   secret_bound = hash_2(secret, label)                                                   (BindSecretWithLabel)
+// Byte-identical to the circuit's BindSecretWithLabel and to the ragequit recompute.
+const labelScopeLe = labelScopeHexToLe(labelScopeHex);
+const labelNonceLe = hexToLe32(labelNonceHex);
+const labelLe = hash2(hash3(labelScopeLe[0], labelScopeLe[1], labelScopeLe[2]), labelNonceLe);
+const secretBoundLe = hash2(secretLe, labelLe);
+
+// commitment = Compose5(nullifier, secret_bound, asset_id, amount_p_digest, POOL_ID)
+//   V4: the 2nd slot is the LABEL-BOUND secret (breaks the old label≡commitment invariant).
+const commitmentLe = compose5(nullifierLe, secretBoundLe, assetIdLe, amountPDigestLe, poolIdLe);
 // amount_tag = Compose5(amount_p_digest, deposit_blind, asset_id, vault_addr_hash, CHAIN_ID)
 const amountTagLe = compose5(
   amountPDigestLe,
@@ -203,9 +255,12 @@ const witness = {
   amount_p_digest: le32ToDec(amountPDigestLe),
   // privates
   nullifier: le32ToDec(nullifierLe),
-  secret: le32ToDec(secretLe),
+  secret: le32ToDec(secretLe), // RAW secret entropy; circuit folds the label in to get secret_bound.
   deposit_blind: le32ToDec(depositBlindLe),
   amount_p_limbs: amountPLimbsBig.map((b) => b.toString()),
+  // V4 D6 stable-label privates (deposit publics stay 5 / IC 6; label PRIVATE).
+  label_scope: labelScopeLe.map(le32ToDec),
+  label_nonce: le32ToDec(labelNonceLe),
 };
 
 writeFileSync(outputPath, JSON.stringify(witness, null, 2) + "\n");
@@ -222,6 +277,9 @@ console.log(
       commitmentHex: toHex(commitmentLe),
       amountTagHex: toHex(amountTagLe),
       amountPDigestHex: toHex(amountPDigestLe),
+      // V4 D6: label + secret_bound emitted so the ASP builder + ragequit can cross-check.
+      labelHex: toHex(labelLe),
+      secretBoundHex: toHex(secretBoundLe),
     },
     null,
     2,

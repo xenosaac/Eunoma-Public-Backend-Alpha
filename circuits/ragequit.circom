@@ -23,7 +23,12 @@ pragma circom 2.1.6;
 //
 // Private inputs:
 //   nullifier, secret, asset_id, amount_p_digest   — commitment preimage (amount stays private)
+//   label_scope[3], label_nonce                    — V4 D6 stable-label inputs (recompute secret_bound)
 //   state_siblings[MAX_DEPTH], state_leaf_index     — state LeanIMT co-path
+//
+// V4 D6: the ragequit commitment recompute MUST fold the SAME stable label as the deposit circuit
+// (secret_bound = hash_2(secret, hash_2(hash_3(label_scope), label_nonce))) so every V4 deposit can
+// ragequit — the recomputed commitment must match the deposit leaf BYTE-FOR-BYTE.
 
 include "eunoma_templates.circom";
 
@@ -39,17 +44,28 @@ template RagequitProof() {
 
     // -------- private inputs --------
     signal input nullifier;
-    signal input secret;
+    signal input secret;              // RAW secret entropy (same as deposit); folded with label below.
     signal input asset_id;
     signal input amount_p_digest;     // stays private (amount confidential)
+    signal input label_scope[3];      // V4 D6 stable-label scope (PRIVATE; IC stays 5)
+    signal input label_nonce;         // V4 D6 per-deposit label nonce (PRIVATE)
     signal input state_siblings[MAX_DEPTH];
     signal input state_leaf_index;
 
-    // 1. commitment = Compose5(nullifier, secret, asset_id, amount_p_digest, POOL_ID).
-    //    Binds the revealed commitment to (nullifier, secret) so the nullifier can't be swapped.
+    // 1a. V4 D6: recompute the SAME label-bound secret the deposit circuit committed.
+    //     secret_bound = hash_2(secret, label); label = hash_2(hash_3(label_scope), label_nonce).
+    component bind = BindSecretWithLabel();
+    bind.secret_raw <== secret;
+    bind.label_scope[0] <== label_scope[0];
+    bind.label_scope[1] <== label_scope[1];
+    bind.label_scope[2] <== label_scope[2];
+    bind.label_nonce <== label_nonce;
+
+    // 1b. commitment = Compose5(nullifier, secret_bound, asset_id, amount_p_digest, POOL_ID).
+    //     Binds the revealed commitment to (nullifier, secret, label) so the nullifier can't be swapped.
     component cmt = Compose5();
     cmt.in[0] <== nullifier;
-    cmt.in[1] <== secret;
+    cmt.in[1] <== bind.secret_bound;
     cmt.in[2] <== asset_id;
     cmt.in[3] <== amount_p_digest;
     cmt.in[4] <== POOL_ID;

@@ -47,17 +47,24 @@ export class Web3StoragePublisher {
 
 // Dev fallback: writes the set locally + returns a content-hash pseudo-CID prefixed "local-" so it
 // is NEVER confused with a real IPFS pin. Use only when no PINATA_JWT / WEB3_STORAGE_TOKEN is set.
+// TESTNET-ALPHA CAVEAT: a "local-"-CID set is NOT publicly retrievable — it is content-addressed on
+// THIS host only. The ASP set's public-transparency property (anyone can fetch + audit the approved
+// LABEL set the on-chain root commits to) holds ONLY behind a real pin (Pinata / web3.storage). On
+// testnet-alpha the on-chain root may therefore reference a CID no third party can resolve; mainnet
+// MUST set PINATA_JWT. The "local-" prefix is the load-bearing marker that this is the alpha fallback.
 export class LocalDevPublisher {
   constructor({ dir } = {}) {
     this.dir = dir || resolve(process.cwd(), ".agent-local", "asp-sets");
     this.kind = "local-dev-fallback";
+    this.testnetAlphaCaveat =
+      "local- CID is NOT a real IPFS pin; content-addressed on this host only (testnet-alpha). Set PINATA_JWT for a public pin.";
   }
   async publish(data, name = "eunoma-asp-set") {
     mkdirSync(this.dir, { recursive: true });
     const json = JSON.stringify(data);
     const cid = "local-" + Buffer.from(keccak_256(new TextEncoder().encode(json))).toString("hex").slice(0, 46);
     writeFileSync(resolve(this.dir, `${cid}.json`), json);
-    return { cid, source: this.kind };
+    return { cid, source: this.kind, caveat: this.testnetAlphaCaveat };
   }
 }
 

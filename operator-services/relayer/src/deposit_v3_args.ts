@@ -134,6 +134,7 @@ export function parseDepositV3DelegateArgs(body: unknown): DepositV3DelegateArgs
   assertNoForbidden(body); // privacy guard FIRST — may throw ForbiddenPlaintextFieldError
   const o = objectBody(body);
   return {
+    assetAddr: hexStr(o, "assetAddr", 32),
     userAddr: hexStr(o, "userAddr", 32),
     commitment: hexStr(o, "commitment", 32),
     amountTag: hexStr(o, "amountTag", 32),

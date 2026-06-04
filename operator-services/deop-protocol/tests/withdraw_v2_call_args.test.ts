@@ -7,10 +7,14 @@ import {
   parseWithdrawV2CallArgs,
 } from "../src/index.js";
 
-// 27 entries — matches the Move signature at
-// move/sources/eunoma_bridge.move:515-543 (excluding `_relayer: &signer`).
-const EXPECTED_FIELD_COUNT = 30;
+// Matches the V4 Move signature at
+// move/sources/eunoma_bridge.move:withdraw_to_recipient_v2 (excluding the leading
+// `_relayer: &signer`). V4 (CP5 RC1): asset_addr is the +1 routing key, FIRST
+// positional arg → 30 → 31 fields. V4 (CP2 CP1): change_commitment public[12] is
+// a further +1 between aspTreeDepth and vaultSequence → 31 → 32 fields.
+const EXPECTED_FIELD_COUNT = 35;
 const EXPECTED_MOVE_ORDER = [
+  "assetAddr",
   "root",
   "nullifierHash",
   "recipient",
@@ -21,6 +25,10 @@ const EXPECTED_MOVE_ORDER = [
   "aspRoot",
   "stateTreeDepth",
   "aspTreeDepth",
+  "changeCommitment",
+  "amountPDigest",
+  "amountPOld",
+  "amountPRem",
   "vaultSequence",
   "withdrawProof",
   "expirySecs",
@@ -62,6 +70,7 @@ function buildValidFixture(): Record<string, unknown> {
   const hexN = (n: number, seed: number): string =>
     Array.from({ length: n }, (_, i) => ((i + seed) & 0xff).toString(16).padStart(2, "0")).join("");
   return {
+    assetAddr: hex32(0x01),
     root: hex32(0x10),
     nullifierHash: hex32(0x11),
     recipient: hex32(0x12),
@@ -72,6 +81,10 @@ function buildValidFixture(): Record<string, unknown> {
     aspRoot: hex32(0x17),
     stateTreeDepth: "4",
     aspTreeDepth: "3",
+    changeCommitment: hex32(0x18), // V4 (CP2 CP1) public[12]; 32 zero bytes = full withdraw
+    amountPDigest: hex32(0x19),
+    amountPOld: Array.from({ length: 4 }, (_, i) => hex32(0x1a + i)),
+    amountPRem: Array.from({ length: 4 }, (_, i) => hex32(0x1e + i)),
     vaultSequence: "42",
     withdrawProof: hexN(192, 0x20), // Groth16 BN254 proof = 192 bytes (3 G1 + 1 G2 in compressed form)
     expirySecs: "1800000000",

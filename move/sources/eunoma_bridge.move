@@ -7,6 +7,7 @@ module eunoma::eunoma_bridge {
     use aptos_std::aptos_hash;
     use aptos_std::crypto_algebra;
     use aptos_std::ed25519;
+    use aptos_std::ristretto255;
     use aptos_std::table::{Self, Table};
 
     use std::bn254_algebra::{
@@ -48,12 +49,22 @@ module eunoma::eunoma_bridge {
     // Deposit publics: commitment, amount_tag, asset_id, vault_addr_hash, amount_p_digest (5) + 1 const term = 6.
     // ASP (2026-05-30, asp-tree-design §5.2/§6): withdraw circuit gains 3 publics
     //   (asp_root, state_tree_depth, asp_tree_depth) so publics 9 -> 12, VK IC 10 -> 13.
-    // Withdraw publics (EXACT order, must match Move publics vector byte-for-byte):
-    //   [0]root [1]nullifier_hash [2]asset_id [3]recipient_hash [4]amount_tag [5]ca_payload_hash
-    //   [6]request_hash [7]vault_sequence [8]amount_p_digest [9]asp_root [10]state_tree_depth
-    //   [11]asp_tree_depth (12) + 1 const term = 13.
+    // V4 (2026-06-02): pruned withdraw public vector to stay near deposit-level verifier cost.
+    // CANONICAL public order:
+    //   [0]root [1]nullifier_hash [2]request_hash [3]amount_p_digest [4]asp_root
+    //   [5]change_commitment.
+    // Public count = 6; VK IC length = 7. Move recomputes request_hash from public route args
+    // before verification, and uses proof-bound amount_p_digest directly instead of recomputing
+    // Poseidon8 over amount_p_old on the prepare hot path.
+    // EMPTY change_commitment sentinel = 0 (CHANGE_COMMITMENT_EMPTY): a full withdraw binds
+    // change_commitment public[12] to the field element 0.
     const DEPOSIT_VK_IC_LENGTH: u64 = 6;
-    const WITHDRAW_VK_IC_LENGTH: u64 = 13;
+    const WITHDRAW_VK_IC_LENGTH: u64 = 7;
+    // V4 (CP1/CP2 MB-5): the EMPTY change_commitment sentinel = the field element 0, encoded as
+    // 32 little-endian zero bytes. A full withdraw binds public[12] to this value and emits NO
+    // ChangeNoteAppendedV4; a partial withdraw binds a non-zero Compose5 change commitment and
+    // emits the change-leaf event (has_change == change_commitment != CHANGE_COMMITMENT_EMPTY).
+    const CHANGE_COMMITMENT_EMPTY: vector<u8> = x"0000000000000000000000000000000000000000000000000000000000000000";
     // CP6 ragequit (asp-tree-design §8 / §5.4): the standalone transparent-exit circuit has 4
     // publics (EXACT order, must match the Move publics vector byte-for-byte):
     //   [0]commitment [1]nullifier_hash [2]root [3]state_tree_depth
@@ -72,6 +83,12 @@ module eunoma::eunoma_bridge {
     // misdirected. Kept additive because Aptos upgrades reject layout/signature changes.
     const DOMAIN_DEPOSIT_V3: vector<u8> = b"EUNOMA_DEPOSIT_BIND_V3";
     const DOMAIN_WITHDRAW_V2: vector<u8> = b"EUNOMA_WITHDRAW_ATTESTATION_V2";
+    // V4 (CP2 MB-6, dormant-lifecycle-VERIFIED §3): de-list emergency-exit attestation domain. The
+    // 5-of-7 deoperators sign (asset_type, recipient, amount, expiry) to authorize a withdraw_to_raw
+    // to plain FA when Aptos has de-listed the asset for CA (normal withdraw + ragequit both brick
+    // on is_confidentiality_enabled). Distinct domain so an emergency-exit signature can never be
+    // replayed as a normal-withdraw attestation.
+    const DOMAIN_EMERGENCY_EXIT_V4: vector<u8> = b"EUNOMA_EMERGENCY_EXIT_V4";
     const POSEIDON_DOMAIN_ASSET_ID: vector<u8> = b"EUNOMA_ASSET_ID_V2";
     const POSEIDON_DOMAIN_VAULT_ADDR_HASH: vector<u8> = b"EUNOMA_VAULT_ADDR_V2";
     const POSEIDON_DOMAIN_RECIPIENT_HASH: vector<u8> = b"EUNOMA_RECIPIENT_V2";
@@ -139,6 +156,37 @@ module eunoma::eunoma_bridge {
     // CP6 ragequit (transparent exit): only the original depositor may ragequit a commitment.
     const E_NOT_ORIGINAL_DEPOSITOR: u64 = 39;
 
+    // ============================================================================
+    // V4 multi-asset (CP2 MB-1, design 2026-06-01 §4 + dormant-lifecycle-VERIFIED §2-4).
+    // Per-asset DORMANT->ACTIVE lifecycle, append-only registry, on-chain-derived asset_id.
+    // ============================================================================
+    // Asset resolved from the registry is not in the ACTIVE state (DORMANT/PAUSED) — every
+    // registry-resolving spend/deposit/prepare/ragequit entry gates on this at the TOP, before
+    // any global table write. A DORMANT entry is unspendable by construction.
+    const E_ASSET_NOT_ACTIVE: u64 = 40;
+    // activate_asset_ca_v4 idempotency gate — st.status must be DORMANT to activate. Belt over
+    // the framework's E_CONFIDENTIAL_STORE_ALREADY_REGISTERED suspenders.
+    const E_ASSET_ALREADY_ACTIVE: u64 = 41;
+    // register_asset_metadata_v4 validation — the asset_addr is already registered, OR the
+    // on-chain-derived asset_id_fr collides with an already-registered asset (uniqueness),
+    // OR a caller-supplied asset_id_fr disagrees with the on-chain derivation.
+    const E_ASSET_ID_MISMATCH: u64 = 42;
+    // V4 (CP2 MB-4, design §6 B-prime): aggregate-Pedersen amount-conservation equality failed —
+    // point_equals(P_old, P_wd + P_rem) is false, i.e. the partial-withdraw split does not conserve
+    // the spent note's amount (A_old != W + A_rem). Raised in the cache-once prepare path.
+    const E_AMOUNT_CONSERVATION: u64 = 43;
+    // V4 (CP2 MB-6, dormant-lifecycle-VERIFIED §3): de-list emergency exit invoked while the asset
+    // is STILL CA-enabled (is_confidentiality_enabled == true). The emergency path is ONLY for a
+    // governance-de-listed asset; while CA is live, use the normal withdraw / ragequit paths.
+    const E_NOT_DELISTED: u64 = 44;
+
+    // Per-asset lifecycle status (AssetVaultStateV4.status). DORMANT = registered metadata only
+    // (no CA store yet, unspendable); ACTIVE = CA-registered + spendable; PAUSED = block-new
+    // (drain-in-flight). status + vault_ek are the ONLY mutable fields on a registry row.
+    const ASSET_STATUS_DORMANT: u8 = 0;
+    const ASSET_STATUS_ACTIVE: u8 = 1;
+    const ASSET_STATUS_PAUSED: u8 = 2;
+
     struct BridgeVault has key {
         admin: address,
         vault_addr: address,
@@ -157,6 +205,65 @@ module eunoma::eunoma_bridge {
     }
 
     struct BridgeVaultTablesV2 has key {
+        used_deposit_nonces: Table<vector<u8>, bool>,
+        used_nullifiers: Table<vector<u8>, bool>,
+        known_roots: Table<vector<u8>, bool>,
+    }
+
+    // ============================================================================
+    // V4 multi-asset storage (CP2 MB-1). Design: §4.3 (struct sketch) of
+    // 2026-06-01-eunoma-v4-multi-asset-partial-withdraw-design.md, refined by §2 of
+    // 2026-06-01-eunoma-v4-dormant-lifecycle-and-delist-exit-VERIFIED.md.
+    //
+    // Topology T1 (D4): ONE shared vault resource account registered for N CA assets. The
+    // signer cap is a SINGLE field on VaultCoreV4 (NOT fanned across the Table) — per-asset CA
+    // balance isolation is the framework's job (ConfidentialStore is keyed per (account,
+    // asset_type)). Per-asset metadata lives in an APPEND-ONLY registry; globals (counters,
+    // nonces, nullifiers, known_roots) are single instances across all assets.
+    // ============================================================================
+
+    // GLOBAL vault core. vault_sequence is byte-identical to V3 BridgeVault.vault_sequence
+    // (still withdraw public[7] + FROST attestation message field — zero blast radius, D5).
+    // next_leaf_index is the NEW global unified-tree append index (one monotonic counter across
+    // every asset's deposit finalization AND every partial-withdraw change-leaf emission, §10.1).
+    struct VaultCoreV4 has key {
+        admin: address,
+        vault_addr: address,
+        vault_signer_cap: account::SignerCapability,   // SignerCapability has drop,store (account.move:57)
+        paused: bool,
+        next_leaf_index: u64,   // GLOBAL unified-tree append index (deposits + change leaves)
+        vault_sequence: u64,    // GLOBAL anti-replay nonce (S-A) — byte-identical to V3 public[7]
+    }
+
+    // Per-asset metadata — NO signer cap (one shared account; T1). Legal Table value (store+drop).
+    // asset_type / asset_id_fr / decimals are IMMUTABLE after register (MA-1 soundness premise:
+    // routing correctness = derive_asset_id(st.asset_type) == proven_asset_id depends only on the
+    // immutable asset_type + immutable asset_id_fr). status + vault_ek are the ONLY mutable fields.
+    // asset_id_fr is COMPUTED on-chain via derive_asset_id(asset_type) at register, NEVER a caller arg.
+    struct AssetVaultStateV4 has store, drop {
+        asset_type: Object<fungible_asset::Metadata>,  // feeds confidential_transfer_raw + ca_payload_hash
+        asset_id_fr: vector<u8>,                        // derive_asset_id(asset_type) — circuit public[2]
+        vault_addr_hash_fr: vector<u8>,                 // constant in T1; stored per-asset for symmetry
+        vault_ek: vector<u8>,                           // per-asset CA encryption key (∅ while DORMANT)
+        decimals: u8,                                   // 8 APT / 6 cUSDC,cUSDT — IMMUTABLE after register
+        deposit_count: u64,                             // PER-ASSET observer cursor (NOT the tree key)
+        status: u8,                                     // DORMANT(0)/ACTIVE(1)/PAUSED(2)
+    }
+
+    // APPEND-ONLY registry (FIX-3). by_asset keyed by the FA metadata object-address; there is
+    // intentionally NO reverse index asset_id_fr -> asset_addr (derive_asset_id is one-way), so
+    // spends thread asset_addr as an explicit arg and assert the Poseidon-link (MA-1). asset_list
+    // makes the registry enumerable for ops / off-chain config build.
+    struct AssetRegistryV4 has key {
+        by_asset: Table<address, AssetVaultStateV4>,    // key = object::object_address(metadata)
+        asset_list: vector<address>,
+    }
+
+    // GLOBAL tables — same shape as BridgeVaultTablesV2, ONE set across all assets. used_nullifiers
+    // is global because asset_id is inside the Compose5 preimage, so cross-asset nullifier / leaf
+    // collisions are cryptographically impossible. known_roots is the ONE unified state tree's
+    // root history.
+    struct BridgeTablesV4 has key {
         used_deposit_nonces: Table<vector<u8>, bool>,
         used_nullifiers: Table<vector<u8>, bool>,
         known_roots: Table<vector<u8>, bool>,
@@ -265,20 +372,9 @@ module eunoma::eunoma_bridge {
         hash: vector<u8>,
     }
 
-    struct PendingWithdrawProofsV2 has key {
-        by_request_hash: Table<vector<u8>, PendingWithdrawProofV2>,
-    }
-
-    struct PendingWithdrawProofV2 has store, drop {
-        root: vector<u8>,
-        nullifier_hash: vector<u8>,
-        asset_id: vector<u8>,
-        recipient_hash: vector<u8>,
-        amount_tag: vector<u8>,
-        ca_payload_hash: vector<u8>,
-        vault_sequence: u64,
-        amount_p_digest: vector<u8>,
-    }
+    // V4 (CP2 MB-3, 2026-06-01): PendingWithdrawProofsV2 / PendingWithdrawProofV2 PHYSICALLY
+    // DELETED (legacy asset_id-blind-at-consume cache; cross-asset bypass under multi-asset).
+    // Only the V3b cache (asset_id + change_commitment carrying, re-asserted on cache-hit) ships.
 
     struct PendingWithdrawAttestationsV2 has key {
         by_request_hash: Table<vector<u8>, PendingWithdrawAttestationV2>,
@@ -327,29 +423,21 @@ module eunoma::eunoma_bridge {
         memo: vector<u8>,
     }
 
-    // Round 4 WB2.E B — Withdraw V3 cache mirror (mirror of round-1 deposit V3 pattern).
-    // Three compact V3 caches replace the heavy V2 mirrors. V3-first lookup in the 3
-    // consume_or_verify_* readers falls through to V2 (legacy) then to fresh
-    // verify on cache-miss. Storage savings: ~58-95% per pending entry.
+    // V4 (CP2 MB-3, 2026-06-01): PendingWithdrawProofsV3 / PendingWithdrawProofV3 (msg_hash
+    // keccak cache) PHYSICALLY DELETED. Its cache-consume branch recomputed an asset_id-bearing
+    // msg_hash but the cache row never stored asset_id, so a multi-asset settle could collide it.
+    // The V3b cache (below) carries asset_id + change_commitment and is the only survivor.
+
+    // Round 5 Wave E.5 (R5-R) — V3b proof cache: field-by-field equality at consume instead of
+    // keccak. Codex constraint (audit 2026-05-25): every Groth16-bound non-key public input MUST
+    // be stored and compared. P0 hotfix at prepare_withdraw_payload_v3 + consume_or_compute_
+    // withdraw_payload (recompute amount_p_digest + assert ==) MUST remain.
     //
-    // ProofV3 keeps ca_payload_hash + amount_p_digest so prepare_withdraw_payload_v3 can
-    // SKIP the cross-stage Compose8 recompute that prepare_v2 did (FR-4.6, ~1-2k gas/withdraw).
-    struct PendingWithdrawProofsV3 has key {
-        by_request_hash: Table<vector<u8>, PendingWithdrawProofV3>,
-    }
-
-    struct PendingWithdrawProofV3 has store, drop {
-        msg_hash: vector<u8>,
-        ca_payload_hash: vector<u8>,
-        amount_p_digest: vector<u8>,
-    }
-
-    // Round 5 Wave E.5 (R5-R) — V3b proof cache: 7 explicit fields (drops asset_id like V2b;
-    // drops msg_hash because we use field-by-field equality at consume instead of keccak).
-    // Codex constraint (audit 2026-05-25): every Groth16-bound non-key public input MUST be
-    // stored and compared. asset_id may be omitted only because VaultPublicInputsV2.asset_id_fr
-    // is immutable post-V2-bootstrap. P0 hotfix at prepare_withdraw_payload_v3 + consume_or_
-    // compute_withdraw_payload (recompute amount_p_digest + assert ==) MUST remain.
+    // V4 (CP2 MB-3, 2026-06-01): asset_id RE-ADDED (the V3 singleton assumption dies under
+    // multi-asset — asset_id is now the registry-resolved AssetVaultStateV4.asset_id_fr and is
+    // re-asserted on cache-hit). change_commitment ADDED (CP1 public[12]) and re-asserted on
+    // cache-hit. This is the ONLY surviving withdraw-proof cache struct; the legacy V2b/V3/V2
+    // asset_id-blind cache-consume branches are physically deleted (MA-1 / FIX-2).
     struct PendingWithdrawProofsV3b has key {
         by_request_hash: Table<vector<u8>, PendingWithdrawProofV3b>,
     }
@@ -357,31 +445,20 @@ module eunoma::eunoma_bridge {
     struct PendingWithdrawProofV3b has store, drop {
         root: vector<u8>,
         nullifier_hash: vector<u8>,
+        asset_id: vector<u8>,          // V4 MB-3: registry-resolved asset_id_fr (re-asserted on cache-hit)
         recipient_hash: vector<u8>,
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         vault_sequence: u64,
         amount_p_digest: vector<u8>,
+        change_commitment: vector<u8>, // V4 CP1: public[12] (EMPTY = 32 zero bytes)
     }
 
-    // Round 5 Wave E.2 (P06-1) — V2b proof cache drops asset_id field. asset_id is read
-    // from VaultPublicInputsV2.asset_id_fr at consume time. Safe because asset_type is
-    // immutable post-V2-bootstrap (only init_bridge_vault_v2 / rollover_vault... write
-    // it, both one-shot gated). Soft migration: prepare writes V2b, consume reads V3 →
-    // V2b → V2 → miss.
-    struct PendingWithdrawProofsV2b has key {
-        by_request_hash: Table<vector<u8>, PendingWithdrawProofV2b>,
-    }
-
-    struct PendingWithdrawProofV2b has store, drop {
-        root: vector<u8>,
-        nullifier_hash: vector<u8>,
-        recipient_hash: vector<u8>,
-        amount_tag: vector<u8>,
-        ca_payload_hash: vector<u8>,
-        vault_sequence: u64,
-        amount_p_digest: vector<u8>,
-    }
+    // V4 (CP2 MB-3, 2026-06-01): PendingWithdrawProofsV2b / PendingWithdrawProofV2b PHYSICALLY
+    // DELETED. The V2b cache dropped asset_id and re-read it from the now-dead singleton
+    // VaultPublicInputsV2.asset_id_fr at consume — a total cross-asset bypass under multi-asset
+    // (MA-1 / FIX-2). The ONLY surviving withdraw-proof cache is V3b (which now CARRIES asset_id
+    // + change_commitment and re-asserts both on cache-hit).
 
     struct PendingWithdrawAttestationsV3 has key {
         by_request_hash: Table<vector<u8>, PendingWithdrawAttestationV3>,
@@ -412,12 +489,33 @@ module eunoma::eunoma_bridge {
         amount_p_digest: vector<u8>,
     }
 
+    // V4 (CP2 MB-4, design §6 B-prime / §6.4): cache-once aggregate-Pedersen conservation result,
+    // keyed by request_hash (mirrors the amount_p_digest payload cache). The ~3 multi_scalar_mul +
+    // 12 VALIDATING decompressions + point_equals run EXACTLY ONCE in the prepare path
+    // (prepare_withdraw_conservation_v4) and the cheap boolean is read on the hot step2b path — the
+    // gas-placement requirement of §6.4 (heavy curve math off the already-over-cap settle tx). The
+    // cached row also pins the amount_p_digest the conservation was proven against, so a consumer
+    // re-asserts the SAME spent-note amount the Groth16 public[8] bound (no rebind to a different
+    // amount). A FULL withdraw (no remainder) records conserved=true trivially (A_rem = 0).
+    struct PendingWithdrawConservationsV4 has key {
+        by_request_hash: Table<vector<u8>, PendingWithdrawConservationV4>,
+    }
+
+    struct PendingWithdrawConservationV4 has store, drop {
+        amount_p_digest: vector<u8>,   // the spent note's amount_p_digest (Groth16 public[8])
+        conserved: bool,               // point_equals(P_old, P_wd + P_rem) held
+    }
+
     struct PendingWithdrawFinalizationsV3 has key {
         by_request_hash: Table<vector<u8>, PendingWithdrawFinalizationV3>,
     }
 
     struct PendingWithdrawFinalizationV3 has store, drop {
         sender: address,
+        // V4 (CP2 MB-3, 2026-06-01): asset_addr + asset_id stored so TX4 re-resolves the SAME
+        // registry entry TX3 validated (FIX-4) — the finalization row is no longer asset-blind.
+        asset_addr: address,
+        asset_id: vector<u8>,
         root: vector<u8>,
         nullifier_hash: vector<u8>,
         recipient: address,
@@ -427,6 +525,10 @@ module eunoma::eunoma_bridge {
         request_hash: vector<u8>,
         vault_sequence: u64,
         expiry_secs: u64,
+        // V4 (CP2 MB-5): change_commitment public[12], validated at step2a (TX3) via the V3b cache
+        // re-assert + the Groth16 binding, carried here so step2b (TX4) emits ChangeNoteAppendedV4
+        // (only when has_change) under the GLOBAL next_leaf_index without re-reading the V3b cache.
+        change_commitment: vector<u8>,
     }
 
     struct DeoperatorConfigV2 has key {
@@ -690,6 +792,21 @@ module eunoma::eunoma_bridge {
         timestamp: u64,
     }
 
+    // V4 (CP2 MB-5, design 2026-06-01 §3.3/§4.4/§10.1): a partial-withdraw change/remainder note
+    // commitment appended to the SAME single global state LeanIMT under the GLOBAL next_leaf_index.
+    // Emitted ONLY when has_change == 1 (change_commitment != CHANGE_COMMITMENT_EMPTY) — a full
+    // withdraw emits NO ChangeNoteAppendedV4. Deliberately a SEPARATE event (not folded into the
+    // withdraw event) so the off-chain LeanIMT builder ingests the change leaf as a first-class
+    // appendable leaf under one global counter, and so it carries NO co-emitted parent identifier
+    // (avoids on-chain parent->change linkage in the event payload). The change leaf's
+    // amount_p_digest stays private/in-circuit; NO plaintext amount is emitted.
+    #[event]
+    struct ChangeNoteAppendedV4 has drop, store {
+        leaf_index: u64,             // GLOBAL unified-tree append index (post-increment)
+        change_commitment: vector<u8>,
+        asset_type: address,         // the partial-withdraw's asset (change is same-asset)
+    }
+
     public entry fun init_vault_with_ca_registration_v2(
         admin: &signer,
         vault_seed: vector<u8>,
@@ -756,6 +873,197 @@ module eunoma::eunoma_bridge {
         event::emit(VaultInitializedV2 {
             vault_addr,
             asset_type: object::object_address(&asset_type),
+            operator_set_version,
+            dkg_epoch,
+            threshold: THRESHOLD_V2,
+            roster_hash,
+        });
+    }
+
+    // ============================================================================
+    // V4 multi-asset onboarding lifecycle (CP2 MB-1). DORMANT->ACTIVE two-step register, so a
+    // not-yet-allow-listed asset (e.g. a stablecoin behind the CA double wall) can be registered
+    // DORMANT now and activated later with one admin tx, zero module upgrade. Design:
+    // dormant-lifecycle-VERIFIED §2; main design §4.3.
+    // ============================================================================
+
+    // STEP 1 — register asset metadata only. ALWAYS succeeds even for a not-yet-allow-listed asset
+    // (does NOT call register_raw). Inserts status=DORMANT into the append-only registry +
+    // appends asset_list. asset_id_fr is COMPUTED ON-CHAIN via derive_asset_id(asset_type), never
+    // a caller arg (FIX-3). asset_type/asset_id_fr/decimals are immutable after this.
+    public entry fun register_asset_metadata_v4(
+        admin: &signer,
+        asset_addr: address,
+        vault_addr_hash_fr: vector<u8>,
+        decimals: u8,
+    ) acquires VaultCoreV4, AssetRegistryV4, DepositBindingTestOverride {
+        assert_admin_v4(admin);
+        // FIX-5: the DepositBindingTestOverride short-circuits derive_asset_id to a constant — its
+        // presence on a live module would collapse every asset to the same asset_id_fr. Refuse to
+        // register while it exists (cutover checklist also verifies absence before flipping active).
+        assert!(!exists<DepositBindingTestOverride>(@eunoma), E_ASSET_ID_MISMATCH);
+        assert_hash(&vault_addr_hash_fr);
+
+        let registry = borrow_global_mut<AssetRegistryV4>(@eunoma);
+        // APPEND-ONLY: asset_addr must not already be present.
+        assert!(!table::contains(&registry.by_asset, asset_addr), E_ASSET_ID_MISMATCH);
+
+        let asset_type = object::address_to_object<fungible_asset::Metadata>(asset_addr);
+        // Compute asset_id_fr ON-CHAIN. Never a caller arg (MA-1 / FIX-3).
+        let asset_id_fr = derive_asset_id(asset_type);
+        // Uniqueness: the derived asset_id_fr must not already be used by another registered asset
+        // (no two asset_addrs may share an asset_id_fr — would break the Poseidon-link routing).
+        assert!(!asset_id_fr_in_use(&registry.asset_list, &registry.by_asset, &asset_id_fr), E_ASSET_ID_MISMATCH);
+
+        table::add(&mut registry.by_asset, asset_addr, AssetVaultStateV4 {
+            asset_type,
+            asset_id_fr,
+            vault_addr_hash_fr,
+            vault_ek: vector::empty<u8>(),   // ∅ while DORMANT; filled at activate
+            decimals,
+            deposit_count: 0,
+            status: ASSET_STATUS_DORMANT,
+        });
+        vector::push_back(&mut registry.asset_list, asset_addr);
+    }
+
+    // STEP 2 — CA-register the (already metadata-registered) asset + flip ACTIVE. Succeeds ONLY
+    // after Aptos allow-lists the asset (register_raw hard-asserts is_confidentiality_enabled).
+    // Reads asset_type FROM THE REGISTRY (never a caller-supplied asset_type) so a remap is
+    // impossible. ACTIVE is reachable ONLY through this register_raw-bearing path (no standalone
+    // set_status). vault_ek must equal the shared threshold CA EK (chosen default, §7).
+    public entry fun activate_asset_ca_v4(
+        admin: &signer,
+        asset_addr: address,
+        vault_ek: vector<u8>,
+        registration_sigma_comm: vector<vector<u8>>,
+        registration_sigma_resp: vector<vector<u8>>,
+    ) acquires VaultCoreV4, AssetRegistryV4, DeoperatorConfigV2 {
+        assert_admin_v4(admin);
+        assert!(vector::length(&vault_ek) == ED25519_PUBLIC_KEY_BYTES, E_BAD_VAULT_EK);
+        // Chosen default (§7): ONE shared threshold CA EK across all assets.
+        let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
+        assert!(vault_ek == cfg.vault_ek, E_BAD_VAULT_EK);
+
+        let core = borrow_global<VaultCoreV4>(@eunoma);
+        let vault_signer = account::create_signer_with_capability(&core.vault_signer_cap);
+
+        // Read the row + assert DORMANT (idempotency belt over the framework store-exists abort).
+        // Read st.asset_type from the registry FIRST (never a caller arg), then register_raw.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        assert!(table::contains(&registry.by_asset, asset_addr), E_ASSET_ID_MISMATCH);
+        let asset_type = table::borrow(&registry.by_asset, asset_addr).asset_type;
+        assert!(table::borrow(&registry.by_asset, asset_addr).status == ASSET_STATUS_DORMANT, E_ASSET_ALREADY_ACTIVE);
+
+        // register_raw FIRST — internally hard-asserts is_confidentiality_enabled_for_asset_type;
+        // aborts E_ASSET_TYPE_DISALLOWED until Aptos allow-lists. Any abort rolls back the whole tx.
+        confidential_asset::register_raw(
+            &vault_signer,
+            asset_type,
+            *&vault_ek,
+            registration_sigma_comm,
+            registration_sigma_resp,
+        );
+
+        // ONLY AFTER register_raw returns: set vault_ek + flip ACTIVE. Never touches the immutable
+        // asset_type / asset_id_fr / decimals triple.
+        let st = table::borrow_mut(&mut borrow_global_mut<AssetRegistryV4>(@eunoma).by_asset, asset_addr);
+        st.vault_ek = vault_ek;
+        st.status = ASSET_STATUS_ACTIVE;
+    }
+
+    // init_v4 — create_resource_account ONCE, seed the global core/tables/registry, and onboard
+    // APT (register DORMANT then activate=ACTIVE). Stablecoins ship DORMANT (register only, no
+    // activate) — only APT is ACTIVE at init. FIX-5: assert the DepositBindingTestOverride is
+    // absent so derive_asset_id is honest on the live module.
+    public entry fun init_v4(
+        admin: &signer,
+        vault_seed: vector<u8>,
+        apt_asset_type: Object<fungible_asset::Metadata>,
+        operator_set_version: u64,
+        dkg_epoch: u64,
+        roster_hash: vector<u8>,
+        frost_group_pubkey: vector<u8>,
+        vault_ek: vector<u8>,
+        registration_sigma_comm: vector<vector<u8>>,
+        registration_sigma_resp: vector<vector<u8>>,
+        deposit_circuit_version: vector<u8>,
+        withdraw_circuit_version: vector<u8>,
+        ca_payload_circuit_version: vector<u8>,
+        fallback_pubkeys: vector<vector<u8>>,
+        apt_decimals: u8,
+    ) acquires VaultCoreV4, AssetRegistryV4, DeoperatorConfigV2, DepositBindingTestOverride {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(!exists<VaultCoreV4>(@eunoma), E_ALREADY_INITIALIZED);
+        assert!(!exists<AssetRegistryV4>(@eunoma), E_ALREADY_INITIALIZED);
+        assert!(!exists<BridgeTablesV4>(@eunoma), E_ALREADY_INITIALIZED);
+        // FIX-5: the override collapses derive_asset_id to a constant — must be absent on a live init.
+        assert!(!exists<DepositBindingTestOverride>(@eunoma), E_ASSET_ID_MISMATCH);
+        assert_hash(&roster_hash);
+        assert!(vector::length(&frost_group_pubkey) == ED25519_PUBLIC_KEY_BYTES, E_BAD_GROUP_PUBKEY);
+        assert!(vector::length(&vault_ek) == ED25519_PUBLIC_KEY_BYTES, E_BAD_VAULT_EK);
+        assert_valid_fallback_pubkeys(&fallback_pubkeys);
+
+        // ONE shared resource account for N CA assets (T1).
+        let (vault_signer, vault_signer_cap) = account::create_resource_account(admin, vault_seed);
+        let vault_addr = signer::address_of(&vault_signer);
+
+        // Seed the global core, registry, and tables.
+        move_to(admin, VaultCoreV4 {
+            admin: signer::address_of(admin),
+            vault_addr,
+            vault_signer_cap,
+            paused: false,
+            next_leaf_index: 0,
+            vault_sequence: 0,
+        });
+        move_to(admin, AssetRegistryV4 {
+            by_asset: table::new<address, AssetVaultStateV4>(),
+            asset_list: vector::empty<address>(),
+        });
+        move_to(admin, BridgeTablesV4 {
+            used_deposit_nonces: table::new<vector<u8>, bool>(),
+            used_nullifiers: table::new<vector<u8>, bool>(),
+            known_roots: table::new<vector<u8>, bool>(),
+        });
+
+        // Deoperator config (threshold hard-set to THRESHOLD_V2 = 5 — no override path).
+        if (!exists<DeoperatorConfigV2>(@eunoma)) {
+            move_to(admin, DeoperatorConfigV2 {
+                operator_set_version,
+                dkg_epoch,
+                threshold: THRESHOLD_V2,
+                roster_hash,
+                frost_group_pubkey,
+                vault_ek: *&vault_ek,
+                deposit_circuit_version,
+                withdraw_circuit_version,
+                ca_payload_circuit_version,
+                fallback_pubkeys,
+            });
+        };
+
+        // ASP/CP6: deposit_sender map for ragequit (global, asset-agnostic).
+        if (!exists<DepositSenderMap>(@eunoma)) {
+            move_to(admin, DepositSenderMap { by_commitment: table::new<vector<u8>, address>() });
+        };
+
+        // Onboard APT: register metadata DORMANT then activate=ACTIVE. Only APT is ACTIVE at init;
+        // stablecoins ship DORMANT (a later register_asset_metadata_v4 + activate_asset_ca_v4).
+        let apt_asset_addr = object::object_address(&apt_asset_type);
+        let apt_vault_addr_hash_fr = derive_vault_addr_hash(vault_addr);
+        register_asset_metadata_v4(admin, apt_asset_addr, apt_vault_addr_hash_fr, apt_decimals);
+        activate_asset_ca_v4(
+            admin,
+            apt_asset_addr,
+            vault_ek,
+            registration_sigma_comm,
+            registration_sigma_resp,
+        );
+
+        event::emit(VaultInitializedV2 {
+            vault_addr,
+            asset_type: apt_asset_addr,
             operator_set_version,
             dkg_epoch,
             threshold: THRESHOLD_V2,
@@ -937,11 +1245,24 @@ module eunoma::eunoma_bridge {
         event::emit(RootRecordedV2 { root });
     }
 
+    // V4 clean-replace: record roots into BridgeTablesV4. The legacy V2 recorder writes
+    // BridgeVaultTablesV2, which does not exist on a fresh V4 package; withdraw V4 checks the
+    // unified BridgeTablesV4.known_roots table.
+    public entry fun record_known_root_v4(
+        admin: &signer,
+        root: vector<u8>,
+    ) acquires VaultCoreV4, BridgeTablesV4 {
+        assert_admin_v4(admin);
+        assert_hash(&root);
+        record_known_root_internal_v4(*&root);
+        event::emit(RootRecordedV2 { root });
+    }
+
     // R7-OPS-1: admin one-time init seeds RecorderDelegate.addr = admin's own address.
     // After init, admin can rotate via admin_set_recorder_delegate. This is required
     // before any record_known_root_v2_via_delegate call.
-    public entry fun init_recorder_delegate(admin: &signer) acquires BridgeVault {
-        assert_admin(admin);
+    public entry fun init_recorder_delegate(admin: &signer) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<RecorderDelegate>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, RecorderDelegate { addr: signer::address_of(admin) });
     }
@@ -953,8 +1274,8 @@ module eunoma::eunoma_bridge {
     public entry fun admin_set_recorder_delegate(
         admin: &signer,
         delegate_addr: address,
-    ) acquires RecorderDelegate, BridgeVault {
-        assert_admin(admin);
+    ) acquires RecorderDelegate, BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(exists<RecorderDelegate>(@eunoma), E_RECORDER_DELEGATE_NOT_INITIALIZED);
         let rd = borrow_global_mut<RecorderDelegate>(@eunoma);
         rd.addr = delegate_addr;
@@ -1002,12 +1323,24 @@ module eunoma::eunoma_bridge {
         event::emit(RootRecordedV2 { root });
     }
 
+    public entry fun record_known_root_v4_via_delegate(
+        delegate: &signer,
+        root: vector<u8>,
+    ) acquires RecorderDelegate, BridgeTablesV4 {
+        assert!(exists<RecorderDelegate>(@eunoma), E_RECORDER_DELEGATE_NOT_INITIALIZED);
+        let rd = borrow_global<RecorderDelegate>(@eunoma);
+        assert!(signer::address_of(delegate) == rd.addr, E_NOT_RECORDER_DELEGATE);
+        assert_hash(&root);
+        record_known_root_internal_v4(*&root);
+        event::emit(RootRecordedV2 { root });
+    }
+
     // ASP (2026-05-30, asp-tree-design §6 / D4): admin one-time init seeds ASPRecorderDelegate.addr
     // = admin's own address, and seeds an empty KnownASPRoots log. After init, admin can rotate the
     // delegate via admin_set_asp_recorder_delegate. Required before any record_asp_root_via_delegate.
     // Mirrors init_recorder_delegate exactly (same low-priv, no-admin-key delegate pattern).
-    public entry fun init_asp_recorder_delegate(admin: &signer) acquires BridgeVault {
-        assert_admin(admin);
+    public entry fun init_asp_recorder_delegate(admin: &signer) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<ASPRecorderDelegate>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, ASPRecorderDelegate { addr: signer::address_of(admin) });
         if (!exists<KnownASPRoots>(@eunoma)) {
@@ -1021,8 +1354,8 @@ module eunoma::eunoma_bridge {
     public entry fun admin_set_asp_recorder_delegate(
         admin: &signer,
         delegate_addr: address,
-    ) acquires ASPRecorderDelegate, BridgeVault {
-        assert_admin(admin);
+    ) acquires ASPRecorderDelegate, BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(exists<ASPRecorderDelegate>(@eunoma), E_ASP_RECORDER_DELEGATE_NOT_INITIALIZED);
         let rd = borrow_global_mut<ASPRecorderDelegate>(@eunoma);
         rd.addr = delegate_addr;
@@ -1052,6 +1385,10 @@ module eunoma::eunoma_bridge {
 
     public entry fun deposit_with_commitment_v2(
         sender: &signer,
+        // V4 (CP2 MB-2): asset_addr +1 routing key (also bound into the deop attestation as
+        // asset_type_addr — a wrong asset_addr fails attestation). Registry resolution adds the
+        // per-asset status gate.
+        asset_addr: address,
         commitment: vector<u8>,
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
@@ -1075,22 +1412,31 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingDepositBindingsV2, PendingDepositBindingsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK, CircuitVersionsHashCacheV2 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, PendingDepositBindingsV2, PendingDepositBindingsV3, DeoperatorConfigV2, PreparedDepositBindingVK, CircuitVersionsHashCacheV2, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert_not_expired(expiry_secs);
         // R6-A.1: inline 3-hash block (mirrors R5-G.2 assert_6_withdraw_hashes idiom).
         assert_3_deposit_hashes(&commitment, &amount_tag, &ca_payload_hash);
 
-        // A5a + A4 + A2 + A6 gas opt: combined nonce check+mark via V1 helper; single mut
-        // borrow of BridgeVault held across body (no helper between here and deposit_count
-        // bump acquires BridgeVault post-V1); hoist asset_type_addr once; use cached
-        // circuit_versions_hash via C3 helper.
-        check_and_mark_deposit_nonce_v2(&deposit_nonce);
-        let vault = borrow_global_mut<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        let asset_type = vault.asset_type;
+        // V4 MB-2 (LOAD-BEARING): STATUS GATE at the TOP, BEFORE the nonce mark + any global write.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
         let asset_type_addr = object::object_address(&asset_type);
-        let vault_addr = vault.vault_addr;
+        let asset_id_fr = *&st.asset_id_fr;
+        let vault_addr_hash_fr = *&st.vault_addr_hash_fr;
+        assert!(derive_asset_id(asset_type) == asset_id_fr, E_ASSET_ID_MISMATCH);
+
+        let core = borrow_global_mut<VaultCoreV4>(@eunoma);
+        assert!(!core.paused, E_PAUSED);
+        let vault_addr = core.vault_addr;
+
+        // Nonce mark AFTER the status gate (MB-2 ordering invariant).
+        {
+            let tables = borrow_global_mut<BridgeTablesV4>(@eunoma);
+            check_and_mark_deposit_nonce_v4(tables, &deposit_nonce);
+        };
 
         let ca_payload_hash_raw = hash_confidential_transfer_payload_v2(
             &asset_type,
@@ -1152,6 +1498,8 @@ module eunoma::eunoma_bridge {
         // R7-W1: pass sender_addr for composite (sender, commitment) V3 cache lookup.
         consume_or_verify_deposit_binding(
             signer::address_of(sender),
+            &asset_id_fr,
+            &vault_addr_hash_fr,
             &commitment,
             &amount_tag,
             &amount_p,
@@ -1178,19 +1526,26 @@ module eunoma::eunoma_bridge {
             memo,
         );
 
-        // Goal.md M3: increment deposit_count AFTER confidential_transfer_raw succeeds.
-        // If the CA payload had failed verification or aborted, deposit_count must NOT
-        // advance — the observer's strict-monotonic-ordering check would otherwise see a
-        // counter gap that no event could explain. A4 gas opt: reuse mut borrow from line 624.
-        let new_deposit_count = vault.deposit_count + 1;
-        vault.deposit_count = new_deposit_count;
+        // V4 (§10.1): advance the GLOBAL unified-tree append index AFTER confidential_transfer_raw
+        // succeeds (a failed CA payload must NOT advance it, else the off-chain builder sees a
+        // dense-index gap). The per-asset deposit_count is a separate observer cursor.
+        core.next_leaf_index = core.next_leaf_index + 1;
+        let leaf_index = core.next_leaf_index;
+        let new_deposit_count = {
+            let st_mut = table::borrow_mut(&mut borrow_global_mut<AssetRegistryV4>(@eunoma).by_asset, asset_addr);
+            st_mut.deposit_count = st_mut.deposit_count + 1;
+            st_mut.deposit_count
+        };
 
-        // Goal.md M3: post-success deposit event keyed by deposit_count. Observers use this
-        // to advance their local state-share cursor; strictly ordered by deposit_count.
+        // Post-success deposit event. Observers advance their local state-share cursor strictly
+        // ordered by the global leaf_index. (V4 DepositConfirmedV4 event is a separate stage;
+        // the retained DepositConfirmedV2 shape is reused here with the global counter as
+        // deposit_count for now.)
+        let _ = new_deposit_count;
         event::emit(DepositConfirmedV2 {
             vault_addr,
             asset_type: asset_type_addr,
-            deposit_count: new_deposit_count,
+            deposit_count: leaf_index,
             commitment,
             amount_tag,
             ca_payload_hash,
@@ -1221,6 +1576,8 @@ module eunoma::eunoma_bridge {
 
     public entry fun deposit_step2a_eunoma_verify(
         sender: &signer,
+        // V4 (CP2 MB-2): asset_addr +1 routing key (forwarded to the v3 entry).
+        asset_addr: address,
         commitment: vector<u8>,
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
@@ -1244,9 +1601,10 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingDepositBindingsV2, PendingDepositBindingsV3, PendingDepositFinalizationsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK, CircuitVersionsHashCacheV2 {
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, PendingDepositBindingsV2, PendingDepositBindingsV3, PendingDepositFinalizationsV3, DeoperatorConfigV2, PreparedDepositBindingVK, CircuitVersionsHashCacheV2, DepositBindingTestOverride {
         deposit_step2a_eunoma_verify_v3(
             sender,
+            asset_addr,
             signer::address_of(sender),
             commitment,
             amount_tag,
@@ -1278,6 +1636,10 @@ module eunoma::eunoma_bridge {
         // (B) deposit re-key: tx submitter (relayer OR the user themselves) — UNUSED for auth.
         // Authority = the deop FROST attestation (now binds user_addr) + the deposit-binding proof.
         _relayer: &signer,
+        // V4 (CP2 MB-2): asset_addr +1 routing key. The deop attestation already binds
+        // asset_type_addr, so a wrong asset_addr fails attestation; the registry resolution here
+        // adds the per-asset status gate (DORMANT assets are unspendable).
+        asset_addr: address,
         // (B) the depositing user's address; the finalization + binding cache are keyed by this,
         // and it is bound into the signed attestation message so a relayer cannot misdirect it.
         user_addr: address,
@@ -1304,18 +1666,35 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingDepositBindingsV2, PendingDepositBindingsV3, PendingDepositFinalizationsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedDepositBindingVK, CircuitVersionsHashCacheV2 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, PendingDepositBindingsV2, PendingDepositBindingsV3, PendingDepositFinalizationsV3, DeoperatorConfigV2, PreparedDepositBindingVK, CircuitVersionsHashCacheV2, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert!(exists<PendingDepositFinalizationsV3>(@eunoma), E_NOT_INITIALIZED);
         assert_not_expired(expiry_secs);
         assert_3_deposit_hashes(&commitment, &amount_tag, &ca_payload_hash);
 
-        check_and_mark_deposit_nonce_v2(&deposit_nonce);
-        let vault = borrow_global_mut<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        let asset_type = vault.asset_type;
+        // V4 MB-2 (LOAD-BEARING): STATUS GATE at the TOP, BEFORE check_and_mark_deposit_nonce_v4.
+        // step2a never calls the CA framework (no store-existence backstop), so gating after the
+        // nonce mark would burn a permanent nonce slot + write an undrainable finalization row for
+        // a DORMANT asset. Resolve the registry row first and require ACTIVE.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
         let asset_type_addr = object::object_address(&asset_type);
-        let vault_addr = vault.vault_addr;
+        // V4: per-asset deposit publics from the registry row (deposit circuit FROZEN; only the
+        // SOURCE of asset_id_fr / vault_addr_hash_fr moves singleton -> registry).
+        let asset_id_fr = *&st.asset_id_fr;
+        let vault_addr_hash_fr = *&st.vault_addr_hash_fr;
+        // V4 MA-1: pin the route to the registry's immutable on-chain-derived asset_id_fr.
+        assert!(derive_asset_id(asset_type) == asset_id_fr, E_ASSET_ID_MISMATCH);
+
+        let core = borrow_global<VaultCoreV4>(@eunoma);
+        assert!(!core.paused, E_PAUSED);
+        let vault_addr = core.vault_addr;
+
+        // Nonce mark AFTER the status gate (MB-2 ordering invariant).
+        let tables = borrow_global_mut<BridgeTablesV4>(@eunoma);
+        check_and_mark_deposit_nonce_v4(tables, &deposit_nonce);
 
         let ca_payload_hash_raw = hash_confidential_transfer_payload_v2(
             &asset_type,
@@ -1372,6 +1751,8 @@ module eunoma::eunoma_bridge {
         // the R7-W1 squat-DoS (an attacker cannot mint a valid binding for a commitment they don't own).
         consume_or_verify_deposit_binding(
             user_addr,
+            &asset_id_fr,
+            &vault_addr_hash_fr,
             &commitment,
             &amount_tag,
             &amount_p,
@@ -1408,6 +1789,8 @@ module eunoma::eunoma_bridge {
 
     public entry fun deposit_step2b_invoke_framework(
         sender: &signer,
+        // V4 (CP2 MB-2): asset_addr +1 routing key.
+        asset_addr: address,
         commitment: vector<u8>,
         new_balance_p: vector<vector<u8>>,
         new_balance_r: vector<vector<u8>>,
@@ -1423,8 +1806,8 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, DepositSenderMap, PendingDepositFinalizationsV3, GasFeeConfigV1 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, DepositSenderMap, PendingDepositFinalizationsV3, GasFeeConfigV1, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert!(exists<PendingDepositFinalizationsV3>(@eunoma), E_NOT_INITIALIZED);
 
         // R7-W1: composite (sender, commitment) key — table contains() with attacker's
@@ -1436,15 +1819,21 @@ module eunoma::eunoma_bridge {
         assert!(table::contains(&pending.by_commitment, key), E_NO_PENDING_FINALIZATION);
         let entry = table::remove(&mut pending.by_commitment, key);
 
-        // Re-checks (Plan agent B.0 audit): sender, expiry, paused, ca_payload_hash.
+        // Re-checks (Plan agent B.0 audit): sender, expiry, ca_payload_hash.
         assert!(sender_addr == entry.sender, E_NOT_DEPOSIT_OWNER);
         assert_not_expired(entry.expiry_secs);
 
-        let vault = borrow_global_mut<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        let asset_type = vault.asset_type;
+        // V4 MB-2: STATUS GATE. PAUSED = drain-in-flight (a post-step2a finalization row settles
+        // under ACTIVE or PAUSED; a DORMANT asset is never spendable). MA-1 Poseidon-link the route.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status != ASSET_STATUS_DORMANT, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
         let asset_type_addr = object::object_address(&asset_type);
-        let vault_addr = vault.vault_addr;
+        assert!(derive_asset_id(asset_type) == st.asset_id_fr, E_ASSET_ID_MISMATCH);
+
+        let core = borrow_global_mut<VaultCoreV4>(@eunoma);
+        let vault_addr = core.vault_addr;
 
         // ANTI VAULT-DRAIN: recompute ca_payload_hash from supplied CA args + assert
         // matches entry.ca_payload_hash (verified by step2a's FROST attest binding).
@@ -1501,8 +1890,14 @@ module eunoma::eunoma_bridge {
             };
         };
 
-        let new_deposit_count = vault.deposit_count + 1;
-        vault.deposit_count = new_deposit_count;
+        // V4 (§10.1): advance the GLOBAL unified-tree append index (the leaf ordering key) AFTER
+        // the CA transfer succeeds; the per-asset deposit_count is a separate observer cursor.
+        core.next_leaf_index = core.next_leaf_index + 1;
+        let leaf_index = core.next_leaf_index;
+        {
+            let st_mut = table::borrow_mut(&mut borrow_global_mut<AssetRegistryV4>(@eunoma).by_asset, asset_addr);
+            st_mut.deposit_count = st_mut.deposit_count + 1;
+        };
 
         // ASP/CP6 (asp-tree-design §6/§8): record deposit_sender[commitment] = sender now that the
         // deposit is final (CA transfer succeeded) + commitment known + sender = the signer here.
@@ -1522,7 +1917,7 @@ module eunoma::eunoma_bridge {
         event::emit(DepositConfirmedV2 {
             vault_addr,
             asset_type: asset_type_addr,
-            deposit_count: new_deposit_count,
+            deposit_count: leaf_index,
             commitment,
             amount_tag: entry.amount_tag,
             ca_payload_hash: entry.ca_payload_hash,
@@ -1545,6 +1940,9 @@ module eunoma::eunoma_bridge {
     // ASP-root window and binds the 3 publics into the Groth16 verify.
     public entry fun withdraw_to_recipient_v2(
         _relayer: &signer,
+        // V4 (CP2 MB-3): asset_addr is an explicit +1 positional routing key (attacker-chosen);
+        // the registry row is resolved + gated ACTIVE + MA-1 Poseidon-linked to the proof.
+        asset_addr: address,
         root: vector<u8>,
         nullifier_hash: vector<u8>,
         recipient: address,
@@ -1555,6 +1953,8 @@ module eunoma::eunoma_bridge {
         asp_root: vector<u8>,
         state_tree_depth: u64,
         asp_tree_depth: u64,
+        // V4 (CP1): change_commitment public[12] (EMPTY = 32 zero bytes for a full withdraw).
+        change_commitment: vector<u8>,
         vault_sequence: u64,
         withdraw_proof: vector<u8>,
         expiry_secs: u64,
@@ -1575,35 +1975,42 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, KnownASPRoots, PendingWithdrawProofsV2, PendingWithdrawProofsV2b, PendingWithdrawProofsV3, PendingWithdrawProofsV3b, PendingWithdrawAttestationsV2, PendingWithdrawAttestationsV2b, PendingWithdrawAttestationsV3, PendingWithdrawPayloadsV2, PendingWithdrawPayloadsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK, CircuitVersionsHashCacheV2 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, KnownASPRoots, PendingWithdrawProofsV3b, PendingWithdrawPayloadsV2, PendingWithdrawPayloadsV3, PendingWithdrawAttestationsV2, PendingWithdrawAttestationsV2b, PendingWithdrawAttestationsV3, DeoperatorConfigV2, PreparedWithdrawProofVK, CircuitVersionsHashCacheV2, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert_not_expired(expiry_secs);
         // R5-P (Wave G.2): inlined 6-hash assertion block.
         assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
         // ASP: asp_root is a 32B Fr like root.
         assert_hash(&asp_root);
+        // V4 CP1: change_commitment is a 32B Fr (EMPTY = 32 zero bytes).
+        assert_hash(&change_commitment);
 
-        // WB2.D/FW8.3: hold ONE mut borrow on BridgeVaultTablesV2 across known_root check +
-        // nullifier check + nullifier mark. Round-1 deposit V1 did the same for nonce check+mark
-        // via `check_and_mark_deposit_nonce_v2`; withdraw has 3 separate uses so we expose
-        // `_with_tables` variants and the borrow lives across the whole body.
-        let tables = borrow_global_mut<BridgeVaultTablesV2>(@eunoma);
-        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
-        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        // V4 MB-2: STATUS GATE at the TOP, before any global table read/write. Resolve the
+        // registry row by the attacker-chosen asset_addr and require ACTIVE. V4 MA-1: bind the
+        // route to the proof via derive_asset_id(st.asset_type) == st.asset_id_fr (proven_asset_id
+        // fed to publics[2]).
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
+        let asset_id = *&st.asset_id_fr;
+        assert!(derive_asset_id(asset_type) == asset_id, E_ASSET_ID_MISMATCH);
+
+        // Hold ONE mut borrow on BridgeTablesV4 (global) across known_root check + nullifier check
+        // + nullifier mark.
+        let tables = borrow_global_mut<BridgeTablesV4>(@eunoma);
+        assert!(known_root_recorded_with_tables_v4(tables, &root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables_v4(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
         // ASP (asp-tree-design §6): asp_root must be in the recent ASP-root window, parallel to the
         // state-root check above. Reads KnownASPRoots (a different global than `tables`).
         assert!(asp_root_in_recent_window(&asp_root), E_INVALID_ASP_ROOT);
 
-        // WB2.B/FS1.5+FW2.1: hold a single mut borrow on BridgeVault across the whole withdraw
-        // body (round-1 A4 deposit-side pattern, now applied to withdraw). Replaces 3 separate
-        // borrow_global calls (immut at 801 + immut at 862-865 + mut at 867) with one.
-        let vault = borrow_global_mut<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
-        let asset_type = vault.asset_type;
-        let vault_addr = vault.vault_addr;
-        // WB2.F (codex missed opt #3): hoist asset_type_addr once instead of recomputing
-        // inside consume_or_verify_withdraw_attestation callsite.
+        // V4: hold a single mut borrow on VaultCoreV4 (global signer cap + vault_addr +
+        // vault_sequence) across the whole withdraw body.
+        let core = borrow_global_mut<VaultCoreV4>(@eunoma);
+        assert!(!core.paused, E_PAUSED);
+        assert!(core.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
+        let vault_addr = core.vault_addr;
         let asset_type_addr = object::object_address(&asset_type);
         let expected_recipient_hash = derive_recipient_hash(recipient);
         assert!(expected_recipient_hash == recipient_hash, E_RECIPIENT_HASH_MISMATCH);
@@ -1653,13 +2060,10 @@ module eunoma::eunoma_bridge {
             asset_type_addr,
             &circuit_versions_hash,
         );
-        // WB2.C/FW2.4: inline VaultPublicInputsV2 read. asset_id_fr bound to a local because
-        // FR-1.3 (Round 4 WB2.E B) flipped consume_or_verify_withdraw_proof to by-ref; we need
-        // a named address-of target for asset_id_fr.
-        let asset_id = borrow_global<VaultPublicInputsV2>(@eunoma).asset_id_fr;
-        // FR-1.3: 7 `*&` clones eliminated; all hash args now passed as &vector<u8> refs.
+        // V4 MA-1: asset_id is the registry-resolved asset_id_fr (Poseidon-linked above), NOT a
+        // dead singleton read.
         // ASP: monolith hits the VERIFY branch — pass the real asp_root + depths so they are bound
-        // into the Groth16 publics.
+        // into the Groth16 publics. V4 CP1: change_commitment public[12] also bound here.
         consume_or_verify_withdraw_proof(
             &root,
             &nullifier_hash,
@@ -1673,17 +2077,15 @@ module eunoma::eunoma_bridge {
             &asp_root,
             state_tree_depth,
             asp_tree_depth,
+            &change_commitment,
             withdraw_proof,
         );
 
-        // WB2.B continued: derive signer from the held mut borrow (immut field-borrow of mut
-        // borrow), then bump seq on same mut borrow. No second/third borrow_global needed.
-        let vault_signer = account::create_signer_with_capability(&vault.vault_signer_cap);
-        // WB2.D continued: use already-held `tables` mut borrow for the mark (no second
-        // borrow_global_mut<BridgeVaultTablesV2>). nullifier_hash is still owned and consumed
-        // by the event emit below; the *& makes the required clone for the table::add key.
-        mark_nullifier_used_with_tables(tables, *&nullifier_hash);
-        vault.vault_sequence = vault.vault_sequence + 1;
+        // V4: derive signer from the held VaultCoreV4 mut borrow, then bump the GLOBAL
+        // vault_sequence on the same borrow. nullifier marked in the held BridgeTablesV4 borrow.
+        let vault_signer = account::create_signer_with_capability(&core.vault_signer_cap);
+        mark_nullifier_used_with_tables_v4(tables, *&nullifier_hash);
+        core.vault_sequence = core.vault_sequence + 1;
 
         confidential_asset::confidential_transfer_raw(
             &vault_signer,
@@ -1717,6 +2119,8 @@ module eunoma::eunoma_bridge {
 
     public entry fun withdraw_step2a_eunoma_verify_v3(
         relayer: &signer,
+        // V4 (CP2 MB-3): asset_addr +1 routing key; change_commitment public[12] (cache re-assert).
+        asset_addr: address,
         root: vector<u8>,
         nullifier_hash: vector<u8>,
         recipient: address,
@@ -1724,24 +2128,34 @@ module eunoma::eunoma_bridge {
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         request_hash: vector<u8>,
+        change_commitment: vector<u8>,
         vault_sequence: u64,
         expiry_secs: u64,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawFinalizationsV3, PendingWithdrawPayloadsV2, PendingWithdrawPayloadsV3, PendingWithdrawProofsV2, PendingWithdrawProofsV2b, PendingWithdrawProofsV3, PendingWithdrawProofsV3b, PendingWithdrawAttestationsV2, PendingWithdrawAttestationsV2b, PendingWithdrawAttestationsV3, DeoperatorConfigV2, VaultPublicInputsV2, PreparedWithdrawProofVK, CircuitVersionsHashCacheV2 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, PendingWithdrawFinalizationsV3, PendingWithdrawPayloadsV2, PendingWithdrawPayloadsV3, PendingWithdrawProofsV3b, PendingWithdrawConservationsV4, PendingWithdrawAttestationsV2, PendingWithdrawAttestationsV2b, PendingWithdrawAttestationsV3, DeoperatorConfigV2, PreparedWithdrawProofVK, CircuitVersionsHashCacheV2, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert!(exists<PendingWithdrawFinalizationsV3>(@eunoma), E_NOT_INITIALIZED);
         assert_not_expired(expiry_secs);
         assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
+        assert_hash(&change_commitment);
 
-        let tables = borrow_global<BridgeVaultTablesV2>(@eunoma);
-        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
-        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
-
-        let vault = borrow_global<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
-        let vault_addr = vault.vault_addr;
-        let asset_type = vault.asset_type;
+        // V4 MB-2: STATUS GATE at the TOP, before any global table read/write + before the
+        // finalization-row write. V4 MA-1: Poseidon-link the attacker-chosen route to the proof.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
+        let asset_id = *&st.asset_id_fr;
+        assert!(derive_asset_id(asset_type) == asset_id, E_ASSET_ID_MISMATCH);
         let asset_type_addr = object::object_address(&asset_type);
+
+        let tables = borrow_global<BridgeTablesV4>(@eunoma);
+        assert!(known_root_recorded_with_tables_v4(tables, &root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables_v4(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+
+        let core = borrow_global<VaultCoreV4>(@eunoma);
+        assert!(!core.paused, E_PAUSED);
+        assert!(core.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
+        let vault_addr = core.vault_addr;
         let expected_recipient_hash = derive_recipient_hash(recipient);
         assert!(expected_recipient_hash == recipient_hash, E_RECIPIENT_HASH_MISMATCH);
 
@@ -1769,12 +2183,12 @@ module eunoma::eunoma_bridge {
             &circuit_versions_hash,
         );
 
-        let asset_id = borrow_global<VaultPublicInputsV2>(@eunoma).asset_id_fr;
         let empty_proof: vector<u8> = vector[];
         // ASP: step2a is CACHE-ONLY (empty_proof -> cache-path early return in
         // consume_or_verify_withdraw_proof). The asp_root window + the 3 asp publics were already
-        // enforced/bound when the proof was first verified at prepare_withdraw_proof_v{2,3}, so the
-        // asp_root / depths are UNUSED here — pass placeholders (empty asp_root, 0, 0).
+        // enforced/bound when the proof was first verified at prepare_withdraw_proof_v3, so the
+        // asp_root / depths are UNUSED here — pass placeholders. change_commitment IS re-asserted
+        // against the V3b cache row on the cache-hit (V4 CP1).
         let empty_asp_root: vector<u8> = vector[];
         consume_or_verify_withdraw_proof(
             &root,
@@ -1789,8 +2203,19 @@ module eunoma::eunoma_bridge {
             &empty_asp_root,
             0,
             0,
+            &change_commitment,
             empty_proof,
         );
+
+        // V4 (CP2 MB-4): a PARTIAL withdraw (has_change) MUST have a cached aggregate-Pedersen
+        // conservation proof bound to this spend's amount_p_digest. Consume it here (off the
+        // step2b CA-transfer hot path) as a HARD GATE before the finalization row is written, so a
+        // bad split (A_old != W + A_rem) can never reach the framework transfer. A FULL withdraw
+        // (CHANGE_COMMITMENT_EMPTY) has no remainder and skips this (conservation is trivially
+        // A_old = W, already enforced by the withdrawn leg's own CA sigma proof).
+        if (has_change_commitment(&change_commitment)) {
+            consume_withdraw_conservation_v4(&request_hash, &amount_p_digest);
+        };
 
         let sender_addr = signer::address_of(relayer);
         let key = compose_pending_key(sender_addr, &request_hash);
@@ -1801,6 +2226,8 @@ module eunoma::eunoma_bridge {
         );
         table::add(&mut pending.by_request_hash, key, PendingWithdrawFinalizationV3 {
             sender: sender_addr,
+            asset_addr,
+            asset_id,
             root,
             nullifier_hash,
             recipient,
@@ -1810,6 +2237,8 @@ module eunoma::eunoma_bridge {
             request_hash,
             vault_sequence,
             expiry_secs,
+            // V4 (CP2 MB-5): carry the validated change_commitment public[12] to TX4.
+            change_commitment,
         });
     }
 
@@ -1830,8 +2259,8 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawFinalizationsV3 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, PendingWithdrawFinalizationsV3, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert_hash(&request_hash);
 
         let sender_addr = signer::address_of(relayer);
@@ -1843,14 +2272,23 @@ module eunoma::eunoma_bridge {
         assert!(&entry.request_hash == &request_hash, E_NO_PENDING_FINALIZATION);
         assert_not_expired(entry.expiry_secs);
 
-        let tables = borrow_global_mut<BridgeVaultTablesV2>(@eunoma);
-        assert!(known_root_recorded_with_tables(tables, &entry.root), E_INVALID_ROOT);
-        assert!(!nullifier_used_with_tables(tables, &entry.nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        // V4 (CP2 MB-3 / FIX-4): re-resolve the SAME registry entry TX3 validated, from the
+        // asset_addr stored on the finalization row. MB-2 STATUS GATE: PAUSED is drain-in-flight,
+        // so TX4 settles a post-TX3 row under ACTIVE *or* PAUSED, but a DORMANT asset is never
+        // spendable. V4 MA-1: re-assert the Poseidon-link against the row's stored asset_id.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, entry.asset_addr);
+        assert!(st.status != ASSET_STATUS_DORMANT, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
+        assert!(derive_asset_id(asset_type) == entry.asset_id, E_ASSET_ID_MISMATCH);
 
-        let vault = borrow_global_mut<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        assert!(vault.vault_sequence == entry.vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
-        let asset_type = vault.asset_type;
+        let tables = borrow_global_mut<BridgeTablesV4>(@eunoma);
+        assert!(known_root_recorded_with_tables_v4(tables, &entry.root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables_v4(tables, &entry.nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+
+        let core = borrow_global_mut<VaultCoreV4>(@eunoma);
+        // PAUSED = drain-in-flight: do NOT block a post-TX3 finalization row on core.paused.
+        assert!(core.vault_sequence == entry.vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
         let computed_hash = ca_payload_hash_to_fr_safe(hash_confidential_transfer_payload_v2(
             &asset_type,
             &entry.recipient,
@@ -1871,9 +2309,9 @@ module eunoma::eunoma_bridge {
         ));
         assert!(&computed_hash == &entry.ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
 
-        let vault_signer = account::create_signer_with_capability(&vault.vault_signer_cap);
-        mark_nullifier_used_with_tables(tables, *&entry.nullifier_hash);
-        vault.vault_sequence = vault.vault_sequence + 1;
+        let vault_signer = account::create_signer_with_capability(&core.vault_signer_cap);
+        mark_nullifier_used_with_tables_v4(tables, *&entry.nullifier_hash);
+        core.vault_sequence = core.vault_sequence + 1;
 
         confidential_asset::confidential_transfer_raw(
             &vault_signer,
@@ -1902,6 +2340,25 @@ module eunoma::eunoma_bridge {
             request_hash: entry.request_hash,
             vault_sequence: entry.vault_sequence,
         });
+
+        // V4 (CP2 MB-5, design §3.3/§4.4/§10.1): a PARTIAL withdraw (has_change) appends the
+        // change/remainder note commitment as a first-class leaf to the SINGLE global state
+        // LeanIMT, under the GLOBAL next_leaf_index. The remainder is NOT backed by a CA transfer
+        // (vault->vault is E_SELF_TRANSFER): the withdrawn leg's own framework sigma proof leaves
+        // A_rem in the vault's CA available balance, and the change commitment is the spendable
+        // claim on that residual (conservation proven by MB-4 + in-circuit, not a per-note ledger).
+        // A FULL withdraw (change_commitment == CHANGE_COMMITMENT_EMPTY) appends NO leaf and bumps
+        // NO index. The change leaf's amount_p_digest stays private/in-circuit — NO plaintext
+        // amount. The event carries NO parent identifier (avoids on-chain parent->change linkage).
+        if (has_change_commitment(&entry.change_commitment)) {
+            core.next_leaf_index = core.next_leaf_index + 1;
+            let leaf_index = core.next_leaf_index;
+            event::emit(ChangeNoteAppendedV4 {
+                leaf_index,
+                change_commitment: entry.change_commitment,
+                asset_type: object::object_address(&asset_type),
+            });
+        };
     }
 
     // CP6 ragequit access control (asp-tree-design §8 iron law): resolve the original depositor for
@@ -1949,6 +2406,11 @@ module eunoma::eunoma_bridge {
     // because there is no proof binding to such a param (the circuit has no vault_sequence public).
     public entry fun ragequit(
         depositor: &signer,
+        // V4 (CP2 MB-3): asset_addr +1 routing key. The ragequit circuit has NO asset_id public,
+        // so there is no Poseidon-link to a proof here; the registry row only sources asset_type
+        // for the CA exit + the status gate. CA-account isolation (the cUSDC store has no APT to
+        // move) + the on-chain-derived asset_id_fr immutability still pin the route.
+        asset_addr: address,
         commitment: vector<u8>,
         nullifier_hash: vector<u8>,
         root: vector<u8>,
@@ -1970,9 +2432,9 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, DepositSenderMap, PreparedRagequitProofVK {
-        // (a) bridge must be initialized + not paused.
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, DepositSenderMap, PreparedRagequitProofVK {
+        // (a) bridge must be initialized.
+        assert_initialized_v4();
 
         // (b)+(c) resolve the original depositor for this commitment and enforce that the signer IS
         // that original depositor. Returns the original deposit address (the forced exit recipient).
@@ -1981,25 +2443,31 @@ module eunoma::eunoma_bridge {
         // unit tests via test_only_resolve_ragequit_original_sender.
         let original_sender = resolve_ragequit_original_sender(signer::address_of(depositor), &commitment);
 
+        // V4 MB-2: STATUS GATE at the TOP, before any global table write. Resolve the registry row
+        // by the attacker-chosen asset_addr and require ACTIVE.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
+
         // (d) root must be a known state root + the nullifier must not already be spent. Single
         // mut borrow held across the known-root check + nullifier check + mark (same pattern as
         // withdraw_to_recipient_v2).
-        let tables = borrow_global_mut<BridgeVaultTablesV2>(@eunoma);
-        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
-        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        let tables = borrow_global_mut<BridgeTablesV4>(@eunoma);
+        assert!(known_root_recorded_with_tables_v4(tables, &root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables_v4(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
 
         // (e) verify the standalone ragequit Groth16 (4 publics, exact order; commitment revealed).
         assert_valid_ragequit_proof(&commitment, &nullifier_hash, &root, state_tree_depth, ragequit_proof);
 
-        let vault = borrow_global_mut<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        let asset_type = vault.asset_type;
-        let vault_signer = account::create_signer_with_capability(&vault.vault_signer_cap);
+        let core = borrow_global_mut<VaultCoreV4>(@eunoma);
+        assert!(!core.paused, E_PAUSED);
+        let vault_signer = account::create_signer_with_capability(&core.vault_signer_cap);
 
         // (f) mark the nullifier spent BEFORE the transfer (anti-replay), then advance the exit-side
         // vault_sequence counter consistently with both withdraw CA-transfer paths.
-        mark_nullifier_used_with_tables(tables, *&nullifier_hash);
-        vault.vault_sequence = vault.vault_sequence + 1;
+        mark_nullifier_used_with_tables_v4(tables, *&nullifier_hash);
+        core.vault_sequence = core.vault_sequence + 1;
 
         // (g) CA transfer the (confidential) amount back to the ORIGINAL depositor. Identical
         // confidential_transfer_raw call as withdraw, recipient forced = original_sender.
@@ -2032,11 +2500,126 @@ module eunoma::eunoma_bridge {
         });
     }
 
+    // V4 (CP2 MB-6, dormant-lifecycle-VERIFIED §3): de-list EMERGENCY EXIT.
+    //
+    // THE BROKEN ITEM IT FIXES: normal bridge withdraw (withdraw_step2b -> confidential_transfer_raw)
+    // AND ragequit both settle via confidential_transfer, which hard-asserts
+    // is_confidentiality_enabled_for_asset_type. If Aptos governance DE-LISTS an active asset for CA,
+    // EVERY withdraw and ragequit bricks E_ASSET_TYPE_DISALLOWED — total fund freeze. The design's
+    // assumption that ragequit is a universal escape is FALSE under de-list.
+    //
+    // THE FIX (additive, 5-of-7, no redesign): settle via the framework `withdraw_to_raw` primitive,
+    // which checks ONLY is_emergency_paused + is_safe_for_confidentiality (NOT the allow-list), to
+    // exit funds to PLAIN FA. Authorized by the SAME 5-of-7 FROST attestation layer (THRESHOLD_V2=5,
+    // no override). The recipient is PINNED in the signed message (relayer cannot redirect). The
+    // asset_type is READ FROM THE REGISTRY (never a caller-supplied asset_type) and Poseidon-link is
+    // unnecessary here (no Groth16 / no asset_id public in this path) — CA-account isolation + the
+    // immutable registry asset_type pin the route.
+    //
+    // GATES: (1) status != DORMANT (a never-CA-registered asset has nothing to drain); PAUSED is
+    // allowed (emergency drain is exactly when the bridge is winding an asset down). (2) the asset
+    // MUST actually be de-listed (is_confidentiality_enabled == false) else E_NOT_DELISTED — while
+    // CA is live, use the normal withdraw / ragequit paths.
+    //
+    // NOTE: withdraw_to_raw exits to PLAIN FA and takes a PLAINTEXT `amount` — the emergency
+    // disclosure is intentional and is bound into the 5-of-7 attestation. No note nullifier is
+    // consumed (this is a vault-level emergency drain, not a single-note spend); vault_sequence is
+    // still advanced for exit-side monotonicity consistency with all other CA-exit paths.
+    //
+    // RESIDUAL (disclosure, not fixable on-chain): framework-wide set_emergency_paused is checked by
+    // EVERY CA primitive INCLUDING withdraw_to_raw, so a global pause halts even this exit. Surface
+    // is_emergency_paused() in the UI; never a silent tx error.
+    public entry fun emergency_exit_to_raw_v4(
+        // Any relayer may submit — authorization is the 5-of-7 FROST attestation, NOT the submitter
+        // (recipient + amount are signed; the relayer is low-privilege and cannot redirect funds).
+        _relayer: &signer,
+        // asset_addr +1 routing key (the registry-resolved row supplies the immutable asset_type).
+        asset_addr: address,
+        recipient: address,
+        amount: u64,
+        expiry_secs: u64,
+        // 5-of-7 FROST attestation over the emergency-exit message (group sig OR fallback bitmap).
+        group_signature: vector<u8>,
+        fallback_bitmap: u8,
+        fallback_signatures: vector<vector<u8>>,
+        // Framework withdraw_to_raw CA args (new available balance + range/sigma proofs).
+        new_balance_p: vector<vector<u8>>,
+        new_balance_r: vector<vector<u8>>,
+        new_balance_r_aud: vector<vector<u8>>,
+        zkrp_new_balance: vector<u8>,
+        sigma_proto_comm: vector<vector<u8>>,
+        sigma_proto_resp: vector<vector<u8>>,
+    ) acquires VaultCoreV4, AssetRegistryV4, DeoperatorConfigV2 {
+        assert_initialized_v4();
+        assert_not_expired(expiry_secs);
+
+        // Resolve the registry row by the attacker-chosen asset_addr; require it was CA-registered
+        // at some point (status != DORMANT). asset_type READ FROM REGISTRY (never caller-supplied).
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status != ASSET_STATUS_DORMANT, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
+        let asset_type_addr = object::object_address(&asset_type);
+
+        // The emergency path is ONLY for a governance-de-listed asset. While CA is still enabled,
+        // the normal withdraw / ragequit paths work and MUST be used (this entry reveals the amount).
+        assert!(
+            !confidential_asset::is_confidentiality_enabled_for_asset_type(asset_type),
+            E_NOT_DELISTED,
+        );
+
+        // 5-of-7 FROST attestation over (asset_type, recipient, amount, expiry) bound to the config
+        // epoch. THRESHOLD_V2 = 5 is enforced inside assert_deop_attestation_v2 -> cfg.threshold; no
+        // override path exists. The relayer cannot redirect the recipient or change the amount —
+        // both are signed bytes.
+        let core = borrow_global_mut<VaultCoreV4>(@eunoma);
+        let vault_addr = core.vault_addr;
+        let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
+        let msg_bytes = serialize_emergency_exit_attestation_v4_msg(
+            &DOMAIN_EMERGENCY_EXIT_V4,
+            chain_id::get(),
+            @eunoma,
+            vault_addr,
+            asset_type_addr,
+            cfg.operator_set_version,
+            cfg.dkg_epoch,
+            &cfg.roster_hash,
+            &cfg.frost_group_pubkey,
+            recipient,
+            amount,
+            expiry_secs,
+        );
+        assert_deop_attestation_v2(
+            &msg_bytes,
+            group_signature,
+            fallback_bitmap,
+            fallback_signatures,
+            cfg,
+        );
+
+        // Advance the exit-side monotonic nonce (consistent with every other CA-exit path), then
+        // drain to plain FA via the de-list-safe framework primitive.
+        let vault_signer = account::create_signer_with_capability(&core.vault_signer_cap);
+        core.vault_sequence = core.vault_sequence + 1;
+        confidential_asset::withdraw_to_raw(
+            &vault_signer,
+            asset_type,
+            recipient,
+            amount,
+            new_balance_p,
+            new_balance_r,
+            new_balance_r_aud,
+            zkrp_new_balance,
+            sigma_proto_comm,
+            sigma_proto_resp,
+        );
+    }
+
     public entry fun operator_rollover_vault_pending_v2(
         operator: &signer,
-    ) acquires BridgeVault {
-        assert_admin(operator);
-        let (vault_signer, asset_type) = vault_signer_and_asset_type();
+    ) acquires BridgeVault, VaultCoreV4, AssetRegistryV4 {
+        assert_admin_legacy_or_v4(operator);
+        let (vault_signer, asset_type) = vault_signer_and_active_asset_type_legacy_or_v4();
         confidential_asset::rollover_pending_balance(&vault_signer, asset_type);
     }
 
@@ -2048,11 +2631,11 @@ module eunoma::eunoma_bridge {
     // own rollover for the bridge vault — cannot touch any other admin-controlled state.
     public entry fun operator_rollover_vault_pending_via_delegate(
         delegate: &signer,
-    ) acquires RecorderDelegate, BridgeVault {
+    ) acquires RecorderDelegate, BridgeVault, VaultCoreV4, AssetRegistryV4 {
         assert!(exists<RecorderDelegate>(@eunoma), E_RECORDER_DELEGATE_NOT_INITIALIZED);
         let rd = borrow_global<RecorderDelegate>(@eunoma);
         assert!(signer::address_of(delegate) == rd.addr, E_NOT_RECORDER_DELEGATE);
-        let (vault_signer, asset_type) = vault_signer_and_asset_type();
+        let (vault_signer, asset_type) = vault_signer_and_active_asset_type_legacy_or_v4();
         confidential_asset::rollover_pending_balance(&vault_signer, asset_type);
     }
 
@@ -2064,9 +2647,9 @@ module eunoma::eunoma_bridge {
         zkrp_new_balance: vector<u8>,
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
-    ) acquires BridgeVault {
-        assert_admin(operator);
-        let (vault_signer, asset_type) = vault_signer_and_asset_type();
+    ) acquires BridgeVault, VaultCoreV4, AssetRegistryV4 {
+        assert_admin_legacy_or_v4(operator);
+        let (vault_signer, asset_type) = vault_signer_and_active_asset_type_legacy_or_v4();
         confidential_asset::normalize_raw(
             &vault_signer,
             asset_type,
@@ -2087,11 +2670,11 @@ module eunoma::eunoma_bridge {
         zkrp_new_balance: vector<u8>,
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
-    ) acquires BridgeVault, RecorderDelegate {
+    ) acquires BridgeVault, VaultCoreV4, AssetRegistryV4, RecorderDelegate {
         assert!(exists<RecorderDelegate>(@eunoma), E_RECORDER_DELEGATE_NOT_INITIALIZED);
         let rd = borrow_global<RecorderDelegate>(@eunoma);
         assert!(signer::address_of(delegate) == rd.addr, E_NOT_RECORDER_DELEGATE);
-        let (vault_signer, asset_type) = vault_signer_and_asset_type();
+        let (vault_signer, asset_type) = vault_signer_and_active_asset_type_legacy_or_v4();
         confidential_asset::normalize_raw(
             &vault_signer,
             asset_type,
@@ -2106,8 +2689,8 @@ module eunoma::eunoma_bridge {
 
     public entry fun init_pending_deposit_bindings_v2(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingDepositBindingsV2>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingDepositBindingsV2 {
             by_commitment: table::new<vector<u8>, PendingDepositBindingV2>(),
@@ -2118,8 +2701,8 @@ module eunoma::eunoma_bridge {
     // Idempotent via E_ALREADY_INITIALIZED. Must run before first deposit post-upgrade.
     public entry fun init_pending_deposit_bindings_v3(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingDepositBindingsV3>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingDepositBindingsV3 {
             by_commitment: table::new<vector<u8>, PendingDepositBindingV3>(),
@@ -2130,8 +2713,8 @@ module eunoma::eunoma_bridge {
     // idempotent. Must run before first deposit_step2a_eunoma_verify call.
     public entry fun init_pending_deposit_finalizations_v3(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingDepositFinalizationsV3>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingDepositFinalizationsV3 {
             by_commitment: table::new<vector<u8>, PendingDepositFinalizationV3>(),
@@ -2184,28 +2767,20 @@ module eunoma::eunoma_bridge {
     // from current DeoperatorConfigV2. Idempotent via E_ALREADY_INITIALIZED.
     public entry fun init_circuit_versions_hash_cache_v2(
         admin: &signer,
-    ) acquires BridgeVault, DeoperatorConfigV2 {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4, DeoperatorConfigV2 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<CircuitVersionsHashCacheV2>(@eunoma), E_ALREADY_INITIALIZED);
         let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
         let hash = circuit_versions_hash(cfg);
         move_to(admin, CircuitVersionsHashCacheV2 { hash });
     }
 
-    public entry fun init_pending_withdraw_proofs_v2(
-        admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
-        assert!(!exists<PendingWithdrawProofsV2>(@eunoma), E_ALREADY_INITIALIZED);
-        move_to(admin, PendingWithdrawProofsV2 {
-            by_request_hash: table::new<vector<u8>, PendingWithdrawProofV2>(),
-        });
-    }
+    // V4 (CP2 MB-3, 2026-06-01): init_pending_withdraw_proofs_v2 DELETED (cache struct removed).
 
     public entry fun init_pending_withdraw_attestations_v2(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingWithdrawAttestationsV2>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawAttestationsV2 {
             by_request_hash: table::new<vector<u8>, PendingWithdrawAttestationV2>(),
@@ -2214,43 +2789,22 @@ module eunoma::eunoma_bridge {
 
     public entry fun init_pending_withdraw_payloads_v2(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingWithdrawPayloadsV2>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawPayloadsV2 {
             by_request_hash: table::new<vector<u8>, PendingWithdrawPayloadV2>(),
         });
     }
 
-    // Round 4 WB2.E B — V3 cache admin migrations (one-shot per testnet deployment).
-    // Mirror init_pending_deposit_bindings_v3 (round-1) pattern: idempotent guard +
-    // narrow `acquires BridgeVault` (only assert_admin reads it).
-    public entry fun init_pending_withdraw_proofs_v3(
-        admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
-        assert!(!exists<PendingWithdrawProofsV3>(@eunoma), E_ALREADY_INITIALIZED);
-        move_to(admin, PendingWithdrawProofsV3 {
-            by_request_hash: table::new<vector<u8>, PendingWithdrawProofV3>(),
-        });
-    }
+    // V4 (CP2 MB-3, 2026-06-01): init_pending_withdraw_proofs_v3 + ..._v2b DELETED (cache
+    // structs removed). The only surviving withdraw-proof cache init is ..._v3b below.
 
-    // Round 5 Wave E.2 (P06-1) — admin init for V2b proof cache (no asset_id field).
-    public entry fun init_pending_withdraw_proofs_v2b(
-        admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
-        assert!(!exists<PendingWithdrawProofsV2b>(@eunoma), E_ALREADY_INITIALIZED);
-        move_to(admin, PendingWithdrawProofsV2b {
-            by_request_hash: table::new<vector<u8>, PendingWithdrawProofV2b>(),
-        });
-    }
-
-    // Round 5 Wave E.5 (R5-R) — admin init for V3b proof cache (7 explicit fields).
+    // Round 5 Wave E.5 (R5-R) — admin init for V3b proof cache (now asset_id + change_commitment).
     public entry fun init_pending_withdraw_proofs_v3b(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingWithdrawProofsV3b>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawProofsV3b {
             by_request_hash: table::new<vector<u8>, PendingWithdrawProofV3b>(),
@@ -2259,8 +2813,8 @@ module eunoma::eunoma_bridge {
 
     public entry fun init_pending_withdraw_attestations_v3(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingWithdrawAttestationsV3>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawAttestationsV3 {
             by_request_hash: table::new<vector<u8>, PendingWithdrawAttestationV3>(),
@@ -2270,8 +2824,8 @@ module eunoma::eunoma_bridge {
     // Round 5 Wave E.1 (R5-D) — admin init for V2b attestation cache.
     public entry fun init_pending_withdraw_attestations_v2b(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingWithdrawAttestationsV2b>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawAttestationsV2b {
             by_request_hash: table::new<vector<u8>, PendingWithdrawAttestationV2b>(),
@@ -2280,8 +2834,8 @@ module eunoma::eunoma_bridge {
 
     public entry fun init_pending_withdraw_payloads_v3(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingWithdrawPayloadsV3>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawPayloadsV3 {
             by_request_hash: table::new<vector<u8>, PendingWithdrawPayloadV3>(),
@@ -2290,29 +2844,63 @@ module eunoma::eunoma_bridge {
 
     public entry fun init_pending_withdraw_finalizations_v3(
         admin: &signer,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<PendingWithdrawFinalizationsV3>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, PendingWithdrawFinalizationsV3 {
             by_request_hash: table::new<vector<u8>, PendingWithdrawFinalizationV3>(),
         });
     }
 
+    // V4 (CP2 MB-4): create the cache-once aggregate-Pedersen conservation table. Admin-only
+    // (anchored to @eunoma so it works under the clean-replace V4 deploy where the legacy
+    // BridgeVault singleton may be absent). One-shot. The deploy script calls this alongside the
+    // other init_pending_* entries after init_v4.
+    public entry fun init_pending_withdraw_conservations_v4(
+        admin: &signer,
+    ) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(!exists<PendingWithdrawConservationsV4>(@eunoma), E_ALREADY_INITIALIZED);
+        move_to(admin, PendingWithdrawConservationsV4 {
+            by_request_hash: table::new<vector<u8>, PendingWithdrawConservationV4>(),
+        });
+    }
+
+    // V4 (CP2 MB-2): registry-resolving deposit-binding helper. Resolve the row by asset_addr,
+    // require ACTIVE, MA-1 Poseidon-link, and return the per-asset (asset_id_fr, vault_addr_hash_fr)
+    // deposit publics for the FROZEN deposit circuit.
+    fun resolve_active_asset_deposit_publics_v4(asset_addr: address): (vector<u8>, vector<u8>)
+        acquires AssetRegistryV4, DepositBindingTestOverride
+    {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let asset_id_fr = *&st.asset_id_fr;
+        assert!(derive_asset_id(st.asset_type) == asset_id_fr, E_ASSET_ID_MISMATCH);
+        (asset_id_fr, *&st.vault_addr_hash_fr)
+    }
+
     public entry fun prepare_deposit_binding_v2(
         _sender: &signer,
+        // V4 (CP2 MB-2): asset_addr +1 routing key.
+        asset_addr: address,
         commitment: vector<u8>,
         amount_tag: vector<u8>,
         amount_p: vector<vector<u8>>,
         deposit_binding_proof: vector<u8>,
-    ) acquires PendingDepositBindingsV2, PreparedDepositBindingVK, VaultPublicInputsV2 {
-        assert_initialized();
+    ) acquires AssetRegistryV4, PendingDepositBindingsV2, PreparedDepositBindingVK, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert_hash(&commitment);
         assert_hash(&amount_tag);
         assert!(exists<PendingDepositBindingsV2>(@eunoma), E_NOT_INITIALIZED);
+        // V4 MB-2: STATUS GATE at the TOP (resolve registry, require ACTIVE, MA-1 Poseidon-link).
+        let (asset_id_fr, vault_addr_hash_fr) = resolve_active_asset_deposit_publics_v4(asset_addr);
         let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
         assert_valid_deposit_binding_proof(
             &commitment,
             &amount_tag,
+            &asset_id_fr,
+            &vault_addr_hash_fr,
             &amount_p_digest,
             deposit_binding_proof,
         );
@@ -2326,13 +2914,15 @@ module eunoma::eunoma_bridge {
 
     public entry fun prepare_deposit_binding_v3(
         sender: &signer,
+        asset_addr: address,
         commitment: vector<u8>,
         amount_tag: vector<u8>,
         amount_p: vector<vector<u8>>,
         deposit_binding_proof: vector<u8>,
-    ) acquires PendingDepositBindingsV3, VaultPublicInputsV2, PreparedDepositBindingVK {
+    ) acquires AssetRegistryV4, PendingDepositBindingsV3, PreparedDepositBindingVK, DepositBindingTestOverride {
         prepare_deposit_binding_v3_for_user(
             sender,
+            asset_addr,
             signer::address_of(sender),
             commitment,
             amount_tag,
@@ -2346,19 +2936,24 @@ module eunoma::eunoma_bridge {
     // the already-published prepare_deposit_binding_v3 ABI.
     public entry fun prepare_deposit_binding_v3_for_user(
         _relayer: &signer,
+        asset_addr: address,
         user_addr: address,
         commitment: vector<u8>,
         amount_tag: vector<u8>,
         amount_p: vector<vector<u8>>,
         deposit_binding_proof: vector<u8>,
-    ) acquires PendingDepositBindingsV3, VaultPublicInputsV2, PreparedDepositBindingVK {
-        assert_initialized();
+    ) acquires AssetRegistryV4, PendingDepositBindingsV3, PreparedDepositBindingVK, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert_hash(&commitment);
         assert_hash(&amount_tag);
+        // V4 MB-2: STATUS GATE at the TOP (resolve registry, require ACTIVE, MA-1 Poseidon-link).
+        let (asset_id_fr, vault_addr_hash_fr) = resolve_active_asset_deposit_publics_v4(asset_addr);
         let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
         assert_valid_deposit_binding_proof(
             &commitment,
             &amount_tag,
+            &asset_id_fr,
+            &vault_addr_hash_fr,
             &amount_p_digest,
             deposit_binding_proof,
         );
@@ -2374,11 +2969,22 @@ module eunoma::eunoma_bridge {
         });
     }
 
-    // ASP (2026-05-30, asp-tree-design §6): legacy path — same treatment as prepare_withdraw_proof_v3.
-    // The 3 new publics (asp_root, state_tree_depth, asp_tree_depth) are appended AFTER request_hash
-    // (before vault_sequence), identical relative position to v3.
-    public entry fun prepare_withdraw_proof_v2(
+    // V4 (CP2 MB-3, 2026-06-01): prepare_withdraw_proof_v2 DELETED (wrote the asset_id-blind V2b
+    // cache). Only prepare_withdraw_proof_v3 ships, and it now resolves the registry by asset_addr.
+
+    // V4 (CP2 MB-2 + MB-3, 2026-06-01): prepare writes V3b carrying asset_id + change_commitment
+    // (re-asserted on cache-hit). asset_addr is threaded as an explicit +1 call-arg (the
+    // attacker-chosen routing key); the registry row is resolved, gated status==ACTIVE at the TOP
+    // before any global table read/write, and the MA-1 Poseidon-link assert
+    // derive_asset_id(st.asset_type) == proven_asset_id (proven_asset_id := st.asset_id_fr fed to
+    // publics[2]) fuses the route to the proof. change_commitment is the CP1 public[12]
+    // (EMPTY = 32 zero bytes for a full withdraw).
+    // ASP (2026-05-30, asp-tree-design §6): the 3 ASP publics (asp_root, state_tree_depth,
+    // asp_tree_depth) keep their position AFTER request_hash (before vault_sequence). asp_root is
+    // checked against the recent ASP-root window here; the Groth16 verify binds all 13 publics.
+    public entry fun prepare_withdraw_proof_v3(
         _sender: &signer,
+        asset_addr: address,
         root: vector<u8>,
         nullifier_hash: vector<u8>,
         recipient_hash: vector<u8>,
@@ -2388,74 +2994,36 @@ module eunoma::eunoma_bridge {
         asp_root: vector<u8>,
         state_tree_depth: u64,
         asp_tree_depth: u64,
+        change_commitment: vector<u8>,
         vault_sequence: u64,
-        amount_p: vector<vector<u8>>,
+        amount_p_old: vector<vector<u8>>,
         withdraw_proof: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, KnownASPRoots, PendingWithdrawProofsV2b, PreparedWithdrawProofVK, VaultPublicInputsV2 {
-        assert_initialized();
-        // R5-P (Wave G.2): inlined 6-hash assertion block.
-        assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
-        // ASP: asp_root is a 32B Fr like root.
-        assert_hash(&asp_root);
-        // Round 5 Wave E.2 (P06-1): write target migrated V2 → V2b (drops asset_id field;
-        // consume re-reads from VaultPublicInputsV2 — safe because asset_type is immutable
-        // post-V2-bootstrap).
-        assert!(exists<PendingWithdrawProofsV2b>(@eunoma), E_NOT_INITIALIZED);
-        // R5-B (Round 5 Wave B): hoist duplicate-pending check BEFORE Groth16 verify.
-        {
-            let pending_chk = borrow_global<PendingWithdrawProofsV2b>(@eunoma);
-            assert!(!table::contains(&pending_chk.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_PROOF);
-        };
-        // FR-4.1: single borrow_global<BridgeVaultTablesV2> for root + nullifier check.
-        let tables = borrow_global<BridgeVaultTablesV2>(@eunoma);
-        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
-        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
-        // ASP (asp-tree-design §6): asp_root must be in the recent ASP-root window.
-        assert!(asp_root_in_recent_window(&asp_root), E_INVALID_ASP_ROOT);
-        let vault = borrow_global<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
-        let asset_id = borrow_global<VaultPublicInputsV2>(@eunoma).asset_id_fr;
-        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
-        assert_valid_withdraw_proof(
-            &root,
-            &nullifier_hash,
-            &asset_id,
-            &recipient_hash,
-            &amount_tag,
-            &ca_payload_hash,
-            &request_hash,
-            vault_sequence,
-            &amount_p_digest,
-            &asp_root,
-            state_tree_depth,
-            asp_tree_depth,
-            withdraw_proof,
-        );
-        let pending = borrow_global_mut<PendingWithdrawProofsV2b>(@eunoma);
-        assert!(!table::contains(&pending.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_PROOF);
-        table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawProofV2b {
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, KnownASPRoots, PendingWithdrawProofsV3b, PreparedWithdrawProofVK, DepositBindingTestOverride {
+        let amount_p_digest = compute_amount_p_digest_v2(&amount_p_old);
+        prepare_withdraw_proof_v4(
+            _sender,
+            asset_addr,
             root,
             nullifier_hash,
             recipient_hash,
             amount_tag,
             ca_payload_hash,
+            request_hash,
+            asp_root,
+            state_tree_depth,
+            asp_tree_depth,
+            change_commitment,
             vault_sequence,
             amount_p_digest,
-        });
+            withdraw_proof,
+        );
     }
 
-    // Round 5 Wave E.5 (R5-R) — prepare writes V3b (7 fields, no msg_hash, no asset_id).
-    // Consume uses field-by-field equality instead of keccak. The cross-stage payload
-    // reader (prepare_withdraw_payload_v3) still finds ca_payload_hash + amount_p_digest
-    // because V3b retains both — codex guard for the FR-4.6 P0 hotfix is preserved.
-    // ASP (2026-05-30, asp-tree-design §6): the 3 new withdraw publics (asp_root, state_tree_depth,
-    // asp_tree_depth) are appended AFTER request_hash (before vault_sequence) in the entry signature.
-    // The relayer MUST keep this exact relative position when it builds the prepare_withdraw_proof_v3
-    // call (same order in prepare_withdraw_proof_v2). asp_root is additionally checked against the
-    // recent ASP-root window here; the Groth16 verify binds all 3 publics.
-    public entry fun prepare_withdraw_proof_v3(
+    // V4 IC7 optimized prepare: amount_p_digest is proof-public, so this hot path avoids the
+    // expensive Move-side Poseidon8 over amount_p_old while preserving the old v3 ABI above.
+    public entry fun prepare_withdraw_proof_v4(
         _sender: &signer,
+        asset_addr: address,
         root: vector<u8>,
         nullifier_hash: vector<u8>,
         recipient_hash: vector<u8>,
@@ -2465,35 +3033,42 @@ module eunoma::eunoma_bridge {
         asp_root: vector<u8>,
         state_tree_depth: u64,
         asp_tree_depth: u64,
+        change_commitment: vector<u8>,
         vault_sequence: u64,
-        amount_p: vector<vector<u8>>,
+        amount_p_digest: vector<u8>,
         withdraw_proof: vector<u8>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, KnownASPRoots, PendingWithdrawProofsV3b, PreparedWithdrawProofVK, VaultPublicInputsV2 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, KnownASPRoots, PendingWithdrawProofsV3b, PreparedWithdrawProofVK, DepositBindingTestOverride {
+        assert_initialized_v4();
         // R5-P (Wave G.2): inlined 6-hash assertion block.
         assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
         // ASP: asp_root is a 32B Fr like root.
         assert_hash(&asp_root);
-        // Round 5 Wave E.5 (R5-R): write target migrated V3 → V3b (field-by-field cache).
+        // V4 CP1: change_commitment is a 32B Fr (EMPTY = 32 zero bytes).
+        assert_hash(&change_commitment);
+        assert_hash(&amount_p_digest);
         assert!(exists<PendingWithdrawProofsV3b>(@eunoma), E_NOT_INITIALIZED);
+        // V4 MB-2: STATUS GATE at the TOP, before any global table read/write. Resolve the
+        // registry row by the attacker-chosen asset_addr and require ACTIVE.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        // V4 MA-1: proven_asset_id = the registry row's immutable asset_id_fr (fed to publics[2]);
+        // the Poseidon-link assert fuses the route to the proof.
+        let asset_id = *&st.asset_id_fr;
+        assert!(derive_asset_id(st.asset_type) == asset_id, E_ASSET_ID_MISMATCH);
         // R5-B (Round 5 Wave B): hoist duplicate-pending check BEFORE Groth16 verify.
         {
             let pending_chk = borrow_global<PendingWithdrawProofsV3b>(@eunoma);
             assert!(!table::contains(&pending_chk.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_PROOF);
         };
-        // FR-4.1: single borrow_global<BridgeVaultTablesV2> for root + nullifier check.
-        let tables = borrow_global<BridgeVaultTablesV2>(@eunoma);
-        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
-        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
-        // ASP (asp-tree-design §6): asp_root must be in the recent ASP-root window (parallel to the
-        // state-root known_roots check above). Revoked commitments age out once their root falls
-        // past the window.
+        let tables = borrow_global<BridgeTablesV4>(@eunoma);
+        assert!(known_root_recorded_with_tables_v4(tables, &root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables_v4(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        // ASP (asp-tree-design §6): asp_root must be in the recent ASP-root window.
         assert!(asp_root_in_recent_window(&asp_root), E_INVALID_ASP_ROOT);
-        let vault = borrow_global<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
-        let asset_id = borrow_global<VaultPublicInputsV2>(@eunoma).asset_id_fr;
-        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
+        let core = borrow_global<VaultCoreV4>(@eunoma);
+        assert!(!core.paused, E_PAUSED);
+        assert!(core.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
         assert_valid_withdraw_proof(
             &root,
             &nullifier_hash,
@@ -2507,6 +3082,7 @@ module eunoma::eunoma_bridge {
             &asp_root,
             state_tree_depth,
             asp_tree_depth,
+            &change_commitment,
             withdraw_proof,
         );
         let pending = borrow_global_mut<PendingWithdrawProofsV3b>(@eunoma);
@@ -2514,104 +3090,18 @@ module eunoma::eunoma_bridge {
         table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawProofV3b {
             root,
             nullifier_hash,
+            asset_id,
             recipient_hash,
             amount_tag,
             ca_payload_hash,
             vault_sequence,
             amount_p_digest,
+            change_commitment,
         });
     }
 
-    public entry fun prepare_withdraw_attestation_v2(
-        _sender: &signer,
-        root: vector<u8>,
-        nullifier_hash: vector<u8>,
-        recipient: address,
-        recipient_hash: vector<u8>,
-        amount_tag: vector<u8>,
-        ca_payload_hash: vector<u8>,
-        request_hash: vector<u8>,
-        vault_sequence: u64,
-        expiry_secs: u64,
-        group_signature: vector<u8>,
-        fallback_bitmap: u8,
-        fallback_signatures: vector<vector<u8>>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawAttestationsV2b, DeoperatorConfigV2, CircuitVersionsHashCacheV2 {
-        assert_initialized();
-        assert_not_expired(expiry_secs);
-        // R5-P (Wave G.2): inlined 6-hash assertion block.
-        assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
-        // Round 5 Wave E.1 (R5-D): write target migrated V2 → V2b (msg_hash-only cache).
-        // In-flight V2 entries from pre-Round-5 deploys still drain via consume V2 branch.
-        assert!(exists<PendingWithdrawAttestationsV2b>(@eunoma), E_NOT_INITIALIZED);
-        // R5-B (Round 5 Wave B): hoist duplicate-pending check BEFORE BCS + ed25519 verify.
-        {
-            let pending_chk = borrow_global<PendingWithdrawAttestationsV2b>(@eunoma);
-            assert!(!table::contains(&pending_chk.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_ATTESTATION);
-        };
-        // FR-4.1: single borrow_global<BridgeVaultTablesV2> for root + nullifier check
-        // (collapses 2 borrows -> 1 in each of the 4 prepare_withdraw_* entries).
-        let tables = borrow_global<BridgeVaultTablesV2>(@eunoma);
-        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
-        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
-        let vault = borrow_global<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
-        let vault_addr = vault.vault_addr;
-        let asset_type = vault.asset_type;
-        // FR-1.5(a) Round 4 F: entry-level derive_recipient_hash check dropped here —
-        // recipient + recipient_hash are bound cryptographically inside the FROST-signed
-        // WithdrawAttestationV2Message and re-bound on cache-hit at consume_or_verify_
-        // withdraw_attestation V2 branch / V2b + V3 msg_hash branches. Top-level
-        // withdraw_to_recipient_v2 entry still enforces derive at line ~882-883.
-
-        let cfg = borrow_global<DeoperatorConfigV2>(@eunoma);
-        // A6 gas opt: use cached circuit_versions_hash via defensive helper.
-        let versions_hash = get_or_compute_circuit_versions_hash(cfg);
-        let asset_type_addr = object::object_address(&asset_type);
-        // R5-C (Round 5 Wave C): struct-free BCS via serializer helper. Byte-identical
-        // to bcs::to_bytes(&WithdrawAttestationV2Message{...}).
-        let msg_bytes = serialize_withdraw_attestation_v2_msg(
-            &DOMAIN_WITHDRAW_V2,
-            chain_id::get(),
-            @eunoma,
-            vault_addr,
-            asset_type_addr,
-            cfg.operator_set_version,
-            cfg.dkg_epoch,
-            &cfg.roster_hash,
-            &cfg.frost_group_pubkey,
-            &root,
-            &nullifier_hash,
-            recipient,
-            &recipient_hash,
-            &amount_tag,
-            &ca_payload_hash,
-            &request_hash,
-            vault_sequence,
-            expiry_secs,
-            &versions_hash,
-        );
-        assert_deop_attestation_v2(
-            &msg_bytes,
-            group_signature,
-            fallback_bitmap,
-            fallback_signatures,
-            cfg,
-        );
-        // Round 5 Wave E.1 (R5-D): compact V2b write — keccak256(msg_bytes) replaces 15-field
-        // struct (~570B → 32B). Cache-hit reader recomputes msg_bytes via
-        // serialize_withdraw_attestation_v2_msg + keccak256 and asserts equality.
-        let msg_hash = aptos_hash::keccak256(msg_bytes);
-        let pending = borrow_global_mut<PendingWithdrawAttestationsV2b>(@eunoma);
-        assert!(
-            !table::contains(&pending.by_request_hash, *&request_hash),
-            E_PENDING_WITHDRAW_ATTESTATION,
-        );
-        table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawAttestationV2b {
-            msg_hash,
-        });
-    }
+    // V4 (CP2 MB-2, 2026-06-01): prepare_withdraw_attestation_v2 DELETED (read the now-runtime-
+    // absent BridgeVault singleton). Only prepare_withdraw_attestation_v3 ships (registry-resolving).
 
     // Round 4 WB2.E B — V3 prepare entry for withdraw attestation. msg_hash-only cache
     // (32B vs ~600B V2). msg_bytes computed identically to V2 path so the cache-hit reader
@@ -2619,6 +3109,11 @@ module eunoma::eunoma_bridge {
     // because the FROST sig is over that exact byte form — DO NOT change struct shape.
     public entry fun prepare_withdraw_attestation_v3(
         _sender: &signer,
+        // V4 (CP2 MB-2/MB-3): asset_addr resolves asset_type from the registry to rebuild the FROST
+        // attestation message (which already binds asset_type_addr — so a wrong asset_addr fails
+        // signature verification). MB-3 only excludes this entry from the proof-publics Poseidon-link
+        // (there is no withdraw proof here), NOT from the status gate / registry resolution.
+        asset_addr: address,
         root: vector<u8>,
         nullifier_hash: vector<u8>,
         recipient: address,
@@ -2631,8 +3126,8 @@ module eunoma::eunoma_bridge {
         group_signature: vector<u8>,
         fallback_bitmap: u8,
         fallback_signatures: vector<vector<u8>>,
-    ) acquires BridgeVault, BridgeVaultTablesV2, PendingWithdrawAttestationsV3, DeoperatorConfigV2, CircuitVersionsHashCacheV2 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, BridgeTablesV4, PendingWithdrawAttestationsV3, DeoperatorConfigV2, CircuitVersionsHashCacheV2 {
+        assert_initialized_v4();
         assert_not_expired(expiry_secs);
         // R5-P (Wave G.2): inlined 6-hash assertion block.
         assert_6_withdraw_hashes(&root, &nullifier_hash, &recipient_hash, &amount_tag, &ca_payload_hash, &request_hash);
@@ -2642,16 +3137,18 @@ module eunoma::eunoma_bridge {
             let pending_chk = borrow_global<PendingWithdrawAttestationsV3>(@eunoma);
             assert!(!table::contains(&pending_chk.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_ATTESTATION);
         };
-        // FR-4.1: single borrow_global<BridgeVaultTablesV2> for root + nullifier check
-        // (collapses 2 borrows -> 1 in each of the 4 prepare_withdraw_* entries).
-        let tables = borrow_global<BridgeVaultTablesV2>(@eunoma);
-        assert!(known_root_recorded_with_tables(tables, &root), E_INVALID_ROOT);
-        assert!(!nullifier_used_with_tables(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
-        let vault = borrow_global<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        assert!(vault.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
-        let vault_addr = vault.vault_addr;
-        let asset_type = vault.asset_type;
+        // V4 MB-2: STATUS GATE — resolve the registry row by asset_addr and require ACTIVE.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
+        let tables = borrow_global<BridgeTablesV4>(@eunoma);
+        assert!(known_root_recorded_with_tables_v4(tables, &root), E_INVALID_ROOT);
+        assert!(!nullifier_used_with_tables_v4(tables, &nullifier_hash), E_NULLIFIER_ALREADY_SPENT);
+        let core = borrow_global<VaultCoreV4>(@eunoma);
+        assert!(!core.paused, E_PAUSED);
+        assert!(core.vault_sequence == vault_sequence, E_VAULT_SEQUENCE_MISMATCH);
+        let vault_addr = core.vault_addr;
         // FR-1.5(a) Round 4 F: entry-level derive_recipient_hash check dropped here —
         // see prepare_withdraw_attestation_v2 sibling comment for the rationale (same
         // V3 cache-hit msg_hash bind at consume_or_verify_withdraw_attestation
@@ -2700,100 +3197,8 @@ module eunoma::eunoma_bridge {
         });
     }
 
-    public entry fun prepare_withdraw_payload_v2(
-        _sender: &signer,
-        recipient: address,
-        ca_payload_hash: vector<u8>,
-        request_hash: vector<u8>,
-        new_balance_p: vector<vector<u8>>,
-        new_balance_r: vector<vector<u8>>,
-        new_balance_r_eff_aud: vector<vector<u8>>,
-        amount_p: vector<vector<u8>>,
-        amount_r_sender: vector<vector<u8>>,
-        amount_r_recip: vector<vector<u8>>,
-        amount_r_eff_aud: vector<vector<u8>>,
-        ek_volun_auds: vector<vector<u8>>,
-        amount_r_volun_auds: vector<vector<vector<u8>>>,
-        zkrp_new_balance: vector<u8>,
-        zkrp_amount: vector<u8>,
-        sigma_proto_comm: vector<vector<u8>>,
-        sigma_proto_resp: vector<vector<u8>>,
-        memo: vector<u8>,
-    ) acquires BridgeVault, PendingWithdrawProofsV2, PendingWithdrawPayloadsV2 {
-        assert_initialized();
-        assert_hash(&ca_payload_hash);
-        assert_hash(&request_hash);
-        // R5-O.6 (Round 5 A.10.6): drop redundant `exists<>` guards. Native `borrow_global`
-        // aborts on missing resource with stdlib MISSING_DATA; the explicit guards only add
-        // a different error code. Both V2 pending tables are admin-init'd once and never
-        // dropped; any uninit state is a deployment bug. Saves ~80-150 gas/prepare call.
-        // R5-B (Round 5 Wave B): hoist duplicate-pending check BEFORE BCS+keccak hash.
-        {
-            let pending_chk = borrow_global<PendingWithdrawPayloadsV2>(@eunoma);
-            assert!(!table::contains(&pending_chk.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_PAYLOAD);
-        };
-        let vault = borrow_global<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        let asset_type = vault.asset_type;
-        let computed_hash = ca_payload_hash_to_fr_safe(hash_confidential_transfer_payload_v2(
-            &asset_type,
-            &recipient,
-            &new_balance_p,
-            &new_balance_r,
-            &new_balance_r_eff_aud,
-            &amount_p,
-            &amount_r_sender,
-            &amount_r_recip,
-            &amount_r_eff_aud,
-            &ek_volun_auds,
-            &amount_r_volun_auds,
-            &zkrp_new_balance,
-            &zkrp_amount,
-            &sigma_proto_comm,
-            &sigma_proto_resp,
-            &memo,
-        ));
-        // R5-O.3 (Round 5 A.10.3): ref equality avoids implicit by-value copies of 32B vec.
-        assert!(&computed_hash == &ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
-        // R5-A REVERTED (codex Wave A review RED): keep the explicit recompute +
-        // assert. The withdrawal circuit binds amount_p_digest as a public input but does
-        // NOT recompute it from ca_payload_hash in-circuit, so removing the cross-check
-        // here would allow an attacker to submit a proof claiming amount_p_digest_A while
-        // settling a CA payload containing a different amount_p_B (vote conservation
-        // violation / A6 binding break). FR-4.6 V3 sibling may carry the same gap — flag
-        // for separate codex security review.
-        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
-        let proofs = borrow_global<PendingWithdrawProofsV2>(@eunoma);
-        assert!(table::contains(&proofs.by_request_hash, *&request_hash), E_INVALID_WITHDRAW_PROOF);
-        let proof_cached = table::borrow(&proofs.by_request_hash, *&request_hash);
-        assert!(&proof_cached.ca_payload_hash == &ca_payload_hash, E_INVALID_WITHDRAW_PROOF);
-        assert!(proof_cached.amount_p_digest == amount_p_digest, E_INVALID_WITHDRAW_PROOF);
-        let pending = borrow_global_mut<PendingWithdrawPayloadsV2>(@eunoma);
-        assert!(
-            !table::contains(&pending.by_request_hash, *&request_hash),
-            E_PENDING_WITHDRAW_PAYLOAD,
-        );
-        table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawPayloadV2 {
-            asset_type: object::object_address(&asset_type),
-            recipient,
-            ca_payload_hash,
-            amount_p_digest,
-            new_balance_p,
-            new_balance_r,
-            new_balance_r_eff_aud,
-            amount_p,
-            amount_r_sender,
-            amount_r_recip,
-            amount_r_eff_aud,
-            ek_volun_auds,
-            amount_r_volun_auds,
-            zkrp_new_balance,
-            zkrp_amount,
-            sigma_proto_comm,
-            sigma_proto_resp,
-            memo,
-        });
-    }
+    // V4 (CP2 MB-3, 2026-06-01): prepare_withdraw_payload_v2 DELETED (it read the now-removed
+    // PendingWithdrawProofsV2 cache). Only prepare_withdraw_payload_v3 ships (registry-resolving).
 
     // Round 4 WB2.E B — V3 prepare entry for withdraw payload. msg_hash + amount_p_digest
     // 64B cache (vs ~600B V2 17-field mirror). msg_hash = ca_payload_hash_to_fr_safe(
@@ -2806,6 +3211,9 @@ module eunoma::eunoma_bridge {
     // it; reading the cached value is sound (cache key = request_hash binds the inputs).
     public entry fun prepare_withdraw_payload_v3(
         _sender: &signer,
+        // V4 (CP2 MB-2 + MB-3): asset_addr +1 routing key. Resolve registry, status-gate, source
+        // asset_type for the ca_payload_hash recompute, and re-assert the V3b cache asset_id.
+        asset_addr: address,
         recipient: address,
         ca_payload_hash: vector<u8>,
         request_hash: vector<u8>,
@@ -2823,8 +3231,8 @@ module eunoma::eunoma_bridge {
         sigma_proto_comm: vector<vector<u8>>,
         sigma_proto_resp: vector<vector<u8>>,
         memo: vector<u8>,
-    ) acquires BridgeVault, PendingWithdrawProofsV3, PendingWithdrawProofsV3b, PendingWithdrawPayloadsV3 {
-        assert_initialized();
+    ) acquires VaultCoreV4, AssetRegistryV4, PendingWithdrawProofsV3b, PendingWithdrawPayloadsV3, DepositBindingTestOverride {
+        assert_initialized_v4();
         assert_hash(&ca_payload_hash);
         assert_hash(&request_hash);
         // R5-B (Round 5 Wave B): hoist duplicate-pending check BEFORE BCS+keccak hash.
@@ -2832,9 +3240,15 @@ module eunoma::eunoma_bridge {
             let pending_chk = borrow_global<PendingWithdrawPayloadsV3>(@eunoma);
             assert!(!table::contains(&pending_chk.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_PAYLOAD);
         };
-        let vault = borrow_global<BridgeVault>(@eunoma);
-        assert!(!vault.paused, E_PAUSED);
-        let asset_type = vault.asset_type;
+        // V4 MB-2: STATUS GATE at the TOP. V4 MA-1: Poseidon-link the route to the proof.
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let asset_type = st.asset_type;
+        let proven_asset_id = *&st.asset_id_fr;
+        assert!(derive_asset_id(asset_type) == proven_asset_id, E_ASSET_ID_MISMATCH);
+        let core = borrow_global<VaultCoreV4>(@eunoma);
+        assert!(!core.paused, E_PAUSED);
         let computed_hash = ca_payload_hash_to_fr_safe(hash_confidential_transfer_payload_v2(
             &asset_type,
             &recipient,
@@ -2855,36 +3269,25 @@ module eunoma::eunoma_bridge {
         ));
         // R5-O.3 (Round 5 A.10.3): ref equality avoids implicit by-value copies of 32B vec.
         assert!(&computed_hash == &ca_payload_hash, E_PAYLOAD_HASH_MISMATCH);
-        // Round 5 Wave E.5 (R5-R): cross-stage proof cache read — V3b first (new schema),
-        // V3 fallback (in-flight pre-Round-5 entries). Both store ca_payload_hash +
-        // amount_p_digest, so the P0 hotfix cross-stage check works against either.
-        let (cached_ca_payload_hash, cached_amount_p_digest) =
-            if (exists<PendingWithdrawProofsV3b>(@eunoma)
-                && table::contains(
-                    &borrow_global<PendingWithdrawProofsV3b>(@eunoma).by_request_hash,
-                    *&request_hash,
-                ))
-            {
-                let proofs_v3b = borrow_global<PendingWithdrawProofsV3b>(@eunoma);
-                let pc = table::borrow(&proofs_v3b.by_request_hash, *&request_hash);
-                (*&pc.ca_payload_hash, *&pc.amount_p_digest)
-            } else {
-                let proofs = borrow_global<PendingWithdrawProofsV3>(@eunoma);
-                assert!(table::contains(&proofs.by_request_hash, *&request_hash), E_INVALID_WITHDRAW_PROOF);
-                let pc = table::borrow(&proofs.by_request_hash, *&request_hash);
-                (*&pc.ca_payload_hash, *&pc.amount_p_digest)
-            };
+        // V4 (CP2 MB-3): cross-stage proof cache read — V3b ONLY (V3 fallback deleted). V3b
+        // carries ca_payload_hash + amount_p_digest + asset_id; re-assert the registry-resolved
+        // asset_id here so the payload stage is asset-pinned too.
+        let (cached_ca_payload_hash, cached_amount_p_digest) = {
+            assert!(exists<PendingWithdrawProofsV3b>(@eunoma), E_INVALID_WITHDRAW_PROOF);
+            let proofs_v3b = borrow_global<PendingWithdrawProofsV3b>(@eunoma);
+            assert!(table::contains(&proofs_v3b.by_request_hash, *&request_hash), E_INVALID_WITHDRAW_PROOF);
+            let pc = table::borrow(&proofs_v3b.by_request_hash, *&request_hash);
+            assert!(&pc.asset_id == &proven_asset_id, E_INVALID_WITHDRAW_PROOF);
+            (*&pc.ca_payload_hash, *&pc.amount_p_digest)
+        };
         assert!(&cached_ca_payload_hash == &ca_payload_hash, E_INVALID_WITHDRAW_PROOF);
-        // FR-4.6 REVERTED (Round 5 Wave A codex audit found this was a P0 vuln): the
-        // circuit binds amount_p_digest as a public input but does NOT prove that
-        // ca_payload_hash was built from the same amount_p. A prover at stage 1 could
-        // submit (amount_p_A_witness, amount_p_digest_A_public, ca_payload_hash_for_B_public)
-        // — Groth16 verifies. Then at stage 2 settle with amount_p_B + ca_payload_hash_for_B.
-        // Without the explicit Compose8 recompute + assert below, the cache would serve
-        // digest_A while the actual transfer uses amount_p_B (vote conservation /
-        // A6 binding violation). Cost: ~700-1500 gas back. Trade is mandatory.
-        let amount_p_digest = compute_amount_p_digest_v2(&amount_p);
-        assert!(cached_amount_p_digest == amount_p_digest, E_INVALID_WITHDRAW_PROOF);
+        // V4 B-prime partial withdraw splits the proof-bound spent-note digest (A_old)
+        // from the CA payload's amount_p (W). The recomputed CA payload hash above pins
+        // the current `amount_p` to ca_payload_hash; prepare_withdraw_conservation_v4
+        // separately proves A_old = W + A_rem before step2a can finalize a partial spend.
+        // Keep carrying the proof cache's A_old digest forward for step2a/proof-cache
+        // rebind and conservation consumption.
+        let amount_p_digest = cached_amount_p_digest;
         let pending = borrow_global_mut<PendingWithdrawPayloadsV3>(@eunoma);
         assert!(
             !table::contains(&pending.by_request_hash, *&request_hash),
@@ -2894,6 +3297,72 @@ module eunoma::eunoma_bridge {
             msg_hash: computed_hash,
             amount_p_digest,
         });
+    }
+
+    // V4 (CP2 MB-4, design §6 B-prime / §6.4): cache-once aggregate-Pedersen conservation prepare.
+    // This runs the HEAVY curve math (3 multi_scalar_mul + 12 VALIDATING decompressions +
+    // point_equals) EXACTLY ONCE, in a dedicated prepare tx OFF the already-over-cap settle path
+    // (mirrors the amount_p_digest cache pattern: the hot step2b reads only the cached boolean).
+    //
+    // It does NOT touch any global mutable state and asserts NOTHING about vault_sequence/nullifier
+    // (those are the spend path's job) — it ONLY proves A_old = W + A_rem and pins A_old to the
+    // Groth16-bound amount_p_digest (public[8]). The status gate + MA-1 Poseidon-link still run
+    // (any prepare tx that resolves the registry must gate ACTIVE before touching the cache table).
+    //
+    // amount_p_old = the spent note's 4 chunks; amount_p_wd = the withdrawn leg (the SAME amount_p
+    // fed to the CA transfer); amount_p_rem = the remainder/change chunks. For a FULL withdraw the
+    // caller passes amount_p_rem = the 4 encrypted-zero chunks (A_rem = 0) and amount_p_old ==
+    // amount_p_wd, so conservation holds trivially.
+    public entry fun prepare_withdraw_conservation_v4(
+        _sender: &signer,
+        asset_addr: address,
+        request_hash: vector<u8>,
+        amount_p_digest: vector<u8>,
+        amount_p_old: vector<vector<u8>>,
+        amount_p_wd: vector<vector<u8>>,
+        amount_p_rem: vector<vector<u8>>,
+    ) acquires AssetRegistryV4, PendingWithdrawConservationsV4, DepositBindingTestOverride {
+        assert_initialized_v4();
+        assert_hash(&request_hash);
+        assert_hash(&amount_p_digest);
+        assert!(exists<PendingWithdrawConservationsV4>(@eunoma), E_NOT_INITIALIZED);
+        // Hoist duplicate-pending check BEFORE the heavy curve math (cheap fail-fast).
+        {
+            let pending_chk = borrow_global<PendingWithdrawConservationsV4>(@eunoma);
+            assert!(!table::contains(&pending_chk.by_request_hash, *&request_hash), E_PENDING_WITHDRAW_PAYLOAD);
+        };
+        // V4 MB-2: STATUS GATE at the TOP, before any global table write. V4 MA-1: Poseidon-link
+        // the attacker-chosen route to the proof (proven_asset_id := registry row's asset_id_fr).
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        assert!(derive_asset_id(st.asset_type) == st.asset_id_fr, E_ASSET_ID_MISMATCH);
+        // The B-prime conservation check (pins P_old to amount_p_digest; aborts on a bad split).
+        assert_amount_conservation_v4(&amount_p_old, &amount_p_wd, &amount_p_rem, &amount_p_digest);
+        let pending = borrow_global_mut<PendingWithdrawConservationsV4>(@eunoma);
+        assert!(
+            !table::contains(&pending.by_request_hash, *&request_hash),
+            E_PENDING_WITHDRAW_PAYLOAD,
+        );
+        table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawConservationV4 {
+            amount_p_digest,
+            conserved: true,
+        });
+    }
+
+    // V4 (CP2 MB-4): consume the cached conservation boolean on the hot path. Aborts if no row was
+    // prepared, if the cached amount_p_digest does not match the spend's bound digest (rebind
+    // guard), or if conserved is false (defensive — prepare only ever caches true). Removes the row.
+    fun consume_withdraw_conservation_v4(
+        request_hash: &vector<u8>,
+        amount_p_digest: &vector<u8>,
+    ) acquires PendingWithdrawConservationsV4 {
+        assert!(exists<PendingWithdrawConservationsV4>(@eunoma), E_NOT_INITIALIZED);
+        let pending = borrow_global_mut<PendingWithdrawConservationsV4>(@eunoma);
+        assert!(table::contains(&pending.by_request_hash, *request_hash), E_AMOUNT_CONSERVATION);
+        let cached = table::remove(&mut pending.by_request_hash, *request_hash);
+        assert!(&cached.amount_p_digest == amount_p_digest, E_AMOUNT_CONSERVATION);
+        assert!(cached.conserved, E_AMOUNT_CONSERVATION);
     }
 
     public fun get_vault_sequence_v2(): u64 acquires BridgeVault {
@@ -3222,14 +3691,14 @@ module eunoma::eunoma_bridge {
             beta_g2,
             gamma_g2,
             delta_g2,
-            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6, ic_7, ic_8, ic_9],
+            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5],
         });
     }
 
-    // ASP (2026-05-30, asp-tree-design §5.2/§6): publish the v-next withdraw VK with 13 IC elements
-    // (was 10). The ASP withdraw circuit added 3 publics (asp_root, state_tree_depth, asp_tree_depth)
-    // so the VK has IC[0..12]. Clone of publish_withdraw_proof_vk_v2_a6 with 3 extra IC args; the
-    // stored ic vector therefore has 13 elements, matching WITHDRAW_VK_IC_LENGTH = 13.
+    // V4 (CP1, 2026-06-01): publish the withdraw VK with 14 IC elements (was 13). The partial-
+    // withdraw circuit added public[12] change_commitment so the VK has IC[0..13]. ic_13 is the
+    // new change_commitment IC; the stored ic vector has 14 elements, matching
+    // WITHDRAW_VK_IC_LENGTH = 14.
     public entry fun publish_withdraw_proof_vk_v3_asp(
         admin: &signer,
         alpha_g1: vector<u8>,
@@ -3249,6 +3718,7 @@ module eunoma::eunoma_bridge {
         ic_10: vector<u8>,
         ic_11: vector<u8>,
         ic_12: vector<u8>,
+        ic_13: vector<u8>,
     ) {
         assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
         assert!(!exists<WithdrawProofVK>(@eunoma), E_ALREADY_INITIALIZED);
@@ -3269,12 +3739,153 @@ module eunoma::eunoma_bridge {
         assert_g1(&ic_10, E_INVALID_WITHDRAW_PROOF);
         assert_g1(&ic_11, E_INVALID_WITHDRAW_PROOF);
         assert_g1(&ic_12, E_INVALID_WITHDRAW_PROOF);
-        let ic = vector[
-            ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6,
-            ic_7, ic_8, ic_9, ic_10, ic_11, ic_12,
-        ];
+        assert_g1(&ic_13, E_INVALID_WITHDRAW_PROOF);
+        let ic = vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6];
         assert!(vector::length(&ic) == WITHDRAW_VK_IC_LENGTH, E_INVALID_WITHDRAW_PROOF);
         move_to(admin, WithdrawProofVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic,
+        });
+    }
+
+    // V4 pruned-public withdraw VK. The circuit exposes 6 public inputs, so the IC vector has
+    // seven elements (const + 6 publics). The trailing IC args are retained only for upgrade
+    // compatibility with the old 14-IC publish selector.
+    public entry fun publish_withdraw_proof_vk_v4(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+        ic_5: vector<u8>,
+        ic_6: vector<u8>,
+        ic_7: vector<u8>,
+        ic_8: vector<u8>,
+        ic_9: vector<u8>,
+        ic_10: vector<u8>,
+        ic_11: vector<u8>,
+        ic_12: vector<u8>,
+        ic_13: vector<u8>,
+    ) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(!exists<WithdrawProofVK>(@eunoma), E_ALREADY_INITIALIZED);
+        assert_g1(&alpha_g1, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&beta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&delta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_0, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_1, E_INVALID_WITHDRAW_PROOF);
+        // Backward-compatible public entry signature: the old V4 publish selector accepted
+        // ic_0..ic_13. The pruned VK only stores ic_0..ic_6, but keeping and
+        // length-checking the trailing args lets the existing package upgrade succeed.
+        assert_g1(&ic_2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_3, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_4, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_5, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_6, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_7, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_8, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_9, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_10, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_11, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_12, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_13, E_INVALID_WITHDRAW_PROOF);
+        let ic = vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6];
+        assert!(vector::length(&ic) == WITHDRAW_VK_IC_LENGTH, E_INVALID_WITHDRAW_PROOF);
+        move_to(admin, WithdrawProofVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic,
+        });
+    }
+
+    public entry fun rotate_withdraw_proof_vk_v4_digest(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+    ) acquires WithdrawProofVK, PreparedWithdrawProofVK {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        if (exists<PreparedWithdrawProofVK>(@eunoma)) {
+            let PreparedWithdrawProofVK {
+                pvk_alpha_g1_beta_g2_fq12: _,
+                pvk_gamma_g2_neg: _,
+                pvk_delta_g2_neg: _,
+                pvk_uvw_gamma_g1: _,
+            } = move_from<PreparedWithdrawProofVK>(@eunoma);
+        };
+        if (exists<WithdrawProofVK>(@eunoma)) {
+            let WithdrawProofVK {
+                alpha_g1: _,
+                beta_g2: _,
+                gamma_g2: _,
+                delta_g2: _,
+                ic: _,
+            } = move_from<WithdrawProofVK>(@eunoma);
+        };
+        assert_g1(&alpha_g1, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&beta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g2(&delta_g2, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_0, E_INVALID_WITHDRAW_PROOF);
+        assert_g1(&ic_1, E_INVALID_WITHDRAW_PROOF);
+        assert!(WITHDRAW_VK_IC_LENGTH == 2, E_INVALID_WITHDRAW_PROOF);
+        move_to(admin, WithdrawProofVK {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            ic: vector[ic_0, ic_1],
+        });
+    }
+
+    // V4 (CP2 MB-5): publish the V4 deposit-binding VK. The deposit circuit is FROZEN under V4 —
+    // its 5 publics (commitment, amount_tag, asset_id, vault_addr_hash, amount_p_digest) keep an IC
+    // vector of DEPOSIT_VK_IC_LENGTH = 6 (ic_0..ic_5), UNCHANGED. This is the V4-named clone of
+    // publish_deposit_binding_vk_v2_a6 — same 6-IC shape — surfaced as a distinct V4 entry so the
+    // clean-replace cutover script targets an unambiguous V4 deposit-VK publish selector while the
+    // proving key is regenerated for the fresh module address. Admin-only; one-shot.
+    public entry fun publish_deposit_binding_vk_v4(
+        admin: &signer,
+        alpha_g1: vector<u8>,
+        beta_g2: vector<u8>,
+        gamma_g2: vector<u8>,
+        delta_g2: vector<u8>,
+        ic_0: vector<u8>,
+        ic_1: vector<u8>,
+        ic_2: vector<u8>,
+        ic_3: vector<u8>,
+        ic_4: vector<u8>,
+        ic_5: vector<u8>,
+    ) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_ADMIN);
+        assert!(!exists<DepositBindingVK>(@eunoma), E_ALREADY_INITIALIZED);
+        assert_g1(&alpha_g1, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&beta_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&gamma_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g2(&delta_g2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_0, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_1, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_2, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_3, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_4, E_INVALID_DEPOSIT_BINDING_PROOF);
+        assert_g1(&ic_5, E_INVALID_DEPOSIT_BINDING_PROOF);
+        let ic = vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5];
+        assert!(vector::length(&ic) == DEPOSIT_VK_IC_LENGTH, E_INVALID_DEPOSIT_BINDING_PROOF);
+        move_to(admin, DepositBindingVK {
             alpha_g1,
             beta_g2,
             gamma_g2,
@@ -3418,7 +4029,7 @@ module eunoma::eunoma_bridge {
             beta_g2,
             gamma_g2,
             delta_g2,
-            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6, ic_7, ic_8, ic_9],
+            ic: vector[ic_0, ic_1, ic_2, ic_3, ic_4, ic_5, ic_6],
         });
     }
 
@@ -3458,9 +4069,56 @@ module eunoma::eunoma_bridge {
         assert!(exists<PendingDepositBindingsV3>(@eunoma), E_NOT_INITIALIZED);
     }
 
+    // V4 (CP2, 2026-06-01): the V4 deploy seeds VaultCoreV4 / AssetRegistryV4 / BridgeTablesV4
+    // (NOT the legacy BridgeVault singleton). The registry-resolving spend/deposit/withdraw
+    // entries use this gate instead of assert_initialized.
+    fun assert_initialized_v4() {
+        assert!(exists<VaultCoreV4>(@eunoma), E_NOT_INITIALIZED);
+        assert!(exists<AssetRegistryV4>(@eunoma), E_NOT_INITIALIZED);
+        assert!(exists<BridgeTablesV4>(@eunoma), E_NOT_INITIALIZED);
+        assert!(exists<DeoperatorConfigV2>(@eunoma), E_NOT_INITIALIZED);
+        assert!(exists<PendingDepositBindingsV3>(@eunoma), E_NOT_INITIALIZED);
+    }
+
     fun assert_admin(admin: &signer) acquires BridgeVault {
         let vault = borrow_global<BridgeVault>(@eunoma);
         assert!(signer::address_of(admin) == vault.admin, E_NOT_ADMIN);
+    }
+
+    fun assert_admin_legacy_or_v4(admin: &signer) acquires BridgeVault, VaultCoreV4 {
+        if (exists<VaultCoreV4>(@eunoma)) {
+            assert_admin_v4(admin);
+        } else {
+            assert_admin(admin);
+        }
+    }
+
+    // V4 admin gate — authority anchored to VaultCoreV4.admin (the V4 vault core), independent
+    // of the legacy BridgeVault singleton.
+    fun assert_admin_v4(admin: &signer) acquires VaultCoreV4 {
+        let core = borrow_global<VaultCoreV4>(@eunoma);
+        assert!(signer::address_of(admin) == core.admin, E_NOT_ADMIN);
+    }
+
+    // V4 registry uniqueness helper — true iff `asset_id_fr` is already the derived asset_id of any
+    // registered asset. Enumerates asset_list (small: a handful of assets) and byte-compares each
+    // row's immutable asset_id_fr. Guarantees no two asset_addrs share an asset_id_fr (which would
+    // break the MA-1 Poseidon-link routing).
+    fun asset_id_fr_in_use(
+        asset_list: &vector<address>,
+        by_asset: &Table<address, AssetVaultStateV4>,
+        asset_id_fr: &vector<u8>,
+    ): bool {
+        let n = vector::length(asset_list);
+        let i = 0;
+        while (i < n) {
+            let a = *vector::borrow(asset_list, i);
+            if (&table::borrow(by_asset, a).asset_id_fr == asset_id_fr) {
+                return true
+            };
+            i = i + 1;
+        };
+        false
     }
 
     fun vault_signer_and_asset_type(): (signer, Object<fungible_asset::Metadata>) acquires BridgeVault {
@@ -3469,6 +4127,30 @@ module eunoma::eunoma_bridge {
             account::create_signer_with_capability(&vault.vault_signer_cap),
             vault.asset_type,
         )
+    }
+
+    fun vault_signer_and_active_asset_type_legacy_or_v4(): (signer, Object<fungible_asset::Metadata>)
+    acquires BridgeVault, VaultCoreV4, AssetRegistryV4 {
+        if (exists<VaultCoreV4>(@eunoma)) {
+            let core = borrow_global<VaultCoreV4>(@eunoma);
+            let registry = borrow_global<AssetRegistryV4>(@eunoma);
+            let i = 0;
+            let n = vector::length(&registry.asset_list);
+            while (i < n) {
+                let asset_addr = *vector::borrow(&registry.asset_list, i);
+                let st = table::borrow(&registry.by_asset, asset_addr);
+                if (st.status == ASSET_STATUS_ACTIVE) {
+                    return (
+                        account::create_signer_with_capability(&core.vault_signer_cap),
+                        st.asset_type,
+                    )
+                };
+                i = i + 1;
+            };
+            abort E_ASSET_NOT_ACTIVE
+        } else {
+            vault_signer_and_asset_type()
+        }
     }
 
     // Round 4 WB2.E C / FR-2.5: message_bytes by-ref. Body's two consumers already take &:
@@ -3614,6 +4296,13 @@ module eunoma::eunoma_bridge {
         };
     }
 
+    fun record_known_root_internal_v4(root: vector<u8>) acquires BridgeTablesV4 {
+        let tables = borrow_global_mut<BridgeTablesV4>(@eunoma);
+        if (!table::contains(&tables.known_roots, *&root)) {
+            table::add(&mut tables.known_roots, root, true);
+        };
+    }
+
     // ASP (2026-05-30, asp-tree-design §6 / D3): returns true iff `asp_root` byte-equals the root
     // of any of the LAST ASP_ROOT_WINDOW_K recorded Association Sets. Iterates from the end of the
     // append-only KnownASPRoots.sets log, scanning at most min(K, len) entries so older roots age
@@ -3667,6 +4356,28 @@ module eunoma::eunoma_bridge {
 
     // FR-5.4: dropped `mark_nullifier_used` — 0 callers after WB2.D migrated
     // withdraw_to_recipient_v2 to `mark_nullifier_used_with_tables`.
+
+    // V4 (CP2 MB-3, 2026-06-01): _with_tables_v4 variants operating on the GLOBAL BridgeTablesV4
+    // (one set across all assets — used_nullifiers is global because asset_id lives in the Compose5
+    // preimage, so cross-asset nullifier collisions are cryptographically impossible; known_roots
+    // is the one unified state tree's root history).
+    fun known_root_recorded_with_tables_v4(tables: &BridgeTablesV4, root: &vector<u8>): bool {
+        table::contains(&tables.known_roots, *root)
+    }
+
+    fun nullifier_used_with_tables_v4(tables: &BridgeTablesV4, nullifier_hash: &vector<u8>): bool {
+        table::contains(&tables.used_nullifiers, *nullifier_hash)
+    }
+
+    fun mark_nullifier_used_with_tables_v4(tables: &mut BridgeTablesV4, nullifier_hash: vector<u8>) {
+        table::add(&mut tables.used_nullifiers, nullifier_hash, true);
+    }
+
+    fun check_and_mark_deposit_nonce_v4(tables: &mut BridgeTablesV4, nonce: &vector<u8>) {
+        let n = *nonce;
+        assert!(!table::contains(&tables.used_deposit_nonces, n), E_DEPOSIT_NONCE_REPLAY);
+        table::add(&mut tables.used_deposit_nonces, n, true);
+    }
 
     fun upsert_vault_public_inputs_v2(
         admin: &signer,
@@ -3931,6 +4642,42 @@ module eunoma::eunoma_bridge {
         buf
     }
 
+    // V4 (CP2 MB-6): struct-free BCS serializer for the de-list emergency-exit attestation. The
+    // 5-of-7 deoperators sign these bytes to authorize a withdraw_to_raw to plain FA. Binds the
+    // config epoch (operator_set_version/dkg_epoch/roster_hash/frost_group_pubkey) like the other
+    // attestations so a rotated roster auto-invalidates a stale emergency signature; binds the
+    // recipient + the PLAINTEXT amount (the emergency disclosure) + an expiry. Field order is
+    // load-bearing — the off-chain TS signer MUST serialize identically.
+    fun serialize_emergency_exit_attestation_v4_msg(
+        domain: &vector<u8>,
+        chain_id: u8,
+        bridge: address,
+        vault: address,
+        asset_type: address,
+        operator_set_version: u64,
+        dkg_epoch: u64,
+        roster_hash: &vector<u8>,
+        frost_group_pubkey: &vector<u8>,
+        recipient: address,
+        amount: u64,
+        expiry_secs: u64,
+    ): vector<u8> {
+        let buf = vector::empty<u8>();
+        vector::append(&mut buf, bcs::to_bytes(domain));
+        vector::append(&mut buf, bcs::to_bytes(&chain_id));
+        vector::append(&mut buf, bcs::to_bytes(&bridge));
+        vector::append(&mut buf, bcs::to_bytes(&vault));
+        vector::append(&mut buf, bcs::to_bytes(&asset_type));
+        vector::append(&mut buf, bcs::to_bytes(&operator_set_version));
+        vector::append(&mut buf, bcs::to_bytes(&dkg_epoch));
+        append_vec32_bcs(&mut buf, roster_hash);
+        append_vec32_bcs(&mut buf, frost_group_pubkey);
+        vector::append(&mut buf, bcs::to_bytes(&recipient));
+        vector::append(&mut buf, bcs::to_bytes(&amount));
+        vector::append(&mut buf, bcs::to_bytes(&expiry_secs));
+        buf
+    }
+
     // B1-v2 (codex fix + real Opt #1): take amount_p (not pre-computed digest). V3 cache-hit
     // path byte-compares amount_p directly (128B vs 32B but no Poseidon recompute — ~700 gas
     // saved). V2 cache-hit + Groth16 fallback compute digest internally. Soundness equivalent:
@@ -3939,11 +4686,14 @@ module eunoma::eunoma_bridge {
     // different amount_p must fail the 128B byte-compare.
     fun consume_or_verify_deposit_binding(
         sender_addr: address,
+        // V4 (CP2 MB-2/MB-3): per-asset deposit publics from the registry-resolved row.
+        asset_id_fr: &vector<u8>,
+        vault_addr_hash_fr: &vector<u8>,
         commitment: &vector<u8>,
         amount_tag: &vector<u8>,
         amount_p: &vector<vector<u8>>,
         proof: vector<u8>,
-    ) acquires PendingDepositBindingsV3, PendingDepositBindingsV2, PreparedDepositBindingVK, VaultPublicInputsV2 {
+    ) acquires PendingDepositBindingsV3, PendingDepositBindingsV2, PreparedDepositBindingVK {
         // R6-D.2: hoist proof-length check (reused by V3 + V2 branches; saves
         // ~10-30 gas on V2-hit + Groth16-fallback paths; 0 on V3-hit).
         let is_cache_path = vector::length(&proof) == 0;
@@ -3982,6 +4732,8 @@ module eunoma::eunoma_bridge {
         assert_valid_deposit_binding_proof(
             commitment,
             amount_tag,
+            asset_id_fr,
+            vault_addr_hash_fr,
             &amount_p_digest,
             proof,
         );
@@ -4011,17 +4763,22 @@ module eunoma::eunoma_bridge {
         asp_root: &vector<u8>,
         state_tree_depth: u64,
         asp_tree_depth: u64,
+        // V4 (CP1): change_commitment public[12] (EMPTY = 32 zero bytes). Bound on both the
+        // cache-hit re-assert AND the Groth16 verify fallback.
+        change_commitment: &vector<u8>,
         proof: vector<u8>,
-    ) acquires PendingWithdrawProofsV2, PendingWithdrawProofsV2b, PendingWithdrawProofsV3, PendingWithdrawProofsV3b, PreparedWithdrawProofVK {
+    ) acquires PendingWithdrawProofsV3b, PreparedWithdrawProofVK {
         let is_cache_path = vector::length(&proof) == 0;
-        // Round 5 Wave E.5 (R5-R): V3b cache-hit — 7-field equality (no asset_id; no
-        // msg_hash). Priority chain: V3b → V3 → V2b → V2 → miss. New prepare_withdraw_
-        // proof_v3 writes V3b; legacy V3 entries drain via the V3 branch below.
+        // V4 (CP2 MB-3, 2026-06-01): V3b is the ONLY surviving withdraw-proof cache. The legacy
+        // V3 / V2b / V2 asset_id-blind cache-consume branches are PHYSICALLY DELETED (a surviving
+        // asset_id-blind branch is a total cross-asset bypass — MA-1 / FIX-2). V3b now CARRIES
+        // asset_id + change_commitment and re-asserts BOTH on cache-hit, so the cache-consume path
+        // is asset-pinned and change-pinned exactly like the Groth16 verify.
         if (is_cache_path && exists<PendingWithdrawProofsV3b>(@eunoma)) {
             let pending_v3b = borrow_global_mut<PendingWithdrawProofsV3b>(@eunoma);
             if (table::contains(&pending_v3b.by_request_hash, *request_hash)) {
                 let cached_v3b = table::remove(&mut pending_v3b.by_request_hash, *request_hash);
-                // R5-M order: cheapest / tamper-likely first (mirrors V2 + V2b branches).
+                // R5-M order: cheapest / tamper-likely first.
                 assert!(cached_v3b.vault_sequence == vault_sequence, E_INVALID_WITHDRAW_PROOF);
                 assert!(&cached_v3b.nullifier_hash == nullifier_hash, E_INVALID_WITHDRAW_PROOF);
                 assert!(&cached_v3b.amount_p_digest == amount_p_digest, E_INVALID_WITHDRAW_PROOF);
@@ -4029,69 +4786,17 @@ module eunoma::eunoma_bridge {
                 assert!(&cached_v3b.root == root, E_INVALID_WITHDRAW_PROOF);
                 assert!(&cached_v3b.amount_tag == amount_tag, E_INVALID_WITHDRAW_PROOF);
                 assert!(&cached_v3b.ca_payload_hash == ca_payload_hash, E_INVALID_WITHDRAW_PROOF);
-                return
-            };
-        };
-        if (is_cache_path && exists<PendingWithdrawProofsV3>(@eunoma)) {
-            let pending_v3 = borrow_global_mut<PendingWithdrawProofsV3>(@eunoma);
-            if (table::contains(&pending_v3.by_request_hash, *request_hash)) {
-                let cached_v3 = table::remove(&mut pending_v3.by_request_hash, *request_hash);
-                let computed_msg_hash = compute_withdraw_proof_msg_hash(
-                    root, nullifier_hash, asset_id, recipient_hash, amount_tag,
-                    ca_payload_hash, vault_sequence, amount_p_digest,
-                );
-                assert!(cached_v3.msg_hash == computed_msg_hash, E_INVALID_WITHDRAW_PROOF);
-                return
-            };
-        };
-        // Round 5 Wave E.2 (P06-1): V2b cache-hit — 7-field equality (no asset_id; the
-        // caller's asset_id arg already comes from VaultPublicInputsV2.asset_id_fr, which
-        // is immutable post-V2-bootstrap, so no rotation skew is possible).
-        if (is_cache_path && exists<PendingWithdrawProofsV2b>(@eunoma)) {
-            let pending_v2b = borrow_global_mut<PendingWithdrawProofsV2b>(@eunoma);
-            if (table::contains(&pending_v2b.by_request_hash, *request_hash)) {
-                let cached_v2b = table::remove(&mut pending_v2b.by_request_hash, *request_hash);
-                // R5-M order: cheapest / tamper-likely first (mirrors V2 branch below).
-                assert!(cached_v2b.vault_sequence == vault_sequence, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached_v2b.nullifier_hash == nullifier_hash, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached_v2b.amount_p_digest == amount_p_digest, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached_v2b.recipient_hash == recipient_hash, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached_v2b.root == root, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached_v2b.amount_tag == amount_tag, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached_v2b.ca_payload_hash == ca_payload_hash, E_INVALID_WITHDRAW_PROOF);
-                return
-            };
-        };
-        if (is_cache_path && exists<PendingWithdrawProofsV2>(@eunoma)) {
-            let pending = borrow_global_mut<PendingWithdrawProofsV2>(@eunoma);
-            if (table::contains(&pending.by_request_hash, *request_hash)) {
-                let cached = table::remove(&mut pending.by_request_hash, *request_hash);
-                // R5-M (Round 5 A.8): assert order reorganized for fail-fast on tampered
-                // inputs. Exploits Move `==` short-circuit semantics on vectors. Order:
-                //   1) vault_sequence (u64, cheapest comparison, unique per epoch)
-                //   2) nullifier_hash (32B, unique per spent note — replay-attempt detector)
-                //   3) amount_p_digest (32B, tamper-likely for overdraw attempts)
-                //   4) recipient_hash (32B)
-                //   5) root (32B)
-                //   6) amount_tag (32B)
-                //   7) ca_payload_hash (32B)
-                //   8) asset_id (32B, constant per vault — last because least likely to differ)
-                // Happy path cost unchanged. Aborts ~80-250 gas faster on tampered inputs.
-                assert!(cached.vault_sequence == vault_sequence, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached.nullifier_hash == nullifier_hash, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached.amount_p_digest == amount_p_digest, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached.recipient_hash == recipient_hash, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached.root == root, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached.amount_tag == amount_tag, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached.ca_payload_hash == ca_payload_hash, E_INVALID_WITHDRAW_PROOF);
-                assert!(&cached.asset_id == asset_id, E_INVALID_WITHDRAW_PROOF);
+                // V4 MB-3: re-assert the registry-resolved asset_id (MA-1 Poseidon-link image).
+                assert!(&cached_v3b.asset_id == asset_id, E_INVALID_WITHDRAW_PROOF);
+                // V4 CP1: re-assert the change_commitment public.
+                assert!(&cached_v3b.change_commitment == change_commitment, E_INVALID_WITHDRAW_PROOF);
                 return
             };
         };
         assert_valid_withdraw_proof(
             root, nullifier_hash, asset_id, recipient_hash, amount_tag,
             ca_payload_hash, request_hash, vault_sequence, amount_p_digest,
-            asp_root, state_tree_depth, asp_tree_depth, proof,
+            asp_root, state_tree_depth, asp_tree_depth, change_commitment, proof,
         );
     }
 
@@ -4374,16 +5079,20 @@ module eunoma::eunoma_bridge {
         );
     }
 
+    // V4 (CP2 MB-2/MB-3, 2026-06-01): asset_id_fr + vault_addr_hash_fr are now passed in by the
+    // caller from the registry-resolved AssetVaultStateV4 row (per-asset deposit publics), NOT read
+    // from the dead VaultPublicInputsV2 singleton. The deposit circuit is FROZEN — only the SOURCE
+    // of its asset_id/vault_addr_hash publics moves singleton -> registry.
     fun assert_valid_deposit_binding_proof(
         commitment: &vector<u8>,
         amount_tag: &vector<u8>,
+        asset_id_fr: &vector<u8>,
+        vault_addr_hash_fr: &vector<u8>,
         amount_p_digest: &vector<u8>,
         proof: vector<u8>,
-    ) acquires PreparedDepositBindingVK, VaultPublicInputsV2 {
+    ) acquires PreparedDepositBindingVK {
         assert!(exists<PreparedDepositBindingVK>(@eunoma), E_NOT_INITIALIZED);
-        assert!(exists<VaultPublicInputsV2>(@eunoma), E_NOT_INITIALIZED);
         let pvk = borrow_global<PreparedDepositBindingVK>(@eunoma);
-        let cache = borrow_global<VaultPublicInputsV2>(@eunoma);
         assert!(vector::length(&pvk.pvk_uvw_gamma_g1) == DEPOSIT_VK_IC_LENGTH, E_INVALID_DEPOSIT_BINDING_PROOF);
         // WB3/FG2.1: dropped per-verify assert_prepared_vk_shape. The 3 prepared VK byte fields
         // (alpha_g1_beta_g2_fq12, gamma_g2_neg, delta_g2_neg) are produced exclusively by
@@ -4399,12 +5108,11 @@ module eunoma::eunoma_bridge {
         let publics = vector[
             de_fr_with_error(commitment, E_INVALID_DEPOSIT_BINDING_PROOF),
             de_fr_with_error(amount_tag, E_INVALID_DEPOSIT_BINDING_PROOF),
-            // R5-T (Wave F.2): asset_id_fr + vault_addr_hash_fr are both Poseidon-derived
-            // (derive_asset_id + derive_vault_addr_hash) and stored as canonical 32B Fr in
-            // VaultPublicInputsV2. amount_p_digest = compute_amount_p_digest_v2 output.
-            // All three are canonical-by-construction → skip the is_some guards.
-            de_fr_unchecked(&cache.asset_id_fr),
-            de_fr_unchecked(&cache.vault_addr_hash_fr),
+            // V4: asset_id_fr + vault_addr_hash_fr come from the registry-resolved row (both
+            // Poseidon-derived canonical 32B Fr). amount_p_digest = compute_amount_p_digest_v2
+            // output. All three are canonical-by-construction → skip the is_some guards.
+            de_fr_unchecked(asset_id_fr),
+            de_fr_unchecked(vault_addr_hash_fr),
             de_fr_unchecked(amount_p_digest),
         ];
         assert_groth16_prepared(
@@ -4436,45 +5144,37 @@ module eunoma::eunoma_bridge {
         asp_root: &vector<u8>,
         state_tree_depth: u64,
         asp_tree_depth: u64,
+        // V4 (CP1, 2026-06-01): partial-withdraw change-note commitment, public[12]. EMPTY
+        // (full withdraw) = the field element 0 (CHANGE_COMMITMENT_EMPTY).
+        change_commitment: &vector<u8>,
         proof: vector<u8>,
     ) acquires PreparedWithdrawProofVK {
-        assert!(exists<PreparedWithdrawProofVK>(@eunoma), E_NOT_INITIALIZED);
+        // Hot-path cost: prepared VK existence/IC length are guaranteed by admin-only
+        // publish/rotate entries. `borrow_global` still aborts if provisioning is missing, and
+        // the Groth16 helper consumes the canonical prepared vector directly.
         let pvk = borrow_global<PreparedWithdrawProofVK>(@eunoma);
-        assert!(vector::length(&pvk.pvk_uvw_gamma_g1) == WITHDRAW_VK_IC_LENGTH, E_INVALID_WITHDRAW_PROOF);
+        let _state_tree_depth = state_tree_depth;
+        let _asp_tree_depth = asp_tree_depth;
+        let expected_request_hash = compute_request_hash_v4(
+            amount_tag,
+            recipient_hash,
+            ca_payload_hash,
+            asset_id,
+            vault_sequence,
+            chain_id::get(),
+        );
+        assert!(&expected_request_hash == request_hash, E_INVALID_WITHDRAW_PROOF);
         // WB3/FG2.1: dropped per-verify assert_prepared_vk_shape — see deposit-side comment in
         // assert_valid_deposit_binding_proof for the invariant: prepared-VK byte fields are
         // produced exclusively by canonical crypto_algebra::serialize helpers; resource is
         // replaced-not-mutated; no `borrow_global_mut<PreparedWithdrawProofVK>` exists.
-        // ASP (asp-tree-design §5.2/§6): circuit publics order is now 12 (was 9). MUST match the
-        // circuit's public-input order byte-for-byte:
-        // [0]root [1]nullifier_hash [2]asset_id [3]recipient_hash [4]amount_tag [5]ca_payload_hash
-        // [6]request_hash [7]vault_sequence [8]amount_p_digest [9]asp_root [10]state_tree_depth
-        // [11]asp_tree_depth.
         let publics = vector[
             de_fr_with_error(root, E_INVALID_WITHDRAW_PROOF),
             de_fr_with_error(nullifier_hash, E_INVALID_WITHDRAW_PROOF),
-            // R5-T (Wave F.2): asset_id is `VaultPublicInputsV2.asset_id_fr`, set by
-            // upsert_vault_public_inputs_v2 via derive_asset_id (Poseidon output, canonical
-            // 32B Fr). Skip the option::is_some guard.
-            de_fr_unchecked(asset_id),
-            de_fr_with_error(recipient_hash, E_INVALID_WITHDRAW_PROOF),
-            de_fr_with_error(amount_tag, E_INVALID_WITHDRAW_PROOF),
-            de_fr_with_error(ca_payload_hash, E_INVALID_WITHDRAW_PROOF),
             de_fr_with_error(request_hash, E_INVALID_WITHDRAW_PROOF),
-            // R5-H (Round 5 A.4): `crypto_algebra::from_u64<Fr>(vault_sequence)` direct
-            // replaces `de_fr_with_error(&u64_to_fr_bytes(vault_sequence), ...)`. Eliminates
-            // the 32B temp vector allocation (8B BCS + 24B zero pad) + deserialize roundtrip.
-            // `from_u64` is the native field-construction path used inside `groth16_bn254` for
-            // the constant `1` scalar. Saves ~150-350 gas per Groth16 verify.
-            crypto_algebra::from_u64<Fr>(vault_sequence),
-            // R5-T (Wave F.2): amount_p_digest is compute_amount_p_digest_v2 output —
-            // Poseidon hash_2 of 4 hash_3 outputs, all canonical Fr by construction.
-            de_fr_unchecked(amount_p_digest),
-            // ASP (asp-tree-design §5.2): asp_root is a 32B Fr like root — validate via de_fr_with_error.
+            de_fr_with_error(amount_p_digest, E_INVALID_WITHDRAW_PROOF),
             de_fr_with_error(asp_root, E_INVALID_WITHDRAW_PROOF),
-            // ASP: LeanIMT actual depths as field elements (native u64 -> Fr, no temp vector).
-            crypto_algebra::from_u64<Fr>(state_tree_depth),
-            crypto_algebra::from_u64<Fr>(asp_tree_depth),
+            de_fr_with_error(change_commitment, E_INVALID_WITHDRAW_PROOF),
         ];
         assert_groth16_prepared(
             &pvk.pvk_alpha_g1_beta_g2_fq12,
@@ -4660,6 +5360,28 @@ module eunoma::eunoma_bridge {
         out
     }
 
+    fun u8_to_fr_bytes(n: u8): vector<u8> {
+        let out = vector[n];
+        vector::append(&mut out, vector[0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+                                        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+                                        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+                                        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]);
+        out
+    }
+
+    fun compute_request_hash_v4(
+        amount_tag: &vector<u8>,
+        recipient_hash: &vector<u8>,
+        ca_payload_hash: &vector<u8>,
+        asset_id: &vector<u8>,
+        vault_sequence: u64,
+        chain_id_value: u8,
+    ): vector<u8> {
+        let left = poseidon_bn254::hash_3(*amount_tag, *recipient_hash, *ca_payload_hash);
+        let right = poseidon_bn254::hash_3(*asset_id, u64_to_fr_bytes(vault_sequence), u8_to_fr_bytes(chain_id_value));
+        poseidon_bn254::hash_2(left, right)
+    }
+
     // WB3/FH3.1 REVERTED (codex micro-review): vendored `std::vector::slice` is itself a Move
     // loop (vector.move::732), not a native memcpy. Switching to it added our bounds assert +
     // the stdlib's bounds assert + the same per-byte push_back loop. Net was neutral-to-worse.
@@ -4752,6 +5474,75 @@ module eunoma::eunoma_bridge {
         poseidon_bn254::hash_3(domain_fr, hi, lo)
     }
 
+    // V4 (CP2 MB-4, design §6.1 B-prime): collapse a party's 4 × 16-bit-chunk Pedersen commitments
+    // into ONE aggregate Pedersen point using the framework's own positional chunk weights
+    // [1, 2^16, 2^32, 2^48]. Each amount_p chunk C_i = m_i·G + r_i·H is a 32B COMPRESSED Ristretto
+    // point (the CA Twisted-ElGamal amount component). The aggregate
+    //   P = Σ 2^{16i}·C_i = (Σ m_i·2^{16i})·G + (Σ r_i·2^{16i})·H = A·G + R·H
+    // is a single Pedersen commitment to the FULL integer amount A. Carry-free: subtraction borrows
+    // across 16-bit boundaries cancel because aggregation is over the integer, not per-chunk.
+    //
+    // SOUNDNESS-CRITICAL decompression: use ristretto255::new_point_from_bytes (VALIDATES canonical
+    // encoding; returns Option::none on a non-canonical point) NOT point_decompress (which trusts
+    // the invariant and would mis-bind malformed bytes). A non-canonical chunk aborts here.
+    fun aggregate_pedersen_amount_point(amount_p: &vector<vector<u8>>): ristretto255::RistrettoPoint {
+        assert!(vector::length(amount_p) == 4, E_INVALID_AMOUNT_P_SHAPE);
+        let c0 = vector::borrow(amount_p, 0);
+        let c1 = vector::borrow(amount_p, 1);
+        let c2 = vector::borrow(amount_p, 2);
+        let c3 = vector::borrow(amount_p, 3);
+        assert!(
+            vector::length(c0) == 32 && vector::length(c1) == 32
+                && vector::length(c2) == 32 && vector::length(c3) == 32,
+            E_INVALID_AMOUNT_P_SHAPE
+        );
+        // VALIDATING decompression — option::extract aborts if new_point_from_bytes returned none
+        // (non-canonical encoding), exactly the malformed-bytes mis-bind the spec forbids.
+        let p0 = option::extract(&mut ristretto255::new_point_from_bytes(*c0));
+        let p1 = option::extract(&mut ristretto255::new_point_from_bytes(*c1));
+        let p2 = option::extract(&mut ristretto255::new_point_from_bytes(*c2));
+        let p3 = option::extract(&mut ristretto255::new_point_from_bytes(*c3));
+        // Positional weights [1, 2^16, 2^32, 2^48] as Ristretto scalars (all < 2^64, fit u128).
+        let w0 = ristretto255::new_scalar_from_u128(1u128);
+        let w1 = ristretto255::new_scalar_from_u128(1u128 << 16);
+        let w2 = ristretto255::new_scalar_from_u128(1u128 << 32);
+        let w3 = ristretto255::new_scalar_from_u128(1u128 << 48);
+        let points = vector[p0, p1, p2, p3];
+        let scalars = vector[w0, w1, w2, w3];
+        ristretto255::multi_scalar_mul(&points, &scalars)
+    }
+
+    // V4 (CP2 MB-4, design §6 B-prime, HYBRID): on-chain aggregate-Pedersen conservation. Pins the
+    // spent note's aggregate P_old to the Groth16-bound amount_p_digest (public[8]) via the existing
+    // Compose8 recompute (closes Approach A's "A_old is a free variable" hole), then asserts the
+    // carry-free integer-conservation equality on the aggregated points:
+    //   point_equals(P_old, P_wd + P_rem)   <=>   A_old·G + R_old·H == (W + A_rem)·G + (R_wd + R_rem)·H
+    // The user constructs blinds so R_old = R_wd + R_rem (deterministic HKDF-derived per-chunk
+    // scalar_sub); the H terms cancel and Pedersen binding forces A_old = W + A_rem in Z — given all
+    // three amounts are in [0, 2^64) << L so there is no mod-L wraparound (the IN-CIRCUIT
+    // Num2Bits(16)/LessEqThan(64) remainder range proof is the other half of the hybrid; this Move
+    // half binds those integers to the real amount_p commitments). amount_p_old is the spent note's
+    // chunks; amount_p_wd is the withdrawn leg (== the CA-transfer amount_p); amount_p_rem is the
+    // change/remainder chunks. Returns nothing — aborts E_AMOUNT_CONSERVATION on failure.
+    fun assert_amount_conservation_v4(
+        amount_p_old: &vector<vector<u8>>,
+        amount_p_wd: &vector<vector<u8>>,
+        amount_p_rem: &vector<vector<u8>>,
+        amount_p_digest: &vector<u8>,
+    ) {
+        // Pin P_old to the spent note: Compose8(old chunks) MUST equal the Groth16 public[8] digest
+        // (which the withdraw circuit binds into the spent Compose5 commitment proven in-tree). So
+        // the chunks aggregated below are cryptographically the deposited note's amount, not a
+        // prover-invented number.
+        let old_digest = compute_amount_p_digest_v2(amount_p_old);
+        assert!(&old_digest == amount_p_digest, E_AMOUNT_CONSERVATION);
+        let p_old = aggregate_pedersen_amount_point(amount_p_old);
+        let p_wd = aggregate_pedersen_amount_point(amount_p_wd);
+        let p_rem = aggregate_pedersen_amount_point(amount_p_rem);
+        let p_sum = ristretto255::point_add(&p_wd, &p_rem);
+        assert!(ristretto255::point_equals(&p_old, &p_sum), E_AMOUNT_CONSERVATION);
+    }
+
     /// Stage 3 A6: compute amount_p_digest from the CA framework's 4 × 32B Ristretto amount_p.
     ///
     /// Mirrors circuits/{deposit_binding,withdrawal_proof}.circom Compose8 template +
@@ -4819,6 +5610,15 @@ module eunoma::eunoma_bridge {
 
     fun assert_hash(bytes: &vector<u8>) {
         assert!(vector::length(bytes) == HASH_BYTES, E_BAD_HASH_LENGTH);
+    }
+
+    // V4 (CP2 MB-5): has_change == change_commitment is NOT the canonical EMPTY sentinel (the field
+    // element 0 = 32 LE zero bytes). A partial withdraw produces a non-zero Compose5 change
+    // commitment (this is true) and emits ChangeNoteAppendedV4; a full withdraw binds public[12] to
+    // CHANGE_COMMITMENT_EMPTY (this is false) and emits no change leaf. Caller has already
+    // assert_hash'd the 32B length, so a ref byte-compare to the 32B sentinel is sufficient.
+    fun has_change_commitment(change_commitment: &vector<u8>): bool {
+        change_commitment != &CHANGE_COMMITMENT_EMPTY
     }
 
     // Round 5 Wave G.2 (R5-P): inline helper for the 6-hash assertion block shared
@@ -5097,61 +5897,10 @@ module eunoma::eunoma_bridge {
         cached.msg_hash
     }
 
-    // Round 5 Wave E.2 (P06-1) test shims: V2b proof cache (no asset_id field).
-    #[test_only]
-    public fun test_only_init_pending_proofs_v2b(admin: &signer) {
-        assert!(signer::address_of(admin) == @eunoma, E_NOT_INITIALIZED);
-        if (!exists<PendingWithdrawProofsV2b>(@eunoma)) {
-            move_to(admin, PendingWithdrawProofsV2b { by_request_hash: table::new() });
-        };
-    }
+    // V4 (CP2 MB-3, 2026-06-01): the V2b proof-cache test shims are DELETED (struct removed).
 
-    #[test_only]
-    public fun test_only_inject_v2b_proof(
-        request_hash: vector<u8>,
-        root: vector<u8>,
-        nullifier_hash: vector<u8>,
-        recipient_hash: vector<u8>,
-        amount_tag: vector<u8>,
-        ca_payload_hash: vector<u8>,
-        vault_sequence: u64,
-        amount_p_digest: vector<u8>,
-    ) acquires PendingWithdrawProofsV2b {
-        let pending = borrow_global_mut<PendingWithdrawProofsV2b>(@eunoma);
-        assert!(
-            !table::contains(&pending.by_request_hash, *&request_hash),
-            E_PENDING_WITHDRAW_PROOF,
-        );
-        table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawProofV2b {
-            root, nullifier_hash, recipient_hash, amount_tag,
-            ca_payload_hash, vault_sequence, amount_p_digest,
-        });
-    }
-
-    #[test_only]
-    public fun test_only_v2b_proof_entry_exists(
-        request_hash: vector<u8>,
-    ): bool acquires PendingWithdrawProofsV2b {
-        let pending = borrow_global<PendingWithdrawProofsV2b>(@eunoma);
-        table::contains(&pending.by_request_hash, *&request_hash)
-    }
-
-    // Returns (vault_sequence, amount_p_digest, recipient_hash) so the test can verify the
-    // 7 fields survive a round-trip. asset_id deliberately NOT stored.
-    #[test_only]
-    public fun test_only_v2b_proof_pop_triplet(
-        request_hash: vector<u8>,
-    ): (u64, vector<u8>, vector<u8>) acquires PendingWithdrawProofsV2b {
-        let pending = borrow_global_mut<PendingWithdrawProofsV2b>(@eunoma);
-        let c = table::remove(&mut pending.by_request_hash, request_hash);
-        let PendingWithdrawProofV2b {
-            root: _, nullifier_hash: _, recipient_hash, amount_tag: _,
-            ca_payload_hash: _, vault_sequence, amount_p_digest,
-        } = c;
-        (vault_sequence, amount_p_digest, recipient_hash)
-    }
-
-    // Round 5 Wave E.5 (R5-R) test shims: V3b proof cache (7 fields).
+    // V4 (CP2 MB-3, 2026-06-01) test shims: V3b proof cache (now 9 fields incl asset_id +
+    // change_commitment).
     #[test_only]
     public fun test_only_init_pending_proofs_v3b(admin: &signer) {
         assert!(signer::address_of(admin) == @eunoma, E_NOT_INITIALIZED);
@@ -5165,11 +5914,13 @@ module eunoma::eunoma_bridge {
         request_hash: vector<u8>,
         root: vector<u8>,
         nullifier_hash: vector<u8>,
+        asset_id: vector<u8>,
         recipient_hash: vector<u8>,
         amount_tag: vector<u8>,
         ca_payload_hash: vector<u8>,
         vault_sequence: u64,
         amount_p_digest: vector<u8>,
+        change_commitment: vector<u8>,
     ) acquires PendingWithdrawProofsV3b {
         let pending = borrow_global_mut<PendingWithdrawProofsV3b>(@eunoma);
         assert!(
@@ -5177,8 +5928,8 @@ module eunoma::eunoma_bridge {
             E_PENDING_WITHDRAW_PROOF,
         );
         table::add(&mut pending.by_request_hash, request_hash, PendingWithdrawProofV3b {
-            root, nullifier_hash, recipient_hash, amount_tag,
-            ca_payload_hash, vault_sequence, amount_p_digest,
+            root, nullifier_hash, asset_id, recipient_hash, amount_tag,
+            ca_payload_hash, vault_sequence, amount_p_digest, change_commitment,
         });
     }
 
@@ -5209,11 +5960,9 @@ module eunoma::eunoma_bridge {
         let pending = borrow_global_mut<PendingWithdrawProofsV3b>(@eunoma);
         let c = table::remove(&mut pending.by_request_hash, request_hash);
         let PendingWithdrawProofV3b {
-            root: _, nullifier_hash: _, recipient_hash, amount_tag: _,
-            ca_payload_hash: _, vault_sequence, amount_p_digest,
+            root: _, nullifier_hash: _, asset_id: _, recipient_hash, amount_tag: _,
+            ca_payload_hash: _, vault_sequence, amount_p_digest, change_commitment: _,
         } = c;
-        // (vault_sequence, amount_p_digest, recipient_hash) — same shape as V2b shim so
-        // both round-trip tests can share assert pattern.
         (vault_sequence, amount_p_digest, recipient_hash)
     }
 
@@ -5563,4 +6312,324 @@ module eunoma::eunoma_bridge {
         };
         bcs::to_bytes(&msg)
     }
+
+    // V4 (CP2 MB-4) test shim: drive the REAL assert_amount_conservation_v4 (aggregate-Pedersen
+    // B-prime check). Aborts E_AMOUNT_CONSERVATION on a bad split or a P_old/digest mismatch.
+    #[test_only]
+    public fun test_only_assert_amount_conservation_v4(
+        amount_p_old: vector<vector<u8>>,
+        amount_p_wd: vector<vector<u8>>,
+        amount_p_rem: vector<vector<u8>>,
+        amount_p_digest: vector<u8>,
+    ) {
+        assert_amount_conservation_v4(&amount_p_old, &amount_p_wd, &amount_p_rem, &amount_p_digest);
+    }
+
+    // V4 (CP2 MB-4) test shim: expose compute_amount_p_digest_v2 so a test can pin the spent-note
+    // digest (public[8]) for the conservation check input.
+    #[test_only]
+    public fun test_only_compute_amount_p_digest(amount_p: vector<vector<u8>>): vector<u8> {
+        compute_amount_p_digest_v2(&amount_p)
+    }
+
+    // V4 (CP2 MB-5) test shim: expose the change-commitment EMPTY sentinel + the has_change helper.
+    #[test_only]
+    public fun test_only_change_commitment_empty(): vector<u8> { CHANGE_COMMITMENT_EMPTY }
+
+    #[test_only]
+    public fun test_only_has_change_commitment(change_commitment: vector<u8>): bool {
+        has_change_commitment(&change_commitment)
+    }
+
+    // =================================================================================
+    // V4 multi-asset (CP2 MB-1..MB-6) test-only scaffolding. Mirrors the ASP/ragequit seeder
+    // style: plant the GLOBAL VaultCoreV4 + empty AssetRegistryV4 + BridgeTablesV4 directly at
+    // @eunoma (with a real resource-account signer cap so the row shape is identical to init_v4),
+    // so unit tests can drive the REAL register_asset_metadata_v4 entry, the REAL status gate, the
+    // REAL MA-1 Poseidon-link assert, and the REAL append-only / uniqueness asserts — WITHOUT the
+    // confidential_asset::register_raw + 5-of-7 FROST + confidential_transfer_raw machinery (those
+    // are E2E, exercised on testnet later). #[test_only] -> excluded from production bytecode; the
+    // production lifecycle/gate logic is unchanged.
+    //
+    // ACTIVE is reached here via test_only_set_asset_status (NOT a standalone production set_status
+    // — none exists; production ACTIVE is reachable ONLY through the register_raw-bearing
+    // activate_asset_ca_v4). The shim flips the in-registry status byte to let the gate/route tests
+    // observe an ACTIVE/PAUSED/DORMANT row; it never touches the immutable asset_type/asset_id_fr.
+    // =================================================================================
+    #[test_only]
+    public fun test_only_seed_v4_core_and_registry(admin: &signer, vault_seed: vector<u8>) {
+        assert!(signer::address_of(admin) == @eunoma, E_NOT_INITIALIZED);
+        if (!exists<VaultCoreV4>(@eunoma)) {
+            let (vault_signer, vault_signer_cap) = account::create_resource_account(admin, vault_seed);
+            let vault_addr = signer::address_of(&vault_signer);
+            move_to(admin, VaultCoreV4 {
+                admin: signer::address_of(admin),
+                vault_addr,
+                vault_signer_cap,
+                paused: false,
+                next_leaf_index: 0,
+                vault_sequence: 0,
+            });
+        };
+        if (!exists<AssetRegistryV4>(@eunoma)) {
+            move_to(admin, AssetRegistryV4 {
+                by_asset: table::new<address, AssetVaultStateV4>(),
+                asset_list: vector::empty<address>(),
+            });
+        };
+        if (!exists<BridgeTablesV4>(@eunoma)) {
+            move_to(admin, BridgeTablesV4 {
+                used_deposit_nonces: table::new<vector<u8>, bool>(),
+                used_nullifiers: table::new<vector<u8>, bool>(),
+                known_roots: table::new<vector<u8>, bool>(),
+            });
+        };
+    }
+
+    // Read the per-asset lifecycle status byte from the REAL registry row (DORMANT/ACTIVE/PAUSED).
+    #[test_only]
+    public fun test_only_asset_status(asset_addr: address): u8 acquires AssetRegistryV4 {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        table::borrow(&registry.by_asset, asset_addr).status
+    }
+
+    // Read the on-chain-derived (immutable) asset_id_fr from the REAL registry row. Proves the
+    // register entry stored derive_asset_id(asset_type), never a caller-supplied value (FIX-3).
+    #[test_only]
+    public fun test_only_asset_id_fr(asset_addr: address): vector<u8> acquires AssetRegistryV4 {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        *&table::borrow(&registry.by_asset, asset_addr).asset_id_fr
+    }
+
+    // Read whether the REAL registry contains a row for asset_addr (append-only membership).
+    #[test_only]
+    public fun test_only_registry_contains(asset_addr: address): bool acquires AssetRegistryV4 {
+        table::contains(&borrow_global<AssetRegistryV4>(@eunoma).by_asset, asset_addr)
+    }
+
+    // Flip the in-registry status byte WITHOUT register_raw (test-only; production ACTIVE is
+    // reachable ONLY via the register_raw-bearing activate_asset_ca_v4). Touches ONLY the mutable
+    // status field — never the immutable asset_type/asset_id_fr/decimals triple.
+    #[test_only]
+    public fun test_only_set_asset_status(asset_addr: address, status: u8) acquires AssetRegistryV4 {
+        let registry = borrow_global_mut<AssetRegistryV4>(@eunoma);
+        table::borrow_mut(&mut registry.by_asset, asset_addr).status = status;
+    }
+
+    // Drive the REAL DORMANT-idempotency gate inside activate_asset_ca_v4 (the exact
+    // `assert(st.status == DORMANT, E_ASSET_ALREADY_ACTIVE)` belt that guards a double-activate),
+    // bypassing only the register_raw + EK machinery (E2E). Aborts E_ASSET_ALREADY_ACTIVE (41) if
+    // the row is not DORMANT.
+    #[test_only]
+    public fun test_only_assert_activate_requires_dormant(asset_addr: address) acquires AssetRegistryV4 {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        assert!(table::contains(&registry.by_asset, asset_addr), E_ASSET_ID_MISMATCH);
+        assert!(
+            table::borrow(&registry.by_asset, asset_addr).status == ASSET_STATUS_DORMANT,
+            E_ASSET_ALREADY_ACTIVE,
+        );
+    }
+
+    // Drive the REAL per-asset status gate (`assert(st.status == ACTIVE, E_ASSET_NOT_ACTIVE)`) the
+    // production deposit/withdraw/prepare/ragequit entries run at the TOP, before any global write.
+    #[test_only]
+    public fun test_only_assert_status_active(asset_addr: address) acquires AssetRegistryV4 {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        assert!(
+            table::borrow(&registry.by_asset, asset_addr).status == ASSET_STATUS_ACTIVE,
+            E_ASSET_NOT_ACTIVE,
+        );
+    }
+
+    // Expose the REAL on-chain derive_asset_id (Poseidon3 over the FA object-address). The MA-1
+    // routing premise is that this is one-way + immutable per asset_type.
+    #[test_only]
+    public fun test_only_derive_asset_id(asset_type: Object<fungible_asset::Metadata>): vector<u8>
+        acquires DepositBindingTestOverride
+    {
+        derive_asset_id(asset_type)
+    }
+
+    // Drive the EXACT MA-1 Poseidon-link assert the spend entries run at TX0/TX2/TX3/TX4:
+    //   assert!(derive_asset_id(st.asset_type) == proven_asset_id, E_ASSET_ID_MISMATCH)
+    // st.asset_type is read from the REAL registry row (attacker-chosen asset_addr is the routing
+    // key); proven_asset_id is the value fed to the Groth16 publics. A cUSDC inclusion proof routed
+    // through an APT asset_addr => derive_asset_id(APT) != cUSDC proven_asset_id => abort (42).
+    #[test_only]
+    public fun test_only_assert_ma1_route(asset_addr: address, proven_asset_id: vector<u8>)
+        acquires AssetRegistryV4, DepositBindingTestOverride
+    {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let asset_type = table::borrow(&registry.by_asset, asset_addr).asset_type;
+        assert!(derive_asset_id(asset_type) == proven_asset_id, E_ASSET_ID_MISMATCH);
+    }
+
+    // Read whether a deposit nonce is marked in the GLOBAL BridgeTablesV4 (proves the MB-2 ordering
+    // invariant: a DORMANT-asset step2a aborts on the status gate BEFORE the nonce is burned).
+    #[test_only]
+    public fun test_only_deposit_nonce_used(nonce: vector<u8>): bool acquires BridgeTablesV4 {
+        if (!exists<BridgeTablesV4>(@eunoma)) { return false };
+        table::contains(&borrow_global<BridgeTablesV4>(@eunoma).used_deposit_nonces, nonce)
+    }
+
+    // Drive the EXACT deposit_step2a_eunoma_verify_v3 prefix ordering (MB-2, LOAD-BEARING): resolve
+    // the registry row, gate `status == ACTIVE` (E_ASSET_NOT_ACTIVE) FIRST, then — and only then —
+    // mark the deposit nonce via the REAL check_and_mark_deposit_nonce_v4. If the gate aborts
+    // (DORMANT/PAUSED), the abort rolls back the whole tx, so no nonce slot is ever burned. This is
+    // the precise prefix of the production entry (lines :1653-1671), with the FROST + Groth16 + CA
+    // machinery (E2E) elided AFTER the gate-then-nonce ordering it exists to protect.
+    #[test_only]
+    public fun test_only_deposit_step2a_gate_then_mark_nonce(asset_addr: address, nonce: vector<u8>)
+        acquires AssetRegistryV4, BridgeTablesV4
+    {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let st = table::borrow(&registry.by_asset, asset_addr);
+        assert!(st.status == ASSET_STATUS_ACTIVE, E_ASSET_NOT_ACTIVE);
+        let tables = borrow_global_mut<BridgeTablesV4>(@eunoma);
+        check_and_mark_deposit_nonce_v4(tables, &nonce);
+    }
+
+    // Read the GLOBAL unified-tree append index (deposits + change leaves). Monotonic.
+    #[test_only]
+    public fun test_only_next_leaf_index(): u64 acquires VaultCoreV4 {
+        borrow_global<VaultCoreV4>(@eunoma).next_leaf_index
+    }
+
+    // Bump the GLOBAL next_leaf_index via the SAME production statement shape (post-increment) used
+    // by deposit finalization + the partial-withdraw change-leaf emit. Proves the counter is shared
+    // + strictly monotonic across asset-agnostic appends.
+    #[test_only]
+    public fun test_only_bump_next_leaf_index(): u64 acquires VaultCoreV4 {
+        let core = borrow_global_mut<VaultCoreV4>(@eunoma);
+        core.next_leaf_index = core.next_leaf_index + 1;
+        core.next_leaf_index
+    }
+
+    // Filter the REAL append-only asset_list to status == ACTIVE — the ops-liveness invariant
+    // (dormant-lifecycle-VERIFIED §4.9): the rollover/normalize maintenance loop skips DORMANT (and
+    // PAUSED) rows so one not-yet-allow-listed asset can't abort the whole batch.
+    #[test_only]
+    public fun test_only_active_asset_addrs(): vector<address> acquires AssetRegistryV4 {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        let out = vector::empty<address>();
+        let n = vector::length(&registry.asset_list);
+        let i = 0;
+        while (i < n) {
+            let a = *vector::borrow(&registry.asset_list, i);
+            if (table::borrow(&registry.by_asset, a).status == ASSET_STATUS_ACTIVE) {
+                vector::push_back(&mut out, a);
+            };
+            i = i + 1;
+        };
+        out
+    }
+
+    // Drive the REAL emergency-exit DORMANT gate inside emergency_exit_to_raw_v4 (the
+    // `assert(st.status != DORMANT, E_ASSET_NOT_ACTIVE)` belt: a never-CA-registered asset has
+    // nothing to drain; PAUSED/ACTIVE are allowed because emergency drain is exactly when winding an
+    // asset down). The is_confidentiality_enabled de-list gate + 5-of-7 FROST + withdraw_to_raw are
+    // E2E (CA GlobalConfig is public(friend)-init only). Aborts E_ASSET_NOT_ACTIVE (40) on DORMANT.
+    #[test_only]
+    public fun test_only_assert_emergency_exit_not_dormant(asset_addr: address) acquires AssetRegistryV4 {
+        let registry = borrow_global<AssetRegistryV4>(@eunoma);
+        assert!(
+            table::borrow(&registry.by_asset, asset_addr).status != ASSET_STATUS_DORMANT,
+            E_ASSET_NOT_ACTIVE,
+        );
+    }
+
+    // Expose the REAL emergency-exit attestation serializer (the 5-of-7-signed message). recipient +
+    // amount are SIGNED fields, so two different recipients (or amounts) produce different bytes — a
+    // low-priv relayer cannot redirect the recipient or change the amount without a fresh 5-of-7 sig.
+    #[test_only]
+    public fun test_only_serialize_emergency_exit_msg(
+        domain: vector<u8>,
+        chain_id: u8,
+        bridge: address,
+        vault: address,
+        asset_type: address,
+        operator_set_version: u64,
+        dkg_epoch: u64,
+        roster_hash: vector<u8>,
+        frost_group_pubkey: vector<u8>,
+        recipient: address,
+        amount: u64,
+        expiry_secs: u64,
+    ): vector<u8> {
+        serialize_emergency_exit_attestation_v4_msg(
+            &domain, chain_id, bridge, vault, asset_type,
+            operator_set_version, dkg_epoch, &roster_hash, &frost_group_pubkey,
+            recipient, amount, expiry_secs,
+        )
+    }
+
+    public fun domain_emergency_exit_v4(): vector<u8> { DOMAIN_EMERGENCY_EXIT_V4 }
+    public fun domain_withdraw_v2(): vector<u8> { DOMAIN_WITHDRAW_V2 }
+
+    // Read the IC length of the raw WithdrawProofVK / DepositBindingVK published by the V4 publish
+    // entries (proves the stored ic vectors have WITHDRAW_VK_IC_LENGTH = 7 / DEPOSIT_VK_IC_LENGTH = 6).
+    #[test_only]
+    public fun test_only_withdraw_vk_ic_len(): u64 acquires WithdrawProofVK {
+        if (!exists<WithdrawProofVK>(@eunoma)) { return 0 };
+        vector::length(&borrow_global<WithdrawProofVK>(@eunoma).ic)
+    }
+
+    #[test_only]
+    public fun test_only_deposit_vk_ic_len(): u64 acquires DepositBindingVK {
+        if (!exists<DepositBindingVK>(@eunoma)) { return 0 };
+        vector::length(&borrow_global<DepositBindingVK>(@eunoma).ic)
+    }
+
+    // Build the EXACT 6-public vector that assert_valid_withdraw_proof feeds to Groth16.
+    // Returns (length, public[5]) to pin the change_commitment position without running pairing.
+    #[test_only]
+    public fun test_only_withdraw_publics_index5(
+        root: vector<u8>,
+        nullifier_hash: vector<u8>,
+        asset_id: vector<u8>,
+        recipient_hash: vector<u8>,
+        amount_tag: vector<u8>,
+        ca_payload_hash: vector<u8>,
+        request_hash: vector<u8>,
+        vault_sequence: u64,
+        amount_p_digest: vector<u8>,
+        asp_root: vector<u8>,
+        state_tree_depth: u64,
+        asp_tree_depth: u64,
+        change_commitment: vector<u8>,
+    ): (u64, vector<u8>) {
+        let _asset_id = asset_id;
+        let _recipient_hash = recipient_hash;
+        let _amount_tag = amount_tag;
+        let _ca_payload_hash = ca_payload_hash;
+        let _vault_sequence = vault_sequence;
+        let _state_tree_depth = state_tree_depth;
+        let _asp_tree_depth = asp_tree_depth;
+        let publics = vector[
+            root,
+            nullifier_hash,
+            request_hash,
+            amount_p_digest,
+            asp_root,
+            change_commitment,
+        ];
+        let len = vector::length(&publics);
+        let idx5 = *vector::borrow(&publics, 5);
+        (len, idx5)
+    }
+
+    // V4 const / error-code accessors (sanity-pin the hard invariants in tests).
+    public fun withdraw_vk_ic_length(): u64 { WITHDRAW_VK_IC_LENGTH }
+    public fun deposit_vk_ic_length(): u64 { DEPOSIT_VK_IC_LENGTH }
+    public fun threshold_v2(): u64 { THRESHOLD_V2 }
+    public fun asset_status_dormant(): u8 { ASSET_STATUS_DORMANT }
+    public fun asset_status_active(): u8 { ASSET_STATUS_ACTIVE }
+    public fun asset_status_paused(): u8 { ASSET_STATUS_PAUSED }
+    public fun e_asset_not_active(): u64 { E_ASSET_NOT_ACTIVE }
+    public fun e_asset_already_active(): u64 { E_ASSET_ALREADY_ACTIVE }
+    public fun e_asset_id_mismatch(): u64 { E_ASSET_ID_MISMATCH }
+    public fun e_amount_conservation(): u64 { E_AMOUNT_CONSERVATION }
+    public fun e_not_delisted(): u64 { E_NOT_DELISTED }
+    public fun e_not_admin(): u64 { E_NOT_ADMIN }
+    public fun e_already_initialized(): u64 { E_ALREADY_INITIALIZED }
 }

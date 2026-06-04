@@ -38,7 +38,9 @@ use eunoma_crypto_worker::vault_state_v2::{
     finalize_vault_state_v2 as run_vault_state_v2_finalize,
     init_vault_state_v2 as run_vault_state_v2_init,
     observe_deposit_v2 as run_vault_state_v2_observe_deposit,
+    run_vault_sequence_sync_v2,
     run_vault_resync_v2,
+    VaultSequenceSyncRequest,
     VaultResyncRequest,
     FinalizeRequest as VaultStateV2FinalizeRequest,
     InitRequest as VaultStateV2InitRequest,
@@ -337,6 +339,11 @@ async fn main() {
         // like balance/decrypt_partial.
         .route("/worker/v2/vault/resync", post(vault_resync_http))
         .route("/v2/vault/resync", post(vault_resync_http))
+        // Generic monotonic sequence sync. Used before MPCCA round1 so worker
+        // state catches up after any chain-confirmed entrypoint that bumps
+        // VaultCoreV4.vault_sequence, including ragequit.
+        .route("/worker/v2/vault/sync_sequence", post(vault_sequence_sync_http))
+        .route("/v2/vault/sync_sequence", post(vault_sequence_sync_http))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -1140,6 +1147,41 @@ async fn vault_resync_http(
                 status,
                 Json(json!({
                     "error": "vault_resync_error",
+                    "code": err.code(),
+                    "message": err.code(),
+                })),
+            )
+        }
+    }
+}
+
+// Generic sequence sync — advances local worker vault_sequence to the trusted
+// chain VaultCoreV4.vault_sequence. Unlike withdraw-event resync, this also
+// catches ragequit and any future chain-confirmed entrypoint that bumps the
+// shared vault sequence without carrying the legacy WithdrawEvent binding.
+async fn vault_sequence_sync_http(
+    State(state): State<AppState>,
+    Json(body): Json<VaultSequenceSyncRequest>,
+) -> (StatusCode, Json<Value>) {
+    match run_vault_sequence_sync_v2(
+        &state.state_dir,
+        &state.aptos_node_url,
+        &state.bridge_package_address,
+        &state.bridge_vault_address,
+        &state.bridge_asset_type,
+        &body,
+        None,
+    )
+    .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(json!(resp))),
+        Err(err) => {
+            let status = StatusCode::from_u16(err.status_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (
+                status,
+                Json(json!({
+                    "error": "vault_sequence_sync_error",
                     "code": err.code(),
                     "message": err.code(),
                 })),

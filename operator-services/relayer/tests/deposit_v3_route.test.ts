@@ -7,6 +7,7 @@ import type { GasGuard } from "../src/gas_guard.js";
 function validDepositBody(): Record<string, unknown> {
   const h = (b: string, n = 32) => b.repeat(n);
   return {
+    assetAddr: h("00"),
     userAddr: h("01"),
     commitment: h("aa"),
     amountTag: h("a1"),
@@ -37,6 +38,7 @@ function validDepositBody(): Record<string, unknown> {
 describe("parseDepositV3DelegateArgs", () => {
   it("accepts a valid body and normalizes hex (strips 0x, lowercases)", () => {
     const parsed = parseDepositV3DelegateArgs(validDepositBody());
+    expect(parsed.assetAddr).toBe("00".repeat(32));
     expect(parsed.userAddr).toBe("01".repeat(32));
     expect(parsed.amountP.length).toBe(4);
     expect(parsed.sigmaProtoComm.length).toBe(30);
@@ -81,6 +83,7 @@ describe("relayer /v3/relayer/submit/deposit", () => {
     const server = buildRelayerServer({
       depositV3Submitter: async (args) => {
         called = true;
+        expect(args.assetAddr).toBe("00".repeat(32));
         expect(args.userAddr).toBe("01".repeat(32));
         return okSubmitter();
       },

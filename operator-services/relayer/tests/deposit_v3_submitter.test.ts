@@ -13,6 +13,7 @@ function fixtureArgs(): DepositV3DelegateArgs {
   const hexN = (n: number, seed: number): string =>
     Array.from({ length: n }, (_, i) => ((i + seed) & 0xff).toString(16).padStart(2, "0")).join("");
   return {
+    assetAddr: hex32(0x00),
     userAddr: hex32(0x01),
     commitment: hex32(0x02),
     amountTag: hex32(0x03),
@@ -70,8 +71,8 @@ describe("DEPOSIT_V3_DELEGATE_ENTRIES — field mapping", () => {
       "prepare_deposit_binding_v3_for_user",
       "deposit_step2a_eunoma_verify_v3",
     ]);
-    expect(DEPOSIT_V3_DELEGATE_ENTRIES[0].keys.length).toBe(5);
-    expect(DEPOSIT_V3_DELEGATE_ENTRIES[1].keys.length).toBe(24);
+    expect(DEPOSIT_V3_DELEGATE_ENTRIES[0].keys.length).toBe(6);
+    expect(DEPOSIT_V3_DELEGATE_ENTRIES[1].keys.length).toBe(25);
     // step2b is NOT delegated (user-signed CA debit).
     expect(DEPOSIT_V3_DELEGATE_ENTRIES.some((e) => e.fn.includes("step2b"))).toBe(false);
   });
@@ -81,9 +82,10 @@ describe("DEPOSIT_V3_DELEGATE_ENTRIES — field mapping", () => {
     for (const entry of DEPOSIT_V3_DELEGATE_ENTRIES) {
       expect(encodeDepositV3EntryArgs(entry, args).length).toBe(entry.keys.length);
     }
-    // userAddr encodes as an address: arg (not hex:) so the Move `address` param deserializes.
+    // assetAddr and userAddr encode as address: args (not hex:) so Move address params deserialize.
     const prepare = encodeDepositV3EntryArgs(DEPOSIT_V3_DELEGATE_ENTRIES[0], args);
     expect(prepare[0]).toMatch(/^address:0x/);
+    expect(prepare[1]).toMatch(/^address:0x/);
   });
 });
 

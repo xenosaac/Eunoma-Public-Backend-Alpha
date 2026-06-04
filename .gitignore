@@ -12,6 +12,7 @@ target/
 
 # Aptos local state
 .aptos/
+**/.aptos
 
 # Logs
 *.log
@@ -47,6 +48,7 @@ operator-services/**/testnet_state*.json
 *.r1cs
 *.wtns
 *.sym
+*.v3bak
 
 # Test outputs
 coverage/
@@ -99,3 +101,8 @@ Dockerfile
 /move/.gas_final.json
 /operator-services/scripts/measure_deposit_gas.mjs
 /operator-services/scripts/measure_deposit_gas.mjs.bak
+
+# ---- Public-mirror policy (2026-06-01, per owner): ALL markdown is internal/local-only
+# ---- EXCEPT README. New .md files are auto-ignored; README stays trackable. ----
+*.md
+!README.md

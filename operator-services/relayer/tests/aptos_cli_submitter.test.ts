@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   WITHDRAW_V2_CALL_ARGS_ORDER,
+  WITHDRAW_V2_MONOLITH_CALL_ARGS_ORDER,
   type WithdrawV2CallArgs,
 } from "@eunoma/deop-protocol";
 import {
@@ -23,6 +24,7 @@ function fixtureCallArgs(): WithdrawV2CallArgs {
   const hexN = (n: number, seed: number): string =>
     Array.from({ length: n }, (_, i) => ((i + seed) & 0xff).toString(16).padStart(2, "0")).join("");
   return {
+    assetAddr: hex32(0x01),
     root: hex32(0x10),
     nullifierHash: hex32(0x11),
     recipient: hex32(0x12),
@@ -33,6 +35,10 @@ function fixtureCallArgs(): WithdrawV2CallArgs {
     aspRoot: hex32(0x17),
     stateTreeDepth: "4",
     aspTreeDepth: "3",
+    changeCommitment: hex32(0x18),
+    amountPDigest: hex32(0x19),
+    amountPOld: Array.from({ length: 4 }, (_, i) => hex32(0x1a + i)),
+    amountPRem: Array.from({ length: 4 }, (_, i) => hex32(0x1e + i)),
     vaultSequence: "42",
     withdrawProof: hexN(192, 0x20),
     expirySecs: "1800000000",
@@ -225,24 +231,34 @@ describe("createAptosCliSubmitter — argv encoding", () => {
     const argsIdx = capture.args!.indexOf("--args");
     expect(argsIdx).toBeGreaterThanOrEqual(0);
     const positional = capture.args!.slice(argsIdx + 1);
-    expect(positional.length).toBe(30);
+    // V4 (CP5 RC1): 30 → 31 with assetAddr at index 0.
+    // V4 (CP2 CP1): 31 → 32 with changeCommitment public[12] inserted between
+    // aspTreeDepth and vaultSequence (mirrors withdraw_to_recipient_v2).
+    expect(positional.length).toBe(32);
 
     // Recompute the expected positional vector from the canonical Move-order
     // manifest. If the encoder or the manifest drift, this catches it.
     const expected = encodeCallArgs(args);
     expect(positional).toEqual(expected);
-    expect(expected.length).toBe(WITHDRAW_V2_CALL_ARGS_ORDER.length);
+    expect(WITHDRAW_V2_CALL_ARGS_ORDER.length).toBe(35);
+    expect(expected.length).toBe(WITHDRAW_V2_MONOLITH_CALL_ARGS_ORDER.length);
 
     // Smoke that each positional arg carries the expected aptos-cli type
     // prefix (u64:, hex:, u8:). The order is locked, so we can predict the
     // prefixes positionally.
-    expect(positional[0]).toMatch(/^hex:0x/); // root
-    expect(positional[7]).toMatch(/^hex:0x/); // aspRoot (ASP)
-    expect(positional[8]).toMatch(/^u64:/); // stateTreeDepth (ASP)
-    expect(positional[10]).toMatch(/^u64:/); // vaultSequence
-    expect(positional[12]).toMatch(/^u64:/); // expirySecs
-    expect(positional[14]).toMatch(/^u8:/); // fallbackBitmap
-    expect(positional[24]).toMatch(/^hex:\[/); // amountRVolunAuds (vector form)
+    // V4 (CP5 RC1): assetAddr at index 0 (address: form), shifting every
+    // subsequent positional by +1.
+    // V4 (CP2 CP1): changeCommitment public[12] at index 11 shifts every
+    // positional from vaultSequence onward by +1.
+    expect(positional[0]).toMatch(/^address:0x/); // assetAddr
+    expect(positional[1]).toMatch(/^hex:0x/); // root
+    expect(positional[8]).toMatch(/^hex:0x/); // aspRoot (ASP)
+    expect(positional[9]).toMatch(/^u64:/); // stateTreeDepth (ASP)
+    expect(positional[11]).toMatch(/^hex:0x/); // changeCommitment (V4 CP1)
+    expect(positional[12]).toMatch(/^u64:/); // vaultSequence
+    expect(positional[14]).toMatch(/^u64:/); // expirySecs
+    expect(positional[16]).toMatch(/^u8:/); // fallbackBitmap
+    expect(positional[26]).toMatch(/^hex:\[/); // amountRVolunAuds (vector form)
   });
 });
 

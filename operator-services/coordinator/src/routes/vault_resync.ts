@@ -70,6 +70,7 @@ export type VaultResyncForwarder = (
 
 const DEFAULT_WORKER_TIMEOUT_MS = 30_000;
 const WORKER_RESYNC_PATH = "/v2/vault/resync";
+const WORKER_SYNC_SEQUENCE_PATH = "/v2/vault/sync_sequence";
 
 export type VaultResyncTrigger = "after_withdraw" | "before_round1";
 
@@ -86,6 +87,14 @@ interface ParsedResyncRequest {
   requestHash: string;
   eventVaultSequence: number;
   expectedNextSequence: number;
+}
+
+interface ParsedSequenceSyncRequest {
+  dkgEpoch: string;
+  requestId: string;
+  bridgePackage: string;
+  vault: string;
+  assetType: string;
 }
 
 const HEX64_RE = /^(0x)?[0-9a-fA-F]{64}$/;
@@ -159,6 +168,44 @@ function parseRequest(raw: unknown): ParsedResyncRequest {
     requestHash: reqHex64("requestHash"),
     eventVaultSequence,
     expectedNextSequence,
+  };
+}
+
+function parseSequenceSyncRequest(raw: unknown): ParsedSequenceSyncRequest {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("invalid_request:body_must_be_object");
+  }
+  const obj = raw as Record<string, unknown>;
+  if ("caDkgV2Roster" in obj) {
+    throw new Error("invalid_request:caDkgV2Roster_not_allowed_in_body");
+  }
+  const reqString = (key: string): string => {
+    const v = obj[key];
+    if (typeof v !== "string" || v.length === 0) {
+      throw new Error(`invalid_request:${key}_must_be_nonempty_string`);
+    }
+    return v;
+  };
+  const reqAddr = (key: string): string => {
+    const v = reqString(key);
+    if (!ADDR_RE.test(v)) {
+      throw new Error(`invalid_request:${key}_must_be_hex_address`);
+    }
+    return v;
+  };
+  const reqSafeId = (key: string): string => {
+    const v = reqString(key);
+    if (!SAFE_ID_RE.test(v)) {
+      throw new Error(`invalid_request:${key}_must_be_safe_id`);
+    }
+    return v;
+  };
+  return {
+    dkgEpoch: reqSafeId("dkgEpoch"),
+    requestId: reqSafeId("requestId"),
+    bridgePackage: reqAddr("bridgePackage"),
+    vault: reqAddr("vault"),
+    assetType: reqString("assetType"),
   };
 }
 
@@ -359,6 +406,169 @@ export function registerVaultResyncRoute(
           error: "internal_error",
           requestId: parsed.requestId,
           message: `vault_resync transcript persist failed: ${
+            err instanceof Error ? err.message : "unknown"
+          }`,
+        });
+      }
+    }
+
+    return reply.code(thresholdMet ? 200 : 502).send(responseBody);
+  });
+}
+
+export function registerVaultSequenceSyncRoute(
+  app: FastifyInstance,
+  opts: RegisterVaultResyncOptions,
+): void {
+  const workerTimeoutMs = opts.workerTimeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS;
+
+  app.post("/v2/vault/sync_sequence", async (req: FastifyRequest, reply: FastifyReply) => {
+    const raw = req.body ?? {};
+
+    try {
+      assertNoForbiddenKeys(raw);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "forbidden_field";
+      return reply
+        .code(400)
+        .send({ error: msg.split(":")[0], field: msg.split(":").slice(1).join(":") });
+    }
+
+    let parsed: ParsedSequenceSyncRequest;
+    try {
+      parsed = parseSequenceSyncRequest(raw);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "invalid_request:unknown";
+      const [code, ...rest] = msg.split(":");
+      return reply.code(400).send({ error: code ?? "invalid_request", message: rest.join(":") });
+    }
+
+    const configuredVault = opts.getBridgeVaultAddress();
+    const configuredAsset = opts.getBridgeAssetType();
+    if (!configuredVault || !configuredAsset) {
+      return reply.code(500).send({
+        error: "internal_error",
+        message:
+          "coordinator missing BRIDGE_VAULT_ADDRESS or BRIDGE_ASSET_TYPE config — refusing to sync vault sequence",
+      });
+    }
+    const cfgVaultNorm = normalizeAptosAddr(configuredVault);
+    const reqVaultNorm = normalizeAptosAddr(parsed.vault);
+    if (!cfgVaultNorm || !reqVaultNorm || cfgVaultNorm !== reqVaultNorm) {
+      return reply
+        .code(400)
+        .send({ error: "invalid_request", message: "vault does not match the configured bridge vault" });
+    }
+    const stripPrefix = (s: string): string => s.toLowerCase().replace(/^0x/, "");
+    const cfgAssetNorm = normalizeAptosAddr(configuredAsset);
+    const reqAssetNorm = normalizeAptosAddr(parsed.assetType);
+    const assetMatches =
+      cfgAssetNorm && reqAssetNorm
+        ? cfgAssetNorm === reqAssetNorm
+        : stripPrefix(configuredAsset) === stripPrefix(parsed.assetType);
+    if (!assetMatches) {
+      return reply
+        .code(400)
+        .send({ error: "invalid_request", message: "assetType does not match the configured bridge asset" });
+    }
+
+    const dkgRoster = opts.getDefaultRoster();
+    if (!dkgRoster) {
+      return reply
+        .code(400)
+        .send({ error: "invalid_request", message: "CA_DKG_V2_ROSTER_JSON is required for vault sequence sync" });
+    }
+    if (parsed.dkgEpoch !== dkgRoster.dkgEpoch) {
+      return reply.code(400).send({
+        error: "stale_dkg_epoch",
+        message: `request.dkgEpoch=${parsed.dkgEpoch} roster.dkgEpoch=${dkgRoster.dkgEpoch}`,
+      });
+    }
+    if (dkgRoster.nodes.length < DEOPERATOR_THRESHOLD) {
+      return reply.code(400).send({
+        error: "under_quorum",
+        message: `roster has ${dkgRoster.nodes.length} nodes < threshold ${DEOPERATOR_THRESHOLD}`,
+      });
+    }
+
+    const workerBody = {
+      dkgEpoch: parsed.dkgEpoch,
+      requestId: parsed.requestId,
+      bridgePackage: parsed.bridgePackage,
+      vault: parsed.vault,
+      assetType: parsed.assetType,
+    };
+    const allSlots = dkgRoster.nodes.map((n) => n.slot).sort((a, b) => a - b);
+    const results: ForwarderResult[] = await Promise.all(
+      allSlots.map<Promise<ForwarderResult>>(async (slot) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), workerTimeoutMs);
+        try {
+          return await opts.forwarder(
+            WORKER_SYNC_SEQUENCE_PATH,
+            workerBody,
+            dkgRoster,
+            slot,
+            controller.signal,
+          );
+        } catch (err) {
+          return {
+            slot,
+            ok: false,
+            error: err instanceof Error ? err.message : "worker_forward_rejected",
+          };
+        } finally {
+          clearTimeout(timer);
+        }
+      }),
+    );
+
+    const okSlots = results.filter((r) => r.ok && r.statusCode === 200).map((r) => r.slot).sort((a, b) => a - b);
+    const failedSlots = allSlots.filter((s) => !okSlots.includes(s));
+    const thresholdMet = okSlots.length >= DEOPERATOR_THRESHOLD;
+    const summary = {
+      okSlots,
+      failedSlots,
+      total: allSlots.length,
+      threshold: DEOPERATOR_THRESHOLD,
+      thresholdMet,
+    };
+    const responseBody = { ok: thresholdMet, trigger: "sync_sequence", requestId: parsed.requestId, summary, results };
+
+    try {
+      assertNoForbiddenKeys(responseBody);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "forbidden_field";
+      return reply.code(500).send({ error: "outbound_forbidden_field", message: msg });
+    }
+
+    if (opts.stateRoot) {
+      try {
+        const dir = join(opts.stateRoot, "coordinator", "vault_sequence_sync");
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        const finalPath = join(dir, `${parsed.dkgEpoch}__${parsed.requestId}.json`);
+        const tmpPath = `${finalPath}.tmp.${process.pid}`;
+        await writeFile(
+          tmpPath,
+          JSON.stringify(
+            {
+              trigger: "sync_sequence",
+              request: workerBody,
+              summary,
+              results,
+              writtenAtMs: Date.now(),
+            },
+            null,
+            2,
+          ),
+          { mode: 0o600 },
+        );
+        await rename(tmpPath, finalPath);
+      } catch (err) {
+        return reply.code(500).send({
+          error: "internal_error",
+          requestId: parsed.requestId,
+          message: `vault_sequence_sync transcript persist failed: ${
             err instanceof Error ? err.message : "unknown"
           }`,
         });

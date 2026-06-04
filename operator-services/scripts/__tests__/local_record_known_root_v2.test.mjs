@@ -331,6 +331,93 @@ exit 99
       await new Promise((resolve) => server.close(resolve));
     }
   });
+
+  it("defers instead of submitting when the known_roots precheck is unavailable", async () => {
+    const { path } = await makeTreeFixture(stateDir, 8);
+    const fakeBin = join(tmpRoot, "bin-precheck-defer");
+    const aptosInvokedPath = join(tmpRoot, "aptos_precheck_defer_invoked");
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      join(fakeBin, "aptos"),
+      `#!/usr/bin/env bash
+echo invoked > "${aptosInvokedPath}"
+exit 99
+`,
+    );
+    chmodSync(join(fakeBin, "aptos"), 0o755);
+
+    const server = createServer((_req, res) => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "fullnode unavailable" }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    try {
+      const r = await runCliAsync(
+        [
+          "--bridge-package-address",
+          BRIDGE,
+          "--commitment-tree",
+          path,
+          "--state-dir",
+          stateDir,
+          "--aptos-node-url",
+          `http://127.0.0.1:${port}/v1`,
+        ],
+        { PATH: `${fakeBin}:${process.env.PATH}` },
+      );
+      expect(r.status).toBe(32);
+      expect(r.stderr).toMatch(/not submitting duplicate-prone record_known_root tx/);
+      expect(existsSync(aptosInvokedPath)).toBe(false);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it("can preserve legacy submit-on-precheck-failure behavior behind an explicit env override", async () => {
+    const { path } = await makeTreeFixture(stateDir, 8);
+    const fakeBin = join(tmpRoot, "bin-precheck-override");
+    const aptosInvokedPath = join(tmpRoot, "aptos_precheck_override_invoked");
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      join(fakeBin, "aptos"),
+      `#!/usr/bin/env bash
+echo invoked > "${aptosInvokedPath}"
+exit 99
+`,
+    );
+    chmodSync(join(fakeBin, "aptos"), 0o755);
+
+    const server = createServer((_req, res) => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "fullnode unavailable" }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    try {
+      const r = await runCliAsync(
+        [
+          "--bridge-package-address",
+          BRIDGE,
+          "--commitment-tree",
+          path,
+          "--state-dir",
+          stateDir,
+          "--aptos-node-url",
+          `http://127.0.0.1:${port}/v1`,
+        ],
+        {
+          PATH: `${fakeBin}:${process.env.PATH}`,
+          EUNOMA_RECORD_KNOWN_ROOT_SUBMIT_ON_PRECHECK_FAILURE: "1",
+        },
+      );
+      expect(r.status).toBe(31);
+      expect(r.stderr).toMatch(/submitting anyway because EUNOMA_RECORD_KNOWN_ROOT_SUBMIT_ON_PRECHECK_FAILURE=1/);
+      expect(existsSync(aptosInvokedPath)).toBe(true);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
 });
 
 describe("local_record_known_root_v2 — legacy single-leaf rejection", () => {

@@ -24,6 +24,7 @@ import {
 } from "./server.js";
 
 export interface DepositV3DelegateArgs {
+  assetAddr: string;
   userAddr: string;
   commitment: string;
   amountTag: string;
@@ -53,6 +54,7 @@ export interface DepositV3DelegateArgs {
 type FieldType = "address" | "hex" | "u64" | "u8" | "hexVector" | "hexVector3";
 
 const FIELD_TYPES: Record<keyof DepositV3DelegateArgs, FieldType> = {
+  assetAddr: "address",
   userAddr: "address",
   commitment: "hex",
   amountTag: "hex",
@@ -117,12 +119,12 @@ export interface DepositV3DelegateEntry {
 export const DEPOSIT_V3_DELEGATE_ENTRIES: ReadonlyArray<DepositV3DelegateEntry> = [
   {
     fn: "prepare_deposit_binding_v3_for_user",
-    keys: ["userAddr", "commitment", "amountTag", "amountP", "depositBindingProof"],
+    keys: ["assetAddr", "userAddr", "commitment", "amountTag", "amountP", "depositBindingProof"],
   },
   {
     fn: "deposit_step2a_eunoma_verify_v3",
     keys: [
-      "userAddr", "commitment", "amountTag", "caPayloadHash", "depositNonce",
+      "assetAddr", "userAddr", "commitment", "amountTag", "caPayloadHash", "depositNonce",
       "depositBindingProof", "expirySecs", "groupSignature", "fallbackBitmap",
       "fallbackSignatures", "newBalanceP", "newBalanceR", "newBalanceREffAud",
       "amountP", "amountRSender", "amountRRecip", "amountREffAud", "ekVolunAuds",

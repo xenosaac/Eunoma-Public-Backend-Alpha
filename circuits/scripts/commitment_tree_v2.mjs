@@ -107,16 +107,38 @@ export class CommitmentTreeV2 {
     }
   }
 
+  // V4 OB1: ordering key is the GLOBAL on-chain `leafIndex` (0-based, monotonic across ALL assets
+  // AND across both leaf classes — deposits via DepositConfirmedV4 + change notes via
+  // ChangeNoteAppendedV4). The dense gap-check is now on `leafIndex` (expected === current leaf
+  // count), NOT the per-asset `depositCount`. `depositCount`/`kind`/`assetType` are retained as
+  // PUBLIC per-leaf metadata only (audit/observe cursors); they are NOT the tree ordering key.
+  //
+  // Back-compat: a legacy single-asset caller that passes only `meta.depositCount` (1-based dense)
+  // and no `meta.leafIndex` is mapped to `leafIndex = depositCount - 1` so the same dense stream
+  // ingests unchanged.
   append(commitmentBig, meta) {
     if (typeof commitmentBig !== "bigint") {
       throw new Error("append: commitmentBig must be bigint");
     }
-    if (!meta || typeof meta.depositCount !== "number") {
-      throw new Error("append: meta.depositCount must be number");
+    if (!meta || typeof meta !== "object") {
+      throw new Error("append: meta must be an object");
     }
-    if (meta.depositCount !== this.leaves.length + 1) {
+    // Resolve the global leaf index (ordering key). Prefer explicit leafIndex; fall back to the
+    // legacy 1-based depositCount for single-asset back-compat.
+    let leafIndex;
+    if (meta.leafIndex !== undefined && meta.leafIndex !== null) {
+      if (typeof meta.leafIndex !== "number" || !Number.isInteger(meta.leafIndex)) {
+        throw new Error(`append: meta.leafIndex must be an integer, got ${meta.leafIndex}`);
+      }
+      leafIndex = meta.leafIndex;
+    } else if (typeof meta.depositCount === "number") {
+      leafIndex = meta.depositCount - 1; // legacy 1-based dense → 0-based global
+    } else {
+      throw new Error("append: meta.leafIndex (or legacy meta.depositCount) required");
+    }
+    if (leafIndex !== this.leaves.length) {
       throw new Error(
-        `deposit_count_gap: expected ${this.leaves.length + 1}, got ${meta.depositCount}`,
+        `leaf_index_gap: expected ${this.leaves.length}, got ${leafIndex}`,
       );
     }
     if (
@@ -129,9 +151,14 @@ export class CommitmentTreeV2 {
     if (rebuiltBig !== commitmentBig) {
       throw new Error("append: commitmentBig does not match leBytesToBig(hexToLE32(commitmentHex))");
     }
+    const kind = meta.kind === "change" ? "change" : "deposit";
     this.leaves.push(commitmentBig);
     this.depositMeta.push({
-      depositCount: meta.depositCount,
+      leafIndex,
+      kind, // "deposit" (DepositConfirmedV4) | "change" (ChangeNoteAppendedV4)
+      // depositCount is a PER-ASSET observer cursor; only meaningful for deposit leaves.
+      depositCount: typeof meta.depositCount === "number" ? meta.depositCount : 0,
+      assetType: typeof meta.assetType === "string" ? meta.assetType.toLowerCase() : "",
       depositTxHash: typeof meta.depositTxHash === "string" ? meta.depositTxHash : "",
       txVersion: String(meta.txVersion ?? ""),
       sequenceNumber: String(meta.sequenceNumber ?? ""),
@@ -212,7 +239,12 @@ export class CommitmentTreeV2 {
     for (let i = 0; i < this.leaves.length; i++) {
       const meta = this.depositMeta[i];
       pushFr(enc, this.leaves[i]);
-      pushU64LE(enc, meta.depositCount);
+      // V4 OB1: bind the global leaf_index + leaf class + asset_type so any reorder/tamper of the
+      // unified (deposit + change-note, multi-asset) leaf stream invalidates the transcript hash.
+      pushU64LE(enc, meta.leafIndex ?? i);
+      pushLpString(enc, meta.kind ?? "deposit");
+      pushLpString(enc, meta.assetType ?? "");
+      pushU64LE(enc, meta.depositCount ?? 0);
       pushLpString(enc, meta.commitmentHex);
       pushLpString(enc, meta.sender);
       pushLpString(enc, meta.depositTxHash);
@@ -269,6 +301,11 @@ export class CommitmentTreeV2 {
       const meta = obj.depositMeta[i];
       const commitmentBig = leBytesToBig(hexToLE32(leafHex));
       t.append(commitmentBig, {
+        // V4 OB1: prefer the persisted global leafIndex; fall back to dense position for legacy
+        // single-asset snapshots that predate the unified-index meta.
+        leafIndex: typeof meta.leafIndex === "number" ? meta.leafIndex : i,
+        kind: meta.kind,
+        assetType: meta.assetType,
         depositCount: meta.depositCount,
         depositTxHash: meta.depositTxHash,
         txVersion: meta.txVersion,

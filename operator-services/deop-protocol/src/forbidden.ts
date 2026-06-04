@@ -49,6 +49,17 @@ const FORBIDDEN_FIELD_NAMES = new Set([
   "ca_dk_share",
   "shamirshare",
   "shamir_share",
+  // V4 partial-withdraw change-note LINEAGE — FRONTEND-ONLY metadata. It must NEVER become a circuit
+  // input or a Move call-arg: a parent identifier on the spend/proof boundary re-links deposit↔
+  // withdraw (the exact correlation WithdrawConfirmedV4's minimal fields exist to avoid). Ban the
+  // lineage block and its load-bearing parent identifiers defensively.
+  "lineage",
+  "parentcommitment",
+  "parent_commitment",
+  "parentnullifier",
+  "parent_nullifier",
+  "parentnullifierhash",
+  "parent_nullifier_hash",
 ]);
 
 export function assertNoForbiddenPlaintextFields(value: unknown): void {
