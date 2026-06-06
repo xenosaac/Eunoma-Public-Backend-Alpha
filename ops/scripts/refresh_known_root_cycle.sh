@@ -171,6 +171,63 @@ read_observed_queue() {
   normalize_tx_hashes < "${OBSERVED_QUEUE}"
 }
 
+recover_published_tree_from_validated_staging() {
+  if [ -f "${LEANIMT_JSON}" ] && [ -f "${TREE_JSON}" ]; then
+    return 0
+  fi
+  if [ ! -f "${STAGED_LEANIMT_JSON}" ]; then
+    return 0
+  fi
+
+  local root_prefix
+  root_prefix=$(node - "${STAGED_LEANIMT_JSON}" "${STATE_DIR}" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const [stagedPath, stateDir] = process.argv.slice(2);
+let staged;
+try {
+  staged = JSON.parse(fs.readFileSync(stagedPath, "utf8"));
+} catch {
+  process.exit(0);
+}
+const root = typeof staged.latestRootHex === "string" ? staged.latestRootHex.toLowerCase() : "";
+if (
+  staged.scheme !== "eunoma_leanimt_tree_v1" ||
+  !/^0x[0-9a-f]{64}$/.test(root) ||
+  !Array.isArray(staged.leaves) ||
+  !Array.isArray(staged.depositMeta)
+) {
+  process.exit(0);
+}
+const prefix = root.slice(2, 10);
+const sidecarPath = path.join(stateDir, `known_root_v2_${prefix}.json`);
+let sidecar;
+try {
+  sidecar = JSON.parse(fs.readFileSync(sidecarPath, "utf8"));
+} catch {
+  process.exit(0);
+}
+if (typeof sidecar.rootHex === "string" && sidecar.rootHex.toLowerCase() !== root) {
+  process.exit(0);
+}
+process.stdout.write(prefix);
+NODE
+)
+  if [ -z "${root_prefix}" ]; then
+    return 0
+  fi
+
+  echo "[$(date -u +%FT%TZ)] refresh_known_root_cycle: recovering missing public tree from validated staging root ${root_prefix}"
+  if [ ! -f "${LEANIMT_JSON}" ]; then
+    cp "${STAGED_LEANIMT_JSON}" "${LEANIMT_JSON}.tmp"
+    mv "${LEANIMT_JSON}.tmp" "${LEANIMT_JSON}"
+  fi
+  if [ ! -f "${TREE_JSON}" ] && [ -f "${STAGED_TREE_JSON}" ]; then
+    cp "${STAGED_TREE_JSON}" "${TREE_JSON}.tmp"
+    mv "${TREE_JSON}.tmp" "${TREE_JSON}"
+  fi
+}
+
 prune_observed_queue() {
   if [ ! -f "${OBSERVED_QUEUE}" ]; then
     return 0
@@ -544,6 +601,7 @@ normalize_if_needed() {
 # Re-pack chain available_balance into the 4 x 16-bit chunk layout the CA framework
 # requires for the next transfer / withdraw. Idempotent: the script's first action
 # is `is_normalized(vault, asset_type)` view; when already normalized it exits 0.
+recover_published_tree_from_validated_staging
 normalize_if_needed "before tree refresh"
 
 EXTRA_TX_HASHES=${EUNOMA_EXTRA_DEPOSIT_TX_HASHES:-}

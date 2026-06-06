@@ -2,10 +2,11 @@
  * M10-c payload types for the coordinator's `POST /v2/balance/decrypt` fan-out route.
  *
  * The orchestrator (M10-d) sends `BalanceDecryptRequest` to the coordinator; the
- * coordinator selects a 5-of-7 quorum, fans out to each worker's M10-b
+ * coordinator fans out to the configured 7-worker roster, keeps a valid
+ * 5-of-7 quorum, calls each worker's M10-b
  * `/v2/balance/decrypt_partial` (or `/worker/v2/balance/decrypt_partial`),
  * verifies each worker's SHA-256 transcript hash byte-for-byte, computes
- * Lagrange coefficients over the selected quorum's slot ids, and returns
+ * Lagrange coefficients over the returned quorum's slot ids, and returns
  * `BalanceDecryptResponse` to the caller.
  *
  * The shapes mirror what M10-b returns (snake_case `partial_hex`,

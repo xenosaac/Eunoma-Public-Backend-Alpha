@@ -5,12 +5,21 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use eunoma_crypto_worker::ca_dkg_v2::{init_hpke_local, run_round as run_ca_dkg_v2_round, CaDkgV2RoundRequest};
+use eunoma_crypto_worker::ca_dkg_v2::{
+    init_hpke_local, run_round as run_ca_dkg_v2_round, CaDkgV2RoundRequest,
+};
 use eunoma_crypto_worker::ca_local::{
     aggregate_registration_commitment, aggregate_registration_proof, ca_state_summary,
-    create_registration_nonce_commitment, create_registration_partial_response,
-    init_ca_dkg_local, load_ca_share, registration_challenge, RegistrationCommitmentInput,
-    RegistrationResponseInput,
+    create_registration_nonce_commitment, create_registration_partial_response, init_ca_dkg_local,
+    load_ca_share, registration_challenge, RegistrationCommitmentInput, RegistrationResponseInput,
+};
+use eunoma_crypto_worker::ca_registration_v2::{
+    aggregate_commitments_v2, challenge_v2, create_registration_nonce_commitment_v2,
+    create_registration_partial_response_v2, run_aggregate_v2 as run_ca_registration_v2_aggregate,
+    run_verify_v2 as run_ca_registration_v2_verify,
+    AggregateRequest as CaRegistrationV2AggregateRequest,
+    Round1Request as CaRegistrationV2Round1Request, Round2Request as CaRegistrationV2Round2Request,
+    VerifyRequest as CaRegistrationV2VerifyRequest,
 };
 use eunoma_crypto_worker::frost_dkg_v2::{
     run_round as run_frost_dkg_v2_round, FrostDkgV2Roster, FrostDkgV2RoundRequest,
@@ -23,40 +32,26 @@ use eunoma_crypto_worker::local_state::{
 };
 use eunoma_crypto_worker::mpc_inverse_adapter::{MpcInverseAdapter, UnavailableMpcInverseAdapter};
 use eunoma_crypto_worker::mpc_spdz_adapter::MpcSpdzInverseAdapter;
+use eunoma_crypto_worker::mpcca_withdraw_v2::{
+    last_persisted_round_state as mpcca_last_persisted_round_state, mpcca_withdraw_session_dir,
+    run_finalize_v2 as run_mpcca_withdraw_finalize_v2, run_prove_v2 as run_mpcca_withdraw_prove_v2,
+    run_round1_v2 as run_mpcca_withdraw_round1_v2, run_round2_v2 as run_mpcca_withdraw_round2_v2,
+    ChainedRoundRequest as MpccaWithdrawChainedRoundRequest,
+    FinalizeRequest as MpccaWithdrawFinalizeRequest, Round1Request as MpccaWithdrawRound1Request,
+    Round2Request as MpccaWithdrawRound2Request,
+};
 use eunoma_crypto_worker::vault_ek_derivation_v2::{
     run_round0 as run_vault_ek_round0, run_round1 as run_vault_ek_round1,
     run_verify as run_vault_ek_verify, Round0Request, Round1Request, VerifyRequest,
 };
-use eunoma_crypto_worker::ca_registration_v2::{
-    aggregate_commitments_v2, challenge_v2, create_registration_nonce_commitment_v2,
-    create_registration_partial_response_v2, run_aggregate_v2 as run_ca_registration_v2_aggregate,
-    run_verify_v2 as run_ca_registration_v2_verify, AggregateRequest as CaRegistrationV2AggregateRequest,
-    Round1Request as CaRegistrationV2Round1Request,
-    Round2Request as CaRegistrationV2Round2Request, VerifyRequest as CaRegistrationV2VerifyRequest,
-};
 use eunoma_crypto_worker::vault_state_v2::{
     finalize_vault_state_v2 as run_vault_state_v2_finalize,
     init_vault_state_v2 as run_vault_state_v2_init,
-    observe_deposit_v2 as run_vault_state_v2_observe_deposit,
-    run_vault_sequence_sync_v2,
-    run_vault_resync_v2,
-    VaultSequenceSyncRequest,
-    VaultResyncRequest,
-    FinalizeRequest as VaultStateV2FinalizeRequest,
+    observe_deposit_v2 as run_vault_state_v2_observe_deposit, run_vault_resync_v2,
+    run_vault_sequence_sync_v2, FinalizeRequest as VaultStateV2FinalizeRequest,
     InitRequest as VaultStateV2InitRequest,
-    ObserveDepositRequest as VaultStateV2ObserveDepositRequest,
-};
-use eunoma_crypto_worker::mpcca_withdraw_v2::{
-    last_persisted_round_state as mpcca_last_persisted_round_state,
-    mpcca_withdraw_session_dir,
-    run_finalize_v2 as run_mpcca_withdraw_finalize_v2,
-    run_prove_v2 as run_mpcca_withdraw_prove_v2,
-    run_round1_v2 as run_mpcca_withdraw_round1_v2,
-    run_round2_v2 as run_mpcca_withdraw_round2_v2,
-    ChainedRoundRequest as MpccaWithdrawChainedRoundRequest,
-    FinalizeRequest as MpccaWithdrawFinalizeRequest,
-    Round1Request as MpccaWithdrawRound1Request,
-    Round2Request as MpccaWithdrawRound2Request,
+    ObserveDepositRequest as VaultStateV2ObserveDepositRequest, VaultResyncRequest,
+    VaultSequenceSyncRequest,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -114,9 +109,7 @@ impl eunoma_crypto_worker::balance_decrypt::AppStateForBalanceDecrypt for AppSta
 // handler's read-only view. No chain re-fetch (no aptos_node_url needed)
 // but the (vault, asset) bridge binding still applies — same M10-l iter-6
 // closure as balance_decrypt.
-impl eunoma_crypto_worker::normalize_sigma_partial::AppStateForNormalizeSigmaPartial
-    for AppState
-{
+impl eunoma_crypto_worker::normalize_sigma_partial::AppStateForNormalizeSigmaPartial for AppState {
     fn state_dir(&self) -> &std::path::Path {
         &self.state_dir
     }
@@ -141,7 +134,10 @@ async fn main() {
         run_init_ca_local(args);
         return;
     }
-    if args.first().is_some_and(|arg| arg == "init-ca-dkg-v2-hpke-local") {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "init-ca-dkg-v2-hpke-local")
+    {
         args.remove(0);
         run_init_ca_dkg_v2_hpke_local(args);
         return;
@@ -195,10 +191,7 @@ async fn main() {
         .route("/worker/v2/session-share", post(fail_closed))
         .route("/worker/v2/dkg/ca/start", post(ca_dkg_start))
         .route("/worker/v2/dkg/frost/start", post(frost_dkg_start))
-        .route(
-            "/worker/v2/dkg/:protocol/:round",
-            post(dkg_round),
-        )
+        .route("/worker/v2/dkg/:protocol/:round", post(dkg_round))
         // Codex M3a P3: the legacy generic MPCCA route was removed. Its only crypto path
         // was `load_ca_share(&state.state_dir)` which crosses the `ca_local` trusted-party
         // surface — a violation of the V2 invariant that production code must not import
@@ -262,10 +255,7 @@ async fn main() {
         // Milestone 2a — per-worker vault-state share initialisation. Bound to (Phase 2
         // vault_ek, Milestone 1 sigma tuple, CA DKG V2 share metadata). No secret material on
         // the wire; the worker re-verifies the Milestone 1 public equation before persisting.
-        .route(
-            "/worker/v2/vault_state/init",
-            post(vault_state_v2_init),
-        )
+        .route("/worker/v2/vault_state/init", post(vault_state_v2_init))
         // Codex M3a P1 (regression fix): vault_state_v2 init finalize. Coordinator fans this
         // round out AFTER collecting all 5 per-slot init contributions + computing the FINAL
         // transcript hash. Each worker re-derives the final hash locally, asserts byte-
@@ -342,7 +332,10 @@ async fn main() {
         // Generic monotonic sequence sync. Used before MPCCA round1 so worker
         // state catches up after any chain-confirmed entrypoint that bumps
         // VaultCoreV4.vault_sequence, including ragequit.
-        .route("/worker/v2/vault/sync_sequence", post(vault_sequence_sync_http))
+        .route(
+            "/worker/v2/vault/sync_sequence",
+            post(vault_sequence_sync_http),
+        )
         .route("/v2/vault/sync_sequence", post(vault_sequence_sync_http))
         .with_state(app_state);
 
@@ -377,11 +370,10 @@ fn run_init_frost_local(args: Vec<String>) {
         }
         index += 1;
     }
-    match init_frost_local(&state_root, force)
-        .and_then(|summary| serde_json::to_string_pretty(&summary).map_err(|err| {
-            eunoma_crypto_worker::WorkerError::Serde(err.to_string())
-        }))
-    {
+    match init_frost_local(&state_root, force).and_then(|summary| {
+        serde_json::to_string_pretty(&summary)
+            .map_err(|err| eunoma_crypto_worker::WorkerError::Serde(err.to_string()))
+    }) {
         Ok(json) => println!("{json}"),
         Err(err) => {
             eprintln!("init-frost-local failed: {err:?}");
@@ -421,11 +413,10 @@ fn run_init_ca_local(args: Vec<String>) {
         }
         index += 1;
     }
-    match init_ca_dkg_local(&state_root, &dkg_epoch, force)
-        .and_then(|summary| serde_json::to_string_pretty(&summary).map_err(|err| {
-            eunoma_crypto_worker::WorkerError::Serde(err.to_string())
-        }))
-    {
+    match init_ca_dkg_local(&state_root, &dkg_epoch, force).and_then(|summary| {
+        serde_json::to_string_pretty(&summary)
+            .map_err(|err| eunoma_crypto_worker::WorkerError::Serde(err.to_string()))
+    }) {
         Ok(json) => println!("{json}"),
         Err(err) => {
             eprintln!("init-ca-local failed: {err:?}");
@@ -456,11 +447,10 @@ fn run_init_ca_dkg_v2_hpke_local(args: Vec<String>) {
         }
         index += 1;
     }
-    match init_hpke_local(&state_root, force)
-        .and_then(|summary| serde_json::to_string_pretty(&summary).map_err(|err| {
-            eunoma_crypto_worker::WorkerError::Serde(err.to_string())
-        }))
-    {
+    match init_hpke_local(&state_root, force).and_then(|summary| {
+        serde_json::to_string_pretty(&summary)
+            .map_err(|err| eunoma_crypto_worker::WorkerError::Serde(err.to_string()))
+    }) {
         Ok(json) => println!("{json}"),
         Err(err) => {
             eprintln!("init-ca-dkg-v2-hpke-local failed: {err:?}");
@@ -489,20 +479,23 @@ async fn local_state(State(state): State<AppState>) -> impl IntoResponse {
     match state_summary(state.slot, &state.state_dir) {
         Ok(summary) => {
             let ca = ca_state_summary(state.slot, &state.state_dir).ok();
-            (StatusCode::OK, Json(json!({
-                "slot": summary.slot,
-                "state_dir": summary.state_dir,
-                "has_frost_key_package": summary.has_frost_key_package,
-                "has_frost_public_package": summary.has_frost_public_package,
-                "frost_key_package_hash": summary.frost_key_package_hash,
-                "frost_public_package_hash": summary.frost_public_package_hash,
-                "pending_frost_nonces": summary.pending_frost_nonces,
-                "has_ca_dkg_share": ca.as_ref().is_some_and(|item| item.has_ca_dkg_share),
-                "ca_dkg_share_hash": ca.as_ref().and_then(|item| item.ca_dkg_share_hash.clone()),
-                "ca_dkg_transcript_hash": ca.as_ref().and_then(|item| item.ca_dkg_transcript_hash.clone()),
-                "vault_ek": ca.as_ref().and_then(|item| item.vault_ek.clone()),
-                "pending_registration_nonces": ca.as_ref().map(|item| item.pending_registration_nonces).unwrap_or(0),
-            })))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "slot": summary.slot,
+                    "state_dir": summary.state_dir,
+                    "has_frost_key_package": summary.has_frost_key_package,
+                    "has_frost_public_package": summary.has_frost_public_package,
+                    "frost_key_package_hash": summary.frost_key_package_hash,
+                    "frost_public_package_hash": summary.frost_public_package_hash,
+                    "pending_frost_nonces": summary.pending_frost_nonces,
+                    "has_ca_dkg_share": ca.as_ref().is_some_and(|item| item.has_ca_dkg_share),
+                    "ca_dkg_share_hash": ca.as_ref().and_then(|item| item.ca_dkg_share_hash.clone()),
+                    "ca_dkg_transcript_hash": ca.as_ref().and_then(|item| item.ca_dkg_transcript_hash.clone()),
+                    "vault_ek": ca.as_ref().and_then(|item| item.vault_ek.clone()),
+                    "pending_registration_nonces": ca.as_ref().map(|item| item.pending_registration_nonces).unwrap_or(0),
+                })),
+            )
         }
         Err(err) => worker_error_response(err),
     }
@@ -585,7 +578,9 @@ async fn frost_dkg_start(
         Err(err) => {
             let kind = err.kind();
             let mapped = if kind == std::io::ErrorKind::NotFound {
-                eunoma_crypto_worker::WorkerError::MissingLocalState(manifest_path.display().to_string())
+                eunoma_crypto_worker::WorkerError::MissingLocalState(
+                    manifest_path.display().to_string(),
+                )
             } else {
                 eunoma_crypto_worker::WorkerError::Io(err.to_string())
             };
@@ -594,7 +589,9 @@ async fn frost_dkg_start(
     };
     let manifest: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
-        Err(err) => return worker_error_response(eunoma_crypto_worker::WorkerError::Serde(err.to_string())),
+        Err(err) => {
+            return worker_error_response(eunoma_crypto_worker::WorkerError::Serde(err.to_string()))
+        }
     };
     let group_public_key = manifest
         .get("groupPublicKey")
@@ -823,7 +820,9 @@ async fn dkg_round(
                     })),
                 );
             }
-            let transcript_hash = body.transcript_hash.unwrap_or_else(|| share.transcript_hash.clone());
+            let transcript_hash = body
+                .transcript_hash
+                .unwrap_or_else(|| share.transcript_hash.clone());
             let artifact_hash = hash_hex(&[
                 b"EUNOMA_CA_DKG_ROUND_ARTIFACT_V1".as_slice(),
                 body.request_id.as_bytes(),
@@ -838,7 +837,9 @@ async fn dkg_round(
             let abort_evidence_hash = body.complaint.as_ref().map(|complaint| {
                 hash_hex(&[
                     b"EUNOMA_CA_DKG_COMPLAINT_V1".as_slice(),
-                    serde_json::to_string(complaint).unwrap_or_default().as_bytes(),
+                    serde_json::to_string(complaint)
+                        .unwrap_or_default()
+                        .as_bytes(),
                 ])
             });
             (
@@ -1141,8 +1142,8 @@ async fn vault_resync_http(
     {
         Ok(resp) => (StatusCode::OK, Json(json!(resp))),
         Err(err) => {
-            let status = StatusCode::from_u16(err.status_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(err.status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (
                 status,
                 Json(json!({
@@ -1176,8 +1177,8 @@ async fn vault_sequence_sync_http(
     {
         Ok(resp) => (StatusCode::OK, Json(json!(resp))),
         Err(err) => {
-            let status = StatusCode::from_u16(err.status_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(err.status_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (
                 status,
                 Json(json!({
@@ -1350,9 +1351,10 @@ fn mpcca_not_implemented_response(
     let raw = match std::fs::read(&session_state_path) {
         Ok(raw) => raw,
         Err(err) => {
-            return worker_error_response(eunoma_crypto_worker::WorkerError::Crypto(
-                format!("read mpcca round state {}: {err}", session_state_path.display()),
-            ));
+            return worker_error_response(eunoma_crypto_worker::WorkerError::Crypto(format!(
+                "read mpcca round state {}: {err}",
+                session_state_path.display()
+            )));
         }
     };
     let parsed: serde_json::Value = match serde_json::from_slice(&raw) {
@@ -1387,9 +1389,7 @@ fn mpcca_not_implemented_response(
     )
 }
 
-fn vault_ek_error_response(
-    err: eunoma_crypto_worker::WorkerError,
-) -> (StatusCode, Json<Value>) {
+fn vault_ek_error_response(err: eunoma_crypto_worker::WorkerError) -> (StatusCode, Json<Value>) {
     if let eunoma_crypto_worker::WorkerError::NotImplemented(msg) = &err {
         if *msg == "mpc_inverse_unavailable" {
             return (
@@ -1401,9 +1401,7 @@ fn vault_ek_error_response(
     worker_error_response(err)
 }
 
-fn worker_error_response(
-    err: eunoma_crypto_worker::WorkerError,
-) -> (StatusCode, Json<Value>) {
+fn worker_error_response(err: eunoma_crypto_worker::WorkerError) -> (StatusCode, Json<Value>) {
     // Codex M3a P1 v4: extract the worker's specific error code (the inner string of
     // `InvalidDkgState(...)`, `InvalidRequest(...)`, etc.) into a dedicated `code` field on
     // the response body so the coordinator can pattern-match without parsing the Debug-
@@ -1418,42 +1416,58 @@ fn worker_error_response(
     // The coordinator's MPCCA round1 fan-out checks `body.code` to surface a specific
     // 503 retryable-operator-action signal instead of the generic 502.
     let (status, error, code): (StatusCode, &'static str, String) = match &err {
-        eunoma_crypto_worker::WorkerError::BadThreshold { .. } => {
-            (StatusCode::BAD_REQUEST, "bad_threshold", "bad_threshold".to_string())
-        }
-        eunoma_crypto_worker::WorkerError::UnderQuorum { .. } => {
-            (StatusCode::BAD_REQUEST, "under_quorum", "under_quorum".to_string())
-        }
-        eunoma_crypto_worker::WorkerError::ForbiddenPlaintextField(field) => {
-            (StatusCode::BAD_REQUEST, "forbidden_plaintext_field", format!("forbidden_plaintext_field:{field}"))
-        }
-        eunoma_crypto_worker::WorkerError::MissingLocalState(path) => {
-            (StatusCode::PRECONDITION_FAILED, "missing_local_state", format!("missing_local_state:{path}"))
-        }
+        eunoma_crypto_worker::WorkerError::BadThreshold { .. } => (
+            StatusCode::BAD_REQUEST,
+            "bad_threshold",
+            "bad_threshold".to_string(),
+        ),
+        eunoma_crypto_worker::WorkerError::UnderQuorum { .. } => (
+            StatusCode::BAD_REQUEST,
+            "under_quorum",
+            "under_quorum".to_string(),
+        ),
+        eunoma_crypto_worker::WorkerError::ForbiddenPlaintextField(field) => (
+            StatusCode::BAD_REQUEST,
+            "forbidden_plaintext_field",
+            format!("forbidden_plaintext_field:{field}"),
+        ),
+        eunoma_crypto_worker::WorkerError::MissingLocalState(path) => (
+            StatusCode::PRECONDITION_FAILED,
+            "missing_local_state",
+            format!("missing_local_state:{path}"),
+        ),
         eunoma_crypto_worker::WorkerError::InvalidRequest(msg) => {
             (StatusCode::BAD_REQUEST, "invalid_request", msg.clone())
         }
         eunoma_crypto_worker::WorkerError::Io(msg) => {
             (StatusCode::BAD_REQUEST, "worker_error", format!("io:{msg}"))
         }
-        eunoma_crypto_worker::WorkerError::Serde(msg) => {
-            (StatusCode::BAD_REQUEST, "worker_error", format!("serde:{msg}"))
-        }
-        eunoma_crypto_worker::WorkerError::Crypto(msg) => {
-            (StatusCode::BAD_REQUEST, "worker_error", format!("crypto:{msg}"))
-        }
-        eunoma_crypto_worker::WorkerError::NotImplemented(msg) => {
-            (StatusCode::NOT_IMPLEMENTED, "not_implemented", msg.to_string())
-        }
+        eunoma_crypto_worker::WorkerError::Serde(msg) => (
+            StatusCode::BAD_REQUEST,
+            "worker_error",
+            format!("serde:{msg}"),
+        ),
+        eunoma_crypto_worker::WorkerError::Crypto(msg) => (
+            StatusCode::BAD_REQUEST,
+            "worker_error",
+            format!("crypto:{msg}"),
+        ),
+        eunoma_crypto_worker::WorkerError::NotImplemented(msg) => (
+            StatusCode::NOT_IMPLEMENTED,
+            "not_implemented",
+            msg.to_string(),
+        ),
         eunoma_crypto_worker::WorkerError::InvalidDkgState(msg) => {
             (StatusCode::CONFLICT, "invalid_dkg_state", msg.clone())
         }
         eunoma_crypto_worker::WorkerError::Complaint(msg) => {
             (StatusCode::CONFLICT, "complaint", msg.clone())
         }
-        eunoma_crypto_worker::WorkerError::InvalidPathSegment(label) => {
-            (StatusCode::BAD_REQUEST, "invalid_path_segment", format!("invalid_path_segment:{label}"))
-        }
+        eunoma_crypto_worker::WorkerError::InvalidPathSegment(label) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_path_segment",
+            format!("invalid_path_segment:{label}"),
+        ),
     };
     (
         status,

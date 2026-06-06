@@ -35,11 +35,12 @@ import {
   u64Arg,
 } from "@eunoma/shared";
 import { spawn as nodeSpawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { WithdrawV3SubmitResult } from "./withdraw_v3_submitter.js";
 import type { GasGuard } from "./gas_guard.js";
 import type { VaultSequencer } from "./vault_sequencer.js";
 import type { SubmitJournal } from "./submit_journal.js";
-import type { DepositV3DelegateArgs, DepositV3SubmitResult } from "./deposit_v3_submitter.js";
+import type { DepositV3DelegateArgs, DepositV3SubmitHooks, DepositV3SubmitResult } from "./deposit_v3_submitter.js";
 import { DepositV3ArgsError, parseDepositV3DelegateArgs } from "./deposit_v3_args.js";
 
 /** The v3 split-tx withdraw submitter (createWithdrawV3Submitter's return), with optional per-step
@@ -53,6 +54,11 @@ export type WithdrawV3SubmitterFn = (
     resumeAfterStep?: number;
   },
 ) => Promise<WithdrawV3SubmitResult>;
+
+export type DepositV3SubmitterFn = (
+  args: DepositV3DelegateArgs,
+  hooks?: DepositV3SubmitHooks,
+) => Promise<DepositV3SubmitResult>;
 
 export interface RelayerSubmitResult {
   accepted: true;
@@ -103,7 +109,7 @@ export interface RelayerServerOptions {
   journal?: SubmitJournal;
   /** Deposit-delegate submitter (prepare_deposit_binding_v3 + deposit_step2a_v3). When set, the /v3
    *  deposit route is active. step2b is NEVER relayer-submitted (it is the user's own CA debit). */
-  depositV3Submitter?: (args: DepositV3DelegateArgs) => Promise<DepositV3SubmitResult>;
+  depositV3Submitter?: DepositV3SubmitterFn;
 }
 
 export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInstance {
@@ -262,8 +268,21 @@ export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInst
         return reply.code(200).send({ action: "self_submit", reason: decision.reason });
       }
     }
+    const journal = opts.journal;
+    const requestHash = depositDelegateRequestHash(args);
+    const resume = buildJournalResume(journal, requestHash);
     try {
-      const result = await opts.depositV3Submitter(args);
+      const result = await opts.depositV3Submitter(
+        args,
+        journal
+          ? {
+              completedTxHashes: resume.completedTxHashes,
+              onStepStart: (step) => journal.recordIntent(requestHash, step),
+              onStepDone: (step, _fn, txHash) => journal.recordCompleted(requestHash, step, txHash),
+              resumeAfterStep: resume.resumeAfterStep,
+            }
+          : undefined,
+      );
       return reply.code(202).send(result);
     } catch (err) {
       if (err instanceof RelayerSubmitterError) {
@@ -277,6 +296,17 @@ export function buildRelayerServer(opts: RelayerServerOptions = {}): FastifyInst
   });
 
   return server;
+}
+
+export function depositDelegateRequestHash(args: DepositV3DelegateArgs): string {
+  const stablePublicParts = [
+    args.assetAddr,
+    args.userAddr,
+    args.commitment,
+    args.caPayloadHash,
+    args.depositNonce,
+  ];
+  return `0x${createHash("sha256").update(stablePublicParts.join("|")).digest("hex")}`;
 }
 
 function terminalSubmitterErrorStatus(err: RelayerSubmitterError): 409 | 502 {

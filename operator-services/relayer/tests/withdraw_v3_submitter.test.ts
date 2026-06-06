@@ -243,6 +243,26 @@ describe("createWithdrawV3Submitter — drives the 5 v3 txs", () => {
     }
   });
 
+  it("logs non-zero stdout locally with long hex redacted", async () => {
+    const longHex = `0x${"ab".repeat(96)}`;
+    const { fn } = buildScriptedMockSpawn([
+      {
+        exitCode: 1,
+        stdout: `Simulation failed with status Move abort: E_PENDING_WITHDRAW_PROOF ${longHex}`,
+      },
+    ]);
+    const buffered: string[] = [];
+    const submitter = createWithdrawV3Submitter("0xabc", "relayer-lowpriv", {
+      spawnAptos: fn,
+      stderrSink: { write: (c: string) => buffered.push(c) },
+    });
+    await expect(submitter(fixtureCallArgs())).rejects.toBeInstanceOf(RelayerSubmitterError);
+    const sinkText = buffered.join("");
+    expect(sinkText).toContain("E_PENDING_WITHDRAW_PROOF");
+    expect(sinkText).toContain("0x<redacted:192hex>");
+    expect(sinkText).not.toContain(longHex);
+  });
+
   it("retries Aptos fullnode rate-limit output when CLI exits 0 without a tx hash", async () => {
     const success = (idx: number) => ({
       stdout: JSON.stringify({ Result: { transaction_hash: `0x${idx.toString(16).padStart(64, "0")}` } }),

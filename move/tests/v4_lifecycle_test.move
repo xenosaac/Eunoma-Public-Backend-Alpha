@@ -16,6 +16,8 @@
 ///       (41) once a row is ACTIVE (production ACTIVE is reachable ONLY through the register_raw-
 ///       bearing activate_asset_ca_v4; here the ACTIVE flip is the test_only_set_asset_status shim).
 ///   (e) a non-admin caller cannot register — E_NOT_ADMIN (1) (assert_admin_v4 over VaultCoreV4.admin).
+///   (g) gas-fee config init/admin-set works on a fresh V4 package that has VaultCoreV4 but no
+///       legacy BridgeVault, so deposit_step2b can collect the flat relayer reserve fee.
 ///   (f) init_v4 asserts !exists<DepositBindingTestOverride> (FIX-5): with the override installed,
 ///       init_v4 aborts E_ASSET_ID_MISMATCH (42) at the FIX-5 guard, BEFORE any resource-account /
 ///       register_raw work (so derive_asset_id stays honest on the live module).
@@ -123,6 +125,23 @@ module eunoma::v4_lifecycle_test {
         let apt_addr = object::object_address(&apt);
         // attacker is not VaultCoreV4.admin.
         eunoma_bridge::register_asset_metadata_v4(attacker, apt_addr, vault_addr_hash(), 8);
+    }
+
+    // (g) Gas-fee config must be V4-admin compatible. The seeder creates VaultCoreV4 only; it does
+    // NOT create legacy BridgeVault. This test would abort if the gas-fee entries used assert_admin.
+    #[test(admin = @eunoma)]
+    fun test_gas_fee_config_init_and_update_under_v4_admin(admin: &signer) {
+        eunoma_bridge::test_only_seed_v4_core_and_registry(admin, b"v4_vault_seed_lifecycle_g");
+
+        eunoma_bridge::init_gas_fee_config_v1(admin, 1000000, @0x123);
+        let (fee, reserve) = eunoma_bridge::test_only_gas_fee_config_v1();
+        assert!(fee == 1000000, 130);
+        assert!(reserve == @0x123, 131);
+
+        eunoma_bridge::admin_set_gas_fee_config_v1(admin, 2000000, @0x456);
+        let (fee2, reserve2) = eunoma_bridge::test_only_gas_fee_config_v1();
+        assert!(fee2 == 2000000, 132);
+        assert!(reserve2 == @0x456, 133);
     }
 
     // (f) init_v4 asserts !exists<DepositBindingTestOverride> (FIX-5). With the override installed,

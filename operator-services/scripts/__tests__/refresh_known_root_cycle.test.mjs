@@ -63,6 +63,41 @@ afterEach(() => {
 });
 
 describe("refresh_known_root_cycle.sh route-ready publication", () => {
+  it("recovers missing public tree files from a validated staging snapshot", () => {
+    writeFileSync(fakeFetchScript, "#!/usr/bin/env bash\nexit 0\n");
+    chmodSync(fakeFetchScript, 0o755);
+    rmSync(join(stateDir, "commitment_tree_v2.json"), { force: true });
+    const stagingDir = join(stateDir, ".refresh-staging");
+    mkdirSync(stagingDir, { recursive: true });
+    const leaves = Array.from({ length: 8 }, (_, i) => `0x${String(i + 1).padStart(64, "0")}`);
+    const lean = {
+      scheme: "eunoma_leanimt_tree_v1",
+      treeDepth: 4,
+      latestRootHex: NEW_ROOT,
+      leafCount: leaves.length,
+      leaves,
+      depositMeta: leaves.map((commitmentHex, i) => ({
+        depositTxHash: `0x${String(i + 1).padStart(64, "a")}`,
+        commitmentHex,
+      })),
+    };
+    const fixed = { ...lean, scheme: "commitment_tree_v2_snapshot", treeDepth: 20 };
+    writeFileSync(join(stagingDir, "state_leanimt_tree.json"), JSON.stringify(lean, null, 2));
+    writeFileSync(join(stagingDir, "commitment_tree_v2.json"), JSON.stringify(fixed, null, 2));
+    writeFileSync(
+      join(stateDir, `known_root_v2_${NEW_ROOT.replace(/^0x/, "").slice(0, 8)}.json`),
+      JSON.stringify({ rootHex: NEW_ROOT }),
+    );
+
+    const result = runWrapper();
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("recovering missing public tree from validated staging root");
+    expect(JSON.parse(readFileSync(join(stateDir, "state_leanimt_tree.json"), "utf8")).latestRootHex).toBe(NEW_ROOT);
+    expect(readTree().latestRootHex).toBe(NEW_ROOT);
+    expect(readOps()).toEqual(["normalize"]);
+  });
+
   it("keeps the public tree unchanged when record_known_root fails", () => {
     const result = runWrapper({ FAKE_RECORD_FAIL: "1", FAKE_TREE_ROOT: NEW_ROOT });
 

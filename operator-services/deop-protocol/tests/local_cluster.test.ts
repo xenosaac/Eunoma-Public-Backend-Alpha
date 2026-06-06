@@ -107,6 +107,39 @@ describe("local cluster planning", () => {
     expect(plan.relayer.env.RELAYER_PROFILE).toBe("testnet-asp-relayer");
   });
 
+  it("generates v3 relayer gas-reserve env with a nonzero reserve floor", () => {
+    const bridgePackageAddress = `0x${"acb0f899".repeat(8)}`;
+    const reserveAccountAddress = `0x${"1347ad32".repeat(8)}`;
+    const plan = buildLocalClusterPlan({
+      vaultEk: h32("a"),
+      bridgePackageAddress,
+      bridgeVaultAddress: `0x${"9415c478".repeat(8)}`,
+      bridgeAssetType: "0xa",
+      adminProfile: "bridge-user",
+      relayerProfile: "testnet-asp-relayer",
+      relayerReserveAccountAddress: reserveAccountAddress,
+      relayerReserveMinBalanceOctas: "0",
+      frost: {
+        groupPublicKey: h32("b"),
+        verifyingShares: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({
+          slot,
+          frostVerifyingShare: String(slot + 1).repeat(64),
+        })),
+      },
+      randomHex: deterministicHex(),
+    });
+
+    expect(plan.relayer.env.BRIDGE_PACKAGE_ADDRESS).toBe(bridgePackageAddress);
+    expect(plan.relayer.env.RELAYER_USE_V3).toBe("1");
+    expect(plan.relayer.env.RELAYER_SUBMIT_ENABLED).toBe("1");
+    expect(plan.relayer.env.RESERVE_ACCOUNT_ADDRESS).toBe(reserveAccountAddress);
+    expect(plan.relayer.env.RELAYER_MAX_GAS_PRICE_OCTAS).toBe("1000");
+    expect(plan.relayer.env.RELAYER_RESERVE_MIN_BALANCE_OCTAS).toBe("200000000");
+    expect(plan.relayer.env.BRIDGE_VAULT_ADDRESS).toBe(`0x${"9415c478".repeat(8)}`);
+    expect(plan.relayer.env.BRIDGE_ASSET_TYPE).toBe("0xa");
+    expect(plan.relayer.env.ADMIN_PROFILE).toBe("bridge-user");
+  });
+
   it("keeps bearer tokens out of the public roster", () => {
     const plan = buildLocalClusterPlan({
       vaultEk: h32("a"),

@@ -30,11 +30,13 @@
 // (fixed-20 vs LeanIMT dynamic). The LeanIMT snapshot is byte-parity-proven against the withdraw
 // circuit + the frontend lib/protocol/leanimt.ts.
 // =============================================================================================
-import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  COMMITMENT_TREE_SCHEME,
   CommitmentTreeV2,
+  TREE_DEPTH_DEFAULT,
   assertTreeArtifactPublicOnly,
 } from "../../circuits/scripts/commitment_tree_v2.mjs";
 import { LeanIMTTree } from "../../circuits/scripts/leanimt_tree.mjs";
@@ -264,6 +266,56 @@ function parseEventAssetType(assetRaw, txHash) {
   throw new Error(`wrong_asset:${txHash}:unparseable_shape=${JSON.stringify(assetRaw)}`);
 }
 
+async function commitmentTreeFromRefreshSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    throw new Error("refresh_snapshot_missing");
+  }
+  if (snapshot.scheme === COMMITMENT_TREE_SCHEME) {
+    return await CommitmentTreeV2.deserialize(snapshot);
+  }
+  if (snapshot.scheme !== "eunoma_leanimt_tree_v1") {
+    throw new Error(`scheme_mismatch: ${snapshot.scheme}`);
+  }
+  if (!Array.isArray(snapshot.leaves) || !Array.isArray(snapshot.depositMeta)) {
+    throw new Error("leaves_or_depositMeta_missing");
+  }
+  if (snapshot.leaves.length !== snapshot.depositMeta.length) {
+    throw new Error(
+      `length_mismatch: leaves=${snapshot.leaves.length} meta=${snapshot.depositMeta.length}`,
+    );
+  }
+  if (snapshot.leafCount !== snapshot.leaves.length) {
+    throw new Error(
+      `leafCount_mismatch: declared=${snapshot.leafCount} actual=${snapshot.leaves.length}`,
+    );
+  }
+
+  const tree = new CommitmentTreeV2(TREE_DEPTH_DEFAULT);
+  tree.createdAtUnixMs = snapshot.createdAtUnixMs ?? Date.now();
+  for (let i = 0; i < snapshot.leaves.length; i++) {
+    const leafHex = snapshot.leaves[i];
+    const meta = snapshot.depositMeta[i] ?? {};
+    const commitmentHex = meta.commitmentHex ?? leafHex;
+    tree.append(leBytesToBig(hexToLE32(leafHex)), {
+      leafIndex: typeof meta.leafIndex === "number" ? meta.leafIndex : i,
+      kind: meta.kind,
+      assetType: meta.assetType,
+      depositCount:
+        typeof meta.depositCount === "number"
+          ? meta.depositCount
+          : typeof meta.count === "number"
+            ? meta.count
+            : 0,
+      depositTxHash: meta.depositTxHash,
+      txVersion: meta.txVersion,
+      sequenceNumber: meta.sequenceNumber,
+      sender: meta.sender,
+      commitmentHex,
+    });
+  }
+  return tree;
+}
+
 // R7-OPS-1 / V4 OB1: returns true if the event should be included, false if it is an out-of-scope
 // (cross-vault / non-allow-listed-asset) skip (warns to stderr). Hard-throws for malformed shapes.
 //
@@ -357,14 +409,16 @@ async function ingest({ argv }) {
 
   // Existing tree state for --refresh
   const artifactPath = join(opts.stateDir, "commitment_tree_v2.json");
+  const leanArtifactPath = join(opts.stateDir, "state_leanimt_tree.json");
   let tree;
   let existingTxHashes = new Set();
   let existingVerSeq = new Set();
   if (opts.refresh) {
     try {
-      const prior = JSON.parse(readFileSync(artifactPath, "utf8"));
-      tree = await CommitmentTreeV2.deserialize(prior);
-      for (const m of prior.depositMeta) {
+      const refreshPath = existsSync(artifactPath) ? artifactPath : leanArtifactPath;
+      const prior = JSON.parse(readFileSync(refreshPath, "utf8"));
+      tree = await commitmentTreeFromRefreshSnapshot(prior);
+      for (const m of tree.depositMeta) {
         if (m.depositTxHash) existingTxHashes.add(m.depositTxHash.toLowerCase());
         existingVerSeq.add(`${m.txVersion}:${m.sequenceNumber}`);
       }
@@ -570,7 +624,6 @@ async function ingest({ argv }) {
   writeFileSync(tmp, JSON.stringify(snapshot, null, 2) + "\n", { mode: 0o644 });
   renameSync(tmp, artifactPath);
 
-  const leanArtifactPath = join(opts.stateDir, "state_leanimt_tree.json");
   const leanTmp = leanArtifactPath + ".tmp";
   writeFileSync(leanTmp, JSON.stringify(leanSnapshot, null, 2) + "\n", { mode: 0o644 });
   renameSync(leanTmp, leanArtifactPath);

@@ -132,4 +132,66 @@ describe("createDepositV3Submitter", () => {
     expect(calls.length).toBe(2); // stopped after the failing step2a
     expect(buffered.join("")).toContain("WALLET_PATH"); // logged locally only
   });
+
+  it("resumes after journal-completed deposit steps without replaying them", async () => {
+    const { fn, calls } = buildMultiMockSpawn();
+    const submitter = createDepositV3Submitter("0xabc", "relayer-lowpriv", {
+      submit: true,
+      env: { RELAYER_SUBMIT_ENABLED: "1" },
+      spawnAptos: fn,
+    });
+
+    const result = await submitter(fixtureArgs(), {
+      completedTxHashes: ["0x" + "a".repeat(64)],
+      resumeAfterStep: 0,
+    });
+
+    expect(result.txHashes).toEqual([
+      "0x" + "a".repeat(64),
+      "0x" + "0".repeat(64),
+    ]);
+    expect(calls.length).toBe(1);
+    const fnIdx = calls[0].args.indexOf("--function-id");
+    expect(calls[0].args[fnIdx + 1]).toBe("0xabc::eunoma_bridge::deposit_step2a_eunoma_verify_v3");
+  });
+
+  it("recovers already-prepared deposit binding state when a prior CLI call committed without a tx hash", async () => {
+    const outputs = [
+      {
+        stdout: JSON.stringify({
+          Error:
+            "API error: Unknown error Transaction committed on chain, but failed execution: Move abort in 0xabc::eunoma_bridge: E_PENDING_DEPOSIT_BINDING(0x18): ",
+        }),
+      },
+      {
+        stdout: JSON.stringify({ Result: { transaction_hash: `0x${"1".padStart(64, "0")}` } }),
+      },
+    ];
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const fn: SpawnAptosFn = (command, args) => {
+      const out = outputs[calls.length] ?? {};
+      calls.push({ command, args });
+      async function* stdoutGen() {
+        if (out.stdout) yield out.stdout;
+      }
+      async function* stderrGen() {}
+      return { stdout: stdoutGen(), stderr: stderrGen(), done: Promise.resolve(0) };
+    };
+    const buffered: string[] = [];
+    const submitter = createDepositV3Submitter("0xabc", "relayer-lowpriv", {
+      submit: true,
+      env: { RELAYER_SUBMIT_ENABLED: "1" },
+      spawnAptos: fn,
+      stderrSink: { write: (c) => buffered.push(c) },
+    });
+
+    const result = await submitter(fixtureArgs());
+
+    expect(result.txHashes).toEqual([
+      "recovered:prepare_deposit_binding_v3_for_user:step0",
+      "0x" + "1".padStart(64, "0"),
+    ]);
+    expect(calls.length).toBe(2);
+    expect(buffered.join("")).toContain("recovered already-prepared on-chain state");
+  });
 });

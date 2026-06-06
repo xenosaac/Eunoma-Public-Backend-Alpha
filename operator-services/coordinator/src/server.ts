@@ -183,6 +183,15 @@ interface AspSetArtifact {
   updatedAtUnix: number | null;
 }
 
+interface StateTreeSnapshot {
+  scheme: "eunoma_leanimt_tree_v1";
+  treeDepth: number;
+  latestRootHex: string;
+  leafCount?: number | string;
+  leaves: unknown[];
+  depositMeta: unknown[];
+}
+
 /**
  * Read + validate <stateRoot>/coordinator/asp_set.json. Returns the artifact, or null when
  * stateRoot is unconfigured / the file is missing / unreadable / malformed (callers map null
@@ -229,6 +238,72 @@ async function parseAspSetArtifactFile(aspPath: string): Promise<AspSetArtifact 
         ? raw.updatedAtUnix
         : null,
   };
+}
+
+async function readStateTreeSnapshot(stateRoot: string | undefined): Promise<StateTreeSnapshot | null> {
+  if (!stateRoot) return null;
+  const coordinatorDir = join(stateRoot, "coordinator");
+  const current = await parseStateTreeSnapshotFile(join(coordinatorDir, "state_leanimt_tree.json"));
+  if (current) return current;
+
+  // Local durability fallback: if the canonical artifact disappeared but the refresh staging
+  // snapshot has already been recorded as a known root, serve that recorded public tree instead
+  // of taking the product UI offline. Never expose an unrecorded staged root.
+  const staged = await parseStateTreeSnapshotFile(
+    join(coordinatorDir, ".refresh-staging", "state_leanimt_tree.json"),
+  );
+  if (staged && (await hasKnownRootSidecar(coordinatorDir, staged.latestRootHex))) {
+    return staged;
+  }
+  return null;
+}
+
+async function parseStateTreeSnapshotFile(treePath: string): Promise<StateTreeSnapshot | null> {
+  let snap: {
+    scheme?: unknown;
+    treeDepth?: unknown;
+    leaves?: unknown;
+    depositMeta?: unknown;
+    latestRootHex?: unknown;
+    leafCount?: unknown;
+  };
+  try {
+    snap = JSON.parse(await readFile(treePath, "utf8")) as typeof snap;
+  } catch {
+    return null;
+  }
+  if (
+    snap.scheme !== "eunoma_leanimt_tree_v1" ||
+    typeof snap.latestRootHex !== "string" ||
+    typeof snap.treeDepth !== "number" ||
+    !Array.isArray(snap.leaves) ||
+    !Array.isArray(snap.depositMeta)
+  ) {
+    return null;
+  }
+  return {
+    scheme: snap.scheme,
+    treeDepth: snap.treeDepth,
+    latestRootHex: snap.latestRootHex,
+    leafCount:
+      typeof snap.leafCount === "number" || typeof snap.leafCount === "string"
+        ? snap.leafCount
+        : snap.leaves.length,
+    leaves: snap.leaves,
+    depositMeta: snap.depositMeta,
+  };
+}
+
+async function hasKnownRootSidecar(coordinatorDir: string, rootHex: string): Promise<boolean> {
+  const match = /^0x([0-9a-fA-F]{64})$/.exec(rootHex);
+  if (!match) return false;
+  const sidecarPath = join(coordinatorDir, `known_root_v2_${match[1].slice(0, 8).toLowerCase()}.json`);
+  try {
+    const sidecar = JSON.parse(await readFile(sidecarPath, "utf8")) as { rootHex?: unknown };
+    return typeof sidecar.rootHex !== "string" || sidecar.rootHex.toLowerCase() === rootHex.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -440,6 +515,17 @@ function eventsContainRouteLeaf(events: unknown[] | undefined, bridgePackage: st
     }
   }
   return false;
+}
+
+function shouldScheduleRouteMaintenanceForSubmit(
+  events: unknown[] | undefined,
+  bridgePackage: string | undefined,
+): boolean {
+  // If the post-confirmation event refetch failed, schedule conservatively. The
+  // refresh wrapper is idempotent and records no-leaf withdraws as skipped, but
+  // skipping maintenance here can strand a successful partial-withdraw change leaf.
+  if (events === undefined) return true;
+  return eventsContainRouteLeaf(events, bridgePackage);
 }
 
 async function fetchAptosTransactionByHash(
@@ -906,28 +992,14 @@ export function buildCoordinatorServer(
     if (!opts.stateRoot) {
       return reply.code(503).send({ error: "pool_state_unavailable" });
     }
-    const treePath = join(opts.stateRoot, "coordinator", "state_leanimt_tree.json");
-    let tree: { scheme?: unknown; latestRootHex?: unknown; leafCount?: unknown; leaves?: unknown };
-    try {
-      tree = JSON.parse(await readFile(treePath, "utf8")) as typeof tree;
-    } catch {
+    const tree = await readStateTreeSnapshot(opts.stateRoot);
+    if (!tree) {
       return reply.code(503).send({ error: "pool_state_unavailable" });
     }
-    const root = tree.latestRootHex;
-    const leaves = tree.leaves;
-    const leafCount = tree.leafCount;
-    if (
-      tree.scheme !== "eunoma_leanimt_tree_v1" ||
-      typeof root !== "string" ||
-      !Array.isArray(leaves) ||
-      (typeof leafCount !== "number" && typeof leafCount !== "string")
-    ) {
-      return reply.code(503).send({ error: "pool_state_malformed" });
-    }
     return {
-      current_finalized_root: root,
-      pending_next_index: String(leafCount),
-      commitments: leaves,
+      current_finalized_root: tree.latestRootHex,
+      pending_next_index: String(tree.leafCount ?? tree.leaves.length),
+      commitments: tree.leaves,
     };
   });
 
@@ -938,30 +1010,9 @@ export function buildCoordinatorServer(
   // posture as /v2/pool/state: safety is enforced on-chain (root ∈ known_roots + proof binds the
   // note's commitment). Mirrors /v2/pool/state's 503-on-missing behavior.
   server.get("/v2/state-tree", async (_req, reply) => {
-    if (!opts.stateRoot) {
+    const snap = await readStateTreeSnapshot(opts.stateRoot);
+    if (!snap) {
       return reply.code(503).send({ error: "state_tree_unavailable" });
-    }
-    const treePath = join(opts.stateRoot, "coordinator", "state_leanimt_tree.json");
-    let snap: {
-      scheme?: unknown;
-      treeDepth?: unknown;
-      leaves?: unknown;
-      depositMeta?: unknown;
-      latestRootHex?: unknown;
-    };
-    try {
-      snap = JSON.parse(await readFile(treePath, "utf8")) as typeof snap;
-    } catch {
-      return reply.code(503).send({ error: "state_tree_unavailable" });
-    }
-    if (
-      snap.scheme !== "eunoma_leanimt_tree_v1" ||
-      typeof snap.latestRootHex !== "string" ||
-      typeof snap.treeDepth !== "number" ||
-      !Array.isArray(snap.leaves) ||
-      !Array.isArray(snap.depositMeta)
-    ) {
-      return reply.code(503).send({ error: "state_tree_malformed" });
     }
     return {
       scheme: snap.scheme,
@@ -7139,7 +7190,7 @@ export function buildCoordinatorServer(
           if (
             !wasSimulated &&
             existingTxHash &&
-            eventsContainRouteLeaf(existingEvents, existingBridge)
+            shouldScheduleRouteMaintenanceForSubmit(existingEvents, existingBridge)
           ) {
             scheduleBridgeMaintenance(reply, req, [existingTxHash]);
           }
@@ -7318,7 +7369,7 @@ export function buildCoordinatorServer(
             finalize!.attestationConfig && typeof finalize!.attestationConfig.bridge === "string"
               ? finalize!.attestationConfig.bridge
               : undefined;
-          if (eventsContainRouteLeaf(replayEvents, refreshBridge)) {
+          if (shouldScheduleRouteMaintenanceForSubmit(replayEvents, refreshBridge)) {
             scheduleBridgeMaintenance(reply, req, [existingTxHash]);
           }
           return reply.code(200).send({
@@ -7624,7 +7675,7 @@ export function buildCoordinatorServer(
             : undefined;
         if (
           !relayerResult.simulated &&
-          eventsContainRouteLeaf(submitTxEvents, refreshBridge)
+          shouldScheduleRouteMaintenanceForSubmit(submitTxEvents, refreshBridge)
         ) {
           scheduleBridgeMaintenance(reply, req, [relayerResult.txHash]);
         }

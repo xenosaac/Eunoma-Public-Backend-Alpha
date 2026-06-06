@@ -56,7 +56,10 @@ impl MpcSpdzInverseAdapter {
     }
 
     pub fn from_home(mp_spdz_home: PathBuf) -> Option<Self> {
-        let bytecode_path = mp_spdz_home.join("Programs").join("Bytecode").join(BYTECODE_FILE);
+        let bytecode_path = mp_spdz_home
+            .join("Programs")
+            .join("Bytecode")
+            .join(BYTECODE_FILE);
         if !bytecode_path.exists() {
             return None;
         }
@@ -224,14 +227,21 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
             public_input.push_str(&scalar_to_decimal(lambda));
             public_input.push('\n');
         }
-        fs::write(public_input_dir.join(&self.program_name), public_input.as_bytes())
-            .map_err(|e| AdapterError::Internal(format!("write Public-Input: {e}")))?;
+        fs::write(
+            public_input_dir.join(&self.program_name),
+            public_input.as_bytes(),
+        )
+        .map_err(|e| AdapterError::Internal(format!("write Public-Input: {e}")))?;
         let self_lambda_decimal = scalar_to_decimal(&local_lambdas[ctx.player_id]);
 
         // Symlink the compiled bytecode + schedule + compiled-VAR file into the session dir so
         // mascot-party.x finds them under cwd = session_dir.
         let host_programs = self.mp_spdz_home.join("Programs");
-        link_programs(&host_programs, &session_dir.join("Programs"), &self.program_name)?;
+        link_programs(
+            &host_programs,
+            &session_dir.join("Programs"),
+            &self.program_name,
+        )?;
 
         // Codex P1 #3: we used to copy every peer's PRIVATE key into our session dir, which
         // means a compromised worker would have peer parties' private keys locally. Fix:
@@ -377,8 +387,12 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
                         let _ = child.kill();
                         let _ = child.wait();
                         // Drain logs for diagnostics.
-                        let so = stdout_rx.recv_timeout(Duration::from_millis(500)).unwrap_or_default();
-                        let se = stderr_rx.recv_timeout(Duration::from_millis(500)).unwrap_or_default();
+                        let so = stdout_rx
+                            .recv_timeout(Duration::from_millis(500))
+                            .unwrap_or_default();
+                        let se = stderr_rx
+                            .recv_timeout(Duration::from_millis(500))
+                            .unwrap_or_default();
                         let _ = fs::write(&log_stdout, &so);
                         let _ = fs::write(&log_stderr, &se);
                         let _ = stdout_handle.join();
@@ -413,8 +427,12 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
         };
 
         // Collect logs.
-        let stdout_bytes = stdout_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-        let stderr_bytes = stderr_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        let stdout_bytes = stdout_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default();
+        let stderr_bytes = stderr_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default();
         let _ = stdout_handle.join();
         let _ = stderr_handle.join();
         let _ = fs::write(&log_stdout, &stdout_bytes);
@@ -437,7 +455,10 @@ impl MpcInverseAdapter for MpcSpdzInverseAdapter {
             r_i_local.zeroize();
             return Err(AdapterError::Internal(format!(
                 "mascot-party.x exited {} — stderr tail: {}",
-                status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
                 last_lines
             )));
         }
@@ -505,9 +526,8 @@ fn ed25519_scalar_prime_biguint() -> BigUint {
 /// Returns true iff `s` is non-empty and contains only `[A-Za-z0-9._-]`.
 pub(crate) fn is_safe_id(s: &str) -> bool {
     !s.is_empty()
-        && s.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-'
-        })
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
 /// Codex P2 #6: RAII scrubber for plaintext on-disk secrets.
@@ -618,7 +638,9 @@ fn scalar_from_decimal(s: &str) -> Result<Scalar, AdapterError> {
     };
     let mut le = reduced.to_bytes_le();
     if le.len() > 32 {
-        return Err(AdapterError::Internal("opened m too large after reduction".to_string()));
+        return Err(AdapterError::Internal(
+            "opened m too large after reduction".to_string(),
+        ));
     }
     while le.len() < 32 {
         le.push(0);
@@ -668,10 +690,7 @@ fn zeroize_file_inplace(path: &Path) -> Result<(), std::io::Error> {
     };
     let len = metadata.len() as usize;
     let zeros = vec![0u8; len];
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(false)
-        .open(path)?;
+    let mut file = OpenOptions::new().write(true).truncate(false).open(path)?;
     file.write_all(&zeros)?;
     file.sync_all()?;
     // Now truncate (defensive: in case the file grew, we still wrote `len` bytes of zeros).
@@ -720,8 +739,13 @@ fn symlink_or_copy(src: &Path, dst: &Path) -> Result<(), AdapterError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
-        return symlink(src, dst)
-            .map_err(|e| AdapterError::Internal(format!("symlink {} -> {}: {e}", dst.display(), src.display())));
+        return symlink(src, dst).map_err(|e| {
+            AdapterError::Internal(format!(
+                "symlink {} -> {}: {e}",
+                dst.display(),
+                src.display()
+            ))
+        });
     }
     #[cfg(not(unix))]
     {
@@ -747,12 +771,16 @@ fn link_programs(
         .map_err(|e| AdapterError::Internal(format!("mkdir Programs/Schedules: {e}")))?;
     // Source — for diagnostics
     symlink_or_copy(
-        &host_programs.join("Source").join(format!("{program_name}.mpc")),
+        &host_programs
+            .join("Source")
+            .join(format!("{program_name}.mpc")),
         &dest_source.join(format!("{program_name}.mpc")),
     )?;
     // Schedule
     symlink_or_copy(
-        &host_programs.join("Schedules").join(format!("{program_name}.sch")),
+        &host_programs
+            .join("Schedules")
+            .join(format!("{program_name}.sch")),
         &dest_schedule.join(format!("{program_name}.sch")),
     )?;
     // Bytecode — link every .bc that starts with our program name (the compiler may emit
@@ -779,7 +807,11 @@ fn run_c_rehash(player_data: &Path) -> Result<(), ()> {
         .stderr(Stdio::null())
         .status()
         .map_err(|_| ())?;
-    if status.success() { Ok(()) } else { Err(()) }
+    if status.success() {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 fn cleanup_or_keep(session_dir: &Path, keep: bool) {
@@ -1248,11 +1280,7 @@ mod inner_tests {
     fn scalar_from_hex_accepts_canonical_lambda_bytes() {
         // Sanity: canonical bytes for a small scalar still parse cleanly.
         let s = Scalar::from(42_u64);
-        let hex: String = s
-            .to_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hex: String = s.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
         let parsed = scalar_from_hex(&hex).expect("canonical 42");
         assert_eq!(parsed, s);
     }
@@ -1281,5 +1309,4 @@ mod inner_tests {
         assert!(result.is_err(), "test scenario must panic");
         assert!(!path.exists(), "Drop must scrub even when panic unwinds");
     }
-
 }

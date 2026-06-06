@@ -71,8 +71,7 @@ fn det_scalar(seed: u64) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-const H_RISTRETTO_HEX: &str =
-    "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+const H_RISTRETTO_HEX: &str = "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
 
 fn h_point() -> RistrettoPoint {
     let bytes = hex_decode(H_RISTRETTO_HEX);
@@ -173,8 +172,7 @@ fn write_v2_share(
         created_at_unix_ms: 1_700_000_000_000,
     };
     let path = state_dir.join("ca_dkg_share_v2.json");
-    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap())
-        .expect("write share file");
+    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap()).expect("write share file");
     dk_share
 }
 
@@ -216,9 +214,16 @@ async fn happy_path_partial_decrypt() {
         slot,
     };
 
-    let resp = handle(&slot_dir, "", VAULT_ADDR, ASSET_TYPE, req, Some(chain_d.clone()))
-        .await
-        .expect("happy-path partial decrypt");
+    let resp = handle(
+        &slot_dir,
+        "",
+        VAULT_ADDR,
+        ASSET_TYPE,
+        req,
+        Some(chain_d.clone()),
+    )
+    .await
+    .expect("happy-path partial decrypt");
 
     assert_eq!(resp.slot, slot);
     assert_eq!(resp.partial_hex.len(), ell, "ell=8 partials returned");
@@ -280,7 +285,10 @@ async fn chain_d_mismatch_rejects() {
         code.contains("d_mismatch"),
         "expected d_mismatch error, got {code}"
     );
-    assert!(code.contains("3"), "expected chunk index 3 in error, got {code}");
+    assert!(
+        code.contains("3"),
+        "expected chunk index 3 in error, got {code}"
+    );
     assert!(matches!(err, BalanceDecryptError::DMismatch { chunk: 3 }));
 }
 
@@ -340,7 +348,7 @@ async fn ell_mismatch_rejects() {
     );
 
     let chain_d = synthetic_chain_d(8, 4); // chain says ell=8
-    // Request supplies only ell=4.
+                                           // Request supplies only ell=4.
     let short_hex: Vec<String> = chain_d.iter().take(4).map(compressed_hex).collect();
 
     let req = BalanceDecryptPartialRequest {

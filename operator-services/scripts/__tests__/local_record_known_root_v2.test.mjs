@@ -304,7 +304,11 @@ exit 99
           "--aptos-node-url",
           `http://127.0.0.1:${port}/v1`,
         ],
-        { PATH: `${fakeBin}:${process.env.PATH}` },
+        {
+          PATH: `${fakeBin}:${process.env.PATH}`,
+          EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_ATTEMPTS: "1",
+          EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_DELAY_MS: "1",
+        },
       );
       expect(r.status).toBe(0);
       const body = parseStdoutJson(r.stdout);
@@ -364,11 +368,113 @@ exit 99
           "--aptos-node-url",
           `http://127.0.0.1:${port}/v1`,
         ],
-        { PATH: `${fakeBin}:${process.env.PATH}` },
+        {
+          PATH: `${fakeBin}:${process.env.PATH}`,
+          EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_ATTEMPTS: "1",
+          EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_DELAY_MS: "1",
+        },
       );
       expect(r.status).toBe(32);
       expect(r.stderr).toMatch(/not submitting duplicate-prone record_known_root tx/);
       expect(existsSync(aptosInvokedPath)).toBe(false);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it("retries transient fullnode 429 during known_roots precheck before submitting", async () => {
+    const { path, snapshot } = await makeTreeFixture(stateDir, 8);
+    const fakeBin = join(tmpRoot, "bin-precheck-429-retry");
+    mkdirSync(fakeBin, { recursive: true });
+    const txHash = "0x" + "c".repeat(64);
+    writeFileSync(
+      join(fakeBin, "aptos"),
+      `#!/usr/bin/env bash
+cat <<'JSON'
+{
+  "Result": {
+    "transaction_hash": "${txHash}"
+  }
+}
+JSON
+exit 0
+`,
+    );
+    chmodSync(join(fakeBin, "aptos"), 0o755);
+
+    let tableResourceRequests = 0;
+    let tableItemRequests = 0;
+    const server = createServer((req, res) => {
+      if (req.method === "GET" && req.url?.includes("/accounts/") && req.url.includes("/resource/")) {
+        tableResourceRequests += 1;
+        if (tableResourceRequests < 3) {
+          res.writeHead(429, { "content-type": "application/json" });
+          res.end(JSON.stringify({ message: "rate limited" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { known_roots: { handle: "known-roots-handle" } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url?.endsWith("/tables/known-roots-handle/item")) {
+        tableItemRequests += 1;
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      if (req.method === "GET" && req.url?.startsWith(`/v1/transactions/by_hash/${txHash}`)) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            type: "user_transaction",
+            version: "9999",
+            success: true,
+            vm_status: "Executed successfully",
+            events: [
+              {
+                type: `${BRIDGE}::eunoma_bridge::RootRecordedV2`,
+                data: { root: snapshot.latestRootHex },
+              },
+            ],
+          }),
+        );
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    try {
+      const r = await runCliAsync(
+        [
+          "--bridge-package-address",
+          BRIDGE,
+          "--commitment-tree",
+          path,
+          "--state-dir",
+          stateDir,
+          "--aptos-node-url",
+          `http://127.0.0.1:${port}/v1`,
+        ],
+        {
+          PATH: `${fakeBin}:${process.env.PATH}`,
+          EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_ATTEMPTS: "4",
+          EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_DELAY_MS: "1",
+        },
+      );
+      expect(r.status).toBe(0);
+      expect(r.stderr).not.toMatch(/not submitting duplicate-prone record_known_root tx/);
+      expect(tableResourceRequests).toBe(3);
+      expect(tableItemRequests).toBe(1);
+      const body = parseStdoutJson(r.stdout);
+      expect(body).toMatchObject({
+        ok: true,
+        status: "recorded",
+        root: snapshot.latestRootHex,
+        txHash,
+        eventVerified: true,
+      });
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
@@ -409,6 +515,8 @@ exit 99
         {
           PATH: `${fakeBin}:${process.env.PATH}`,
           EUNOMA_RECORD_KNOWN_ROOT_SUBMIT_ON_PRECHECK_FAILURE: "1",
+          EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_ATTEMPTS: "1",
+          EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_DELAY_MS: "1",
         },
       );
       expect(r.status).toBe(31);

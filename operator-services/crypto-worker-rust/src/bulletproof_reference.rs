@@ -361,9 +361,7 @@ pub mod threshold {
     /// Validates:
     /// - `blinding_shares` is non-empty,
     /// - every per-deoperator vector has the same length.
-    pub fn aggregate_blinding_shares(
-        blinding_shares: &[Vec<Scalar>],
-    ) -> WorkerResult<Vec<Scalar>> {
+    pub fn aggregate_blinding_shares(blinding_shares: &[Vec<Scalar>]) -> WorkerResult<Vec<Scalar>> {
         if blinding_shares.is_empty() {
             return Err(WorkerError::InvalidRequest(
                 "aggregate_blinding_shares: empty share set".to_string(),

@@ -24,6 +24,9 @@ import type {
   FrostDkgV2Roster,
 } from "./types.js";
 
+const DEFAULT_RELAYER_MAX_GAS_PRICE_OCTAS = "1000";
+const DEFAULT_RELAYER_RESERVE_MIN_BALANCE_OCTAS = "200000000";
+
 export interface LocalFrostMaterial {
   groupPublicKey: string;
   verifyingShares: Array<{
@@ -78,6 +81,11 @@ export interface LocalClusterPlanOptions {
   bridgePackageAddress?: string;
   adminProfile?: string;
   relayerProfile?: string;
+  relayerSubmitEnabled?: string;
+  relayerReserveAccountAddress?: string;
+  relayerMaxGasPriceOctas?: string;
+  relayerReserveMinBalanceOctas?: string;
+  aptosCliCwd?: string;
   refreshSignerMode?: "admin" | "delegate";
   refreshAdminProfile?: string;
   refreshDelegateProfile?: string;
@@ -187,6 +195,7 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
   const caDkgV2RosterJson = caDkgV2Roster ? JSON.stringify(caDkgV2Roster) : undefined;
   const caDkgV2RosterPath = caDkgV2Roster ? `${stateRoot}/cluster/ca-dkg-v2-roster.json` : undefined;
   const frostDkgV2RosterJson = frostDkgV2Roster ? JSON.stringify(frostDkgV2Roster) : undefined;
+  const relayerGasEnv = buildRelayerGasEnv(opts);
   return {
     stateRoot,
     roster,
@@ -231,7 +240,19 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
         RELAYER_PORT: String(relayerPort),
         RELAYER_BEARER_TOKEN: relayerBearer,
         APTOS_NODE_URL: opts.aptosNodeUrl ?? "https://fullnode.testnet.aptoslabs.com/v1",
+        ...(opts.bridgePackageAddress ? { BRIDGE_PACKAGE_ADDRESS: opts.bridgePackageAddress } : {}),
+        ...(opts.bridgePackageAddress ? { RELAYER_USE_V3: "1" } : {}),
+        ...(opts.bridgePackageAddress
+          ? { RELAYER_SUBMIT_ENABLED: opts.relayerSubmitEnabled ?? "1" }
+          : {}),
         ...(opts.relayerProfile ? { RELAYER_PROFILE: opts.relayerProfile } : {}),
+        ...relayerGasEnv,
+        EUNOMA_STATE_ROOT: stateRoot,
+        ...(opts.bridgeAssetType ? { BRIDGE_ASSET_TYPE: opts.bridgeAssetType } : {}),
+        ...(opts.aptosCliCwd ? { APTOS_CLI_CWD: opts.aptosCliCwd } : {}),
+        ...(opts.bridgeVaultAddress ? { BRIDGE_VAULT_ADDRESS: opts.bridgeVaultAddress } : {}),
+        ...(opts.adminProfile ? { ADMIN_PROFILE: opts.adminProfile } : {}),
+        ...(opts.refreshAdminProfile ? { EUNOMA_REFRESH_ADMIN_PROFILE: opts.refreshAdminProfile } : {}),
       },
     },
     nodes: Array.from({ length: DEOPERATOR_COUNT }, (_, slot) => ({
@@ -276,6 +297,35 @@ export function buildLocalClusterPlan(opts: LocalClusterPlanOptions): LocalClust
       },
     })),
   };
+}
+
+function buildRelayerGasEnv(opts: LocalClusterPlanOptions): Record<string, string> {
+  if (!opts.relayerReserveAccountAddress) return {};
+  return {
+    RESERVE_ACCOUNT_ADDRESS: opts.relayerReserveAccountAddress,
+    RELAYER_MAX_GAS_PRICE_OCTAS: decimalString(
+      opts.relayerMaxGasPriceOctas ?? DEFAULT_RELAYER_MAX_GAS_PRICE_OCTAS,
+      "relayerMaxGasPriceOctas",
+    ),
+    RELAYER_RESERVE_MIN_BALANCE_OCTAS: maxDecimalString(
+      opts.relayerReserveMinBalanceOctas ?? DEFAULT_RELAYER_RESERVE_MIN_BALANCE_OCTAS,
+      DEFAULT_RELAYER_RESERVE_MIN_BALANCE_OCTAS,
+      "relayerReserveMinBalanceOctas",
+    ),
+  };
+}
+
+function decimalString(value: string, name: string): string {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${name} must be a decimal string`);
+  }
+  return value;
+}
+
+function maxDecimalString(value: string, floor: string, name: string): string {
+  const parsed = BigInt(decimalString(value, name));
+  const floorParsed = BigInt(decimalString(floor, `${name} floor`));
+  return String(parsed > floorParsed ? parsed : floorParsed);
 }
 
 export interface RenderEnvFilesResult {

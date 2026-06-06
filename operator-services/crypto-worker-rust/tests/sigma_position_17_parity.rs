@@ -224,15 +224,8 @@ fn build_dst(stmt: &StatementFixture, ell: usize, n: usize, chain_id: u8) -> Dom
     let sender = hex_32(&stmt.sender_address_hex);
     let recipient = hex_32(&stmt.recipient_address_hex);
     let asset = hex_32(&stmt.token_address_hex);
-    let session = bcs_serialize_transfer_session(
-        &sender,
-        &recipient,
-        &asset,
-        ell as u64,
-        n as u64,
-        false,
-        0,
-    );
+    let session =
+        bcs_serialize_transfer_session(&sender, &recipient, &asset, ell as u64, n as u64, false, 0);
     DomainSeparator {
         contract_address: APTOS_FRAMEWORK_ADDRESS,
         chain_id,
@@ -241,8 +234,9 @@ fn build_dst(stmt: &StatementFixture, ell: usize, n: usize, chain_id: u8) -> Dom
     }
 }
 
-fn build_statement_from_fixture(stmt: &StatementFixture) -> eunoma_crypto_worker::transfer_sigma_reference::Statement
-{
+fn build_statement_from_fixture(
+    stmt: &StatementFixture,
+) -> eunoma_crypto_worker::transfer_sigma_reference::Statement {
     let inputs = TransferStatementInputs {
         sender_ek: hex_32(&stmt.sender_ek_hex),
         recipient_ek: hex_32(&stmt.recipient_ek_hex),
@@ -254,7 +248,8 @@ fn build_statement_from_fixture(stmt: &StatementFixture) -> eunoma_crypto_worker
         transfer_amount_d_sender: compressed_vec(&stmt.transfer_amount_d_sender),
         transfer_amount_d_recipient: compressed_vec(&stmt.transfer_amount_d_recipient),
     };
-    build_statement(&inputs).expect("M10-g: build_statement failed (compressed ciphertext bytes must decompress)")
+    build_statement(&inputs)
+        .expect("M10-g: build_statement failed (compressed ciphertext bytes must decompress)")
 }
 
 fn build_proof_from_fixture(proof: &SigmaProofFixture) -> SigmaProtocolProof {
@@ -299,7 +294,9 @@ fn run_rust_verifier(fix: &Fixture) -> (Vec<u8>, bool) {
         fix.meta.has_effective_auditor,
         fix.meta.num_volun_auditors,
     )
-    .expect("M10-g: verify_transfer_single_party returned Err (must surface only structural errors)");
+    .expect(
+        "M10-g: verify_transfer_single_party returned Err (must surface only structural errors)",
+    );
     (fails, aggregate)
 }
 
@@ -393,7 +390,10 @@ async fn sigma_position_17_verifies_for_1_deposit_with_correct_new_a() {
     // Plan-mandated 1-deposit baseline (M8 case): 100 octas / 100 octas xfer.
     assert_eq!(fix.meta.total_octas, "100", "{}", fix.meta.name);
     assert_eq!(fix.meta.transfer_octas, "100", "{}", fix.meta.name);
-    assert!(!fix.debug.override_applied, "happy path must use truthful new_a");
+    assert!(
+        !fix.debug.override_applied,
+        "happy path must use truthful new_a"
+    );
     assert_parity(&fix, &[]);
 }
 
@@ -402,7 +402,10 @@ async fn sigma_position_17_verifies_for_2_deposits_with_correct_new_a() {
     let fix = load_fixture("2_deposit_happy_path");
     assert_eq!(fix.meta.total_octas, "250", "{}", fix.meta.name);
     assert_eq!(fix.meta.transfer_octas, "100", "{}", fix.meta.name);
-    assert!(!fix.debug.override_applied, "happy path must use truthful new_a");
+    assert!(
+        !fix.debug.override_applied,
+        "happy path must use truthful new_a"
+    );
     assert_parity(&fix, &[]);
 }
 
@@ -412,7 +415,10 @@ async fn sigma_position_17_verifies_for_8_deposits_with_correct_new_a() {
     // 8-deposit aggregate: 100+101+102+103+104+105+106+107 = 828.
     assert_eq!(fix.meta.total_octas, "828", "{}", fix.meta.name);
     assert_eq!(fix.meta.transfer_octas, "100", "{}", fix.meta.name);
-    assert!(!fix.debug.override_applied, "happy path must use truthful new_a");
+    assert!(
+        !fix.debug.override_applied,
+        "happy path must use truthful new_a"
+    );
     assert_parity(&fix, &[]);
 }
 

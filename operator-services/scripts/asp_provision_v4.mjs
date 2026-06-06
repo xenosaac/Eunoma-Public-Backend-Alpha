@@ -4,7 +4,8 @@
 //   - publishes V4-named deposit/withdraw VKs plus ragequit VK;
 //   - writes <stateRoot>/coordinator/asset_registry.json from on-chain AssetRegistryV4.
 //
-// Env: BRIDGE_PACKAGE_ADDRESS, ADMIN_PROFILE, EUNOMA_LOCAL_STATE_ROOT, APTOS_NODE_URL.
+// Env: BRIDGE_PACKAGE_ADDRESS, ADMIN_PROFILE, EUNOMA_LOCAL_STATE_ROOT, APTOS_NODE_URL,
+//      RESERVE_ACCOUNT_ADDRESS, EUNOMA_DEPOSIT_RELAYER_GAS_FEE_OCTAS.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -19,9 +20,20 @@ const BRIDGE = process.env.BRIDGE_PACKAGE_ADDRESS;
 const PROFILE = process.env.ADMIN_PROFILE || "testnet-user";
 const NODE_URL = normalizeNodeUrl(process.env.APTOS_NODE_URL || "https://fullnode.testnet.aptoslabs.com/v1");
 const STATE_ROOT = resolve(serviceRoot, process.env.EUNOMA_LOCAL_STATE_ROOT ?? ".agent-local/eunoma-v2-asp");
+const GAS_FEE_OCTAS = decimalEnv(
+  process.env.EUNOMA_DEPOSIT_RELAYER_GAS_FEE_OCTAS ??
+    process.env.DEPOSIT_RELAYER_GAS_FEE_OCTAS ??
+    "4000000",
+  "EUNOMA_DEPOSIT_RELAYER_GAS_FEE_OCTAS",
+);
+const RESERVE_ACCOUNT = process.env.RESERVE_ACCOUNT_ADDRESS ?? process.env.RELAYER_RESERVE_ACCOUNT_ADDRESS;
 
 if (!BRIDGE) {
   console.error("BRIDGE_PACKAGE_ADDRESS required");
+  process.exit(2);
+}
+if (GAS_FEE_OCTAS !== "0" && !RESERVE_ACCOUNT) {
+  console.error("RESERVE_ACCOUNT_ADDRESS required when deposit relayer gas fee is nonzero");
   process.exit(2);
 }
 
@@ -51,6 +63,7 @@ const withdrawVkPublishArgs = () => {
 const steps = [
   ["init_recorder_delegate", null],
   ["init_asp_recorder_delegate", null],
+  ["ensure_gas_fee_config_v1", gasFeeArgs()],
   ["init_pending_deposit_bindings_v2", null],
   ["init_pending_deposit_bindings_v3", null],
   ["init_pending_deposit_finalizations_v3", null],
@@ -139,10 +152,47 @@ process.stdout.write(JSON.stringify({ allOk, statePath, registryPath, results },
 process.exit(allOk ? 0 : 1);
 
 function runEntry(entry, args) {
+  if (entry === "ensure_gas_fee_config_v1") {
+    return runGasFeeConfig(args);
+  }
   const resourceName = resourceByEntry.get(entry);
   if (resourceName && resourceExistsSync(resourceName)) {
     return { entry, ok: true, skipped: "resource_exists" };
   }
+  return runMoveEntry(entry, args);
+}
+
+function runGasFeeConfig(args) {
+  const reserveAddr = gasFeeReserveAddress();
+  const existing = resourceReadSync("GasFeeConfigV1");
+  if (existing) {
+    const currentFee = String(existing.data?.flat_fee_octas ?? "");
+    const currentReserve = existing.data?.reserve_addr ? normalizeAddress(existing.data.reserve_addr) : "";
+    if (currentFee === GAS_FEE_OCTAS && currentReserve === reserveAddr) {
+      return {
+        entry: "ensure_gas_fee_config_v1",
+        ok: true,
+        skipped: "resource_matches",
+        flatFeeOctas: GAS_FEE_OCTAS,
+        reserveAddr,
+      };
+    }
+    return {
+      ...runMoveEntry("admin_set_gas_fee_config_v1", args, "ensure_gas_fee_config_v1"),
+      action: "admin_set_gas_fee_config_v1",
+      flatFeeOctas: GAS_FEE_OCTAS,
+      reserveAddr,
+    };
+  }
+  return {
+    ...runMoveEntry("init_gas_fee_config_v1", args, "ensure_gas_fee_config_v1"),
+    action: "init_gas_fee_config_v1",
+    flatFeeOctas: GAS_FEE_OCTAS,
+    reserveAddr,
+  };
+}
+
+function runMoveEntry(entry, args, resultEntry = entry) {
   const cli = [
     "move",
     "run",
@@ -165,7 +215,8 @@ function runEntry(entry, args) {
     const parsed = jsonStart >= 0 ? JSON.parse(out.slice(jsonStart)) : {};
     const r = parsed.Result ?? {};
     return {
-      entry,
+      entry: resultEntry,
+      action: entry,
       ok: r.success === true,
       txHash: r.transaction_hash,
       gas: r.gas_used,
@@ -174,10 +225,11 @@ function runEntry(entry, args) {
   } catch (e) {
     const blob = `${e.stdout ?? ""}${e.stderr ?? ""}`;
     if (/E_ALREADY_INITIALIZED|ALREADY_INITIALIZED|RESOURCE_ALREADY_EXISTS|0x80003/.test(blob)) {
-      return { entry, ok: true, skipped: "already_initialized" };
+      return { entry: resultEntry, action: entry, ok: true, skipped: "already_initialized" };
     }
     return {
-      entry,
+      entry: resultEntry,
+      action: entry,
       ok: false,
       error: blob
         .split("\n")
@@ -189,7 +241,19 @@ function runEntry(entry, args) {
   }
 }
 
+function gasFeeArgs() {
+  return [`u64:${GAS_FEE_OCTAS}`, `address:${gasFeeReserveAddress()}`];
+}
+
+function gasFeeReserveAddress() {
+  return RESERVE_ACCOUNT ? normalizeAddress(RESERVE_ACCOUNT) : normalizeAddress(BRIDGE);
+}
+
 function resourceExistsSync(resourceName) {
+  return resourceReadSync(resourceName) !== null;
+}
+
+function resourceReadSync(resourceName) {
   const type = `${normalizeAddress(BRIDGE)}::eunoma_bridge::${resourceName}`;
   const url = `${NODE_URL}/accounts/${normalizeAddress(BRIDGE)}/resource/${encodeURIComponent(type)}`;
   try {
@@ -199,20 +263,36 @@ function resourceExistsSync(resourceName) {
         "-e",
         `
 const url = process.argv[1];
-const res = await fetch(url, { headers: { accept: "application/json" } });
-if (res.status === 200) process.exit(0);
-if (res.status === 404) process.exit(1);
-console.error(await res.text());
-process.exit(2);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+for (let attempt = 1; attempt <= 10; attempt += 1) {
+  const res = await fetch(url, { headers: { accept: "application/json" } });
+  const text = await res.text();
+  if (res.status === 200) {
+    console.log(text);
+    process.exit(0);
+  }
+  if (res.status === 404) process.exit(1);
+  const retryable =
+    res.status === 408 ||
+    res.status === 409 ||
+    res.status === 425 ||
+    res.status === 429 ||
+    res.status >= 500 ||
+    /rate limit|per anonymous ip/i.test(text);
+  if (!retryable || attempt === 10) {
+    console.error(text);
+    process.exit(2);
+  }
+  await sleep(Math.min(3000 + attempt * 1000, 15000));
+}
 `,
         url,
       ],
       { encoding: "utf8", maxBuffer: 1024 * 1024 },
     );
-    void out;
-    return true;
+    return JSON.parse(out);
   } catch (e) {
-    if (e.status === 1) return false;
+    if (e.status === 1) return null;
     throw new Error(`resource precheck failed for ${resourceName}: ${e.stdout ?? ""}${e.stderr ?? ""}`);
   }
 }
@@ -292,8 +372,10 @@ async function writeAssetRegistryArtifact() {
 }
 
 async function getResource(type) {
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${NODE_URL}/accounts/${normalizeAddress(BRIDGE)}/resource/${encodeURIComponent(type)}`,
+    undefined,
+    `resource ${type}`,
   );
   if (!res.ok) {
     throw new Error(`resource ${type} failed: ${res.status} ${await res.text()}`);
@@ -302,24 +384,65 @@ async function getResource(type) {
 }
 
 async function getTableItem(handle, key) {
-  const res = await fetch(`${NODE_URL}/tables/${handle}/item`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      key_type: "address",
-      value_type: `${normalizeAddress(BRIDGE)}::eunoma_bridge::AssetVaultStateV4`,
-      key: normalizeAddress(key),
-    }),
-  });
+  const res = await fetchWithRetry(
+    `${NODE_URL}/tables/${handle}/item`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        key_type: "address",
+        value_type: `${normalizeAddress(BRIDGE)}::eunoma_bridge::AssetVaultStateV4`,
+        key: normalizeAddress(key),
+      }),
+    },
+    `table item ${handle}/${key}`,
+  );
   if (!res.ok) {
     throw new Error(`table item ${handle}/${key} failed: ${res.status} ${await res.text()}`);
   }
   return res.json();
 }
 
+async function fetchWithRetry(url, init, label) {
+  let lastText = "";
+  for (let attempt = 1; attempt <= 10; attempt += 1) {
+    const res = await fetch(url, init);
+    if (res.ok || res.status === 404) return res;
+    lastText = await res.text();
+    if (!isRetryableHttp(res.status, lastText) || attempt === 10) {
+      throw new Error(`${label} failed: ${res.status} ${lastText}`);
+    }
+    await sleep(Math.min(3000 + attempt * 1000, 15000));
+  }
+  throw new Error(`${label} failed: ${lastText}`);
+}
+
 function normalizeNodeUrl(value) {
   const s = String(value).replace(/\/+$/, "");
   return s.endsWith("/v1") ? s : `${s}/v1`;
+}
+
+function decimalEnv(value, name) {
+  const s = String(value ?? "");
+  if (!/^[0-9]+$/.test(s)) {
+    throw new Error(`${name} must be a decimal u64 string`);
+  }
+  return s;
+}
+
+function isRetryableHttp(status, text) {
+  return (
+    status === 408 ||
+    status === 409 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500 ||
+    /rate limit|per anonymous ip/i.test(text)
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function strip0x(value) {

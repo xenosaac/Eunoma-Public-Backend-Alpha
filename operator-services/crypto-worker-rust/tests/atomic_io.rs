@@ -100,12 +100,10 @@ fn write_atomic_no_clobber_concurrent_writers_one_wins() {
         let target = Arc::new(dir.join("contested.json"));
         let target_a = Arc::clone(&target);
         let target_b = Arc::clone(&target);
-        let handle_a = thread::spawn(move || {
-            write_atomic_no_clobber(&target_a, b"alpha-content", "race_ctx")
-        });
-        let handle_b = thread::spawn(move || {
-            write_atomic_no_clobber(&target_b, b"beta-content", "race_ctx")
-        });
+        let handle_a =
+            thread::spawn(move || write_atomic_no_clobber(&target_a, b"alpha-content", "race_ctx"));
+        let handle_b =
+            thread::spawn(move || write_atomic_no_clobber(&target_b, b"beta-content", "race_ctx"));
         let ra = handle_a.join().expect("thread a panic");
         let rb = handle_b.join().expect("thread b panic");
 
@@ -115,13 +113,19 @@ fn write_atomic_no_clobber_concurrent_writers_one_wins() {
         match (&ra, &rb) {
             (Ok(()), Err(WorkerError::InvalidDkgState(s))) => {
                 assert_eq!(s, "race_ctx_already_exists_with_different_content");
-                assert_eq!(final_bytes, b"alpha-content", "winner A but content mismatched");
+                assert_eq!(
+                    final_bytes, b"alpha-content",
+                    "winner A but content mismatched"
+                );
                 winners_a += 1;
                 errors_b += 1;
             }
             (Err(WorkerError::InvalidDkgState(s)), Ok(())) => {
                 assert_eq!(s, "race_ctx_already_exists_with_different_content");
-                assert_eq!(final_bytes, b"beta-content", "winner B but content mismatched");
+                assert_eq!(
+                    final_bytes, b"beta-content",
+                    "winner B but content mismatched"
+                );
                 winners_b += 1;
                 errors_a += 1;
             }
@@ -147,8 +151,14 @@ fn write_atomic_no_clobber_concurrent_writers_one_wins() {
     // Sanity: both sides should win at least some races (else the test is flaky-but-passing
     // for the wrong reason). With 32 iterations across two threads, demanding at least 1
     // win each is generous.
-    assert!(winners_a >= 1, "thread A never won any race ({winners_a}); scheduling is suspect");
-    assert!(winners_b >= 1, "thread B never won any race ({winners_b}); scheduling is suspect");
+    assert!(
+        winners_a >= 1,
+        "thread A never won any race ({winners_a}); scheduling is suspect"
+    );
+    assert!(
+        winners_b >= 1,
+        "thread B never won any race ({winners_b}); scheduling is suspect"
+    );
 }
 
 /// Concurrent writers with SAME bytes: both should succeed (race winner's content
@@ -160,12 +170,10 @@ fn write_atomic_no_clobber_concurrent_same_bytes_both_succeed() {
         let target = Arc::new(dir.join("same.json"));
         let target_a = Arc::clone(&target);
         let target_b = Arc::clone(&target);
-        let handle_a = thread::spawn(move || {
-            write_atomic_no_clobber(&target_a, b"identical", "same_ctx")
-        });
-        let handle_b = thread::spawn(move || {
-            write_atomic_no_clobber(&target_b, b"identical", "same_ctx")
-        });
+        let handle_a =
+            thread::spawn(move || write_atomic_no_clobber(&target_a, b"identical", "same_ctx"));
+        let handle_b =
+            thread::spawn(move || write_atomic_no_clobber(&target_b, b"identical", "same_ctx"));
         let ra = handle_a.join().expect("thread a panic");
         let rb = handle_b.join().expect("thread b panic");
         assert!(ra.is_ok(), "thread a: {ra:?}");

@@ -67,12 +67,7 @@
 //! protected by the existing 5-of-7 threshold + chain-D byte-equality check.
 //! Tracked for a future hardening milestone (M11+).
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use curve25519_dalek::{
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
@@ -219,9 +214,8 @@ fn hex_to_32(hex: &str) -> Result<[u8; 32], BalanceDecryptError> {
 /// from_bytes_mod_order` accepts any 32 bytes and reduces, which matches the
 /// loader's existing semantics (see `lib.rs:2147`).
 fn scalar_from_share_hex(hex: &str) -> Result<Scalar, BalanceDecryptError> {
-    let bytes = hex_to_32(hex).map_err(|e| {
-        BalanceDecryptError::Internal(format!("share dk_share hex invalid: {e}"))
-    })?;
+    let bytes = hex_to_32(hex)
+        .map_err(|e| BalanceDecryptError::Internal(format!("share dk_share hex invalid: {e}")))?;
     Ok(Scalar::from_bytes_mod_order(bytes))
 }
 
@@ -520,8 +514,7 @@ pub async fn handle(
     dk_share.zeroize();
 
     // 10. Encode partials and compute the attestation transcript hash.
-    let partial_hex: Vec<String> =
-        partials.iter().map(compressed_hex).collect();
+    let partial_hex: Vec<String> = partials.iter().map(compressed_hex).collect();
 
     let transcript = canonical_transcript_bytes(
         &req.dkg_epoch,
@@ -557,7 +550,16 @@ pub async fn handle_http<S: AppStateForBalanceDecrypt + Send + Sync>(
     let trusted_url = state.aptos_node_url().to_string();
     let trusted_vault = state.bridge_vault_address().to_string();
     let trusted_asset = state.bridge_asset_type().to_string();
-    match handle(&state_dir, &trusted_url, &trusted_vault, &trusted_asset, req, None).await {
+    match handle(
+        &state_dir,
+        &trusted_url,
+        &trusted_vault,
+        &trusted_asset,
+        req,
+        None,
+    )
+    .await
+    {
         Ok(resp) => (StatusCode::OK, Json(json!(resp))).into_response(),
         Err(err) => {
             let status = err.http_status();
@@ -591,9 +593,7 @@ pub trait AppStateForBalanceDecrypt: Clone + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curve25519_dalek::{
-        constants::RISTRETTO_BASEPOINT_POINT, scalar::Scalar,
-    };
+    use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT, scalar::Scalar};
 
     #[test]
     fn canonical_bytes_are_deterministic_and_length_bound() {
@@ -603,46 +603,22 @@ mod tests {
                 compressed_hex(&p)
             })
             .collect();
-        let a = canonical_transcript_bytes(
-            "epoch-1",
-            "0xvault",
-            "0x1::asset::T",
-            3,
-            "req-1",
-            &p_hex,
-        );
-        let b = canonical_transcript_bytes(
-            "epoch-1",
-            "0xvault",
-            "0x1::asset::T",
-            3,
-            "req-1",
-            &p_hex,
-        );
+        let a =
+            canonical_transcript_bytes("epoch-1", "0xvault", "0x1::asset::T", 3, "req-1", &p_hex);
+        let b =
+            canonical_transcript_bytes("epoch-1", "0xvault", "0x1::asset::T", 3, "req-1", &p_hex);
         assert_eq!(a, b);
 
         // Tampering with ell MUST change the transcript.
         let mut shorter = p_hex.clone();
         shorter.pop();
-        let c = canonical_transcript_bytes(
-            "epoch-1",
-            "0xvault",
-            "0x1::asset::T",
-            3,
-            "req-1",
-            &shorter,
-        );
+        let c =
+            canonical_transcript_bytes("epoch-1", "0xvault", "0x1::asset::T", 3, "req-1", &shorter);
         assert_ne!(a, c);
 
         // Tampering with slot MUST change the transcript.
-        let d = canonical_transcript_bytes(
-            "epoch-1",
-            "0xvault",
-            "0x1::asset::T",
-            4,
-            "req-1",
-            &p_hex,
-        );
+        let d =
+            canonical_transcript_bytes("epoch-1", "0xvault", "0x1::asset::T", 4, "req-1", &p_hex);
         assert_ne!(a, d);
     }
 

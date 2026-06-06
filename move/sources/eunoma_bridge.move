@@ -1287,8 +1287,8 @@ module eunoma::eunoma_bridge {
         admin: &signer,
         flat_fee_octas: u64,
         reserve_addr: address,
-    ) acquires BridgeVault {
-        assert_admin(admin);
+    ) acquires BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(!exists<GasFeeConfigV1>(@eunoma), E_ALREADY_INITIALIZED);
         move_to(admin, GasFeeConfigV1 { flat_fee_octas, reserve_addr });
     }
@@ -1299,8 +1299,8 @@ module eunoma::eunoma_bridge {
         admin: &signer,
         flat_fee_octas: u64,
         reserve_addr: address,
-    ) acquires GasFeeConfigV1, BridgeVault {
-        assert_admin(admin);
+    ) acquires GasFeeConfigV1, BridgeVault, VaultCoreV4 {
+        assert_admin_legacy_or_v4(admin);
         assert!(exists<GasFeeConfigV1>(@eunoma), E_GAS_FEE_NOT_INITIALIZED);
         let c = borrow_global_mut<GasFeeConfigV1>(@eunoma);
         c.flat_fee_octas = flat_fee_octas;
@@ -6522,6 +6522,12 @@ module eunoma::eunoma_bridge {
             i = i + 1;
         };
         out
+    }
+
+    #[test_only]
+    public fun test_only_gas_fee_config_v1(): (u64, address) acquires GasFeeConfigV1 {
+        let c = borrow_global<GasFeeConfigV1>(@eunoma);
+        (c.flat_fee_octas, c.reserve_addr)
     }
 
     // Drive the REAL emergency-exit DORMANT gate inside emergency_exit_to_raw_v4 (the

@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { ForbiddenPlaintextFieldError } from "@eunoma/deop-protocol";
-import { RelayerSubmitterError, buildRelayerServer } from "../src/server.js";
+import {
+  RelayerSubmitterError,
+  buildRelayerServer,
+  depositDelegateRequestHash,
+} from "../src/server.js";
 import { DepositV3ArgsError, parseDepositV3DelegateArgs } from "../src/deposit_v3_args.js";
 import type { GasGuard } from "../src/gas_guard.js";
+import { FileSubmitJournal } from "../src/submit_journal.js";
 
 function validDepositBody(): Record<string, unknown> {
   const h = (b: string, n = 32) => b.repeat(n);
@@ -145,5 +150,52 @@ describe("relayer /v3/relayer/submit/deposit", () => {
     });
     expect(res.statusCode).toBe(502);
     expect(res.json().code).toBe("aptos_cli_error");
+  });
+
+  it("passes consecutive completed journal steps to the deposit submitter for resume", async () => {
+    const body = validDepositBody();
+    const parsed = parseDepositV3DelegateArgs(body);
+    const requestHash = depositDelegateRequestHash(parsed);
+    const journal = new FileSubmitJournal({ now: () => 1 });
+    journal.recordIntent(requestHash, 0);
+    journal.recordCompleted(requestHash, 0, "0x" + "a".repeat(64));
+
+    let observed:
+      | {
+          completedTxHashes?: string[];
+          resumeAfterStep?: number;
+        }
+      | undefined;
+    const server = buildRelayerServer({
+      gasGuard: allowGuard,
+      journal,
+      depositV3Submitter: async (_args, hooks) => {
+        observed = {
+          completedTxHashes: hooks?.completedTxHashes,
+          resumeAfterStep: hooks?.resumeAfterStep,
+        };
+        hooks?.onStepStart?.(1, "deposit_step2a_eunoma_verify_v3");
+        hooks?.onStepDone?.(1, "deposit_step2a_eunoma_verify_v3", "0x" + "b".repeat(64));
+        return {
+          accepted: true,
+          simulated: false,
+          txHashes: [...(hooks?.completedTxHashes ?? []), "0x" + "b".repeat(64)],
+        };
+      },
+    });
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/v3/relayer/submit/deposit",
+      payload: body,
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(observed).toEqual({
+      completedTxHashes: ["0x" + "a".repeat(64)],
+      resumeAfterStep: 0,
+    });
+    expect(journal.lastCompletedStep(requestHash)).toBe(1);
+    expect(res.json().txHashes).toEqual(["0x" + "a".repeat(64), "0x" + "b".repeat(64)]);
   });
 });

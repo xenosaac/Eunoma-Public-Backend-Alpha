@@ -47,8 +47,7 @@ use eunoma_crypto_worker::{
 use rand_chacha::{rand_core::SeedableRng, ChaCha12Rng};
 use serde::Deserialize;
 
-const FIXTURE_REL_PATH: &str =
-    "../deop-protocol/tests/fixtures/aptos_ca_transfer_v1_fixture.json";
+const FIXTURE_REL_PATH: &str = "../deop-protocol/tests/fixtures/aptos_ca_transfer_v1_fixture.json";
 
 const SDK_TRANSCRIPT_LABEL: &str = "AptosConfidentialAsset/BulletproofRangeProof";
 
@@ -125,7 +124,10 @@ struct RangeProofSection {
 // =============================================================================
 
 fn hex_decode(s: &str) -> Vec<u8> {
-    let raw = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let raw = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     let mut out = Vec::with_capacity(raw.len() / 2);
     for i in (0..raw.len()).step_by(2) {
         out.push(u8::from_str_radix(&raw[i..i + 2], 16).expect("hex byte"));
@@ -147,8 +149,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn load_fixture() -> Fixture {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_REL_PATH);
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|err| panic!("read fixture at {}: {err}", path.display()));
+    let bytes =
+        fs::read(&path).unwrap_or_else(|err| panic!("read fixture at {}: {err}", path.display()));
     serde_json::from_slice(&bytes).expect("parse fixture json")
 }
 
@@ -247,8 +249,13 @@ fn aptos_ca_bulletproof_byte_parity_with_aptos_sdk() {
 
     // -------- Commitment sanity --------
     // Aptos commits use C = G*v + H*r (Pedersen against `(G, H_RISTRETTO)`).
-    let expected_amount_comms: Vec<[u8; 32]> =
-        fix.range_proofs.amount.comms.iter().map(|h| hex_32(h)).collect();
+    let expected_amount_comms: Vec<[u8; 32]> = fix
+        .range_proofs
+        .amount
+        .comms
+        .iter()
+        .map(|h| hex_32(h))
+        .collect();
     assert_eq!(amount_comms, expected_amount_comms);
     let expected_new_balance_comms: Vec<[u8; 32]> = fix
         .range_proofs
@@ -285,8 +292,13 @@ fn verify_range_byte_parity() {
     let n = fix.params.n;
 
     let amount_proof = hex_decode(&fix.range_proofs.amount.proof);
-    let amount_comms: Vec<[u8; 32]> =
-        fix.range_proofs.amount.comms.iter().map(|h| hex_32(h)).collect();
+    let amount_comms: Vec<[u8; 32]> = fix
+        .range_proofs
+        .amount
+        .comms
+        .iter()
+        .map(|h| hex_32(h))
+        .collect();
     assert!(
         verify_range_single_party(&amount_proof, &amount_comms, APTOS_NUM_BITS, n)
             .expect("verify amount"),
@@ -404,13 +416,19 @@ fn threshold_split_actually_sums_to_blindings() {
         split_blindings_into_five_additive_shares(&amt_r, b"M4D_RANGE_BLINDING_AMOUNT_V1");
     for i in 0..amt_r.len() {
         let sum: Scalar = (0..NUM_PARTIES).map(|j| amt_shares[j][i]).sum();
-        assert_eq!(sum, amt_r[i], "amount blinding[{i}] additive split mismatch");
+        assert_eq!(
+            sum, amt_r[i],
+            "amount blinding[{i}] additive split mismatch"
+        );
     }
     let nb_shares =
         split_blindings_into_five_additive_shares(&nb_r, b"M4D_RANGE_BLINDING_NEWBAL_V1");
     for i in 0..nb_r.len() {
         let sum: Scalar = (0..NUM_PARTIES).map(|j| nb_shares[j][i]).sum();
-        assert_eq!(sum, nb_r[i], "newBalance blinding[{i}] additive split mismatch");
+        assert_eq!(
+            sum, nb_r[i],
+            "newBalance blinding[{i}] additive split mismatch"
+        );
     }
 }
 
@@ -436,8 +454,13 @@ fn threshold_partial_commitment_aggregates_to_aptos_commit() {
     let aggregated_comms =
         aggregate_partial_range_commitments(&partials, &amt_values).expect("aggregate commitments");
 
-    let expected_comms: Vec<[u8; 32]> =
-        fix.range_proofs.amount.comms.iter().map(|h| hex_32(h)).collect();
+    let expected_comms: Vec<[u8; 32]> = fix
+        .range_proofs
+        .amount
+        .comms
+        .iter()
+        .map(|h| hex_32(h))
+        .collect();
     assert_eq!(aggregated_comms, expected_comms);
     // And consistent with the single-party aptos_commit helper.
     let single_party_comms = aptos_commit(&amt_values, &amt_blindings).expect("aptos_commit");
@@ -472,14 +495,9 @@ fn threshold_bulletproof_byte_parity_with_m4a_fixture_amount() {
     // because the WASM thread_rng caches state across calls.
     let (_seed_bytes, mut rng) = build_wasm_chacha(&fix.generator.prng_seed, ell, n);
 
-    let (amount_proof_bytes, amount_comms) = prove_threshold_range_multi(
-        &amount_values,
-        &amount_shares,
-        APTOS_NUM_BITS,
-        n,
-        &mut rng,
-    )
-    .expect("threshold amount range proof");
+    let (amount_proof_bytes, amount_comms) =
+        prove_threshold_range_multi(&amount_values, &amount_shares, APTOS_NUM_BITS, n, &mut rng)
+            .expect("threshold amount range proof");
     let (new_balance_proof_bytes, new_balance_comms) = prove_threshold_range_multi(
         &new_balance_values,
         &new_balance_shares,
@@ -490,8 +508,13 @@ fn threshold_bulletproof_byte_parity_with_m4a_fixture_amount() {
     .expect("threshold newBalance range proof");
 
     // Commitment sanity (the same V[i] math the prover produces internally).
-    let expected_amount_comms: Vec<[u8; 32]> =
-        fix.range_proofs.amount.comms.iter().map(|h| hex_32(h)).collect();
+    let expected_amount_comms: Vec<[u8; 32]> = fix
+        .range_proofs
+        .amount
+        .comms
+        .iter()
+        .map(|h| hex_32(h))
+        .collect();
     assert_eq!(amount_comms, expected_amount_comms);
     let expected_new_balance_comms: Vec<[u8; 32]> = fix
         .range_proofs
@@ -545,14 +568,9 @@ fn threshold_bulletproof_byte_parity_with_m4a_fixture_new_balance() {
 
     let (_seed_bytes, mut rng) = build_wasm_chacha(&fix.generator.prng_seed, ell, n);
 
-    let (_amount_proof_bytes, _amount_comms) = prove_threshold_range_multi(
-        &amount_values,
-        &amount_shares,
-        APTOS_NUM_BITS,
-        n,
-        &mut rng,
-    )
-    .expect("threshold amount range proof (pre-roll RNG)");
+    let (_amount_proof_bytes, _amount_comms) =
+        prove_threshold_range_multi(&amount_values, &amount_shares, APTOS_NUM_BITS, n, &mut rng)
+            .expect("threshold amount range proof (pre-roll RNG)");
     let (new_balance_proof_bytes, new_balance_comms) = prove_threshold_range_multi(
         &new_balance_values,
         &new_balance_shares,
@@ -626,8 +644,7 @@ fn threshold_bulletproof_collapses_to_single_party_when_one_holds_all_blinding()
     )
     .expect("threshold prove");
 
-    let (_seed2, mut rng_single) =
-        build_wasm_chacha(&fix.generator.prng_seed, fix.params.ell, n);
+    let (_seed2, mut rng_single) = build_wasm_chacha(&fix.generator.prng_seed, fix.params.ell, n);
     let (single_proof, single_comms) = prove_range_with_rng(
         &amount_values,
         &amount_blindings,
@@ -683,7 +700,10 @@ fn threshold_aggregate_blinding_shares_byte_parity() {
         split_blindings_into_five_additive_shares(&amt_blindings, b"M4D_AGGREGATE_TEST_V1");
     let agg = aggregate_blinding_shares(&shares).expect("aggregate");
     for i in 0..amt_blindings.len() {
-        assert_eq!(agg[i], amt_blindings[i], "aggregated blinding[{i}] mismatch");
+        assert_eq!(
+            agg[i], amt_blindings[i],
+            "aggregated blinding[{i}] mismatch"
+        );
     }
 }
 
@@ -708,14 +728,18 @@ fn threshold_rejects_mismatched_share_lengths() {
 
     let mismatched_partials = vec![
         ThresholdRangePartial {
-            h_blinding_partials: vec![
-                CompressedRistretto::default().decompress().unwrap_or_default()
-            ],
+            h_blinding_partials: vec![CompressedRistretto::default()
+                .decompress()
+                .unwrap_or_default()],
         },
         ThresholdRangePartial {
             h_blinding_partials: vec![
-                CompressedRistretto::default().decompress().unwrap_or_default(),
-                CompressedRistretto::default().decompress().unwrap_or_default(),
+                CompressedRistretto::default()
+                    .decompress()
+                    .unwrap_or_default(),
+                CompressedRistretto::default()
+                    .decompress()
+                    .unwrap_or_default(),
             ],
         },
     ];

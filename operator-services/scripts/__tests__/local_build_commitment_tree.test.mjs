@@ -431,6 +431,35 @@ describe("local_build_commitment_tree.mjs — ordering and idempotency", () => {
     expect(out.depositMeta.map((m) => m.depositCount)).toEqual([1, 2]);
   });
 
+  it("--refresh falls back to state_leanimt_tree.json when fixed-depth artifact is absent", async () => {
+    const tx1 = { txHash: "0x" + "e1".padEnd(64, "0"), depositCount: 1, commitmentHex: leafHex("lean-refresh-1"), sender: senderHex(1), version: 110, sequenceNumber: 0 };
+    const tx2 = { txHash: "0x" + "e2".padEnd(64, "0"), depositCount: 2, commitmentHex: leafHex("lean-refresh-2"), sender: senderHex(2), version: 120, sequenceNumber: 1 };
+
+    globalThis.fetch = makeFetchStub({ [tx1.txHash.toLowerCase()]: txFor(tx1) });
+    writeWitness(witnessDir, tx1);
+    await ingest({ argv: baseArgs() });
+    rmSync(join(stateDir, "commitment_tree_v2.json"));
+
+    globalThis.fetch = makeFetchStub({
+      [tx1.txHash.toLowerCase()]: txFor(tx1),
+      [tx2.txHash.toLowerCase()]: txFor(tx2),
+    });
+    writeWitness(witnessDir, tx2);
+
+    const code = await ingest({ argv: [...baseArgs(), "--refresh"] });
+    expect(code).toBe(0);
+
+    const out = JSON.parse(readFileSync(join(stateDir, "commitment_tree_v2.json"), "utf8"));
+    const lean = JSON.parse(readFileSync(join(stateDir, "state_leanimt_tree.json"), "utf8"));
+    expect(out.leafCount).toBe(2);
+    expect(out.depositMeta.map((m) => m.depositTxHash)).toEqual([
+      tx1.txHash.toLowerCase(),
+      tx2.txHash.toLowerCase(),
+    ]);
+    expect(lean.leafCount).toBe(2);
+    expect(lean.leaves.map((l) => l.toLowerCase())).toEqual(out.leaves.map((l) => l.toLowerCase()));
+  });
+
   it("--refresh defers future deposit-count gaps while appending the contiguous next leaf", async () => {
     const tx1 = { txHash: "0x" + "1".repeat(64), depositCount: 1, commitmentHex: leafHex("fg1"), sender: senderHex(1), version: 10, sequenceNumber: 0 };
     const tx2 = { txHash: "0x" + "2".repeat(64), depositCount: 2, commitmentHex: leafHex("fg2"), sender: senderHex(2), version: 20, sequenceNumber: 1 };

@@ -13,18 +13,22 @@
 //!     the HTTP transport so tests can inject canned JSON without spinning up a
 //!     local Aptos node.
 //!
-//! The fetch is intentionally minimal: no retries, no caching, no rate limiting.
-//! Failures bubble up so the handler can fail closed with a precise reason.
+//! The fetch uses a bounded retry window for transient fullnode failures such as
+//! rate limiting and 5xx responses. Parse and data-shape failures still fail
+//! closed immediately with a precise reason.
 
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::time::sleep;
 
 /// Default timeout for the Aptos `/v1/view` call. Tight on purpose — the worker
 /// is responding to a coordinator HTTP request that itself has a deadline, and
 /// a slow chain RPC should fail fast so the orchestrator can route around it
 /// rather than block the whole quorum.
 pub const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 8;
+const DEFAULT_FETCH_ATTEMPTS: usize = 5;
+const DEFAULT_FETCH_RETRY_DELAY_MS: u64 = 1_000;
 
 /// Decode a 64-hex-character string into a `RistrettoPoint`. Returns `Err` if
 /// the string is not exactly 64 ASCII hex characters or if the bytes don't
@@ -35,10 +39,7 @@ fn ristretto_from_hex(hex: &str) -> Result<RistrettoPoint, String> {
         .or_else(|| hex.strip_prefix("0X"))
         .unwrap_or(hex);
     if raw.len() != 64 {
-        return Err(format!(
-            "ristretto hex must be 64 chars, got {}",
-            raw.len()
-        ));
+        return Err(format!("ristretto hex must be 64 chars, got {}", raw.len()));
     }
     if !raw.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("ristretto hex contains non-hex chars".to_string());
@@ -104,13 +105,20 @@ fn parse_hex_array(arr: &[Value]) -> Result<Vec<RistrettoPoint>, String> {
         } else if let Some(data) = v.get("data").and_then(|d| d.as_str()) {
             data
         } else {
-            return Err(format!(
-                "R[{idx}] is neither string nor {{data:string}}"
-            ));
+            return Err(format!("R[{idx}] is neither string nor {{data:string}}"));
         };
         out.push(ristretto_from_hex(hex_str)?);
     }
     Ok(out)
+}
+
+fn retryable_fetch_error(err: &str) -> bool {
+    err.starts_with("timeout:")
+        || err.starts_with("network:")
+        || matches!(
+            err.strip_prefix("bad_status:"),
+            Some("408" | "425" | "429" | "500" | "502" | "503" | "504")
+        )
 }
 
 /// Build the JSON body for the `0x1::confidential_asset::get_available_balance`
@@ -141,27 +149,35 @@ pub async fn fetch_old_balance_d_from_chain(
         .build()
         .map_err(|e| format!("network:client_build:{e}"))?;
     let body = build_view_request_body(vault, asset);
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                format!("timeout:{e}")
-            } else {
-                format!("network:{e}")
+    for attempt in 1..=DEFAULT_FETCH_ATTEMPTS {
+        let result = async {
+            let resp = client.post(&url).json(&body).send().await.map_err(|e| {
+                if e.is_timeout() {
+                    format!("timeout:{e}")
+                } else {
+                    format!("network:{e}")
+                }
+            })?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("bad_status:{}", status.as_u16()));
             }
-        })?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("bad_status:{}", status.as_u16()));
+            let value: Value = resp.json().await.map_err(|e| format!("bad_json:{e}"))?;
+            parse_view_response_d(&value).map_err(|e| format!("parse:{e}"))
+        }
+        .await;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < DEFAULT_FETCH_ATTEMPTS && retryable_fetch_error(&err) => {
+                sleep(Duration::from_millis(
+                    DEFAULT_FETCH_RETRY_DELAY_MS * attempt as u64,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
     }
-    let value: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("bad_json:{e}"))?;
-    parse_view_response_d(&value).map_err(|e| format!("parse:{e}"))
+    unreachable!("retry loop must return")
 }
 
 /// Parse an Aptos account resource response containing a `vault_sequence` field
@@ -208,22 +224,35 @@ pub async fn fetch_vault_core_sequence_from_chain(
         .timeout(Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("network:client_build:{e}"))?;
-    let resp = client.get(&url).send().await.map_err(|e| {
-        if e.is_timeout() {
-            format!("timeout:{e}")
-        } else {
-            format!("network:{e}")
+    for attempt in 1..=DEFAULT_FETCH_ATTEMPTS {
+        let result = async {
+            let resp = client.get(&url).send().await.map_err(|e| {
+                if e.is_timeout() {
+                    format!("timeout:{e}")
+                } else {
+                    format!("network:{e}")
+                }
+            })?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("bad_status:{}", status.as_u16()));
+            }
+            let value: Value = resp.json().await.map_err(|e| format!("bad_json:{e}"))?;
+            parse_vault_sequence_resource(&value).map_err(|e| format!("parse:{e}"))
         }
-    })?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("bad_status:{}", status.as_u16()));
+        .await;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < DEFAULT_FETCH_ATTEMPTS && retryable_fetch_error(&err) => {
+                sleep(Duration::from_millis(
+                    DEFAULT_FETCH_RETRY_DELAY_MS * attempt as u64,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
     }
-    let value: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("bad_json:{e}"))?;
-    parse_vault_sequence_resource(&value).map_err(|e| format!("parse:{e}"))
+    unreachable!("retry loop must return")
 }
 
 // ── M11: vault-state resync chain helper ──────────────────────────────────
@@ -358,26 +387,42 @@ pub async fn fetch_tx_by_hash(aptos_node_url: &str, tx_hash: &str) -> Result<Val
         .timeout(Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("network:client_build:{e}"))?;
-    let resp = client.get(&url).send().await.map_err(|e| {
-        if e.is_timeout() {
-            format!("timeout:{e}")
-        } else {
-            format!("network:{e}")
+    for attempt in 1..=DEFAULT_FETCH_ATTEMPTS {
+        let result = async {
+            let resp = client.get(&url).send().await.map_err(|e| {
+                if e.is_timeout() {
+                    format!("timeout:{e}")
+                } else {
+                    format!("network:{e}")
+                }
+            })?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("bad_status:{}", status.as_u16()));
+            }
+            resp.json::<Value>()
+                .await
+                .map_err(|e| format!("bad_json:{e}"))
         }
-    })?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("bad_status:{}", status.as_u16()));
+        .await;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < DEFAULT_FETCH_ATTEMPTS && retryable_fetch_error(&err) => {
+                sleep(Duration::from_millis(
+                    DEFAULT_FETCH_RETRY_DELAY_MS * attempt as u64,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
     }
-    resp.json::<Value>().await.map_err(|e| format!("bad_json:{e}"))
+    unreachable!("retry loop must return")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curve25519_dalek::{
-        constants::RISTRETTO_BASEPOINT_POINT, scalar::Scalar,
-    };
+    use curve25519_dalek::{constants::RISTRETTO_BASEPOINT_POINT, scalar::Scalar};
 
     fn compressed_hex(point: &RistrettoPoint) -> String {
         point
@@ -493,19 +538,36 @@ mod tests {
             "P": [],
             "R": [{ "data": 42 }],
         }]);
-        let err = parse_view_response_d(&val)
-            .expect_err("non-string data must be rejected");
+        let err = parse_view_response_d(&val).expect_err("non-string data must be rejected");
         assert!(
             err.contains("neither string nor {data:string}"),
             "expected precise parse error, got {err}"
         );
     }
 
+    #[test]
+    fn retryable_fetch_error_only_matches_transient_failures() {
+        assert!(retryable_fetch_error("bad_status:429"));
+        assert!(retryable_fetch_error("bad_status:503"));
+        assert!(retryable_fetch_error("timeout:deadline"));
+        assert!(retryable_fetch_error("network:connection reset"));
+        assert!(!retryable_fetch_error("bad_status:404"));
+        assert!(!retryable_fetch_error("bad_json:expected value"));
+        assert!(!retryable_fetch_error(
+            "parse:resource data.vault_sequence missing"
+        ));
+    }
+
     // ── M11: parse_tx_withdraw_event_v2 ───────────────────────────────────
 
     const PKG: &str = "0xa08850b1ca22cc5aa3a3a3fb1179cf3f1f169312cea8038ff1b1e3b4ace79ec1";
 
-    fn withdraw_tx_with_event(pkg: &str, seq: serde_json::Value, success: bool, event_name: &str) -> Value {
+    fn withdraw_tx_with_event(
+        pkg: &str,
+        seq: serde_json::Value,
+        success: bool,
+        event_name: &str,
+    ) -> Value {
         json!({
             "success": success,
             "vm_status": if success { "Executed successfully" } else { "ABORTED" },
@@ -586,7 +648,11 @@ mod tests {
         let tx = withdraw_tx(emitted, json!("1"), true);
         assert!(parse_tx_withdraw_event_v2(&tx, trusted).is_err());
         // Same address, only 0x/casing differs → matches.
-        let tx2 = withdraw_tx("0XA08850B1CA22CC5AA3A3A3FB1179CF3F1F169312CEA8038FF1B1E3B4ACE79EC1", json!("1"), true);
+        let tx2 = withdraw_tx(
+            "0XA08850B1CA22CC5AA3A3A3FB1179CF3F1F169312CEA8038FF1B1E3B4ACE79EC1",
+            json!("1"),
+            true,
+        );
         assert!(parse_tx_withdraw_event_v2(&tx2, trusted).is_ok());
     }
 

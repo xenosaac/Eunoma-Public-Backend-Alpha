@@ -58,8 +58,8 @@ use std::path::Path;
 use zeroize::Zeroize;
 
 use crate::ca_dkg_v2::{load_ca_dkg_v2_share, load_hpke_keypair_for_slot};
-use crate::{hpke_aead, DEOPERATOR_THRESHOLD};
 pub use crate::hpke_aead::HpkeEnvelope;
+use crate::{hpke_aead, DEOPERATOR_THRESHOLD};
 
 pub const NORMALIZE_ALPHA_SHARE_INFO: &[u8] = b"EUNOMA_NORMALIZE_ALPHA_SHARE_V1";
 
@@ -196,12 +196,18 @@ fn canonical_scalar_from_hex(
     Ok(opt.unwrap())
 }
 
-fn normalize_hex_no_prefix(raw: &str, field_name: &str) -> Result<String, NormalizeSigmaPartialError> {
+fn normalize_hex_no_prefix(
+    raw: &str,
+    field_name: &str,
+) -> Result<String, NormalizeSigmaPartialError> {
     let stripped = raw
         .strip_prefix("0x")
         .or_else(|| raw.strip_prefix("0X"))
         .unwrap_or(raw);
-    if stripped.is_empty() || stripped.len() % 2 != 0 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+    if stripped.is_empty()
+        || stripped.len() % 2 != 0
+        || !stripped.chars().all(|c| c.is_ascii_hexdigit())
+    {
         return Err(NormalizeSigmaPartialError::BadRequest(format!(
             "{field_name} must be even-length hex"
         )));
@@ -209,7 +215,10 @@ fn normalize_hex_no_prefix(raw: &str, field_name: &str) -> Result<String, Normal
     Ok(stripped.to_ascii_lowercase())
 }
 
-fn normalize_selected_slots(slots: &[usize], self_slot: usize) -> Result<(), NormalizeSigmaPartialError> {
+fn normalize_selected_slots(
+    slots: &[usize],
+    self_slot: usize,
+) -> Result<(), NormalizeSigmaPartialError> {
     if slots.len() != DEOPERATOR_THRESHOLD {
         return Err(NormalizeSigmaPartialError::BadRequest(format!(
             "selectedSlots must contain {DEOPERATOR_THRESHOLD} slots"
@@ -288,14 +297,25 @@ pub fn normalize_alpha_share_aad(
     }
     Ok(format!(
         "domain={}|request={}|dkg={}|roster={}|vault={}|asset={}|challenge={}|slots={}|slot={}",
-        std::str::from_utf8(NORMALIZE_ALPHA_SHARE_INFO).unwrap_or("EUNOMA_NORMALIZE_ALPHA_SHARE_V1"),
+        std::str::from_utf8(NORMALIZE_ALPHA_SHARE_INFO)
+            .unwrap_or("EUNOMA_NORMALIZE_ALPHA_SHARE_V1"),
         request_id,
         dkg_epoch,
         roster,
-        vault_address.trim_start_matches("0x").trim_start_matches("0X").to_ascii_lowercase(),
-        asset_type.trim_start_matches("0x").trim_start_matches("0X").to_ascii_lowercase(),
+        vault_address
+            .trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .to_ascii_lowercase(),
+        asset_type
+            .trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .to_ascii_lowercase(),
         challenge,
-        selected_slots.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","),
+        selected_slots
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         slot,
     )
     .into_bytes())
@@ -306,7 +326,12 @@ pub fn seal_normalize_alpha_share_for_test(
     aad: &[u8],
     plaintext: &[u8],
 ) -> crate::WorkerResult<HpkeEnvelope> {
-    hpke_aead::seal(recipient_public_key_hex, NORMALIZE_ALPHA_SHARE_INFO, aad, plaintext)
+    hpke_aead::seal(
+        recipient_public_key_hex,
+        NORMALIZE_ALPHA_SHARE_INFO,
+        aad,
+        plaintext,
+    )
 }
 
 /// Encode a Scalar as 32-byte LE lowercase hex (no `0x` prefix).
@@ -427,10 +452,8 @@ pub async fn handle(
             "lagrange_coefficient_zero".to_string(),
         ));
     }
-    let e_scalar = canonical_scalar_from_hex(
-        &req.fiat_shamir_challenge_hex,
-        "fiatShamirChallengeHex",
-    )?;
+    let e_scalar =
+        canonical_scalar_from_hex(&req.fiat_shamir_challenge_hex, "fiatShamirChallengeHex")?;
     if e_scalar == Scalar::ZERO {
         return Err(NormalizeSigmaPartialError::BadRequest(
             "fiatShamirChallenge_zero_rejected".to_string(),
@@ -443,7 +466,9 @@ pub async fn handle(
         crate::WorkerError::MissingLocalState(path) => {
             NormalizeSigmaPartialError::MissingShare(format!("hpke_keypair_file_not_found:{path}"))
         }
-        other => NormalizeSigmaPartialError::MissingShare(format!("hpke_keypair_load_failed:{other:?}")),
+        other => {
+            NormalizeSigmaPartialError::MissingShare(format!("hpke_keypair_load_failed:{other:?}"))
+        }
     })?;
     let aad = normalize_alpha_share_aad(
         &req.request_id,
@@ -466,7 +491,9 @@ pub async fn handle(
         &aad,
         &req.alpha_share_hpke,
     )
-    .map_err(|_| NormalizeSigmaPartialError::BadRequest("alpha_share_hpke_open_failed".to_string()))?;
+    .map_err(|_| {
+        NormalizeSigmaPartialError::BadRequest("alpha_share_hpke_open_failed".to_string())
+    })?;
     if alpha_plaintext.len() != 32 {
         alpha_plaintext.zeroize();
         return Err(NormalizeSigmaPartialError::BadRequest(

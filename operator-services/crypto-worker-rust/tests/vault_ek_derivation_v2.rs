@@ -54,8 +54,7 @@ fn det_scalar(seed: u64) -> Scalar {
 
 /// Twisted-ElGamal non-basepoint generator. Byte-identical to the crate-level
 /// `pub(crate) const H_RISTRETTO_HEX` in lib.rs.
-const H_RISTRETTO_HEX: &str =
-    "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+const H_RISTRETTO_HEX: &str = "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
 
 fn h_point() -> RistrettoPoint {
     let bytes: Vec<u8> = (0..H_RISTRETTO_HEX.len())
@@ -141,10 +140,7 @@ fn write_synthetic_share(state_dir: &Path, slot: usize) {
         power *= x;
     }
 
-    let aggregate_commitments: Vec<String> = commits
-        .iter()
-        .map(|p| compressed_hex(p))
-        .collect();
+    let aggregate_commitments: Vec<String> = commits.iter().map(|p| compressed_hex(p)).collect();
 
     let layout = ShareFileLayout {
         scheme: "ca_dkg_v2".to_string(),
@@ -409,7 +405,10 @@ fn http_round1_returns_503_with_default_adapter() {
         .env("CRYPTO_WORKER_HOST", "127.0.0.1")
         .env("CRYPTO_WORKER_PORT", port.to_string())
         .env("CRYPTO_WORKER_SLOT", "0")
-        .env("CRYPTO_WORKER_STATE_DIR", state_dir.to_string_lossy().to_string())
+        .env(
+            "CRYPTO_WORKER_STATE_DIR",
+            state_dir.to_string_lossy().to_string(),
+        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -599,12 +598,14 @@ fn verify_aggregates_five_contributions() {
     let ordered: Vec<(usize, String, SchnorrProof, String)> = request
         .contributions
         .iter()
-        .map(|c| (
-            c.slot,
-            c.h_contribution.clone(),
-            c.schnorr_proof.clone(),
-            c.mpc_open_m.clone(),
-        ))
+        .map(|c| {
+            (
+                c.slot,
+                c.h_contribution.clone(),
+                c.schnorr_proof.clone(),
+                c.mpc_open_m.clone(),
+            )
+        })
         .collect();
     let recomputed = final_transcript_hash(
         &request.dkg_epoch,
@@ -790,7 +791,10 @@ fn verify_rejects_invalid_schnorr_proof() {
         all_h_round_zero: all_h,
     };
     let err = run_verify(&request).unwrap_err();
-    assert!(matches!(&err, WorkerError::Crypto(msg) if msg.contains("schnorr")), "got {err:?}");
+    assert!(
+        matches!(&err, WorkerError::Crypto(msg) if msg.contains("schnorr")),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -875,7 +879,11 @@ fn worker_transcript_hash_is_deterministic_and_layout_documented() {
     expected_input.extend_from_slice(r0_commit.as_bytes());
     let mut hasher = Sha256::new();
     hasher.update(&expected_input);
-    let manual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let manual: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     assert_eq!(observed, manual);
 }
 
@@ -905,7 +913,15 @@ fn emit_worker_transcript_hash_parity_fixture() {
     let r0_commit_hash =
         eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h_round_zero);
     let hash = worker_transcript_hash(
-        dkg_epoch, &ca, &roster, &slots, slot, &h_hex, &h_r_hex, &m_hex, &r0_commit_hash,
+        dkg_epoch,
+        &ca,
+        &roster,
+        &slots,
+        slot,
+        &h_hex,
+        &h_r_hex,
+        &m_hex,
+        &r0_commit_hash,
     );
     let value = serde_json::json!({
         "dkgEpoch": dkg_epoch,
@@ -1040,11 +1056,9 @@ impl MpcInverseAdapter for MockAdditiveInverseAdapter {
         _r_i: &Scalar,
         ctx: &InversionContext,
     ) -> Result<InversionShare, AdapterError> {
-        let q = self
-            .by_slot
-            .get(&ctx.self_slot)
-            .copied()
-            .ok_or_else(|| AdapterError::Internal(format!("no mock share for slot {}", ctx.self_slot)))?;
+        let q = self.by_slot.get(&ctx.self_slot).copied().ok_or_else(|| {
+            AdapterError::Internal(format!("no mock share for slot {}", ctx.self_slot))
+        })?;
         mock_inversion_share_from_q(q)
     }
 }
@@ -1203,16 +1217,15 @@ fn vault_ek_passes_registration_sigma() {
     // c * dk. Verifier checks vault_ek * s == T + h * c — exactly the equation at
     // lib.rs:1293-1294, and the production prover at lib.rs:1099 also commits as
     // `vault_ek * nonce`.
-    let vault_ek_point =
-        curve25519_dalek::ristretto::CompressedRistretto::from_slice(
-            &(0..verify_res.vault_ek.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&verify_res.vault_ek[i..i + 2], 16).unwrap())
-                .collect::<Vec<u8>>(),
-        )
-        .expect("vault_ek compressed slice")
-        .decompress()
-        .expect("vault_ek decompresses");
+    let vault_ek_point = curve25519_dalek::ristretto::CompressedRistretto::from_slice(
+        &(0..verify_res.vault_ek.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&verify_res.vault_ek[i..i + 2], 16).unwrap())
+            .collect::<Vec<u8>>(),
+    )
+    .expect("vault_ek compressed slice")
+    .decompress()
+    .expect("vault_ek decompresses");
     let mut rng = ChaCha20Rng::seed_from_u64(0x7E57_BEEF);
     let mut buf = [0u8; 64];
     rng.fill_bytes(&mut buf);
@@ -1396,7 +1409,11 @@ fn verify_rejects_disagreeing_mpc_open_m() {
     for (idx, slot) in sorted_slots.iter().enumerate() {
         let point = h * honest_q;
         let h_contribution_hex = compressed_hex(&point);
-        let m_hex = if idx == 2 { m_evil_hex.clone() } else { m_honest_hex.clone() };
+        let m_hex = if idx == 2 {
+            m_evil_hex.clone()
+        } else {
+            m_honest_hex.clone()
+        };
         let h_r_hex = all_h[idx].clone();
         let worker_hash = worker_transcript_hash(
             DKG_EPOCH,
@@ -1442,8 +1459,7 @@ fn verify_rejects_zero_mpc_open_m() {
     let m_hex = "00".repeat(32); // m = 0
     let mut contributions = Vec::new();
     // With m=0: h_q_i * 0 = identity. allHRoundZero entries must each be identity too.
-    let h_r_hex_identity =
-        compressed_hex(&curve25519_dalek::ristretto::RistrettoPoint::default());
+    let h_r_hex_identity = compressed_hex(&curve25519_dalek::ristretto::RistrettoPoint::default());
     let all_h: Vec<String> = (0..5).map(|_| h_r_hex_identity.clone()).collect();
     let r0_hash = eunoma_crypto_worker::vault_ek_derivation_v2::round0_commit_hash(&all_h);
     for slot in &sorted_slots {
@@ -1656,9 +1672,7 @@ fn round0_idempotent_same_request() {
         self_slot: 0,
         request_id: "req-idem".to_string(),
         session_id: "sess-idem".to_string(),
-        peer_addresses: (0..5)
-            .map(|i| format!("127.0.0.1:{}", 14000 + i))
-            .collect(),
+        peer_addresses: (0..5).map(|i| format!("127.0.0.1:{}", 14000 + i)).collect(),
         player_id: 0,
         lagrange_coefficients: (0..5)
             .map(|i| scalar_hex(&compute_lagrange_for_test(i, &[0, 1, 2, 3, 4])))
@@ -1702,9 +1716,7 @@ fn round0_session_collision_rejected() {
     // The session_dir layout namespaces by request_id__session_id, so this only matters
     // if the file was opened wrong. We test the resulting `round0_session_collision`
     // path by hand-crafting a file under req-B/sess-B that claims to be req-A/sess-A.
-    let bad_dir = state_dir
-        .join("mpc-sessions")
-        .join("req-B__sess-B");
+    let bad_dir = state_dir.join("mpc-sessions").join("req-B__sess-B");
     fs::create_dir_all(&bad_dir).unwrap();
     let bad_layout = serde_json::json!({
         "session_id": "sess-A",      // mismatch — file claims A but request says B

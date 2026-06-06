@@ -66,8 +66,8 @@ use eunoma_crypto_worker::{
         RegistrationCommitmentInput, RegistrationResponseInput,
     },
     vault_state_v2::{
-        final_transcript_hash, finalize_vault_state_v2, init_vault_state_v2,
-        load_vault_state_v2, observe_deposit_v2, FinalizeContribution, FinalizeRequest,
+        final_transcript_hash, finalize_vault_state_v2, init_vault_state_v2, load_vault_state_v2,
+        observe_deposit_v2, FinalizeContribution, FinalizeRequest,
         InitRequest as VaultStateInitRequest, ObserveDepositRequest,
     },
     WorkerError,
@@ -110,8 +110,7 @@ fn det_scalar(seed: u64) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-const H_RISTRETTO_HEX: &str =
-    "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+const H_RISTRETTO_HEX: &str = "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
 
 fn h_point() -> RistrettoPoint {
     let bytes = hex_decode(H_RISTRETTO_HEX);
@@ -290,9 +289,14 @@ fn build_fixture(label: &str) -> Fixture {
         .collect();
     let aggregate_commitment =
         aggregate_registration_commitment(&commitments).expect("aggregate commitments");
-    let challenge =
-        registration_challenge(&vault_ek_hex, &sender, &asset, chain_id, &aggregate_commitment)
-            .expect("challenge");
+    let challenge = registration_challenge(
+        &vault_ek_hex,
+        &sender,
+        &asset,
+        chain_id,
+        &aggregate_commitment,
+    )
+    .expect("challenge");
     let mut round2_results = Vec::with_capacity(5);
     for (ordinal, &slot) in selected_slots.iter().enumerate() {
         let req = CaRound2Request {
@@ -419,8 +423,7 @@ fn build_e2e_ingress_payload(
         sum_b += b;
         shares.push((a, b));
     }
-    let amount_commitment =
-        compressed_hex(&(RISTRETTO_BASEPOINT_POINT * sum_a + h * sum_b));
+    let amount_commitment = compressed_hex(&(RISTRETTO_BASEPOINT_POINT * sum_a + h * sum_b));
     let mut envelopes = Vec::with_capacity(5);
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
         let aad = m1_ingress_aad_for_test(
@@ -491,7 +494,10 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
             challenge: fix.challenge.clone(),
         };
         let result = init_vault_state_v2(&fix.slot_dirs[slot], &req).expect("init slot");
-        assert!(result.initialized, "slot {slot} should report initialized=true");
+        assert!(
+            result.initialized,
+            "slot {slot} should report initialized=true"
+        );
         per_slot_contribs.push(FinalizeContribution {
             slot,
             vault_state_hash: result.vault_state_hash,
@@ -525,7 +531,11 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
         &fix.challenge,
         &sorted_contribs,
     );
-    assert_eq!(final_hash.len(), 64, "final transcript hash must be 32-byte hex");
+    assert_eq!(
+        final_hash.len(),
+        64,
+        "final transcript hash must be 32-byte hex"
+    );
     // Distinguishability KILLER: the final hash MUST differ from every per-slot worker
     // hash. Pre-fix, the worker compared the request body's value against the per-slot
     // value — which would always mismatch. This assertion is what makes this an
@@ -622,7 +632,10 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
         };
         let res = finalize_vault_state_v2(&fix.slot_dirs[slot], &req)
             .expect("finalize must succeed for legitimate body");
-        assert!(res.finalized, "slot {slot} should report finalized=true on first call");
+        assert!(
+            res.finalized,
+            "slot {slot} should report finalized=true on first call"
+        );
         assert_eq!(
             res.init_transcript_hash.to_lowercase(),
             final_hash.to_lowercase(),
@@ -634,7 +647,10 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
             .expect("load")
             .expect("file present");
         assert_eq!(
-            persisted.init_transcript_hash.as_deref().map(str::to_lowercase),
+            persisted
+                .init_transcript_hash
+                .as_deref()
+                .map(str::to_lowercase),
             Some(final_hash.to_lowercase()),
             "slot {slot}: vault_state_v2.json must persist canonical final hash"
         );
@@ -642,7 +658,10 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
         // Idempotent re-finalize: same canonical hash → finalized=false, no rewrite.
         let res2 = finalize_vault_state_v2(&fix.slot_dirs[slot], &req)
             .expect("idempotent finalize must succeed");
-        assert!(!res2.finalized, "slot {slot}: idempotent finalize must report finalized=false");
+        assert!(
+            !res2.finalized,
+            "slot {slot}: idempotent finalize must report finalized=false"
+        );
         assert_eq!(res.vault_state_hash, res2.vault_state_hash);
     }
 
@@ -678,7 +697,10 @@ fn vault_state_init_finalize_then_mpcca_round1_e2e_happy_path() {
                  FIXED if this slot surfaces {err:?}"
             )
         });
-        assert!(result.completed, "slot {slot}: M1 ingress must complete: {result:?}");
+        assert!(
+            result.completed,
+            "slot {slot}: M1 ingress must complete: {result:?}"
+        );
     }
 }
 
@@ -768,8 +790,7 @@ fn vault_state_init_finalize_rejects_tampered_final_hash() {
         "tampered finalize MUST NOT mutate init_transcript_hash (still None — never finalized)"
     );
     assert_eq!(
-        persisted.worker_transcript_hash,
-        per_slot_contribs[0].worker_transcript_hash,
+        persisted.worker_transcript_hash, per_slot_contribs[0].worker_transcript_hash,
         "tampered finalize MUST NOT mutate the frozen worker_transcript_hash"
     );
 }
@@ -938,9 +959,10 @@ fn vault_state_init_partial_finalize_recoverable() {
 
     // Helper: build the per-slot FinalizeContribution from an InitResult — the EXACT mapping
     // the coordinator does in server.ts:2046 (vaultStateHash: r.vaultStateHash).
-    fn make_contrib(slot: usize, r: &eunoma_crypto_worker::vault_state_v2::InitResult)
-        -> FinalizeContribution
-    {
+    fn make_contrib(
+        slot: usize,
+        r: &eunoma_crypto_worker::vault_state_v2::InitResult,
+    ) -> FinalizeContribution {
         FinalizeContribution {
             slot,
             vault_state_hash: r.vault_state_hash.clone(),
@@ -981,12 +1003,16 @@ fn vault_state_init_partial_finalize_recoverable() {
     // Capture the raw init results too so PHASE 3 can byte-compare them as serde_json::Value
     // dictionaries (catching any field drift, including `initialized` and `createdAtUnixMs`
     // — though the latter is NOT in the contribution tuple).
-    let mut init_responses_v1: Vec<eunoma_crypto_worker::vault_state_v2::InitResult> = Vec::with_capacity(5);
+    let mut init_responses_v1: Vec<eunoma_crypto_worker::vault_state_v2::InitResult> =
+        Vec::with_capacity(5);
     let mut per_slot_contribs_v1: Vec<FinalizeContribution> = Vec::with_capacity(5);
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
         let req = make_init_req(slot, ordinal);
         let result = init_vault_state_v2(&fix.slot_dirs[slot], &req).expect("init");
-        assert!(result.initialized, "slot {slot}: first init must report initialized=true");
+        assert!(
+            result.initialized,
+            "slot {slot}: first init must report initialized=true"
+        );
         per_slot_contribs_v1.push(make_contrib(slot, &result));
         init_responses_v1.push(result);
     }
@@ -1018,12 +1044,13 @@ fn vault_state_init_partial_finalize_recoverable() {
         final_transcript_hash: final_hash_v1.clone(),
     };
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate().take(3) {
-        let res = finalize_vault_state_v2(
-            &fix.slot_dirs[slot],
-            &make_finalize_req_v1(slot, ordinal),
-        )
-        .expect("finalize must succeed for slot 0,1,2");
-        assert!(res.finalized, "slot {slot}: first finalize must report finalized=true");
+        let res =
+            finalize_vault_state_v2(&fix.slot_dirs[slot], &make_finalize_req_v1(slot, ordinal))
+                .expect("finalize must succeed for slot 0,1,2");
+        assert!(
+            res.finalized,
+            "slot {slot}: first finalize must report finalized=true"
+        );
         assert_eq!(
             res.init_transcript_hash.to_lowercase(),
             final_hash_v1.to_lowercase()
@@ -1037,7 +1064,10 @@ fn vault_state_init_partial_finalize_recoverable() {
             .expect("load")
             .expect("file");
         assert_eq!(
-            persisted.init_transcript_hash.as_deref().map(str::to_lowercase),
+            persisted
+                .init_transcript_hash
+                .as_deref()
+                .map(str::to_lowercase),
             Some(final_hash_v1.to_lowercase()),
             "slot {slot}: finalized, init_transcript_hash MUST equal final_hash_v1"
         );
@@ -1069,7 +1099,8 @@ fn vault_state_init_partial_finalize_recoverable() {
     // would return DIFFERENT `vault_state_hash` values for finalized vs not-finalized slots
     // and the same load-bearing assertion would surface that bug. So this single equality
     // check tests both the v4 canonical-hash fix AND the v5 initialized-monotonicity fix.
-    let mut init_responses_v2: Vec<eunoma_crypto_worker::vault_state_v2::InitResult> = Vec::with_capacity(5);
+    let mut init_responses_v2: Vec<eunoma_crypto_worker::vault_state_v2::InitResult> =
+        Vec::with_capacity(5);
     let mut per_slot_contribs_v2: Vec<FinalizeContribution> = Vec::with_capacity(5);
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
         let req = make_init_req(slot, ordinal);
@@ -1094,7 +1125,9 @@ fn vault_state_init_partial_finalize_recoverable() {
     for (i, c) in per_slot_contribs_v2.iter().enumerate() {
         assert_eq!(
             c.worker_transcript_hash.to_lowercase(),
-            per_slot_contribs_v1[i].worker_transcript_hash.to_lowercase(),
+            per_slot_contribs_v1[i]
+                .worker_transcript_hash
+                .to_lowercase(),
             "slot {}: replayed worker_transcript_hash MUST equal original (frozen at init)",
             c.slot,
         );
@@ -1156,8 +1189,14 @@ fn vault_state_init_partial_finalize_recoverable() {
         let v2 = &init_responses_v2[i];
         assert_eq!(v1.slot, v2.slot, "slot drift");
         assert_eq!(v1.player_id, v2.player_id, "player_id drift");
-        assert_eq!(v1.vault_state_path, v2.vault_state_path, "vault_state_path drift");
-        assert_eq!(v1.vault_state_hash, v2.vault_state_hash, "vault_state_hash drift");
+        assert_eq!(
+            v1.vault_state_path, v2.vault_state_path,
+            "vault_state_path drift"
+        );
+        assert_eq!(
+            v1.vault_state_hash, v2.vault_state_hash,
+            "vault_state_hash drift"
+        );
         assert_eq!(
             v1.worker_transcript_hash, v2.worker_transcript_hash,
             "worker_transcript_hash drift"
@@ -1210,11 +1249,11 @@ fn vault_state_init_partial_finalize_recoverable() {
         final_transcript_hash: final_hash.clone(),
     };
     for (ordinal, &slot) in fix.selected_slots.iter().enumerate() {
-        let res = finalize_vault_state_v2(
-            &fix.slot_dirs[slot],
-            &make_finalize_req_v2(slot, ordinal),
-        )
-        .expect("finalize retry MUST succeed on every slot — false positive if this panics");
+        let res =
+            finalize_vault_state_v2(&fix.slot_dirs[slot], &make_finalize_req_v2(slot, ordinal))
+                .expect(
+                    "finalize retry MUST succeed on every slot — false positive if this panics",
+                );
         let already_finalized = ordinal < 3;
         if already_finalized {
             assert!(
@@ -1527,7 +1566,10 @@ fn vault_state_init_replay_returns_frozen_worker_hash_after_finalize() {
         &per_slot_contribs,
     );
     // The final hash MUST differ from the per-slot hash — otherwise this test would prove nothing.
-    assert_ne!(final_hash.to_lowercase(), frozen_per_slot_hash.to_lowercase());
+    assert_ne!(
+        final_hash.to_lowercase(),
+        frozen_per_slot_hash.to_lowercase()
+    );
 
     // PHASE 3: finalize slot 2 with the canonical final hash. After this, the persisted
     // `init_transcript_hash = Some(final_hash)`.
@@ -1554,7 +1596,10 @@ fn vault_state_init_replay_returns_frozen_worker_hash_after_finalize() {
     };
     let f_res = finalize_vault_state_v2(&fix.slot_dirs[slot], &finalize_req).expect("finalize");
     assert!(f_res.finalized);
-    assert_eq!(f_res.init_transcript_hash.to_lowercase(), final_hash.to_lowercase());
+    assert_eq!(
+        f_res.init_transcript_hash.to_lowercase(),
+        final_hash.to_lowercase()
+    );
 
     // Sanity check persisted state: worker_transcript_hash = per-slot (frozen);
     // init_transcript_hash = final_hash.
@@ -1567,7 +1612,10 @@ fn vault_state_init_replay_returns_frozen_worker_hash_after_finalize() {
         "frozen field MUST equal per-slot hash"
     );
     assert_eq!(
-        persisted.init_transcript_hash.as_deref().map(str::to_lowercase),
+        persisted
+            .init_transcript_hash
+            .as_deref()
+            .map(str::to_lowercase),
         Some(final_hash.to_lowercase()),
         "post-finalize init_transcript_hash MUST equal final hash"
     );
@@ -1731,11 +1779,16 @@ fn finalize_replay_after_observe_deposit_succeeds() {
     assert_eq!(post_obs.deposit_count_observed, 2);
     assert_eq!(
         post_obs.worker_transcript_hash.to_lowercase(),
-        per_slot_contribs[ordinal].worker_transcript_hash.to_lowercase(),
+        per_slot_contribs[ordinal]
+            .worker_transcript_hash
+            .to_lowercase(),
         "observe-deposit MUST NOT mutate the FROZEN worker_transcript_hash"
     );
     assert_eq!(
-        post_obs.init_transcript_hash.as_deref().map(str::to_lowercase),
+        post_obs
+            .init_transcript_hash
+            .as_deref()
+            .map(str::to_lowercase),
         Some(final_hash.to_lowercase()),
         "observe-deposit MUST NOT mutate the canonical init_transcript_hash"
     );
@@ -1763,7 +1816,10 @@ fn finalize_replay_after_observe_deposit_succeeds() {
         .expect("file");
     assert_eq!(final_state.deposit_count_observed, 2);
     assert_eq!(
-        final_state.init_transcript_hash.as_deref().map(str::to_lowercase),
+        final_state
+            .init_transcript_hash
+            .as_deref()
+            .map(str::to_lowercase),
         Some(final_hash.to_lowercase())
     );
 }

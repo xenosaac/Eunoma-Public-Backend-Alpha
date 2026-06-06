@@ -6355,6 +6355,77 @@ describe("coordinator", () => {
       expect(artifact.chainConfirmationError).toContain("429");
     });
 
+    it("submit_route_queues_route_maintenance_when_confirmed_submit_event_refetch_fails", async () => {
+      const stateRoot = await makeStateRoot("eunoma-mpcca-submit-event-refetch-");
+      const attestationConfig = {
+        chainId: 2,
+        bridge: h32("1"),
+        vault: h32("2"),
+        assetType: h32("3"),
+        operatorSetVersion: "1",
+        rosterHash: h32("4"),
+        frostGroupPubkey: h32("5"),
+        circuitVersionsHash: h32("6"),
+      };
+      await writeFinalizeTranscriptComplete(
+        stateRoot,
+        "1",
+        "withdraw-event-refetch",
+        {},
+        { attestationConfig },
+      );
+      const txHash = "0x" + "ce".repeat(32);
+      let fetchCount = 0;
+      const fakeChainFetch: typeof fetch = async () => {
+        fetchCount += 1;
+        if (fetchCount === 1) {
+          return new Response(
+            JSON.stringify({ success: true, vm_status: "Executed successfully" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response("Per anonymous IP rate limit exceeded", {
+          status: 429,
+          headers: { "content-type": "text/plain" },
+        });
+      };
+      const maintenanceCalls: Array<{ extraDepositTxHashes?: string[]; stateRoot?: string }> = [];
+      const { server } = buildCoordinatorServer({
+        caDkgV2Roster: dkgRoster(),
+        stateRoot,
+        relayerSubmitter: async () => ({
+          accepted: true,
+          txHash,
+          simulated: false,
+        }),
+        chainNodeUrl: "http://127.0.0.1:8080",
+        chainFetch: fakeChainFetch,
+        chainConfirmationTimeoutMs: 1000,
+        bridgeMaintenanceTrigger: (ctx) => {
+          maintenanceCalls.push({
+            extraDepositTxHashes: ctx.extraDepositTxHashes,
+            stateRoot: ctx.stateRoot,
+          });
+        },
+      });
+
+      const res = await server.inject({
+        method: "POST",
+        url: "/v2/withdraw/mpcca/submit",
+        payload: { dkgEpoch: "1", requestId: "withdraw-event-refetch" },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.completed).toBe(true);
+      expect(body.events).toBeUndefined();
+      expect(body.postWithdrawResync.ok).toBe(false);
+
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(maintenanceCalls).toEqual([
+        { extraDepositTxHashes: [txHash], stateRoot },
+      ]);
+    });
+
     it("submit_route_recovers_incomplete_txhash_artifact_without_rebroadcast", async () => {
       const stateRoot = await makeStateRoot("eunoma-mpcca-submit-recover-incomplete-");
       const bridge = h32("1");
@@ -6744,6 +6815,38 @@ describe("coordinator ASP / state-tree public endpoints", () => {
 
     it("returns 503 when the snapshot file is missing (mirrors /v2/pool/state)", async () => {
       const { stateRoot } = await makeStateRoot();
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/state-tree" });
+      expect(res.statusCode).toBe(503);
+      expect(res.json().error).toBe("state_tree_unavailable");
+    });
+
+    it("serves a validated refresh-staging snapshot when the canonical tree file is missing", async () => {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      const snap = await leanImtSnapshot([11n, 22n, 33n, 44n, 55n]);
+      await mkdir(join(coordinatorDir, ".refresh-staging"), { recursive: true });
+      await writeFile(join(coordinatorDir, ".refresh-staging", "state_leanimt_tree.json"), JSON.stringify(snap));
+      await writeFile(
+        join(coordinatorDir, `known_root_v2_${snap.latestRootHex.replace(/^0x/, "").slice(0, 8)}.json`),
+        JSON.stringify({ rootHex: snap.latestRootHex }),
+      );
+
+      const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
+      const res = await server.inject({ method: "GET", url: "/v2/state-tree" });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().latestRootHex).toBe(snap.latestRootHex);
+    });
+
+    it("does not serve an unrecorded refresh-staging snapshot", async () => {
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      const { stateRoot, coordinatorDir } = await makeStateRoot();
+      const snap = await leanImtSnapshot([11n, 22n, 33n, 44n, 55n]);
+      await mkdir(join(coordinatorDir, ".refresh-staging"), { recursive: true });
+      await writeFile(join(coordinatorDir, ".refresh-staging", "state_leanimt_tree.json"), JSON.stringify(snap));
+
       const { server } = buildCoordinatorServer({ roster: roster(), stateRoot });
       const res = await server.inject({ method: "GET", url: "/v2/state-tree" });
       expect(res.statusCode).toBe(503);

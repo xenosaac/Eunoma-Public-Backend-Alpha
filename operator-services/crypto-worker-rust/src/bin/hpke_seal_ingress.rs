@@ -32,7 +32,9 @@ struct Request {
 }
 
 fn strip_0x(s: &str) -> &str {
-    s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s)
+    s.strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s)
 }
 
 fn decode_hex(s: &str, label: &str) -> Result<Vec<u8>, String> {

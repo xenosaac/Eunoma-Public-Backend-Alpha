@@ -14,8 +14,8 @@ use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, traits::Identity,
 };
 use eunoma_crypto_worker::transfer_sigma_reference::{
-    bcs_fiat_shamir_inputs, bcs_serialize_transfer_session, build_statement,
-    prng_next_scalar_list, prove_transfer_single_party, sigma_fiat_shamir_seed,
+    bcs_fiat_shamir_inputs, bcs_serialize_transfer_session, build_statement, prng_next_scalar_list,
+    prove_transfer_single_party, sigma_fiat_shamir_seed,
     threshold::{
         aggregate_threshold_sigma_commitments, aggregate_threshold_sigma_responses,
         compute_threshold_sigma_partial_commitment, compute_threshold_sigma_response_share,
@@ -26,8 +26,7 @@ use eunoma_crypto_worker::transfer_sigma_reference::{
 };
 use serde::Deserialize;
 
-const FIXTURE_REL_PATH: &str =
-    "../deop-protocol/tests/fixtures/aptos_ca_transfer_v1_fixture.json";
+const FIXTURE_REL_PATH: &str = "../deop-protocol/tests/fixtures/aptos_ca_transfer_v1_fixture.json";
 
 const SDK_FILE_REF: &str = "@aptos-labs/confidential-asset/src/crypto/sigmaProtocolTransfer.ts";
 
@@ -156,7 +155,10 @@ struct PrngInfo {
 // =============================================================================
 
 fn hex_decode(s: &str) -> Vec<u8> {
-    let raw = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let raw = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     let mut out = Vec::with_capacity(raw.len() / 2);
     for i in (0..raw.len()).step_by(2) {
         out.push(u8::from_str_radix(&raw[i..i + 2], 16).expect("hex byte"));
@@ -178,8 +180,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn load_fixture() -> Fixture {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_REL_PATH);
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|err| panic!("read fixture at {}: {err}", path.display()));
+    let bytes =
+        fs::read(&path).unwrap_or_else(|err| panic!("read fixture at {}: {err}", path.display()));
     serde_json::from_slice(&bytes).expect("parse fixture json")
 }
 
@@ -212,15 +214,8 @@ fn build_dst(stmt: &StatementFixture, ell: usize, n: usize) -> DomainSeparator {
     let sender = hex_32(&stmt.sender_address);
     let recipient = hex_32(&stmt.recipient_address);
     let asset = hex_32(&stmt.token_address);
-    let session = bcs_serialize_transfer_session(
-        &sender,
-        &recipient,
-        &asset,
-        ell as u64,
-        n as u64,
-        false,
-        0,
-    );
+    let session =
+        bcs_serialize_transfer_session(&sender, &recipient, &asset, ell as u64, n as u64, false, 0);
     DomainSeparator {
         contract_address: APTOS_FRAMEWORK_ADDRESS,
         chain_id: stmt.chain_id,
@@ -402,7 +397,12 @@ fn verify_transfer_byte_parity() {
     let dst = build_dst(&fix.statement, ell, n);
 
     let proof = SigmaProtocolProof {
-        commitment: fix.sigma_proof.commitment.iter().map(|h| hex_32(h)).collect(),
+        commitment: fix
+            .sigma_proof
+            .commitment
+            .iter()
+            .map(|h| hex_32(h))
+            .collect(),
         response: fix.sigma_proof.response.iter().map(|h| hex_32(h)).collect(),
     };
     assert!(
@@ -610,9 +610,15 @@ fn run_threshold_pipeline(
     // Round 1: each party computes A_share_j = psi(α_share_j).
     let mut commitments = Vec::with_capacity(NUM_PARTIES);
     for j in 0..NUM_PARTIES {
-        let a_share =
-            compute_threshold_sigma_partial_commitment(&alpha_shares[j], statement, ell, n, false, 0)
-                .expect("compute partial commitment");
+        let a_share = compute_threshold_sigma_partial_commitment(
+            &alpha_shares[j],
+            statement,
+            ell,
+            n,
+            false,
+            0,
+        )
+        .expect("compute partial commitment");
         commitments.push(a_share);
     }
 
@@ -635,11 +641,8 @@ fn run_threshold_pipeline(
     // Round 3: each party computes s_share_j = α_share_j + e · w_share_j.
     let mut responses = Vec::with_capacity(NUM_PARTIES);
     for j in 0..NUM_PARTIES {
-        let s_share = compute_threshold_sigma_response_share(
-            &alpha_shares[j],
-            &witness_shares[j],
-            &e,
-        );
+        let s_share =
+            compute_threshold_sigma_response_share(&alpha_shares[j], &witness_shares[j], &e);
         responses.push(s_share);
     }
 
@@ -842,10 +845,7 @@ fn derive_dk_base_points_bases_match_canonical_ek_sid_and_old_r_combined() {
 
     // Position 0 → base == ek_sid.
     let expected_ek_sid_bytes = hex_32(&fix.statement.sender_ek);
-    let actual_idx0 = pts
-        .iter()
-        .find(|p| p.index == 0)
-        .expect("index 0 missing");
+    let actual_idx0 = pts.iter().find(|p| p.index == 0).expect("index 0 missing");
     let actual_idx0_bytes = actual_idx0.base.compress().to_bytes();
     assert_eq!(
         hex_encode(&actual_idx0_bytes),
@@ -903,12 +903,7 @@ fn derive_dk_base_points_bases_match_canonical_ek_sid_and_old_r_combined() {
     let identity = RistrettoPoint::identity();
     for (idx, point) in a_partial.iter().enumerate() {
         if idx == 0 || idx == 17 {
-            let expected = pts
-                .iter()
-                .find(|p| p.index == idx)
-                .expect("base")
-                .base
-                * alpha_scalar;
+            let expected = pts.iter().find(|p| p.index == idx).expect("base").base * alpha_scalar;
             assert_eq!(
                 *point, expected,
                 "psi(α_unit)[{idx}] != α · base — derive_dk_base_points base is wrong"

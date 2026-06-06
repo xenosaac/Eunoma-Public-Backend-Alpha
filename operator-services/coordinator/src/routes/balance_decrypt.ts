@@ -12,19 +12,22 @@
  *   2. Run the forbidden-key regex guard on the inbound body BEFORE any worker
  *      dispatch — any plaintext amount/blind/secret/dk/merkle/sender key fails
  *      400 immediately.
- *   3. Select the lowest-5-of-7 quorum from the CA DKG V2 roster (same
- *      `lowestEligibleSlots` selector used by `/v2/derive/vault_ek/start`
+ *   3. Select every eligible slot from the CA DKG V2 roster (same stable
+ *      ordering used by `/v2/derive/vault_ek/start`
  *      and `/v2/derive/ca_registration/start` MPCCA fan-out). Source: the
  *      coordinator's configured roster via `opts.getDefaultRoster()`.
- *   4. Fan out in parallel to each selected worker's `/v2/balance/decrypt_partial`
+ *   4. Fan out in parallel to each worker's `/v2/balance/decrypt_partial`
  *      endpoint via the injected `SingleNodeForwarder`.
  *   5. For each worker response: re-derive the M10-b canonical bytes from the
  *      coordinator's known inputs + the worker's returned partials and
  *      recompute SHA-256. Reject any slot whose returned `signature` doesn't
  *      match byte-for-byte, OR whose `transcriptDomain` is wrong.
- *   6. Compute Lagrange coefficients at x=0 over the selected quorum's slot
- *      ids (`lagrangeCoefficientsAtZero` from deop-protocol, encoded with
- *      `scalarHexFromBigint`).
+ *   6. Keep the lowest 5 valid worker partials and compute Lagrange
+ *      coefficients at x=0 over those quorum slot ids
+ *      (`lagrangeCoefficientsAtZero` from deop-protocol, encoded with
+ *      `scalarHexFromBigint`). This preserves safety while avoiding one
+ *      transient worker/fullnode read failure taking down an otherwise healthy
+ *      5-of-7 quorum.
  *   7. Run the forbidden-key guard on the assembled outbound response
  *      (defense-in-depth — guards against a worker emitting a forbidden
  *      key in a future protocol revision).
@@ -34,9 +37,7 @@
  *   - 400 `forbidden_field:<path>`           — guard triggered (inbound or outbound)
  *   - 400 `invalid_request:<reason>`         — shape validation
  *   - 400 `stale_dkg_epoch` / `under_quorum` — roster mismatch
- *   - 502 `worker_forward_rejected`          — network error talking to a worker
- *   - 502 `worker_unexpected_status`         — non-200 from a worker
- *   - 502 `signature_verification_failed`    — SHA-256 transcript mismatch
+ *   - 502 `worker_quorum_not_met`            — fewer than 5 valid worker partials
  *   - 500 `internal_error`                   — anything else
  *
  * The route is stateless (no disk writes); the workers persist their own
@@ -89,12 +90,11 @@ export type BalanceDecryptForwarder = (
 /** Per-slot timeout for the worker fan-out. */
 const DEFAULT_WORKER_TIMEOUT_MS = 30_000;
 
-/** Lowest-N selector — mirrors `lowestEligibleSlots` in `server.ts:7021`. */
-function lowestEligibleSlots(roster: CaDkgV2Roster, n: number): number[] {
+/** Stable slot ordering — mirrors the slot ordering used by the MPCCA routes. */
+function sortedEligibleSlots(roster: CaDkgV2Roster): number[] {
   return roster.nodes
     .map((node) => node.slot)
-    .sort((a, b) => a - b)
-    .slice(0, n);
+    .sort((a, b) => a - b);
 }
 
 /** Shape-validate the inbound request. Throws `invalid_request:<reason>`. */
@@ -402,10 +402,7 @@ export function registerBalanceDecryptRoute(
           message: `roster has ${dkgRoster.nodes.length} nodes < threshold ${DEOPERATOR_THRESHOLD}`,
         });
       }
-      const sortedSelectedSlots = lowestEligibleSlots(
-        dkgRoster,
-        DEOPERATOR_THRESHOLD,
-      );
+      const sortedRosterSlots = sortedEligibleSlots(dkgRoster);
 
       // 4. Fan-out.
       const ell = parsed.oldBalanceDHex.length;
@@ -415,7 +412,7 @@ export function registerBalanceDecryptRoute(
         | { kind: "ok"; partial: BalanceDecryptPartialFromWorker }
         | { kind: "err"; slot: number; status: number; reason: string };
       const slotResults: SlotResult[] = await Promise.all(
-        sortedSelectedSlots.map<Promise<SlotResult>>(async (slot) => {
+        sortedRosterSlots.map<Promise<SlotResult>>(async (slot) => {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), workerTimeoutMs);
           try {
@@ -490,29 +487,43 @@ export function registerBalanceDecryptRoute(
         }),
       );
 
-      // 5. Fail closed on any slot error.
-      for (const r of slotResults) {
-        if (r.kind === "err") {
-          const [errCode, ...rest] = r.reason.split(":");
-          return reply.code(r.status).send({
-            error: errCode ?? "worker_failed",
-            slot: r.slot,
-            requestId: parsed.requestId,
-            message: rest.join(":") || r.reason,
-          });
-        }
+      // 5. Keep the lowest threshold-sized set of valid partials. A bad or
+      //    temporarily unavailable worker must not kill the request when the
+      //    configured 5-of-7 quorum still exists.
+      const okResults = slotResults.filter(
+        (r): r is Extract<SlotResult, { kind: "ok" }> => r.kind === "ok",
+      );
+      const errResults = slotResults.filter(
+        (r): r is Extract<SlotResult, { kind: "err" }> => r.kind === "err",
+      );
+      if (okResults.length < DEOPERATOR_THRESHOLD) {
+        const firstErr = errResults[0];
+        const [errCode, ...rest] = (firstErr?.reason ?? "worker_failed").split(":");
+        return reply.code(firstErr?.status ?? 502).send({
+          error: "worker_quorum_not_met",
+          cause: errCode ?? "worker_failed",
+          slot: firstErr?.slot,
+          requestId: parsed.requestId,
+          message: rest.join(":") || firstErr?.reason || "not enough valid worker partials",
+          summary: {
+            okSlots: okResults.map((r) => r.partial.slot),
+            failedSlots: errResults.map((r) => r.slot),
+            total: sortedRosterSlots.length,
+            threshold: DEOPERATOR_THRESHOLD,
+            thresholdMet: false,
+          },
+        });
       }
-      const partials = slotResults.map((r) => {
-        if (r.kind !== "ok") throw new Error("unreachable"); // guarded above
-        return r.partial;
-      });
+      const partials = okResults
+        .slice(0, DEOPERATOR_THRESHOLD)
+        .map((r) => r.partial);
+      const selectedSlots = partials.map((partial) => partial.slot);
 
-      // 6. Compute Lagrange coefficients in the SAME order as
-      //    `sortedSelectedSlots` (and therefore the same order as the
-      //    `partials` array, since the fan-out preserved order).
+      // 6. Compute Lagrange coefficients in the SAME order as the returned
+      //    partials.
       let lagrangeCoeffs: string[];
       try {
-        const coeffs = lagrangeCoefficientsAtZero(sortedSelectedSlots);
+        const coeffs = lagrangeCoefficientsAtZero(selectedSlots);
         lagrangeCoeffs = coeffs.map(scalarHexFromBigint);
       } catch (err) {
         return reply.code(500).send({

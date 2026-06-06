@@ -31,21 +31,20 @@ use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
 };
 use eunoma_crypto_worker::{
-    // Codex M2a P1: V2 production code paths (and tests asserting V2 behaviour) MUST import
-    // the public verifier surface from `registration_verifier`, NOT from `ca_local`.
-    registration_verifier::{
-        aggregate_registration_commitment, registration_challenge,
-        verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
-    },
     ca_dkg_v2::load_ca_dkg_v2_share_metadata,
     ca_registration_v2::{
         create_registration_nonce_commitment_v2, create_registration_partial_response_v2,
         run_aggregate_v2, AggregateRequest, Round1Request, Round2Request,
     },
+    // Codex M2a P1: V2 production code paths (and tests asserting V2 behaviour) MUST import
+    // the public verifier surface from `registration_verifier`, NOT from `ca_local`.
+    registration_verifier::{
+        aggregate_registration_commitment, registration_challenge, verify_registration_proof,
+        RegistrationCommitmentInput, RegistrationResponseInput,
+    },
     vault_state_v2::{
-        init_vault_state_v2, init_worker_transcript_hash, load_vault_state_v2,
-        observe_deposit_v2, observe_worker_transcript_hash, InitRequest, ObserveDepositRequest,
-        VaultStateFile,
+        init_vault_state_v2, init_worker_transcript_hash, load_vault_state_v2, observe_deposit_v2,
+        observe_worker_transcript_hash, InitRequest, ObserveDepositRequest, VaultStateFile,
     },
     WorkerError,
 };
@@ -87,8 +86,7 @@ fn det_scalar(seed: u64) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-const H_RISTRETTO_HEX: &str =
-    "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+const H_RISTRETTO_HEX: &str = "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
 
 fn h_point() -> RistrettoPoint {
     let bytes = hex_decode(H_RISTRETTO_HEX);
@@ -183,8 +181,7 @@ fn write_v2_share(
         created_at_unix_ms: 1_700_000_000_000,
     };
     let path = state_dir.join("ca_dkg_share_v2.json");
-    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap())
-        .expect("write share file");
+    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap()).expect("write share file");
 }
 
 /// Build a real Milestone 1 sigma tuple in-process. Returns
@@ -262,11 +259,16 @@ fn build_milestone1_fixture(label: &str) -> Milestone1Fixture {
             commitment: r.commitment_hex.clone(),
         })
         .collect();
-    let aggregate_commitment = aggregate_registration_commitment(&commitments)
-        .expect("aggregate commitments");
-    let challenge =
-        registration_challenge(&vault_ek_hex, &sender, &asset, chain_id, &aggregate_commitment)
-            .expect("challenge");
+    let aggregate_commitment =
+        aggregate_registration_commitment(&commitments).expect("aggregate commitments");
+    let challenge = registration_challenge(
+        &vault_ek_hex,
+        &sender,
+        &asset,
+        chain_id,
+        &aggregate_commitment,
+    )
+    .expect("challenge");
 
     let mut round2_results = Vec::with_capacity(5);
     for (ordinal, &slot) in selected_slots.iter().enumerate() {
@@ -329,11 +331,7 @@ fn build_milestone1_fixture(label: &str) -> Milestone1Fixture {
     }
 }
 
-fn build_init_request(
-    fix: &Milestone1Fixture,
-    self_slot: usize,
-    player_id: usize,
-) -> InitRequest {
+fn build_init_request(fix: &Milestone1Fixture, self_slot: usize, player_id: usize) -> InitRequest {
     InitRequest {
         dkg_epoch: DKG_EPOCH.to_string(),
         request_id: "vault-state-init-req".to_string(),
@@ -364,10 +362,13 @@ fn vault_state_v2_init_five_workers_idempotent() {
     let mut first_results = Vec::with_capacity(5);
     for (ordinal, &slot) in selected.iter().enumerate() {
         let req = build_init_request(&fix, slot, ordinal);
-        let result = init_vault_state_v2(&fix.slot_dirs[slot], &req)
-            .expect("init_vault_state_v2 round 1");
+        let result =
+            init_vault_state_v2(&fix.slot_dirs[slot], &req).expect("init_vault_state_v2 round 1");
         // KILLER ASSERTION: each worker reports initialized=true, vault_sequence=0, cursor=0.
-        assert!(result.initialized, "slot {slot} should report initialized=true");
+        assert!(
+            result.initialized,
+            "slot {slot} should report initialized=true"
+        );
         assert_eq!(result.slot, slot);
         assert_eq!(result.player_id, ordinal);
         assert_eq!(result.vault_sequence, 0);
@@ -377,12 +378,23 @@ fn vault_state_v2_init_five_workers_idempotent() {
 
         // KILLER ASSERTION: file present, mode 0o600.
         let file_path = fix.slot_dirs[slot].join("vault_state_v2.json");
-        assert!(file_path.exists(), "slot {slot} did not write vault_state_v2.json");
+        assert!(
+            file_path.exists(),
+            "slot {slot} did not write vault_state_v2.json"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = fs::metadata(&file_path).expect("stat file").permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "slot {slot} file mode != 0o600 (got {:o})", mode & 0o777);
+            let mode = fs::metadata(&file_path)
+                .expect("stat file")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "slot {slot} file mode != 0o600 (got {:o})",
+                mode & 0o777
+            );
         }
 
         // KILLER ASSERTION: parsed file has every required binding.
@@ -393,13 +405,28 @@ fn vault_state_v2_init_five_workers_idempotent() {
         assert_eq!(loaded.slot, slot);
         assert_eq!(loaded.player_id, ordinal);
         assert_eq!(loaded.dkg_epoch, DKG_EPOCH);
-        assert_eq!(loaded.vault_ek_hex.to_lowercase(), fix.vault_ek_hex.to_lowercase());
-        assert_eq!(loaded.sender_address.to_lowercase(), fix.sender.to_lowercase());
+        assert_eq!(
+            loaded.vault_ek_hex.to_lowercase(),
+            fix.vault_ek_hex.to_lowercase()
+        );
+        assert_eq!(
+            loaded.sender_address.to_lowercase(),
+            fix.sender.to_lowercase()
+        );
         assert_eq!(loaded.asset_type.to_lowercase(), fix.asset.to_lowercase());
         assert_eq!(loaded.chain_id, fix.chain_id);
-        assert_eq!(loaded.aggregate_commitment.to_lowercase(), fix.aggregate_commitment.to_lowercase());
-        assert_eq!(loaded.aggregate_response.to_lowercase(), fix.aggregate_response.to_lowercase());
-        assert_eq!(loaded.challenge.to_lowercase(), fix.challenge.to_lowercase());
+        assert_eq!(
+            loaded.aggregate_commitment.to_lowercase(),
+            fix.aggregate_commitment.to_lowercase()
+        );
+        assert_eq!(
+            loaded.aggregate_response.to_lowercase(),
+            fix.aggregate_response.to_lowercase()
+        );
+        assert_eq!(
+            loaded.challenge.to_lowercase(),
+            fix.challenge.to_lowercase()
+        );
         assert_eq!(loaded.vault_sequence, 0);
         assert_eq!(loaded.deposit_count_observed, 0);
 
@@ -460,7 +487,10 @@ fn vault_state_v2_init_five_workers_idempotent() {
              Replay on an existing vault MUST return initialized=true (the file IS \
              initialized)."
         );
-        assert_eq!(result.vault_state_hash, first_results[ordinal].vault_state_hash);
+        assert_eq!(
+            result.vault_state_hash,
+            first_results[ordinal].vault_state_hash
+        );
         assert_eq!(
             result.worker_transcript_hash,
             first_results[ordinal].worker_transcript_hash
@@ -504,7 +534,10 @@ fn vault_state_v2_init_rejects_mutated_inputs() {
     mutated.sender_address = "07".repeat(32);
     let err = init_vault_state_v2(&fix.slot_dirs[slot], &mutated)
         .expect_err("mutated sender_address should be rejected");
-    if !matches!(err, WorkerError::InvalidDkgState(_) | WorkerError::Crypto(_)) {
+    if !matches!(
+        err,
+        WorkerError::InvalidDkgState(_) | WorkerError::Crypto(_)
+    ) {
         panic!("expected InvalidDkgState or Crypto for mutated sender_address, got {err:?}");
     }
 
@@ -513,7 +546,10 @@ fn vault_state_v2_init_rejects_mutated_inputs() {
     mutated.chain_id = (mutated.chain_id ^ 1) as u8;
     let err = init_vault_state_v2(&fix.slot_dirs[slot], &mutated)
         .expect_err("mutated chain_id should be rejected");
-    if !matches!(err, WorkerError::InvalidDkgState(_) | WorkerError::Crypto(_)) {
+    if !matches!(
+        err,
+        WorkerError::InvalidDkgState(_) | WorkerError::Crypto(_)
+    ) {
         panic!("expected InvalidDkgState or Crypto for mutated chain_id, got {err:?}");
     }
 
@@ -525,8 +561,13 @@ fn vault_state_v2_init_rejects_mutated_inputs() {
     mutated.selected_slots = vec![1, 2, 3, 4, 5]; // shift by one — slot 2 still in subset
     let err = init_vault_state_v2(&fix.slot_dirs[slot], &mutated)
         .expect_err("mutated selected_slots should be rejected");
-    if !matches!(err, WorkerError::InvalidDkgState(_) | WorkerError::InvalidRequest(_)) {
-        panic!("expected InvalidDkgState or InvalidRequest for mutated selected_slots, got {err:?}");
+    if !matches!(
+        err,
+        WorkerError::InvalidDkgState(_) | WorkerError::InvalidRequest(_)
+    ) {
+        panic!(
+            "expected InvalidDkgState or InvalidRequest for mutated selected_slots, got {err:?}"
+        );
     }
 }
 
@@ -582,7 +623,10 @@ fn load_ca_dkg_v2_share_metadata_returns_only_public_fields() {
     // Public-field sanity.
     assert_eq!(meta.slot, slot);
     assert_eq!(meta.dkg_epoch, DKG_EPOCH);
-    assert_eq!(meta.transcript_hash.to_lowercase(), fix.ca_transcript.to_lowercase());
+    assert_eq!(
+        meta.transcript_hash.to_lowercase(),
+        fix.ca_transcript.to_lowercase()
+    );
     assert_eq!(meta.threshold, 5);
     assert_eq!(meta.count, 7);
     assert_eq!(meta.valid_dealers.len(), 7);
@@ -745,7 +789,10 @@ fn observe_deposit_v2_increments_cursor_monotonically() {
     let res1 = observe_deposit_v2(&fix.slot_dirs[slot], &req1).expect("observe 1");
     assert_eq!(res1.previous_deposit_count_observed, 0);
     assert_eq!(res1.deposit_count_observed, 1);
-    assert_eq!(res1.vault_sequence, 0, "vault_sequence untouched by observe");
+    assert_eq!(
+        res1.vault_sequence, 0,
+        "vault_sequence untouched by observe"
+    );
     assert!(res1.observed);
     let loaded1 = load_vault_state_v2(&fix.slot_dirs[slot])
         .expect("load")
@@ -832,8 +879,8 @@ fn observe_deposit_v2_rejects_missing_vault_state_file() {
         previous_deposit_count_observed: 0,
         new_deposit_count_observed: 1,
     };
-    let err = observe_deposit_v2(&dir, &req)
-        .expect_err("missing vault_state_v2.json must be rejected");
+    let err =
+        observe_deposit_v2(&dir, &req).expect_err("missing vault_state_v2.json must be rejected");
     assert!(
         matches!(err, WorkerError::InvalidDkgState(ref s) if s == "missing_vault_state_file"),
         "expected missing_vault_state_file, got {err:?}"

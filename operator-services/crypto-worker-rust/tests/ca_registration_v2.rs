@@ -20,15 +20,15 @@ use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
 };
 use eunoma_crypto_worker::{
-    // Codex M2a P1: V2 production code paths (and tests asserting V2 behaviour) MUST import
-    // the public verifier surface from `registration_verifier`, NOT from `ca_local`.
-    registration_verifier::{
-        verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
-    },
     ca_registration_v2::{
         create_registration_nonce_commitment_v2, create_registration_partial_response_v2,
         run_aggregate_v2, run_verify_v2, AggregateRequest, Round1Request, Round2Request,
         VerifyRequest,
+    },
+    // Codex M2a P1: V2 production code paths (and tests asserting V2 behaviour) MUST import
+    // the public verifier surface from `registration_verifier`, NOT from `ca_local`.
+    registration_verifier::{
+        verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
     },
     WorkerError,
 };
@@ -71,8 +71,7 @@ fn det_scalar(seed: u64) -> Scalar {
 }
 
 /// Same H_RISTRETTO constant as the crate (lib.rs:74).
-const H_RISTRETTO_HEX: &str =
-    "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+const H_RISTRETTO_HEX: &str = "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
 
 fn h_point() -> RistrettoPoint {
     let bytes = hex_decode(H_RISTRETTO_HEX);
@@ -187,15 +186,20 @@ fn write_v2_share(
         created_at_unix_ms: 1_700_000_000_000,
     };
     let path = state_dir.join("ca_dkg_share_v2.json");
-    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap())
-        .expect("write share file");
+    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap()).expect("write share file");
 }
 
 /// Persist a V1 share file under `state_dir/ca_dkg_share.json`. Used by the
 /// `ca_registration_v2_uses_v2_share` test to verify that V2 ignores V1 files even when
 /// both are present on disk.
 fn write_v1_fixture_share(state_dir: &Path, slot: usize, dk: Scalar) {
-    let coeffs = [dk, det_scalar(0xC1), det_scalar(0xC2), det_scalar(0xC3), det_scalar(0xC4)];
+    let coeffs = [
+        dk,
+        det_scalar(0xC1),
+        det_scalar(0xC2),
+        det_scalar(0xC3),
+        det_scalar(0xC4),
+    ];
     let blind_coeffs = [
         det_scalar(0xB1),
         det_scalar(0xB2),
@@ -231,8 +235,7 @@ fn write_v1_fixture_share(state_dir: &Path, slot: usize, dk: Scalar) {
         created_at_unix_ms: 1_700_000_000_000,
     };
     let path = state_dir.join("ca_dkg_share.json");
-    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap())
-        .expect("write V1 share file");
+    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap()).expect("write V1 share file");
 }
 
 #[test]
@@ -247,7 +250,15 @@ fn ca_registration_v2_uses_v2_share() {
     let state_dir = temp_state_dir("uses-v2-share");
     let ca_transcript = "aa".repeat(32);
     let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
-    write_v2_share(&state_dir, 0, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    write_v2_share(
+        &state_dir,
+        0,
+        &coeffs,
+        &blind_coeffs,
+        &aggregate_commitments,
+        &ca_transcript,
+        DKG_EPOCH,
+    );
 
     // Write a V1 fixture with a DIFFERENT dk + epoch=999 (mismatched binding). If V2
     // somehow loaded V1, the dkg_epoch mismatch would surface as an InvalidRequest. But
@@ -289,7 +300,15 @@ fn ca_registration_v2_transcript_binding() {
     let state_dir = temp_state_dir("transcript-binding");
     let ca_transcript = "aa".repeat(32);
     let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
-    write_v2_share(&state_dir, 0, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    write_v2_share(
+        &state_dir,
+        0,
+        &coeffs,
+        &blind_coeffs,
+        &aggregate_commitments,
+        &ca_transcript,
+        DKG_EPOCH,
+    );
 
     let h = h_point();
     let vault_ek_hex = compressed_hex(&(h * coeffs[0].invert()));
@@ -322,7 +341,15 @@ fn ca_registration_v2_dkg_epoch_mismatch() {
     let state_dir = temp_state_dir("epoch-mismatch");
     let ca_transcript = "aa".repeat(32);
     let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
-    write_v2_share(&state_dir, 0, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    write_v2_share(
+        &state_dir,
+        0,
+        &coeffs,
+        &blind_coeffs,
+        &aggregate_commitments,
+        &ca_transcript,
+        DKG_EPOCH,
+    );
 
     let h = h_point();
     let vault_ek_hex = compressed_hex(&(h * coeffs[0].invert()));
@@ -342,7 +369,10 @@ fn ca_registration_v2_dkg_epoch_mismatch() {
     };
     let err = create_registration_nonce_commitment_v2(&state_dir, &req).unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.contains("dkg_epoch"), "expected dkg_epoch mismatch, got: {msg}");
+    assert!(
+        msg.contains("dkg_epoch"),
+        "expected dkg_epoch mismatch, got: {msg}"
+    );
 }
 
 #[test]
@@ -351,7 +381,15 @@ fn ca_registration_v2_slot_mismatch() {
     let ca_transcript = "aa".repeat(32);
     let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
     // Write share for slot 2.
-    write_v2_share(&state_dir, 2, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    write_v2_share(
+        &state_dir,
+        2,
+        &coeffs,
+        &blind_coeffs,
+        &aggregate_commitments,
+        &ca_transcript,
+        DKG_EPOCH,
+    );
     let h = h_point();
     let vault_ek_hex = compressed_hex(&(h * coeffs[0].invert()));
     let req = Round1Request {
@@ -370,7 +408,10 @@ fn ca_registration_v2_slot_mismatch() {
     };
     let err = create_registration_nonce_commitment_v2(&state_dir, &req).unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.contains("slot"), "expected slot mismatch error, got: {msg}");
+    assert!(
+        msg.contains("slot"),
+        "expected slot mismatch error, got: {msg}"
+    );
 }
 
 #[test]
@@ -382,7 +423,15 @@ fn ca_registration_v2_vault_ek_mismatch_on_replay() {
     let state_dir = temp_state_dir("vault-ek-mismatch");
     let ca_transcript = "aa".repeat(32);
     let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
-    write_v2_share(&state_dir, 0, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    write_v2_share(
+        &state_dir,
+        0,
+        &coeffs,
+        &blind_coeffs,
+        &aggregate_commitments,
+        &ca_transcript,
+        DKG_EPOCH,
+    );
     let h = h_point();
     let vault_ek_a = compressed_hex(&(h * coeffs[0].invert()));
     let vault_ek_b = compressed_hex(&(h * det_scalar(0xDEADBEEF).invert()));
@@ -501,8 +550,10 @@ fn v2_threshold_sigma_passes_local_verifier() {
     // public helpers exposed by ca_local. Easier path: hit the V1 `registration_challenge`
     // helper directly (same Lagrange + Fiat-Shamir math, share-independent).
     let aggregate_commitment =
-        eunoma_crypto_worker::registration_verifier::aggregate_registration_commitment(&commitments)
-            .expect("aggregate commitments");
+        eunoma_crypto_worker::registration_verifier::aggregate_registration_commitment(
+            &commitments,
+        )
+        .expect("aggregate commitments");
     let challenge_hex = eunoma_crypto_worker::registration_verifier::registration_challenge(
         &vault_ek_hex,
         &sender,
@@ -557,7 +608,10 @@ fn v2_threshold_sigma_passes_local_verifier() {
         aggregate.aggregate_commitment.to_lowercase(),
         aggregate_commitment.to_lowercase()
     );
-    assert_eq!(aggregate.challenge.to_lowercase(), challenge_hex.to_lowercase());
+    assert_eq!(
+        aggregate.challenge.to_lowercase(),
+        challenge_hex.to_lowercase()
+    );
 
     // Independent verification via the production verifier.
     verify_registration_proof(
@@ -629,9 +683,8 @@ fn aggregate_proof_invalid_when_response_tampered() {
             asset_type: asset.clone(),
             chain_id,
         };
-        round1_results.push(
-            create_registration_nonce_commitment_v2(&slot_dirs[slot], &req).expect("round1"),
-        );
+        round1_results
+            .push(create_registration_nonce_commitment_v2(&slot_dirs[slot], &req).expect("round1"));
     }
     let commitments: Vec<RegistrationCommitmentInput> = selected_slots
         .iter()
@@ -642,8 +695,10 @@ fn aggregate_proof_invalid_when_response_tampered() {
         })
         .collect();
     let aggregate_commitment =
-        eunoma_crypto_worker::registration_verifier::aggregate_registration_commitment(&commitments)
-            .expect("aggregate commitments");
+        eunoma_crypto_worker::registration_verifier::aggregate_registration_commitment(
+            &commitments,
+        )
+        .expect("aggregate commitments");
     let challenge_hex = eunoma_crypto_worker::registration_verifier::registration_challenge(
         &vault_ek_hex,
         &sender,
@@ -757,7 +812,15 @@ fn nonce_reuse_returns_invalid_request() {
     let state_dir = temp_state_dir("nonce-reuse-sequential");
     let ca_transcript = "55".repeat(32);
     let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
-    write_v2_share(&state_dir, 0, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    write_v2_share(
+        &state_dir,
+        0,
+        &coeffs,
+        &blind_coeffs,
+        &aggregate_commitments,
+        &ca_transcript,
+        DKG_EPOCH,
+    );
     let h = h_point();
     let vault_ek_hex = compressed_hex(&(h * coeffs[0].invert()));
 
@@ -823,7 +886,15 @@ fn nonce_consuming_race_no_share_leak() {
     let state_dir = temp_state_dir("nonce-race");
     let ca_transcript = "55".repeat(32);
     let (coeffs, blind_coeffs, aggregate_commitments) = make_vss_polynomial();
-    write_v2_share(&state_dir, 0, &coeffs, &blind_coeffs, &aggregate_commitments, &ca_transcript, DKG_EPOCH);
+    write_v2_share(
+        &state_dir,
+        0,
+        &coeffs,
+        &blind_coeffs,
+        &aggregate_commitments,
+        &ca_transcript,
+        DKG_EPOCH,
+    );
     let h = h_point();
     let vault_ek_hex = compressed_hex(&(h * coeffs[0].invert()));
 
@@ -867,7 +938,10 @@ fn nonce_consuming_race_no_share_leak() {
         let sess_id_b = req1.session_id.clone();
         let challenge_b = scalar_hex(&det_scalar(0x2_0000 + iter as u64));
         // Different challenges → DIFFERENT responses if both succeed. THIS IS THE ATTACK.
-        assert_ne!(challenge_a, challenge_b, "challenges must differ for the race to surface the bug");
+        assert_ne!(
+            challenge_a, challenge_b,
+            "challenges must differ for the race to surface the bug"
+        );
 
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let b_a = Arc::clone(&barrier);
@@ -933,7 +1007,11 @@ fn nonce_consuming_race_no_share_leak() {
             _ => {
                 // Exactly one succeeded → atomic single-use is honored. Verify the loser
                 // returned the expected InvalidDkgState code.
-                let loser_err = if a_ok { r_b.unwrap_err() } else { r_a.unwrap_err() };
+                let loser_err = if a_ok {
+                    r_b.unwrap_err()
+                } else {
+                    r_a.unwrap_err()
+                };
                 assert!(
                     matches!(&loser_err, WorkerError::InvalidDkgState(msg)
                         if msg.contains("nonce_already_consumed") || msg.contains("nonce_file_missing")),

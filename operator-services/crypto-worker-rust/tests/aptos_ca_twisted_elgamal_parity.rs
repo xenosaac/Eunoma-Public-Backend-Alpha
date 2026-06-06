@@ -11,9 +11,7 @@
 use std::{fs, path::PathBuf};
 
 use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT,
-    ristretto::CompressedRistretto,
-    scalar::Scalar,
+    constants::RISTRETTO_BASEPOINT_POINT, ristretto::CompressedRistretto, scalar::Scalar,
 };
 use eunoma_crypto_worker::twisted_elgamal_reference::{
     assert_no_auditor, chunked_amount_to_chunks, chunks_to_amount, encrypt_chunks_with_pk,
@@ -27,8 +25,7 @@ use eunoma_crypto_worker::twisted_elgamal_reference::{
 };
 use serde::Deserialize;
 
-const FIXTURE_REL_PATH: &str =
-    "../deop-protocol/tests/fixtures/aptos_ca_transfer_v1_fixture.json";
+const FIXTURE_REL_PATH: &str = "../deop-protocol/tests/fixtures/aptos_ca_transfer_v1_fixture.json";
 
 const SDK_FILE_REF: &str = "@aptos-labs/confidential-asset/src/crypto/twistedElGamal.ts";
 
@@ -110,7 +107,10 @@ struct Ciphertexts {
 // =============================================================================
 
 fn hex_decode(s: &str) -> Vec<u8> {
-    let raw = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let raw = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     let mut out = Vec::with_capacity(raw.len() / 2);
     for i in (0..raw.len()).step_by(2) {
         out.push(u8::from_str_radix(&raw[i..i + 2], 16).expect("hex byte"));
@@ -132,8 +132,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn load_fixture() -> Fixture {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_REL_PATH);
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|err| panic!("read fixture at {}: {err}", path.display()));
+    let bytes =
+        fs::read(&path).unwrap_or_else(|err| panic!("read fixture at {}: {err}", path.display()));
     serde_json::from_slice(&bytes).expect("parse fixture json")
 }
 
@@ -227,7 +227,10 @@ fn encrypt_with_pk_byte_parity() {
     let old_chunks: Vec<u64> = decimal_to_u64(&fix.plaintext_chunks.old_balance);
     let old_r: Vec<Scalar> = le_hex_to_scalars(&fix.randomness.old_balance);
     let mine_old = encrypt_chunks_with_pk(&old_chunks, &sender_ek, &old_r).expect("enc old");
-    let expected_old = ct_pairs(&fix.ciphertexts.old_balance_c, &fix.ciphertexts.old_balance_d);
+    let expected_old = ct_pairs(
+        &fix.ciphertexts.old_balance_c,
+        &fix.ciphertexts.old_balance_d,
+    );
     for i in 0..ell {
         assert_eq!(
             hex_encode(&mine_old[i].c),
@@ -245,7 +248,10 @@ fn encrypt_with_pk_byte_parity() {
     let new_chunks: Vec<u64> = decimal_to_u64(&fix.plaintext_chunks.new_balance);
     let new_r: Vec<Scalar> = le_hex_to_scalars(&fix.randomness.new_balance);
     let mine_new = encrypt_chunks_with_pk(&new_chunks, &sender_ek, &new_r).expect("enc new");
-    let expected_new = ct_pairs(&fix.ciphertexts.new_balance_c, &fix.ciphertexts.new_balance_d);
+    let expected_new = ct_pairs(
+        &fix.ciphertexts.new_balance_c,
+        &fix.ciphertexts.new_balance_d,
+    );
     for i in 0..ell {
         assert_eq!(
             hex_encode(&mine_new[i].c),
@@ -273,8 +279,14 @@ fn encrypt_with_pk_byte_parity() {
     );
     for j in 0..n {
         // Sender-keyed: C must match the canonical amount_c, D must match amount_d_sender.
-        assert_eq!(hex_encode(&mine_sender[j].c), hex_encode(&expected_sender[j].c));
-        assert_eq!(hex_encode(&mine_sender[j].d), hex_encode(&expected_sender[j].d));
+        assert_eq!(
+            hex_encode(&mine_sender[j].c),
+            hex_encode(&expected_sender[j].c)
+        );
+        assert_eq!(
+            hex_encode(&mine_sender[j].d),
+            hex_encode(&expected_sender[j].d)
+        );
         // Recipient-keyed: C must STILL match canonical amount_c (same v, same r → same G*v+H*r),
         // but D differs because pk differs.
         assert_eq!(
@@ -362,8 +374,9 @@ fn threshold_aggregation_byte_parity_with_m4a_fixture_new_balance() {
     let new_r: Vec<Scalar> = le_hex_to_scalars(&fix.randomness.new_balance);
 
     // Sanity vs. M4a single-party fixture before the threshold test.
-    let single_party = encrypt_chunks_with_pk(&new_chunks, &hex_32(&fix.statement.sender_ek), &new_r)
-        .expect("M4a single-party encrypt");
+    let single_party =
+        encrypt_chunks_with_pk(&new_chunks, &hex_32(&fix.statement.sender_ek), &new_r)
+            .expect("M4a single-party encrypt");
 
     for i in 0..ell {
         // Additive 5-of-5 split: Σ shares = original r_i (mod q).
@@ -509,12 +522,9 @@ fn multibase_schnorr_pok_verifies_when_same_r_share_used() {
     );
 
     // Transfer-amount shape: sender + recipient leg.
-    let partial_with_recip = compute_partial_ciphertext_share(
-        &r_share,
-        &sender_ek_point,
-        Some(&recipient_ek_point),
-    )
-    .expect("compute partial with-recip");
+    let partial_with_recip =
+        compute_partial_ciphertext_share(&r_share, &sender_ek_point, Some(&recipient_ek_point))
+            .expect("compute partial with-recip");
     let pok_with_recip = prove_multibase_schnorr_pok(
         &r_share,
         &k,
@@ -577,14 +587,9 @@ fn multibase_schnorr_pok_rejects_when_r_share_mismatched_between_bases() {
     let pok = prove_multibase_schnorr_pok(&r1, &k, &sender_ek_point, None, transcript_bind)
         .expect("prove POK with r1");
 
-    let verified = verify_multibase_schnorr_pok(
-        &pok,
-        &bad_partial,
-        &sender_ek_point,
-        None,
-        transcript_bind,
-    )
-    .expect("verify must not error");
+    let verified =
+        verify_multibase_schnorr_pok(&pok, &bad_partial, &sender_ek_point, None, transcript_bind)
+            .expect("verify must not error");
     assert!(
         !verified,
         "multi-base POK MUST reject when r underlying C differs from r underlying D_sender"
@@ -594,14 +599,9 @@ fn multibase_schnorr_pok_rejects_when_r_share_mismatched_between_bases() {
     // but fail the H-leg. Either way, the proof cannot pass.
     let pok2 = prove_multibase_schnorr_pok(&r2, &k, &sender_ek_point, None, transcript_bind)
         .expect("prove POK with r2");
-    let verified2 = verify_multibase_schnorr_pok(
-        &pok2,
-        &bad_partial,
-        &sender_ek_point,
-        None,
-        transcript_bind,
-    )
-    .expect("verify (r2) must not error");
+    let verified2 =
+        verify_multibase_schnorr_pok(&pok2, &bad_partial, &sender_ek_point, None, transcript_bind)
+            .expect("verify (r2) must not error");
     assert!(
         !verified2,
         "the symmetric prover that targets D's r also fails — neither r passes both bases"
@@ -621,8 +621,8 @@ fn aggregate_rejects_d_recip_mismatch() {
     // p0 carries a recipient leg, p1 does NOT — aggregation must reject.
     let p0 = compute_partial_ciphertext_share(&r0, &sender_ek_point, Some(&recipient_ek_point))
         .expect("p0 with recip");
-    let p1 = compute_partial_ciphertext_share(&r1, &sender_ek_point, None)
-        .expect("p1 without recip");
+    let p1 =
+        compute_partial_ciphertext_share(&r1, &sender_ek_point, None).expect("p1 without recip");
 
     let err = aggregate_partial_ciphertext_shares(
         &[p0, p1],
@@ -639,12 +639,9 @@ fn aggregate_rejects_d_recip_mismatch() {
     );
 
     // Also: all partials Some, but ek_recip_opt = None → rejected.
-    let p_both_with = compute_partial_ciphertext_share(
-        &r0,
-        &sender_ek_point,
-        Some(&recipient_ek_point),
-    )
-    .expect("p both with recip");
+    let p_both_with =
+        compute_partial_ciphertext_share(&r0, &sender_ek_point, Some(&recipient_ek_point))
+            .expect("p both with recip");
     let err = aggregate_partial_ciphertext_shares(
         &[p_both_with, p_both_with],
         100u64,
@@ -660,8 +657,8 @@ fn aggregate_rejects_d_recip_mismatch() {
     );
 
     // And: all partials None, but ek_recip_opt = Some → rejected (symmetric).
-    let p_no_recip = compute_partial_ciphertext_share(&r0, &sender_ek_point, None)
-        .expect("p no recip");
+    let p_no_recip =
+        compute_partial_ciphertext_share(&r0, &sender_ek_point, None).expect("p no recip");
     let err = aggregate_partial_ciphertext_shares(
         &[p_no_recip, p_no_recip],
         100u64,

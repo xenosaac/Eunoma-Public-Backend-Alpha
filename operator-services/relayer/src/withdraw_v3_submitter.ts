@@ -36,10 +36,13 @@ export interface WithdrawV3Entry {
   readonly skip?: (args: WithdrawV2CallArgs) => boolean;
 }
 
-const DEFAULT_WITHDRAW_V3_MAX_GAS = 2_000_000;
-const DEFAULT_WITHDRAW_V3_GAS_UNIT_PRICE = 100;
+export const DEFAULT_WITHDRAW_V3_MAX_GAS = 2_000_000;
+export const DEFAULT_WITHDRAW_V3_GAS_UNIT_PRICE = 100;
+export const DEFAULT_WITHDRAW_V3_MAX_FEE_OCTAS =
+  BigInt(DEFAULT_WITHDRAW_V3_MAX_GAS) * BigInt(DEFAULT_WITHDRAW_V3_GAS_UNIT_PRICE);
 const DEFAULT_APTOS_CLI_RETRY_ATTEMPTS = 12;
 const DEFAULT_APTOS_CLI_RETRY_DELAY_MS = 5_000;
+const MAX_APTOS_CLI_LOG_CHARS = 6_000;
 const RECOVERABLE_PENDING_ABORT_BY_FN: Record<string, string> = {
   prepare_withdraw_proof_v4: "E_PENDING_WITHDRAW_PROOF",
   prepare_withdraw_attestation_v3: "E_PENDING_WITHDRAW_ATTESTATION",
@@ -309,7 +312,9 @@ export function createWithdrawV3Submitter(
         }
         if (exitCode !== 0) {
           stderrSink.write(
-            `[relayer-v3] ${entry.fn} (step ${step}/5) exited ${exitCode ?? "(signal)"}; stderr=\n${stderrText}\n`,
+            `[relayer-v3] ${entry.fn} (step ${step}/5) exited ${exitCode ?? "(signal)"}; ` +
+              `${summarizeAptosCliOutput("stdout", stdoutText)}\n---\n` +
+              `${summarizeAptosCliOutput("stderr", stderrText)}\n`,
           );
           throw new RelayerSubmitterError(
             "aptos_cli_error",
@@ -317,7 +322,9 @@ export function createWithdrawV3Submitter(
           );
         }
         stderrSink.write(
-          `[relayer-v3] ${entry.fn} (step ${step}/5) exit=0 but no transaction_hash; stdout=\n${stdoutText}\n`,
+          `[relayer-v3] ${entry.fn} (step ${step}/5) exit=0 but no transaction_hash; ` +
+            `${summarizeAptosCliOutput("stdout", stdoutText)}\n---\n` +
+            `${summarizeAptosCliOutput("stderr", stderrText)}\n`,
         );
         throw new RelayerSubmitterError(
           "aptos_cli_missing_tx_hash",
@@ -367,6 +374,21 @@ function isRetryableAptosCliTransportFailure(stdoutText: string, stderrText: str
     text.includes("http 503") ||
     text.includes("http 504")
   );
+}
+
+function summarizeAptosCliOutput(label: string, text: string): string {
+  const clipped =
+    text.length > MAX_APTOS_CLI_LOG_CHARS
+      ? `${text.slice(0, MAX_APTOS_CLI_LOG_CHARS)}\n...[truncated ${
+          text.length - MAX_APTOS_CLI_LOG_CHARS
+        } chars]`
+      : text;
+  const redacted = clipped.replace(/(?:0x)?[0-9a-fA-F]{64,}/g, (match) => {
+    const hasPrefix = /^0x/i.test(match);
+    const rawHex = match.replace(/^0x/i, "");
+    return `${hasPrefix ? "0x" : ""}<redacted:${rawHex.length}hex>`;
+  });
+  return `${label}=\n${redacted || "<empty>"}`;
 }
 
 function recoverableAlreadyPreparedMarker(

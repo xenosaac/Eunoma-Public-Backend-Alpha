@@ -363,13 +363,31 @@ if (dryRun) {
   process.exit(EXIT_SUCCESS);
 }
 
+function parsePositiveIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function isRetryableFullnodeStatus(status) {
+  return status === 429 || status >= 500;
+}
+
 // Check whether the root is already on chain via the selected known_roots table.
 async function fetchWithRetry(url, init, attempts = 3, backoffMs = 500) {
   let lastErr;
   for (let i = 0; i < attempts; ++i) {
     try {
       const res = await fetch(url, init);
-      if (res.status >= 500) {
+      if (isRetryableFullnodeStatus(res.status)) {
         lastErr = new Error(`HTTP ${res.status}`);
       } else {
         return res;
@@ -381,6 +399,9 @@ async function fetchWithRetry(url, init, attempts = 3, backoffMs = 500) {
   }
   throw lastErr ?? new Error("fetch_failed");
 }
+
+const precheckRetryAttempts = parsePositiveIntEnv("EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_ATTEMPTS", 8);
+const precheckRetryDelayMs = parseNonNegativeIntEnv("EUNOMA_KNOWN_ROOT_PRECHECK_RETRY_DELAY_MS", 1_500);
 
 function failKnownRootPrecheck(message) {
   if (submitOnPrecheckFailure) {
@@ -397,7 +418,12 @@ try {
   const tablesUrl = `${aptosNodeUrl}/accounts/${bridgePackageAddress}/resource/${encodeURIComponent(
     `${bridgePackageAddress}::eunoma_bridge::${tablesStruct}`,
   )}`;
-  const res = await fetchWithRetry(tablesUrl, { method: "GET", headers: { accept: "application/json" } });
+  const res = await fetchWithRetry(
+    tablesUrl,
+    { method: "GET", headers: { accept: "application/json" } },
+    precheckRetryAttempts,
+    precheckRetryDelayMs,
+  );
   if (res.ok) {
     const body = await res.json();
     knownRootsHandle = body?.data?.known_roots?.handle ?? null;
@@ -418,7 +444,8 @@ if (knownRootsHandle) {
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ key_type: "vector<u8>", value_type: "bool", key: rootHex }),
       },
-      2,
+      precheckRetryAttempts,
+      precheckRetryDelayMs,
     );
     if (res.ok) {
       // Table item returned — root is already recorded.

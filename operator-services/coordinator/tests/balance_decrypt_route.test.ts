@@ -3,9 +3,9 @@
  *
  * 5 required tests:
  *   1. happy: 5-of-7 quorum fan-out
- *   2. missing slot fails closed
+ *   2. unavailable slot uses a backup worker
  *   3. forbidden-field guard rejects amount/leafIndex/commitmentHex
- *   4. signature verification rejects forged partial
+ *   4. signature verification rejects forged partials when quorum cannot be reached
  *   5. LagrangeCoeffs match selectedSlots order
  *
  * The route is wired in coordinator/src/server.ts via
@@ -194,8 +194,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
       expect(s.partial_hex).toHaveLength(8);
       expect(s.signature).toMatch(/^[0-9a-f]{64}$/);
     }
-    // The route hit exactly the 5 selected slots via the worker path.
-    expect(calls.map((c) => c.slot).sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4]);
+    // The route probes all configured slots, then returns the lowest valid threshold quorum.
+    expect(calls.map((c) => c.slot).sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6]);
     expect(new Set(calls.map((c) => c.path))).toEqual(
       new Set(["/v2/balance/decrypt_partial"]),
     );
@@ -214,7 +214,7 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     }
   });
 
-  it("missing slot fails closed", async () => {
+  it("uses a backup slot when one worker is unavailable", async () => {
     const caDkgV2Roster = dkgRoster();
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
@@ -237,13 +237,54 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
       url: "/v2/balance/decrypt",
       payload: baseBody(),
     });
-    // Per route contract: any failing slot collapses the request to 5xx.
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.slots.map((s: { slot: number }) => s.slot)).toEqual([0, 1, 3, 4, 5]);
+    expect(body.lagrangeCoeffs).toEqual(
+      lagrangeCoefficientsAtZero([0, 1, 3, 4, 5]).map(scalarHexFromBigint),
+    );
+  });
+
+  it("fails when fewer than threshold workers return valid partials", async () => {
+    const caDkgV2Roster = dkgRoster();
+    const fail = async (slot: number) => ({
+      slot,
+      ok: false,
+      statusCode: 503,
+      error: "worker_down",
+      body: { error: "service_unavailable" },
+    });
+    const { server } = buildCoordinatorServer({
+      caDkgV2Roster,
+      bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
+      bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
+      singleNodeForwarder: makeForwarder({
+        perSlot: {
+          2: fail,
+          5: fail,
+          6: fail,
+        },
+      }),
+    });
+    const res = await server.inject({
+      method: "POST",
+      url: "/v2/balance/decrypt",
+      payload: baseBody(),
+    });
     expect(res.statusCode).toBeGreaterThanOrEqual(500);
     expect(res.statusCode).toBeLessThan(600);
     const body = res.json();
-    expect(body.error).toBe("worker_unexpected_status");
+    expect(body.error).toBe("worker_quorum_not_met");
+    expect(body.cause).toBe("worker_unexpected_status");
     expect(body.slot).toBe(2);
     expect(body.requestId).toBe("m10c-test");
+    expect(body.summary).toMatchObject({
+      okSlots: [0, 1, 3, 4],
+      failedSlots: [2, 5, 6],
+      total: 7,
+      threshold: 5,
+      thresholdMet: false,
+    });
   });
 
   it("forbidden-field guard rejects amount/leafIndex/commitmentHex", async () => {
@@ -309,28 +350,32 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     }
   });
 
-  it("signature verification rejects forged partial", async () => {
+  it("signature verification rejects forged partials when quorum cannot be reached", async () => {
     const caDkgV2Roster = dkgRoster();
+    const forge = async (
+      slot: number,
+      _b: Record<string, unknown>,
+      defaultResponse: Record<string, unknown>,
+    ) => {
+      const tampered = { ...defaultResponse };
+      const flipped = [...(defaultResponse.partialHex as string[])];
+      const first = flipped[0];
+      // Flip the first hex char (00 -> 01, 01 -> 00, etc.) — produces a
+      // valid 64-hex string that no longer matches the worker's signature.
+      const swap = (c: string) => (c === "0" ? "1" : "0");
+      flipped[0] = swap(first[0]) + first.slice(1);
+      tampered.partialHex = flipped;
+      return { slot, ok: true, statusCode: 200, body: tampered };
+    };
     const { server } = buildCoordinatorServer({
       caDkgV2Roster,
       bridgeVaultAddress: TEST_BRIDGE_VAULT_ADDRESS,
       bridgeAssetType: TEST_BRIDGE_ASSET_TYPE,
       singleNodeForwarder: makeForwarder({
         perSlot: {
-          // Slot 3 returns a valid-looking response, but we flip a byte in
-          // partialHex[0] without updating the signature. The route must
-          // recompute SHA-256 and reject the mismatch.
-          3: async (slot, _b, defaultResponse) => {
-            const tampered = { ...defaultResponse };
-            const flipped = [...(defaultResponse.partialHex as string[])];
-            const first = flipped[0];
-            // Flip the first hex char (00 → 01, 01 → 00, etc.) — produces a
-            // valid 64-hex string that no longer matches the worker's signature.
-            const swap = (c: string) => (c === "0" ? "1" : "0");
-            flipped[0] = swap(first[0]) + first.slice(1);
-            tampered.partialHex = flipped;
-            return { slot, ok: true, statusCode: 200, body: tampered };
-          },
+          3: forge,
+          5: forge,
+          6: forge,
         },
       }),
     });
@@ -341,7 +386,8 @@ describe("M10-c — POST /v2/balance/decrypt", () => {
     });
     expect(res.statusCode).toBe(502);
     const body = res.json();
-    expect(body.error).toBe("signature_verification_failed");
+    expect(body.error).toBe("worker_quorum_not_met");
+    expect(body.cause).toBe("signature_verification_failed");
     expect(body.slot).toBe(3);
   });
 

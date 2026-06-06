@@ -41,10 +41,7 @@ fn det_scalar(seed: u64) -> Scalar {
 }
 
 fn scalar_hex(s: &Scalar) -> String {
-    s.to_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    s.to_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Synthesize an adapter pointing at an empty `mp_spdz_home`. Lagrange validation runs before
@@ -72,7 +69,10 @@ fn unavailable_when_env_unset() {
     // may have set MP_SPDZ_HOME), explicitly aim at an empty temp dir.
     let temp = temp_dir("unavailable");
     let result = MpcSpdzInverseAdapter::from_home(temp);
-    assert!(result.is_none(), "from_home must return None when bytecode is missing");
+    assert!(
+        result.is_none(),
+        "from_home must return None when bytecode is missing"
+    );
 }
 
 #[test]
@@ -288,8 +288,12 @@ fn session_dir_collision_resolved_by_request_id() {
     let req_b = "req-BBB".to_string();
     let sess = "shared-session-id".to_string();
 
-    let path_a = work_dir.join("mpc-sessions").join(format!("{req_a}__{sess}"));
-    let path_b = work_dir.join("mpc-sessions").join(format!("{req_b}__{sess}"));
+    let path_a = work_dir
+        .join("mpc-sessions")
+        .join(format!("{req_a}__{sess}"));
+    let path_b = work_dir
+        .join("mpc-sessions")
+        .join(format!("{req_b}__{sess}"));
     assert_ne!(path_a, path_b);
 
     // Sanity: writing both must succeed without contention.
@@ -343,17 +347,12 @@ fn real_mp_spdz_inversion_passes_registration_sigma() {
 
     // Compute Lagrange coefficients at x=0 for the selected set, in player-ordinal order.
     let lagrange_hex: Vec<String> = (0..5)
-        .map(|ordinal| {
-            scalar_hex(&lagrange_coefficient_at_zero(ordinal, &selected_slots))
-        })
+        .map(|ordinal| scalar_hex(&lagrange_coefficient_at_zero(ordinal, &selected_slots)))
         .collect();
 
     // Allocate 5 peer ports on 127.0.0.1.
     let ports = allocate_ports(5);
-    let peer_addresses: Vec<String> = ports
-        .iter()
-        .map(|p| format!("127.0.0.1:{p}"))
-        .collect();
+    let peer_addresses: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect();
 
     // Each player gets its own work_dir under a per-test root so session_dir paths don't
     // collide between parties. We pass a long timeout so MASCOT preprocessing has time.

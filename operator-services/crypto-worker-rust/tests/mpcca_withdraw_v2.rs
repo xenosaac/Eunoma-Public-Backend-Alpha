@@ -41,19 +41,17 @@ use eunoma_crypto_worker::{
         Round1Request as MpccaRound1Request, Round2Request as MpccaRound2Request,
     },
     registration_verifier::{
-        aggregate_registration_commitment, lagrange_coefficients_at_zero,
-        registration_challenge, verify_registration_proof, RegistrationCommitmentInput,
-        RegistrationResponseInput,
+        aggregate_registration_commitment, lagrange_coefficients_at_zero, registration_challenge,
+        verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
     },
     transfer_sigma_reference::{
         bcs_fiat_shamir_inputs, bcs_serialize_transfer_session, build_statement,
-        sigma_fiat_shamir_seed, DomainSeparator, TransferStatementInputs,
-        APTOS_FRAMEWORK_ADDRESS, PROTOCOL_ID, TYPE_NAME,
+        sigma_fiat_shamir_seed, DomainSeparator, TransferStatementInputs, APTOS_FRAMEWORK_ADDRESS,
+        PROTOCOL_ID, TYPE_NAME,
     },
     vault_state_v2::{
-        final_transcript_hash, finalize_vault_state_v2, init_vault_state_v2,
-        FinalizeContribution, FinalizeRequest as VaultStateFinalizeRequest,
-        InitRequest as VaultStateInitRequest,
+        final_transcript_hash, finalize_vault_state_v2, init_vault_state_v2, FinalizeContribution,
+        FinalizeRequest as VaultStateFinalizeRequest, InitRequest as VaultStateInitRequest,
     },
     WorkerError,
 };
@@ -95,8 +93,7 @@ fn det_scalar(seed: u64) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-const H_RISTRETTO_HEX: &str =
-    "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+const H_RISTRETTO_HEX: &str = "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
 
 fn h_point() -> RistrettoPoint {
     let bytes = hex_decode(H_RISTRETTO_HEX);
@@ -191,8 +188,7 @@ fn write_v2_share(
         created_at_unix_ms: 1_700_000_000_000,
     };
     let path = state_dir.join("ca_dkg_share_v2.json");
-    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap())
-        .expect("write share file");
+    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap()).expect("write share file");
 }
 
 // `aggregate_commitment`, `aggregate_response`, `challenge`, `ca_transcript` are part of the
@@ -286,11 +282,16 @@ fn build_milestone1_fixture(label: &str) -> MpccaWithdrawFixture {
             commitment: r.commitment_hex.clone(),
         })
         .collect();
-    let aggregate_commitment = aggregate_registration_commitment(&commitments)
-        .expect("aggregate commitments");
-    let challenge =
-        registration_challenge(&vault_ek_hex, &sender, &asset, chain_id, &aggregate_commitment)
-            .expect("challenge");
+    let aggregate_commitment =
+        aggregate_registration_commitment(&commitments).expect("aggregate commitments");
+    let challenge = registration_challenge(
+        &vault_ek_hex,
+        &sender,
+        &asset,
+        chain_id,
+        &aggregate_commitment,
+    )
+    .expect("challenge");
     let mut round2_results = Vec::with_capacity(5);
     for (ordinal, &slot) in selected_slots.iter().enumerate() {
         let req = CaRound2Request {
@@ -539,7 +540,8 @@ fn build_real_ingress_payload(
         shares.push((a, b));
     }
     // 2. Compute aggregate amount_commitment = G·Σa_j + H·Σb_j.
-    let amount_commitment = compressed_hex(&(RISTRETTO_BASEPOINT_POINT * aggregate_a + h * aggregate_b));
+    let amount_commitment =
+        compressed_hex(&(RISTRETTO_BASEPOINT_POINT * aggregate_a + h * aggregate_b));
 
     // 3. Seal each (a_j, b_j) under selected_slots[j]'s HPKE pubkey with slot-j-specific AAD.
     let mut envelopes: Vec<eunoma_crypto_worker::mpcca_withdraw_v2::HpkeEnvelope> =
@@ -565,9 +567,8 @@ fn build_real_ingress_payload(
         let mut plaintext = Vec::with_capacity(64);
         plaintext.extend_from_slice(&shares[ordinal].0.to_bytes());
         plaintext.extend_from_slice(&shares[ordinal].1.to_bytes());
-        let env =
-            seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext)
-                .expect("seal ingress envelope");
+        let env = seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext)
+            .expect("seal ingress envelope");
         envelopes.push(env);
     }
     IngressTestPayload {
@@ -868,7 +869,10 @@ fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
         "ingressTranscriptHash MUST equal workerTranscriptHash"
     );
     assert!(
-        result.worker_transcript_hash.chars().all(|c| c.is_ascii_hexdigit()),
+        result
+            .worker_transcript_hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()),
         "worker_transcript_hash must be hex"
     );
 
@@ -915,8 +919,9 @@ fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
             mode & 0o777
         );
     }
-    let ingress_file_loaded =
-        load_ingress_state_file(&session_dir).expect("load ingress state").expect("present");
+    let ingress_file_loaded = load_ingress_state_file(&session_dir)
+        .expect("load ingress state")
+        .expect("present");
     assert_eq!(ingress_file_loaded.scheme, "mpcca_withdraw_v2_ingress");
     assert_eq!(ingress_file_loaded.slot, slot);
     assert_eq!(ingress_file_loaded.player_id, player_id);
@@ -926,7 +931,10 @@ fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
         req.per_share_commitments
     );
     // The encrypted_share_envelope MUST be a valid HpkeEnvelope (X25519/HKDF/AES-256-GCM).
-    assert_eq!(ingress_file_loaded.encrypted_share_envelope.kem, "DHKEM_X25519_HKDF_SHA256");
+    assert_eq!(
+        ingress_file_loaded.encrypted_share_envelope.kem,
+        "DHKEM_X25519_HKDF_SHA256"
+    );
 
     // Persisted file parses cleanly and the worker_transcript_hash matches the reconstructor.
     let loaded = load_round_state_file(&session_dir, "round1")
@@ -983,8 +991,7 @@ fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
     // Codex M3a P2 #1: the persisted round state carries the full ordered observe-deposit
     // vector verbatim so milestone 4's crypto can bind the canonical ordering.
     assert_eq!(
-        loaded.observed_deposit_transcript_hashes,
-        req.observed_deposit_transcript_hashes,
+        loaded.observed_deposit_transcript_hashes, req.observed_deposit_transcript_hashes,
         "round state must persist the ordered observe-deposit vector"
     );
 
@@ -1047,7 +1054,8 @@ fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
     // Codex M3a P2 #1: duplicate entries in observed_deposit_transcript_hashes → reject.
     let mut dup = req.clone();
     dup.observed_deposit_transcript_hashes = vec!["44".repeat(32), "44".repeat(32)];
-    let err = run_round1_v2(&state_dir, &dup).expect_err("duplicate observed entries should reject");
+    let err =
+        run_round1_v2(&state_dir, &dup).expect_err("duplicate observed entries should reject");
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("duplicate observed_deposit_transcript_hashes")),
         "duplicate observed vector must surface InvalidRequest, got {err:?}"
@@ -1069,8 +1077,7 @@ fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
     // permutation as long as length + hash-set uniqueness held.
     let mut swapped = req.clone();
     swapped.observed_deposit_cursors = vec![2, 1];
-    let err = run_round1_v2(&state_dir, &swapped)
-        .expect_err("out-of-order cursors should reject");
+    let err = run_round1_v2(&state_dir, &swapped).expect_err("out-of-order cursors should reject");
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("observed_deposit_cursors[0]")),
         "out-of-order cursors must surface InvalidRequest(observed_deposit_cursors[0]), got {err:?}"
@@ -1079,8 +1086,8 @@ fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
     // Cursor starts at 0 instead of 1 → reject.
     let mut zero_indexed = req.clone();
     zero_indexed.observed_deposit_cursors = vec![0, 1];
-    let err = run_round1_v2(&state_dir, &zero_indexed)
-        .expect_err("zero-indexed cursors should reject");
+    let err =
+        run_round1_v2(&state_dir, &zero_indexed).expect_err("zero-indexed cursors should reject");
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("observed_deposit_cursors[0]")),
         "zero-indexed cursors must surface InvalidRequest, got {err:?}"
@@ -1089,8 +1096,7 @@ fn mpcca_withdraw_v2_round1_m1_ingress_completes_happy_path() {
     // Skipped cursor in the middle → reject (e.g. [1, 3] for deposit_count=2).
     let mut skipped = req.clone();
     skipped.observed_deposit_cursors = vec![1, 3];
-    let err = run_round1_v2(&state_dir, &skipped)
-        .expect_err("skipped cursors should reject");
+    let err = run_round1_v2(&state_dir, &skipped).expect_err("skipped cursors should reject");
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.starts_with("observed_deposit_cursors[1]")),
         "skipped cursor must surface InvalidRequest(observed_deposit_cursors[1]), got {err:?}"
@@ -1115,14 +1121,17 @@ fn mpcca_withdraw_v2_round1_rejects_forged_init_transcript_hash() {
     let baseline = build_round1_request(&fix, slot, player_id);
     let baseline_ok =
         run_round1_v2(&state_dir, &baseline).expect("baseline must complete M1 ingress");
-    assert!(baseline_ok.completed, "baseline must complete: {baseline_ok:?}");
+    assert!(
+        baseline_ok.completed,
+        "baseline must complete: {baseline_ok:?}"
+    );
 
     // KILLER: tamper the init_transcript_hash with a random 32-byte hex. Expectation:
     // InvalidDkgState("vault_state_init_transcript_hash_mismatch"), NOT a successful Ok.
     let mut tampered = build_round1_request(&fix, slot, player_id);
     tampered.vault_state_init_transcript_hash = "ab".repeat(32);
-    let err = run_round1_v2(&state_dir, &tampered)
-        .expect_err("forged init_transcript_hash must reject");
+    let err =
+        run_round1_v2(&state_dir, &tampered).expect_err("forged init_transcript_hash must reject");
     assert!(
         matches!(
             err,
@@ -1180,8 +1189,8 @@ fn mpcca_withdraw_v2_session_state_hash_idempotent() {
 
     // First call.
     let first_result = run_round1_v2(&state_dir, &req).expect("M1 ingress");
-    let session_dir = mpcca_withdraw_session_dir(&state_dir, &req.request_id, &req.session_id)
-        .expect("dir");
+    let session_dir =
+        mpcca_withdraw_session_dir(&state_dir, &req.request_id, &req.session_id).expect("dir");
     let first = load_round_state_file(&session_dir, "round1")
         .expect("load 1")
         .expect("file 1");
@@ -1198,7 +1207,8 @@ fn mpcca_withdraw_v2_session_state_hash_idempotent() {
     assert_eq!(first.slot, second.slot);
     assert_eq!(first.not_implemented_phase, second.not_implemented_phase);
     assert_eq!(
-        first_result.ingress_transcript_hash, second_result.ingress_transcript_hash
+        first_result.ingress_transcript_hash,
+        second_result.ingress_transcript_hash
     );
 }
 
@@ -1382,12 +1392,9 @@ fn m1_round1_rejects_under_count_ingress_envelopes() {
     let slot = 0_usize;
     let state_dir = fix.slot_dirs[slot].clone();
     let mut req = build_round1_request(&fix, slot, 0);
-    req.ingress_envelopes = fixture_ingress_envelopes()
-        .into_iter()
-        .take(4)
-        .collect();
-    let err =
-        run_round1_v2(&state_dir, &req).expect_err("under-count ingress_envelopes must fail closed");
+    req.ingress_envelopes = fixture_ingress_envelopes().into_iter().take(4).collect();
+    let err = run_round1_v2(&state_dir, &req)
+        .expect_err("under-count ingress_envelopes must fail closed");
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("ingress_envelopes")),
         "expected ingress_envelopes InvalidRequest, got {err:?}"
@@ -1471,34 +1478,62 @@ fn m1_round1_transcript_hash_binds_amount_commitment() {
     ];
     let envs_hash = "ff".repeat(32);
     let hash_a = round1_worker_transcript_hash(
-        "sess-x", "req-x", "1",
-        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
+        "sess-x",
+        "req-x",
+        "1",
+        &"aa".repeat(32),
+        &"bb".repeat(32),
+        &"cc".repeat(32),
         &observed,
         &"dd".repeat(32),
         &sorted,
-        0, 0,
-        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
+        0,
+        0,
+        &"ee".repeat(32),
+        &"01".repeat(32),
+        &"02".repeat(32),
         2,
-        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
-        &"07".repeat(32), 4, 1_700_000_000,
-        &"08".repeat(32), 7,
+        &"03".repeat(32),
+        &"04".repeat(32),
+        &"05".repeat(32),
+        &"06".repeat(32),
+        &"07".repeat(32),
+        4,
+        1_700_000_000,
+        &"08".repeat(32),
+        7,
         &"aa".repeat(32), // amount_commitment v1
-        &per_share, &envs_hash,
+        &per_share,
+        &envs_hash,
     );
     let hash_b = round1_worker_transcript_hash(
-        "sess-x", "req-x", "1",
-        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
+        "sess-x",
+        "req-x",
+        "1",
+        &"aa".repeat(32),
+        &"bb".repeat(32),
+        &"cc".repeat(32),
         &observed,
         &"dd".repeat(32),
         &sorted,
-        0, 0,
-        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
+        0,
+        0,
+        &"ee".repeat(32),
+        &"01".repeat(32),
+        &"02".repeat(32),
         2,
-        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
-        &"07".repeat(32), 4, 1_700_000_000,
-        &"08".repeat(32), 7,
+        &"03".repeat(32),
+        &"04".repeat(32),
+        &"05".repeat(32),
+        &"06".repeat(32),
+        &"07".repeat(32),
+        4,
+        1_700_000_000,
+        &"08".repeat(32),
+        7,
         &"bb".repeat(32), // amount_commitment v2 — only change
-        &per_share, &envs_hash,
+        &per_share,
+        &envs_hash,
     );
     assert_ne!(
         hash_a, hash_b,
@@ -1521,28 +1556,62 @@ fn m1_round1_transcript_hash_binds_per_share_commitments() {
     per_share_b[2] = "ff".repeat(32); // flip [2]
     let envs_hash = "ee".repeat(32);
     let hash_a = round1_worker_transcript_hash(
-        "sess-x", "req-x", "1",
-        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
-        &observed, &"dd".repeat(32), &sorted, 0, 0,
-        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
-        2,
-        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
-        &"07".repeat(32), 4, 1_700_000_000,
-        &"08".repeat(32), 7,
+        "sess-x",
+        "req-x",
+        "1",
         &"aa".repeat(32),
-        &per_share_a, &envs_hash,
+        &"bb".repeat(32),
+        &"cc".repeat(32),
+        &observed,
+        &"dd".repeat(32),
+        &sorted,
+        0,
+        0,
+        &"ee".repeat(32),
+        &"01".repeat(32),
+        &"02".repeat(32),
+        2,
+        &"03".repeat(32),
+        &"04".repeat(32),
+        &"05".repeat(32),
+        &"06".repeat(32),
+        &"07".repeat(32),
+        4,
+        1_700_000_000,
+        &"08".repeat(32),
+        7,
+        &"aa".repeat(32),
+        &per_share_a,
+        &envs_hash,
     );
     let hash_b = round1_worker_transcript_hash(
-        "sess-x", "req-x", "1",
-        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
-        &observed, &"dd".repeat(32), &sorted, 0, 0,
-        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
-        2,
-        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
-        &"07".repeat(32), 4, 1_700_000_000,
-        &"08".repeat(32), 7,
+        "sess-x",
+        "req-x",
+        "1",
         &"aa".repeat(32),
-        &per_share_b, &envs_hash,
+        &"bb".repeat(32),
+        &"cc".repeat(32),
+        &observed,
+        &"dd".repeat(32),
+        &sorted,
+        0,
+        0,
+        &"ee".repeat(32),
+        &"01".repeat(32),
+        &"02".repeat(32),
+        2,
+        &"03".repeat(32),
+        &"04".repeat(32),
+        &"05".repeat(32),
+        &"06".repeat(32),
+        &"07".repeat(32),
+        4,
+        1_700_000_000,
+        &"08".repeat(32),
+        7,
+        &"aa".repeat(32),
+        &per_share_b,
+        &envs_hash,
     );
     assert_ne!(
         hash_a, hash_b,
@@ -1562,28 +1631,62 @@ fn m1_round1_transcript_hash_binds_ingress_envelopes_hash() {
         "55".repeat(32),
     ];
     let hash_a = round1_worker_transcript_hash(
-        "sess-x", "req-x", "1",
-        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
-        &observed, &"dd".repeat(32), &sorted, 0, 0,
-        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
-        2,
-        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
-        &"07".repeat(32), 4, 1_700_000_000,
-        &"08".repeat(32), 7,
+        "sess-x",
+        "req-x",
+        "1",
         &"aa".repeat(32),
-        &per_share, &"aa".repeat(32),
+        &"bb".repeat(32),
+        &"cc".repeat(32),
+        &observed,
+        &"dd".repeat(32),
+        &sorted,
+        0,
+        0,
+        &"ee".repeat(32),
+        &"01".repeat(32),
+        &"02".repeat(32),
+        2,
+        &"03".repeat(32),
+        &"04".repeat(32),
+        &"05".repeat(32),
+        &"06".repeat(32),
+        &"07".repeat(32),
+        4,
+        1_700_000_000,
+        &"08".repeat(32),
+        7,
+        &"aa".repeat(32),
+        &per_share,
+        &"aa".repeat(32),
     );
     let hash_b = round1_worker_transcript_hash(
-        "sess-x", "req-x", "1",
-        &"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(32),
-        &observed, &"dd".repeat(32), &sorted, 0, 0,
-        &"ee".repeat(32), &"01".repeat(32), &"02".repeat(32),
-        2,
-        &"03".repeat(32), &"04".repeat(32), &"05".repeat(32), &"06".repeat(32),
-        &"07".repeat(32), 4, 1_700_000_000,
-        &"08".repeat(32), 7,
+        "sess-x",
+        "req-x",
+        "1",
         &"aa".repeat(32),
-        &per_share, &"bb".repeat(32), // flip ingress_envelopes_hash
+        &"bb".repeat(32),
+        &"cc".repeat(32),
+        &observed,
+        &"dd".repeat(32),
+        &sorted,
+        0,
+        0,
+        &"ee".repeat(32),
+        &"01".repeat(32),
+        &"02".repeat(32),
+        2,
+        &"03".repeat(32),
+        &"04".repeat(32),
+        &"05".repeat(32),
+        &"06".repeat(32),
+        &"07".repeat(32),
+        4,
+        1_700_000_000,
+        &"08".repeat(32),
+        7,
+        &"aa".repeat(32),
+        &per_share,
+        &"bb".repeat(32), // flip ingress_envelopes_hash
     );
     assert_ne!(
         hash_a, hash_b,
@@ -1598,17 +1701,18 @@ fn m1_ingress_envelopes_hash_ts_rust_parity() {
     // stability + that flipping ANY field flips the hash, which mirrors what the TS-side
     // killer tests assert.
     let envs = fixture_ingress_envelopes();
-    let h_a = eunoma_crypto_worker::mpcca_withdraw_v2::ingress_envelopes_hash(&envs)
-        .expect("hash");
-    let h_b = eunoma_crypto_worker::mpcca_withdraw_v2::ingress_envelopes_hash(&envs)
-        .expect("hash");
+    let h_a = eunoma_crypto_worker::mpcca_withdraw_v2::ingress_envelopes_hash(&envs).expect("hash");
+    let h_b = eunoma_crypto_worker::mpcca_withdraw_v2::ingress_envelopes_hash(&envs).expect("hash");
     assert_eq!(h_a, h_b, "ingress_envelopes_hash must be byte-stable");
 
     let mut envs_mut = envs.clone();
     envs_mut[2].aad_hash = "ff".repeat(32);
     let h_c =
         eunoma_crypto_worker::mpcca_withdraw_v2::ingress_envelopes_hash(&envs_mut).expect("hash");
-    assert_ne!(h_a, h_c, "ingress_envelopes_hash must change on aad_hash flip");
+    assert_ne!(
+        h_a, h_c,
+        "ingress_envelopes_hash must change on aad_hash flip"
+    );
 
     // Also assert order matters.
     let reordered = vec![
@@ -1651,8 +1755,7 @@ fn m1_ingress_zero_share_rejected() {
     // Compute the per-share commitment for (0, b_0) so the worker passes the commitment
     // check first; the zero-share gate runs BEFORE the commitment check.
     let h = h_point();
-    let new_commit_0 =
-        compressed_hex(&(RISTRETTO_BASEPOINT_POINT * zero_a + h * real_b));
+    let new_commit_0 = compressed_hex(&(RISTRETTO_BASEPOINT_POINT * zero_a + h * real_b));
     req.per_share_commitments[0] = new_commit_0.clone();
     // Also rebuild aggregate amount_commitment so the wire stays internally consistent.
     // Note: we don't bother recomputing — the AAD only binds the per_share_commitments_hash,
@@ -1679,7 +1782,8 @@ fn m1_ingress_zero_share_rejected() {
         &req.per_share_commitments,
     );
     req.ingress_envelopes[0] =
-        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext).expect("seal");
+        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext)
+            .expect("seal");
     // Re-seal envelope 1..5 with AAD that reflects the updated commitments. Since the
     // commitments hash is bound in AAD, every slot's envelope AAD changed → re-seal all.
     for (ordinal, &s) in fix.selected_slots.iter().enumerate().skip(1) {
@@ -1753,10 +1857,10 @@ fn m1_ingress_share_commitment_mismatch_rejected() {
         &req.per_share_commitments,
     );
     req.ingress_envelopes[0] =
-        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext).expect("seal");
+        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &aad, &plaintext)
+            .expect("seal");
 
-    let err =
-        run_round1_v2(&state_dir, &req).expect_err("commitment mismatch must reject");
+    let err = run_round1_v2(&state_dir, &req).expect_err("commitment mismatch must reject");
     assert!(
         matches!(err, WorkerError::Crypto(ref s) if s == "ingress_share_commitment_mismatch"),
         "expected Crypto(ingress_share_commitment_mismatch), got {err:?}"
@@ -1799,7 +1903,8 @@ fn m1_ingress_aad_mismatch_rejected_as_hpke_decrypt_failure() {
         &req.per_share_commitments,
     );
     req.ingress_envelopes[0] =
-        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &bad_aad, &plaintext).expect("seal");
+        seal_ingress_envelope_for_test(&fix.hpke_public_keys[slot], &bad_aad, &plaintext)
+            .expect("seal");
 
     let err = run_round1_v2(&state_dir, &req).expect_err("AAD mismatch must reject");
     assert!(
@@ -1908,9 +2013,15 @@ fn m4_round2_completes_dk_threshold_happy_path() {
         .expect("load dk state")
         .expect("dk state file exists");
     assert_eq!(state_file.scheme, "mpcca_withdraw_v2_round2_dk");
-    assert_eq!(state_file.partial_dk_commitments, result.partial_dk_commitments);
+    assert_eq!(
+        state_file.partial_dk_commitments,
+        result.partial_dk_commitments
+    );
     assert_eq!(state_file.dk_base_indices_used, result.dk_base_indices_used);
-    assert_eq!(state_file.worker_transcript_hash, result.worker_transcript_hash);
+    assert_eq!(
+        state_file.worker_transcript_hash,
+        result.worker_transcript_hash
+    );
 }
 
 #[test]
@@ -2001,14 +2112,13 @@ fn m4_round2_missing_dk_share_file_rejected() {
         mpcca_withdraw_session_dir(&state_dir, &req.base.request_id, &req.base.session_id)
             .expect("session dir");
     assert!(
-        !session_dir.join("mpcca_withdraw_v2_round2_dk.json").exists(),
+        !session_dir
+            .join("mpcca_withdraw_v2_round2_dk.json")
+            .exists(),
         "no round2 dk-state file may be written when dk_share is missing"
     );
     assert!(
-        matches!(
-            err,
-            WorkerError::MissingLocalState(_) | WorkerError::Io(_)
-        ),
+        matches!(err, WorkerError::MissingLocalState(_) | WorkerError::Io(_)),
         "missing dk_share must fail closed with MissingLocalState or Io, got {err:?}"
     );
 }
@@ -2022,8 +2132,8 @@ fn m4_round2_tampered_recipient_ek_rejected() {
     let mut req = build_round2_request(&fix, slot, player_id);
     // 0xff^32 is NOT a canonical compressed Ristretto encoding → Statement build fails.
     req.recipient_ek = "ff".repeat(32);
-    let err = run_round2_v2(&state_dir, &req)
-        .expect_err("non-canonical recipient_ek must fail closed");
+    let err =
+        run_round2_v2(&state_dir, &req).expect_err("non-canonical recipient_ek must fail closed");
     assert!(
         matches!(err, WorkerError::InvalidRequest(_)),
         "expected InvalidRequest for non-canonical recipient_ek, got {err:?}"
@@ -2130,8 +2240,8 @@ fn m4_round2_under_count_old_balance_c_rejected() {
     let state_dir = fix.slot_dirs[slot].clone();
     let mut req = build_round2_request(&fix, slot, 0);
     req.old_balance_c.pop(); // 7 instead of 8
-    let err = run_round2_v2(&state_dir, &req)
-        .expect_err("under-count old_balance_c must fail closed");
+    let err =
+        run_round2_v2(&state_dir, &req).expect_err("under-count old_balance_c must fail closed");
     assert!(
         matches!(
             err,
@@ -2148,8 +2258,8 @@ fn m4_round2_under_count_transfer_amount_c_rejected() {
     let state_dir = fix.slot_dirs[slot].clone();
     let mut req = build_round2_request(&fix, slot, 0);
     req.transfer_amount_c.push("01".repeat(32)); // 5 instead of 4
-    let err = run_round2_v2(&state_dir, &req)
-        .expect_err("over-count transfer_amount_c must fail closed");
+    let err =
+        run_round2_v2(&state_dir, &req).expect_err("over-count transfer_amount_c must fail closed");
     assert!(
         matches!(
             err,
@@ -2303,7 +2413,12 @@ fn derive_canonical_challenge_hex(
 
 fn bytes32(hex: &str) -> [u8; 32] {
     let raw = hex_decode(hex);
-    assert_eq!(raw.len(), 32, "expected 32-byte hex, got {} bytes", raw.len());
+    assert_eq!(
+        raw.len(),
+        32,
+        "expected 32-byte hex, got {} bytes",
+        raw.len()
+    );
     let mut arr = [0_u8; 32];
     arr.copy_from_slice(&raw);
     arr
@@ -2335,7 +2450,9 @@ fn build_finalize_request_real(
             // Filled below from the round2 partial.
             agg.push(String::new());
         } else {
-            agg.push(deterministic_compressed_hex(format!("real-agg-{i}").as_bytes()));
+            agg.push(deterministic_compressed_hex(
+                format!("real-agg-{i}").as_bytes(),
+            ));
         }
     }
     for partial in &r2_result.partial_dk_commitments {
@@ -2399,7 +2516,10 @@ fn m4_finalize_completes_dk_threshold_happy_path() {
     let (req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
 
     let result = run_finalize_v2(&state_dir, &req).expect("M4 finalize happy path");
-    assert!(result.completed, "finalize result.completed MUST be true under M4 commit 3");
+    assert!(
+        result.completed,
+        "finalize result.completed MUST be true under M4 commit 3"
+    );
     assert_eq!(result.slot, slot);
     assert_eq!(result.player_id, player_id);
     assert_eq!(result.dk_base_indices_used, vec![0_usize, 17_usize]);
@@ -2507,8 +2627,8 @@ fn m4_finalize_tampered_aggregated_commitment_rejected() {
     // Tamper agg[5] (a non-dk position) — the e re-derivation diverges.
     req.aggregated_sigma_commitments[5] =
         deterministic_compressed_hex(b"tampered-agg-5-replacement");
-    let err = run_finalize_v2(&state_dir, &req)
-        .expect_err("tampered aggregated commitment must reject");
+    let err =
+        run_finalize_v2(&state_dir, &req).expect_err("tampered aggregated commitment must reject");
     assert!(
         matches!(err, WorkerError::Crypto(ref s) if s == "finalize_challenge_mismatch"),
         "expected finalize_challenge_mismatch, got {err:?}"
@@ -2543,8 +2663,8 @@ fn m4_finalize_identity_aggregated_commitment_rejected() {
     let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
     // 32 zero bytes is the canonical encoding of the Ristretto identity point.
     req.aggregated_sigma_commitments[5] = "00".repeat(32);
-    let err = run_finalize_v2(&state_dir, &req)
-        .expect_err("identity aggregated commitment must reject");
+    let err =
+        run_finalize_v2(&state_dir, &req).expect_err("identity aggregated commitment must reject");
     assert!(
         matches!(
             err,
@@ -2563,8 +2683,7 @@ fn m4_finalize_non_canonical_challenge_rejected() {
     let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
     // 0xff * 32 is NOT a canonical Ed25519 scalar (>= group order).
     req.challenge_hex = "ff".repeat(32);
-    let err = run_finalize_v2(&state_dir, &req)
-        .expect_err("non-canonical challenge must reject");
+    let err = run_finalize_v2(&state_dir, &req).expect_err("non-canonical challenge must reject");
     assert!(
         matches!(err, WorkerError::InvalidRequest(ref s) if s.contains("challenge_hex")),
         "expected InvalidRequest re: challenge_hex non-canonical, got {err:?}"
@@ -2579,8 +2698,7 @@ fn m4_finalize_zero_challenge_rejected() {
     let state_dir = fix.slot_dirs[slot].clone();
     let (mut req, _agg) = build_finalize_request_real(&fix, slot, player_id, &state_dir);
     req.challenge_hex = "00".repeat(32);
-    let err = run_finalize_v2(&state_dir, &req)
-        .expect_err("zero challenge must reject");
+    let err = run_finalize_v2(&state_dir, &req).expect_err("zero challenge must reject");
     assert!(
         matches!(err, WorkerError::Crypto(ref s) if s == "finalize_challenge_zero_rejected"),
         "expected finalize_challenge_zero_rejected, got {err:?}"
@@ -2651,10 +2769,7 @@ fn m4_finalize_missing_dk_share_file_rejected() {
     fs::remove_file(state_dir.join("ca_dkg_share_v2.json")).expect("remove dk share");
     let err = run_finalize_v2(&state_dir, &req).expect_err("missing dk_share must fail closed");
     assert!(
-        matches!(
-            err,
-            WorkerError::MissingLocalState(_) | WorkerError::Io(_)
-        ),
+        matches!(err, WorkerError::MissingLocalState(_) | WorkerError::Io(_)),
         "missing dk_share must surface MissingLocalState or Io, got {err:?}"
     );
 }
@@ -2689,12 +2804,9 @@ fn m4_finalize_at_rest_envelope_not_recoverable_with_wrong_aad_seed() {
     let sess_a =
         mpcca_withdraw_session_dir(&state_dir_a, &req_a.base.request_id, &req_a.base.session_id)
             .expect("sess a");
-    let sess_b = mpcca_withdraw_session_dir(
-        &state_dir_b,
-        &req_a.base.request_id,
-        &req_a.base.session_id,
-    )
-    .expect("sess b");
+    let sess_b =
+        mpcca_withdraw_session_dir(&state_dir_b, &req_a.base.request_id, &req_a.base.session_id)
+            .expect("sess b");
     let r2_file_a = sess_a.join("mpcca_withdraw_v2_round2_dk.json");
     let r2_file_b = sess_b.join("mpcca_withdraw_v2_round2_dk.json");
     fs::copy(&r2_file_b, &r2_file_a).expect("copy r2 file");
@@ -2705,7 +2817,10 @@ fn m4_finalize_at_rest_envelope_not_recoverable_with_wrong_aad_seed() {
     //   - finalize_alpha_envelope_open_failed (HPKE key mismatch)
     //   - finalize_round2_state_statement_inputs_hash_mismatch (different fixture data)
     assert!(
-        matches!(err, WorkerError::InvalidDkgState(_) | WorkerError::Crypto(_)),
+        matches!(
+            err,
+            WorkerError::InvalidDkgState(_) | WorkerError::Crypto(_)
+        ),
         "expected fail-closed via InvalidDkgState/Crypto, got {err:?}"
     );
 }

@@ -370,8 +370,7 @@ fn psi_transfer(
 ) -> WorkerResult<Vec<RistrettoPoint>> {
     if has_effective || num_volun > 0 {
         return Err(WorkerError::InvalidRequest(
-            "auditor branches are not supported by the single-party reference port"
-                .to_string(),
+            "auditor branches are not supported by the single-party reference port".to_string(),
         ));
     }
     if witness.len() != 1 + 2 * ell + 2 * n {
@@ -454,8 +453,7 @@ fn f_transfer(
 ) -> WorkerResult<Vec<RistrettoPoint>> {
     if has_effective || num_volun > 0 {
         return Err(WorkerError::InvalidRequest(
-            "auditor branches are not supported by the single-party reference port"
-                .to_string(),
+            "auditor branches are not supported by the single-party reference port".to_string(),
         ));
     }
     let g = stmt.points[IDX_G];
@@ -528,8 +526,7 @@ pub fn prove_transfer_single_party(
 ) -> WorkerResult<SigmaProtocolProof> {
     if has_effective_auditor || num_voluntary_auditors > 0 {
         return Err(WorkerError::InvalidRequest(
-            "auditor branches are not supported by the single-party reference port"
-                .to_string(),
+            "auditor branches are not supported by the single-party reference port".to_string(),
         ));
     }
     if witness.len() != 1 + 2 * ell + 2 * n {
@@ -550,10 +547,7 @@ pub fn prove_transfer_single_party(
     let k = witness.len() as u64;
 
     let a_points = psi_transfer(statement, alpha, ell, n, false, 0)?;
-    let compressed_a: Vec<[u8; 32]> = a_points
-        .iter()
-        .map(|p| p.compress().to_bytes())
-        .collect();
+    let compressed_a: Vec<[u8; 32]> = a_points.iter().map(|p| p.compress().to_bytes()).collect();
 
     let bcs = bcs_fiat_shamir_inputs(
         dst,
@@ -592,8 +586,7 @@ pub fn verify_transfer_single_party(
 ) -> WorkerResult<bool> {
     if has_effective_auditor || num_voluntary_auditors > 0 {
         return Err(WorkerError::InvalidRequest(
-            "auditor branches are not supported by the single-party reference port"
-                .to_string(),
+            "auditor branches are not supported by the single-party reference port".to_string(),
         ));
     }
     if proof.commitment.is_empty() {
@@ -689,8 +682,7 @@ pub fn verify_transfer_per_position_for_parity_tests(
 ) -> WorkerResult<Vec<bool>> {
     if has_effective_auditor || num_voluntary_auditors > 0 {
         return Err(WorkerError::InvalidRequest(
-            "auditor branches are not supported by the single-party reference port"
-                .to_string(),
+            "auditor branches are not supported by the single-party reference port".to_string(),
         ));
     }
     if proof.commitment.is_empty() {

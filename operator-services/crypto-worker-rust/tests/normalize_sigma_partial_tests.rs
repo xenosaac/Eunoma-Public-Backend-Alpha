@@ -83,8 +83,7 @@ fn lambda_for_slot(selected_slots: &[usize], slot: usize) -> Scalar {
     num * den.invert()
 }
 
-const H_RISTRETTO_HEX: &str =
-    "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
+const H_RISTRETTO_HEX: &str = "8c9240b456a9e6dc65c377a1048d745f94a08cdb7f44cbcd7b46f34048871134";
 
 fn h_point() -> RistrettoPoint {
     let bytes = hex_decode(H_RISTRETTO_HEX);
@@ -181,8 +180,7 @@ fn write_v2_share(
         created_at_unix_ms: 1_700_000_000_000,
     };
     let path = state_dir.join("ca_dkg_share_v2.json");
-    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap())
-        .expect("write share file");
+    fs::write(&path, serde_json::to_vec_pretty(&layout).unwrap()).expect("write share file");
     dk_share
 }
 

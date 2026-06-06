@@ -148,13 +148,33 @@ export interface DepositV3SubmitResult {
   txHashes: string[];
 }
 
+export interface DepositV3SubmitHooks {
+  completedTxHashes?: string[];
+  onStepStart?: (step: number, fn: string) => void;
+  onStepDone?: (step: number, fn: string, txHash: string) => void;
+  resumeAfterStep?: number;
+}
+
 export interface CreateDepositV3SubmitterOptions {
   submit?: boolean;
   env?: NodeJS.ProcessEnv;
   spawnAptos?: SpawnAptosFn;
   aptosBin?: string;
   stderrSink?: { write: (chunk: string) => void };
+  onStepStart?: (step: number, fn: string) => void;
+  onStepDone?: (step: number, fn: string, txHash: string) => void;
+  retryAttempts?: number;
+  retryDelayMs?: number;
 }
+
+const DEFAULT_DEPOSIT_V3_MAX_GAS = 2_000_000;
+const DEFAULT_DEPOSIT_V3_GAS_UNIT_PRICE = 100;
+const DEFAULT_APTOS_CLI_RETRY_ATTEMPTS = 12;
+const DEFAULT_APTOS_CLI_RETRY_DELAY_MS = 5_000;
+const RECOVERABLE_PENDING_ABORT_BY_FN: Record<string, string> = {
+  prepare_deposit_binding_v3_for_user: "E_PENDING_DEPOSIT_BINDING",
+  deposit_step2a_eunoma_verify_v3: "E_PENDING_DEPOSIT_FINALIZATION",
+};
 
 /**
  * Build a submitter that drives prepare_deposit_binding_v3 + deposit_step2a_v3 on the user's behalf
@@ -165,7 +185,7 @@ export function createDepositV3Submitter(
   bridgePackage: string,
   relayerProfile: string | undefined,
   opts: CreateDepositV3SubmitterOptions = {},
-): (args: DepositV3DelegateArgs) => Promise<DepositV3SubmitResult> {
+): (args: DepositV3DelegateArgs, hooks?: DepositV3SubmitHooks) => Promise<DepositV3SubmitResult> {
   if (!bridgePackage || !/^0x[0-9a-fA-F]+$/.test(bridgePackage)) {
     throw new Error("bridgePackage must be a non-empty 0x-prefixed hex address");
   }
@@ -179,10 +199,42 @@ export function createDepositV3Submitter(
   }
   const simulate = opts.submit !== true;
   const stderrSink = opts.stderrSink ?? { write: (c: string) => void process.stderr.write(c) };
+  const retryAttempts = Number.parseInt(
+    String(
+      opts.retryAttempts ??
+        env.RELAYER_APTOS_CLI_RETRY_ATTEMPTS ??
+        String(DEFAULT_APTOS_CLI_RETRY_ATTEMPTS),
+    ),
+    10,
+  );
+  const retryDelayMs = Number.parseInt(
+    String(
+      opts.retryDelayMs ??
+        env.RELAYER_APTOS_CLI_RETRY_DELAY_MS ??
+        String(DEFAULT_APTOS_CLI_RETRY_DELAY_MS),
+    ),
+    10,
+  );
+  const maxAttempts = Number.isInteger(retryAttempts) && retryAttempts > 0 ? retryAttempts : 1;
+  const baseRetryDelayMs =
+    Number.isInteger(retryDelayMs) && retryDelayMs >= 0
+      ? retryDelayMs
+      : DEFAULT_APTOS_CLI_RETRY_DELAY_MS;
 
-  return async (callArgs: DepositV3DelegateArgs): Promise<DepositV3SubmitResult> => {
-    const txHashes: string[] = [];
-    for (const entry of DEPOSIT_V3_DELEGATE_ENTRIES) {
+  return async (
+    callArgs: DepositV3DelegateArgs,
+    hooks: DepositV3SubmitHooks = {},
+  ): Promise<DepositV3SubmitResult> => {
+    const txHashes: string[] = [...(hooks.completedTxHashes ?? [])];
+    const resumeAfterStep =
+      Number.isInteger(hooks.resumeAfterStep) && hooks.resumeAfterStep !== undefined
+        ? hooks.resumeAfterStep
+        : -1;
+
+    for (let stepIndex = 0; stepIndex < DEPOSIT_V3_DELEGATE_ENTRIES.length; stepIndex += 1) {
+      const entry = DEPOSIT_V3_DELEGATE_ENTRIES[stepIndex];
+      if (stepIndex <= resumeAfterStep) continue;
+      (hooks.onStepStart ?? opts.onStepStart)?.(stepIndex, entry.fn);
       const positional = encodeDepositV3EntryArgs(entry, callArgs);
       const cliArgs = [
         "move",
@@ -190,34 +242,51 @@ export function createDepositV3Submitter(
         "--function-id",
         `${bridgePackage}::eunoma_bridge::${entry.fn}`,
         ...(relayerProfile ? ["--profile", relayerProfile] : []),
+        "--max-gas",
+        String(DEFAULT_DEPOSIT_V3_MAX_GAS),
+        "--gas-unit-price",
+        String(DEFAULT_DEPOSIT_V3_GAS_UNIT_PRICE),
         "--assume-yes",
         ...(simulate ? ["--simulate"] : []),
         "--args",
         ...positional,
       ];
-      const { stdout, stderr, done } = spawnFn(aptosBin, cliArgs);
-      let stdoutText = "";
-      let stderrText = "";
-      const collectOut = (async () => {
-        for await (const chunk of stdout) stdoutText += chunkToString(chunk);
-      })();
-      const collectErr = (async () => {
-        for await (const chunk of stderr) stderrText += chunkToString(chunk);
-      })();
-      const [exitCode] = await Promise.all([done, collectOut, collectErr]);
 
-      const step = txHashes.length + 1;
-      if (exitCode !== 0) {
-        stderrSink.write(
-          `[relayer-v3-deposit] ${entry.fn} (step ${step}/2) exited ${exitCode ?? "(signal)"}; stderr=\n${stderrText}\n`,
-        );
-        throw new RelayerSubmitterError(
-          "aptos_cli_error",
-          `Aptos CLI ${entry.fn} failed (step ${step}/2); check relayer logs for details.`,
-        );
-      }
-      const txHash = parseTxHashFromAptosCliStdout(stdoutText);
-      if (!txHash) {
+      const step = stepIndex + 1;
+      let txHash: string | undefined;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const { stdoutText, stderrText, exitCode } = await runAptosCli(spawnFn, aptosBin, cliArgs);
+        txHash = parseTxHashFromAptosCliStdout(stdoutText);
+        if (!txHash) {
+          const recovered = recoverableAlreadyPreparedMarker(entry, stdoutText, stderrText, simulate, stepIndex);
+          if (recovered) {
+            stderrSink.write(
+              `[relayer-v3-deposit] ${entry.fn} (step ${step}/2) recovered already-prepared on-chain state; ` +
+                `continuing with marker=${recovered}\n`,
+            );
+            txHash = recovered;
+            break;
+          }
+        }
+        if (exitCode === 0 && txHash) break;
+        const retryable = isRetryableAptosCliTransportFailure(stdoutText, stderrText);
+        if (retryable && attempt < maxAttempts) {
+          stderrSink.write(
+            `[relayer-v3-deposit] ${entry.fn} (step ${step}/2) retryable Aptos CLI transport failure ` +
+              `(attempt ${attempt}/${maxAttempts}); backing off\n`,
+          );
+          await sleep(baseRetryDelayMs * attempt);
+          continue;
+        }
+        if (exitCode !== 0) {
+          stderrSink.write(
+            `[relayer-v3-deposit] ${entry.fn} (step ${step}/2) exited ${exitCode ?? "(signal)"}; stderr=\n${stderrText}\n`,
+          );
+          throw new RelayerSubmitterError(
+            "aptos_cli_error",
+            `Aptos CLI ${entry.fn} failed (step ${step}/2); check relayer logs for details.`,
+          );
+        }
         stderrSink.write(
           `[relayer-v3-deposit] ${entry.fn} (step ${step}/2) exit=0 but no transaction_hash; stdout=\n${stdoutText}\n`,
         );
@@ -226,8 +295,67 @@ export function createDepositV3Submitter(
           `${entry.fn} stdout missing transaction_hash (simulate=${simulate})`,
         );
       }
+      if (!txHash) throw new RelayerSubmitterError("aptos_cli_missing_tx_hash", `${entry.fn} stdout missing transaction_hash`);
       txHashes.push(txHash);
+      (hooks.onStepDone ?? opts.onStepDone)?.(stepIndex, entry.fn, txHash);
     }
     return { accepted: true, simulated: simulate, txHashes };
   };
+}
+
+async function runAptosCli(
+  spawnFn: SpawnAptosFn,
+  aptosBin: string,
+  cliArgs: string[],
+): Promise<{ stdoutText: string; stderrText: string; exitCode: number | null }> {
+  const { stdout, stderr, done } = spawnFn(aptosBin, cliArgs);
+  let stdoutText = "";
+  let stderrText = "";
+  const collectOut = (async () => {
+    for await (const chunk of stdout) stdoutText += chunkToString(chunk);
+  })();
+  const collectErr = (async () => {
+    for await (const chunk of stderr) stderrText += chunkToString(chunk);
+  })();
+  const [exitCode] = await Promise.all([done, collectOut, collectErr]);
+  return { stdoutText, stderrText, exitCode };
+}
+
+function isRetryableAptosCliTransportFailure(stdoutText: string, stderrText: string): boolean {
+  const text = `${stdoutText}\n${stderrText}`.toLowerCase();
+  if (text.includes("move abort") || text.includes("simulation failed with status")) return false;
+  return (
+    text.includes("rate limit") ||
+    text.includes("ratelimit") ||
+    text.includes("too many requests") ||
+    text.includes("http 429") ||
+    text.includes("bad_status:429") ||
+    text.includes("status 429") ||
+    text.includes(" 429 ") ||
+    text.includes("5xx") ||
+    text.includes("http 500") ||
+    text.includes("http 502") ||
+    text.includes("http 503") ||
+    text.includes("http 504")
+  );
+}
+
+function recoverableAlreadyPreparedMarker(
+  entry: DepositV3DelegateEntry,
+  stdoutText: string,
+  stderrText: string,
+  simulate: boolean,
+  stepIndex: number,
+): string | undefined {
+  if (simulate) return undefined;
+  const abortName = RECOVERABLE_PENDING_ABORT_BY_FN[entry.fn];
+  if (!abortName) return undefined;
+  const text = `${stdoutText}\n${stderrText}`.toLowerCase();
+  if (!text.includes("move abort")) return undefined;
+  if (!text.includes(abortName.toLowerCase())) return undefined;
+  return `recovered:${entry.fn}:step${stepIndex}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

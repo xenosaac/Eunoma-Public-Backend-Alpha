@@ -435,8 +435,7 @@ fn load_fixture() -> FixtureFile {
 fn regenerate_fixture() {
     let fixture = build_fixture();
     let json = serde_json::to_string_pretty(&fixture).expect("serialize fixture");
-    fs::create_dir_all(fixture_path().parent().expect("fixture dir"))
-        .expect("create fixtures dir");
+    fs::create_dir_all(fixture_path().parent().expect("fixture dir")).expect("create fixtures dir");
     fs::write(fixture_path(), json).expect("write fixture");
     println!("wrote fixture to {}", fixture_path().display());
 }
@@ -490,27 +489,51 @@ fn move_constants_parity() {
             "Move test missing {label}: {needle}"
         );
     };
-    assert_contains(&format!("x\"{}\"", normalize_hex(&fixture.group_public_key)), "groupPublicKey");
-    assert_contains(&format!("x\"{}\"", normalize_hex(&fixture.signature)), "signature");
-    assert_contains(&format!("x\"{}\"", normalize_hex(&fixture.message_bcs)), "MESSAGE_BCS");
     assert_contains(
-        &format!("x\"{}\"", normalize_hex(&fixture.deposit_message.roster_hash)),
+        &format!("x\"{}\"", normalize_hex(&fixture.group_public_key)),
+        "groupPublicKey",
+    );
+    assert_contains(
+        &format!("x\"{}\"", normalize_hex(&fixture.signature)),
+        "signature",
+    );
+    assert_contains(
+        &format!("x\"{}\"", normalize_hex(&fixture.message_bcs)),
+        "MESSAGE_BCS",
+    );
+    assert_contains(
+        &format!(
+            "x\"{}\"",
+            normalize_hex(&fixture.deposit_message.roster_hash)
+        ),
         "rosterHash",
     );
     assert_contains(
-        &format!("x\"{}\"", normalize_hex(&fixture.deposit_message.commitment)),
+        &format!(
+            "x\"{}\"",
+            normalize_hex(&fixture.deposit_message.commitment)
+        ),
         "commitment",
     );
     assert_contains(
-        &format!("x\"{}\"", normalize_hex(&fixture.deposit_message.amount_tag)),
+        &format!(
+            "x\"{}\"",
+            normalize_hex(&fixture.deposit_message.amount_tag)
+        ),
         "amountTag",
     );
     assert_contains(
-        &format!("x\"{}\"", normalize_hex(&fixture.deposit_message.ca_payload_hash)),
+        &format!(
+            "x\"{}\"",
+            normalize_hex(&fixture.deposit_message.ca_payload_hash)
+        ),
         "caPayloadHash",
     );
     assert_contains(
-        &format!("x\"{}\"", normalize_hex(&fixture.deposit_message.deposit_nonce)),
+        &format!(
+            "x\"{}\"",
+            normalize_hex(&fixture.deposit_message.deposit_nonce)
+        ),
         "depositNonce",
     );
     assert_contains(

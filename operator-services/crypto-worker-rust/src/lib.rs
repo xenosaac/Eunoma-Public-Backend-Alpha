@@ -340,10 +340,7 @@ pub mod local_state {
         })
     }
 
-    pub fn init_frost_local(
-        state_root: &Path,
-        force: bool,
-    ) -> WorkerResult<LocalFrostInitSummary> {
+    pub fn init_frost_local(state_root: &Path, force: bool) -> WorkerResult<LocalFrostInitSummary> {
         assert_v2_threshold(DEOPERATOR_THRESHOLD, DEOPERATOR_COUNT)?;
         for slot in 0..DEOPERATOR_COUNT {
             let key_path = slot_dir(state_root, slot).join(FROST_KEY_PACKAGE_FILE);
@@ -363,9 +360,9 @@ pub mod local_state {
 
         for slot in 0..DEOPERATOR_COUNT {
             let identifier = slot_to_identifier(slot)?;
-            let key_package = key_packages
-                .get(&identifier)
-                .ok_or_else(|| WorkerError::Crypto(format!("missing FROST key package for slot {slot}")))?;
+            let key_package = key_packages.get(&identifier).ok_or_else(|| {
+                WorkerError::Crypto(format!("missing FROST key package for slot {slot}"))
+            })?;
             let key_package_json = to_json_value(key_package)?;
             let frost_verifying_share = json_string_field(&key_package_json, "verifying_share")?;
             verifying_shares.push(LocalFrostVerifyingShare {
@@ -466,10 +463,9 @@ pub mod local_state {
         let key_package = load_key_package(state_dir)?;
         let nonce_path = nonces_path(state_dir, nonce_id)?;
         let stored = read_json(&nonce_path)?;
-        let nonces_value = stored
-            .get("signingNonces")
-            .cloned()
-            .ok_or_else(|| WorkerError::InvalidRequest("stored nonce file is missing signingNonces".to_string()))?;
+        let nonces_value = stored.get("signingNonces").cloned().ok_or_else(|| {
+            WorkerError::InvalidRequest("stored nonce file is missing signingNonces".to_string())
+        })?;
         let nonces: frost::round1::SigningNonces = from_json_value(nonces_value)?;
         let message = hex_decode(message_hex)?;
         let commitments_map = commitments_to_map(commitments)?;
@@ -477,7 +473,8 @@ pub mod local_state {
         let signature_share = frost::round2::sign(&signing_package, &nonces, &key_package)
             .map_err(|err| WorkerError::Crypto(err.to_string()))?;
         let signature_share_json = to_json_value(&signature_share)?;
-        let signature_share_hash = sha256_hex(canonical_json_bytes(&signature_share_json)?.as_slice());
+        let signature_share_hash =
+            sha256_hex(canonical_json_bytes(&signature_share_json)?.as_slice());
         let transcript_hash = sha256_hex(
             [
                 b"EUNOMA_FROST_PARTIAL_TRANSCRIPT_V2".as_slice(),
@@ -515,7 +512,8 @@ pub mod local_state {
         }
         let public_package = load_public_package(state_dir)?;
         let message = hex_decode(message_hex)?;
-        let signing_package = frost::SigningPackage::new(commitments_to_map(commitments)?, &message);
+        let signing_package =
+            frost::SigningPackage::new(commitments_to_map(commitments)?, &message);
         let signature_share_map = signature_shares_to_map(signature_shares)?;
         let signature = frost::aggregate(&signing_package, &signature_share_map, &public_package)
             .map_err(|err| WorkerError::Crypto(err.to_string()))?;
@@ -526,7 +524,9 @@ pub mod local_state {
         let signature_json = to_json_value(&signature)?;
         let signature = signature_json
             .as_str()
-            .ok_or_else(|| WorkerError::Serde("FROST signature did not serialize as hex".to_string()))?
+            .ok_or_else(|| {
+                WorkerError::Serde("FROST signature did not serialize as hex".to_string())
+            })?
             .to_string();
         let signature_hash = sha256_hex(hex_decode(&signature)?.as_slice());
         let transcript_hash = sha256_hex(
@@ -545,8 +545,7 @@ pub mod local_state {
         })
     }
 
-    fn run_frost_dkg_fixture(
-    ) -> WorkerResult<(
+    fn run_frost_dkg_fixture() -> WorkerResult<(
         BTreeMap<frost::Identifier, frost::keys::KeyPackage>,
         frost::keys::PublicKeyPackage,
     )> {
@@ -559,13 +558,9 @@ pub mod local_state {
 
         for participant_index in 1..=max_signers {
             let participant_identifier = identifier_from_u16(participant_index)?;
-            let (round1_secret_package, round1_package) = frost::keys::dkg::part1(
-                participant_identifier,
-                max_signers,
-                min_signers,
-                &mut rng,
-            )
-            .map_err(|err| WorkerError::Crypto(err.to_string()))?;
+            let (round1_secret_package, round1_package) =
+                frost::keys::dkg::part1(participant_identifier, max_signers, min_signers, &mut rng)
+                    .map_err(|err| WorkerError::Crypto(err.to_string()))?;
             round1_secret_packages.insert(participant_identifier, round1_secret_package);
 
             for receiver_index in 1..=max_signers {
@@ -627,7 +622,8 @@ pub mod local_state {
 
         Ok((
             key_packages,
-            public_package.ok_or_else(|| WorkerError::Crypto("missing public key package".to_string()))?,
+            public_package
+                .ok_or_else(|| WorkerError::Crypto("missing public key package".to_string()))?,
         ))
     }
 
@@ -689,7 +685,9 @@ pub mod local_state {
         Ok(out)
     }
 
-    fn frost_signature_share_slots(signature_shares: &[FrostSignatureShareInput]) -> WorkerResult<Vec<usize>> {
+    fn frost_signature_share_slots(
+        signature_shares: &[FrostSignatureShareInput],
+    ) -> WorkerResult<Vec<usize>> {
         signature_shares
             .iter()
             .map(|item| {
@@ -720,7 +718,9 @@ pub mod local_state {
                 "nonceId must be a 32-byte hex string".to_string(),
             ));
         }
-        Ok(state_dir.join(FROST_NONCES_DIR).join(format!("{nonce_id}.json")))
+        Ok(state_dir
+            .join(FROST_NONCES_DIR)
+            .join(format!("{nonce_id}.json")))
     }
 
     fn read_json(path: &Path) -> WorkerResult<Value> {
@@ -735,7 +735,8 @@ pub mod local_state {
     }
 
     fn write_private_json(path: &Path, value: &Value) -> WorkerResult<()> {
-        let bytes = serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let bytes =
+            serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
         write_private_file(path, &bytes)
     }
 
@@ -808,9 +809,14 @@ pub mod local_state {
     }
 
     fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
-        let raw = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
         if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(WorkerError::InvalidRequest("expected even-length hex".to_string()));
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
         }
         (0..raw.len())
             .step_by(2)
@@ -1044,9 +1050,7 @@ pub mod registration_verifier {
     }
 
     /// Public helper: extract + validate the slot vector from a response list.
-    pub fn slots_from_responses(
-        items: &[RegistrationResponseInput],
-    ) -> WorkerResult<Vec<usize>> {
+    pub fn slots_from_responses(items: &[RegistrationResponseInput]) -> WorkerResult<Vec<usize>> {
         let mut slots = Vec::with_capacity(items.len());
         for item in items {
             assert_slot(item.slot)?;
@@ -1159,7 +1163,9 @@ pub mod registration_verifier {
             .or_else(|| hex.strip_prefix("0X"))
             .unwrap_or(hex);
         if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(WorkerError::InvalidRequest("expected even-length hex".to_string()));
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
         }
         (0..raw.len())
             .step_by(2)
@@ -1437,7 +1443,9 @@ pub mod ca_local {
             ca_dkg_share_hash: optional_file_hash(&share_path)?,
             vault_ek: share.as_ref().map(|item| item.vault_ek.clone()),
             ca_dkg_transcript_hash: share.as_ref().map(|item| item.transcript_hash.clone()),
-            pending_registration_nonces: count_json_files(&state_dir.join(CA_REGISTRATION_NONCES_DIR))?,
+            pending_registration_nonces: count_json_files(
+                &state_dir.join(CA_REGISTRATION_NONCES_DIR),
+            )?,
         })
     }
 
@@ -1650,11 +1658,7 @@ pub mod ca_local {
         }
     }
 
-    fn ca_dkg_transcript_hash(
-        dkg_epoch: &str,
-        vault_ek: &str,
-        commitments: &[String],
-    ) -> String {
+    fn ca_dkg_transcript_hash(dkg_epoch: &str, vault_ek: &str, commitments: &[String]) -> String {
         sha256_hex(
             [
                 b"EUNOMA_CA_DKG_TRANSCRIPT_V1".as_slice(),
@@ -1692,7 +1696,9 @@ pub mod ca_local {
     fn ristretto_from_hex(hex: &str) -> WorkerResult<RistrettoPoint> {
         compressed_ristretto_from_hex(hex)?
             .decompress()
-            .ok_or_else(|| WorkerError::InvalidRequest("invalid compressed Ristretto point".to_string()))
+            .ok_or_else(|| {
+                WorkerError::InvalidRequest("invalid compressed Ristretto point".to_string())
+            })
     }
 
     fn compressed_ristretto_from_hex(hex: &str) -> WorkerResult<CompressedRistretto> {
@@ -1752,7 +1758,8 @@ pub mod ca_local {
     }
 
     fn write_private_json(path: &Path, value: &Value) -> WorkerResult<()> {
-        let bytes = serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let bytes =
+            serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
         write_private_file(path, &bytes)
     }
 
@@ -1813,9 +1820,14 @@ pub mod ca_local {
     }
 
     fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
-        let raw = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
         if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(WorkerError::InvalidRequest("expected even-length hex".to_string()));
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
         }
         (0..raw.len())
             .step_by(2)
@@ -2110,7 +2122,8 @@ pub mod ca_dkg_v2 {
             };
             write_private_json(
                 &path,
-                &serde_json::to_value(&keypair).map_err(|err| WorkerError::Serde(err.to_string()))?,
+                &serde_json::to_value(&keypair)
+                    .map_err(|err| WorkerError::Serde(err.to_string()))?,
             )?;
             slots.push(HpkeSlotSummary {
                 slot,
@@ -2184,9 +2197,7 @@ pub mod ca_dkg_v2 {
     ///
     /// Init paths use this loader; ca_registration_v2 round2 still uses
     /// `load_ca_dkg_v2_share` because it genuinely needs the secret share.
-    pub fn load_ca_dkg_v2_share_metadata(
-        state_dir: &Path,
-    ) -> WorkerResult<CaDkgV2ShareMetadata> {
+    pub fn load_ca_dkg_v2_share_metadata(state_dir: &Path) -> WorkerResult<CaDkgV2ShareMetadata> {
         use zeroize::Zeroizing;
         let path = state_dir.join(CA_DKG_V2_SHARE_FILE);
         let raw_bytes = fs::read(&path).map_err(|err| {
@@ -2221,7 +2232,10 @@ pub mod ca_dkg_v2 {
         Ok(meta)
     }
 
-    pub fn run_round(state_dir: &Path, req: CaDkgV2RoundRequest) -> WorkerResult<CaDkgV2RoundResult> {
+    pub fn run_round(
+        state_dir: &Path,
+        req: CaDkgV2RoundRequest,
+    ) -> WorkerResult<CaDkgV2RoundResult> {
         validate_round_request(&req)?;
         match req.round.as_str() {
             "round1" => run_round1(&req),
@@ -2236,7 +2250,9 @@ pub mod ca_dkg_v2 {
 
     fn run_round1(req: &CaDkgV2RoundRequest) -> WorkerResult<CaDkgV2RoundResult> {
         let roster = req.ca_dkg_v2_roster.as_ref().ok_or_else(|| {
-            WorkerError::InvalidRequest("caDkgV2Roster is required for CA DKG V2 round1".to_string())
+            WorkerError::InvalidRequest(
+                "caDkgV2Roster is required for CA DKG V2 round1".to_string(),
+            )
         })?;
         validate_roster(roster)?;
         let mut rng = OsRng;
@@ -2272,10 +2288,13 @@ pub mod ca_dkg_v2 {
                 roster_hash: normalize_hex(&req.roster_hash)?,
                 commitments_hash: commitments_hash.clone(),
                 share: scalar_hex(eval_polynomial(&coeffs, slot_scalar(receiver_slot)?)),
-                blind_share: scalar_hex(eval_polynomial(&blind_coeffs, slot_scalar(receiver_slot)?)),
+                blind_share: scalar_hex(eval_polynomial(
+                    &blind_coeffs,
+                    slot_scalar(receiver_slot)?,
+                )),
             };
-            let plaintext_bytes =
-                serde_json::to_vec(&plaintext).map_err(|err| WorkerError::Serde(err.to_string()))?;
+            let plaintext_bytes = serde_json::to_vec(&plaintext)
+                .map_err(|err| WorkerError::Serde(err.to_string()))?;
             let share_commitment = sha256_hex(&plaintext_bytes);
             let aad = hpke_aad(req, req.slot, receiver_slot, &commitments_hash)?;
             let hpke = hpke_seal(&node.hpke_public_key, &plaintext_bytes, &aad)?;
@@ -2287,7 +2306,11 @@ pub mod ca_dkg_v2 {
             });
         }
         let transcript_hash = dealer_broadcast.transcript_hash.clone();
-        let artifact_hash = artifact_hash(req, &transcript_hash, &[b"round1".as_slice(), commitments_hash.as_bytes()]);
+        let artifact_hash = artifact_hash(
+            req,
+            &transcript_hash,
+            &[b"round1".as_slice(), commitments_hash.as_bytes()],
+        );
         Ok(CaDkgV2RoundResult {
             request_id: req.request_id.clone(),
             session_id: req.session_id.clone(),
@@ -2396,7 +2419,8 @@ pub mod ca_dkg_v2 {
             ))
         };
         if !complaints.is_empty() {
-            let transcript_hash = sha256_hex(abort_evidence_hash.as_ref().expect("complaints").as_bytes());
+            let transcript_hash =
+                sha256_hex(abort_evidence_hash.as_ref().expect("complaints").as_bytes());
             return Ok(CaDkgV2RoundResult {
                 request_id: req.request_id.clone(),
                 session_id: req.session_id.clone(),
@@ -2439,7 +2463,8 @@ pub mod ca_dkg_v2 {
                 .collect::<WorkerResult<Vec<_>>>()?,
             h,
         )?;
-        let transcript_hash = aggregate_transcript_hash(req, &req.dealer_broadcasts, &aggregate_commitments)?;
+        let transcript_hash =
+            aggregate_transcript_hash(req, &req.dealer_broadcasts, &aggregate_commitments)?;
         let share_file = CaDkgV2ShareFile {
             scheme: "ca_dkg_v2_pedersen_vss_ristretto255_hpke".to_string(),
             slot: req.slot,
@@ -2456,7 +2481,8 @@ pub mod ca_dkg_v2 {
         let path = state_dir.join(CA_DKG_V2_SHARE_FILE);
         write_private_json(
             &path,
-            &serde_json::to_value(&share_file).map_err(|err| WorkerError::Serde(err.to_string()))?,
+            &serde_json::to_value(&share_file)
+                .map_err(|err| WorkerError::Serde(err.to_string()))?,
         )?;
         let ca_dkg_share_hash = file_hash(&path)?;
         Ok(CaDkgV2RoundResult {
@@ -2468,7 +2494,11 @@ pub mod ca_dkg_v2 {
             dkg_epoch: req.dkg_epoch.clone(),
             slot: req.slot,
             accepted: true,
-            artifact_hash: artifact_hash(req, &transcript_hash, &[b"round2".as_slice(), ca_dkg_share_hash.as_bytes()]),
+            artifact_hash: artifact_hash(
+                req,
+                &transcript_hash,
+                &[b"round2".as_slice(), ca_dkg_share_hash.as_bytes()],
+            ),
             transcript_hash,
             dealer_broadcast: None,
             encrypted_shares: Vec::new(),
@@ -2482,7 +2512,10 @@ pub mod ca_dkg_v2 {
         })
     }
 
-    fn run_finalize(state_dir: &Path, req: &CaDkgV2RoundRequest) -> WorkerResult<CaDkgV2RoundResult> {
+    fn run_finalize(
+        state_dir: &Path,
+        req: &CaDkgV2RoundRequest,
+    ) -> WorkerResult<CaDkgV2RoundResult> {
         let share = load_ca_dkg_v2_share(state_dir)?;
         if share.dkg_epoch != req.dkg_epoch {
             return Err(WorkerError::InvalidRequest(
@@ -2507,7 +2540,11 @@ pub mod ca_dkg_v2 {
             slot: req.slot,
             accepted: true,
             transcript_hash: share.transcript_hash.clone(),
-            artifact_hash: artifact_hash(req, &share.transcript_hash, &[b"finalize".as_slice(), share_hash.as_bytes()]),
+            artifact_hash: artifact_hash(
+                req,
+                &share.transcript_hash,
+                &[b"finalize".as_slice(), share_hash.as_bytes()],
+            ),
             dealer_broadcast: None,
             encrypted_shares: Vec::new(),
             accepted_dealers: share.valid_dealers.clone(),
@@ -2641,7 +2678,11 @@ pub mod ca_dkg_v2 {
         hpke_aead::seal(public_key_hex, HPKE_INFO, aad, plaintext)
     }
 
-    fn hpke_open(private_key_hex: &str, envelope: &HpkeEnvelope, aad: &[u8]) -> WorkerResult<Vec<u8>> {
+    fn hpke_open(
+        private_key_hex: &str,
+        envelope: &HpkeEnvelope,
+        aad: &[u8],
+    ) -> WorkerResult<Vec<u8>> {
         hpke_aead::open(private_key_hex, HPKE_INFO, aad, envelope)
     }
 
@@ -2716,7 +2757,10 @@ pub mod ca_dkg_v2 {
         Ok(sha256_hex(&bytes))
     }
 
-    fn dealer_transcript_hash(req: &CaDkgV2RoundRequest, commitments: &[String]) -> WorkerResult<String> {
+    fn dealer_transcript_hash(
+        req: &CaDkgV2RoundRequest,
+        commitments: &[String],
+    ) -> WorkerResult<String> {
         dealer_transcript_hash_with_context(
             &req.request_id,
             &req.session_id,
@@ -2855,7 +2899,9 @@ pub mod ca_dkg_v2 {
     fn ristretto_from_hex(hex: &str) -> WorkerResult<RistrettoPoint> {
         compressed_ristretto_from_hex(hex)?
             .decompress()
-            .ok_or_else(|| WorkerError::InvalidRequest("invalid compressed Ristretto point".to_string()))
+            .ok_or_else(|| {
+                WorkerError::InvalidRequest("invalid compressed Ristretto point".to_string())
+            })
     }
 
     fn compressed_ristretto_from_hex(hex: &str) -> WorkerResult<CompressedRistretto> {
@@ -2904,7 +2950,8 @@ pub mod ca_dkg_v2 {
     }
 
     fn write_private_json(path: &Path, value: &Value) -> WorkerResult<()> {
-        let bytes = serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let bytes =
+            serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
         write_private_file(path, &bytes)
     }
 
@@ -2952,9 +2999,14 @@ pub mod ca_dkg_v2 {
     }
 
     fn hex_decode(hex: &str) -> WorkerResult<Vec<u8>> {
-        let raw = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+        let raw = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
         if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(WorkerError::InvalidRequest("expected even-length hex".to_string()));
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
         }
         (0..raw.len())
             .step_by(2)
@@ -3276,7 +3328,10 @@ pub mod atomic_io {
             ))
         })?;
         let file_name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
-            WorkerError::Crypto(format!("{context}: path {} has no file name", path.display()))
+            WorkerError::Crypto(format!(
+                "{context}: path {} has no file name",
+                path.display()
+            ))
         })?;
         let pid = std::process::id();
         let mut rng = rand::rngs::OsRng;
@@ -3319,8 +3374,7 @@ pub mod atomic_io {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
                 {
                     let _ = fs::remove_file(&tmp_path);
                     return Err(WorkerError::Crypto(format!(
@@ -3664,9 +3718,8 @@ pub mod vault_ek_derivation_v2 {
         // with the request, treat as a collision and refuse.
         let file_path = round0_file_path(state_dir, &req.request_id, &req.session_id);
         if file_path.exists() {
-            let raw = fs::read(&file_path).map_err(|err| {
-                WorkerError::Crypto(format!("read existing round0 file: {err}"))
-            })?;
+            let raw = fs::read(&file_path)
+                .map_err(|err| WorkerError::Crypto(format!("read existing round0 file: {err}")))?;
             let layout: Round0FileLayout = serde_json::from_slice(&raw)
                 .map_err(|err| WorkerError::Crypto(format!("parse round0 file: {err}")))?;
             if layout.session_id != req.session_id || layout.request_id != req.request_id {
@@ -3802,7 +3855,11 @@ pub mod vault_ek_derivation_v2 {
         if let Ok(metadata) = fs::metadata(&path) {
             let len = metadata.len() as usize;
             let zeros = vec![0u8; len];
-            if let Ok(mut file) = fs::OpenOptions::new().write(true).truncate(false).open(&path) {
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .open(&path)
+            {
                 use std::io::Write as _;
                 let _ = file.write_all(&zeros);
                 let _ = file.sync_all();
@@ -3891,9 +3948,8 @@ pub mod vault_ek_derivation_v2 {
         }
         let round0_commit_hash_hex = round0_commit_hash(&all_h_normalized);
 
-        let mut r_i = scalar_from_hex(&round0.r_i_hex).map_err(|_| {
-            WorkerError::Crypto("round0_file_r_i_not_canonical".to_string())
-        })?;
+        let mut r_i = scalar_from_hex(&round0.r_i_hex)
+            .map_err(|_| WorkerError::Crypto("round0_file_r_i_not_canonical".to_string()))?;
 
         // Phase 2: derive the per-session work directory from request_id + session_id.
         // Coordinator chooses these (both non-empty in production).
@@ -3989,7 +4045,8 @@ pub mod vault_ek_derivation_v2 {
         let ca_dkg_transcript_hash = normalize_hex(&req.ca_dkg_transcript_hash, 32)?;
         let roster_hash = normalize_hex(&req.roster_hash, 32)?;
         let sorted_slots = sorted_unique_slots(&req.selected_slots)?;
-        let selected_set: std::collections::BTreeSet<usize> = sorted_slots.iter().copied().collect();
+        let selected_set: std::collections::BTreeSet<usize> =
+            sorted_slots.iter().copied().collect();
 
         // Normalize the allHRoundZero vector and decompress for the aggregate check.
         let mut all_h_normalized: Vec<String> = Vec::with_capacity(DEOPERATOR_THRESHOLD);
@@ -4382,7 +4439,9 @@ pub mod vault_ek_derivation_v2 {
             .or_else(|| hex.strip_prefix("0X"))
             .unwrap_or(hex);
         if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(WorkerError::InvalidRequest("expected even-length hex".to_string()));
+            return Err(WorkerError::InvalidRequest(
+                "expected even-length hex".to_string(),
+            ));
         }
         (0..raw.len())
             .step_by(2)
@@ -4392,7 +4451,6 @@ pub mod vault_ek_derivation_v2 {
             })
             .collect()
     }
-
 }
 
 /// Milestone 1: V2 threshold CA registration sigma.
@@ -4414,11 +4472,11 @@ pub mod vault_ek_derivation_v2 {
 /// `crate::ca_local` — that namespace is reserved for unit/local-smoke fixtures only.
 pub mod ca_registration_v2 {
     use crate::ca_dkg_v2::load_ca_dkg_v2_share;
-    use crate::registration_verifier::{
-        aggregate_registration_commitment, registration_challenge_scalar, verify_registration_proof,
-        RegistrationCommitmentInput, RegistrationResponseInput,
-    };
     use crate::mpc_spdz_adapter::{is_safe_id, random_scalar};
+    use crate::registration_verifier::{
+        aggregate_registration_commitment, registration_challenge_scalar,
+        verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
+    };
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
     use curve25519_dalek::{
         ristretto::{CompressedRistretto, RistrettoPoint},
@@ -4693,9 +4751,8 @@ pub mod ca_registration_v2 {
         let file_path = nonce_file_path(state_dir, &req.request_id, &req.session_id);
         if file_path.exists() {
             // Idempotency replay.
-            let raw = fs::read(&file_path).map_err(|err| {
-                WorkerError::Crypto(format!("read existing nonce file: {err}"))
-            })?;
+            let raw = fs::read(&file_path)
+                .map_err(|err| WorkerError::Crypto(format!("read existing nonce file: {err}")))?;
             let layout: NonceFileLayout = serde_json::from_slice(&raw)
                 .map_err(|err| WorkerError::Crypto(format!("parse nonce file: {err}")))?;
             if layout.session_id != req.session_id || layout.request_id != req.request_id {
@@ -4716,8 +4773,7 @@ pub mod ca_registration_v2 {
                 ));
             }
             let commitment_hex = normalize_hex(&layout.commitment_hex, 32)?;
-            let commitment_hash =
-                sha256_hex(hex_decode(&commitment_hex)?.as_slice());
+            let commitment_hash = sha256_hex(hex_decode(&commitment_hex)?.as_slice());
             let worker_transcript_hash = round1_worker_transcript_hash(
                 &req.session_id,
                 &req.request_id,
@@ -4857,7 +4913,8 @@ pub mod ca_registration_v2 {
                 "session_id must be non-empty and contain only [A-Za-z0-9._-]".to_string(),
             ));
         }
-        if req.nonce_id.is_empty() || req.nonce_id.len() != 64
+        if req.nonce_id.is_empty()
+            || req.nonce_id.len() != 64
             || !req.nonce_id.chars().all(|c| c.is_ascii_hexdigit())
         {
             return Err(WorkerError::InvalidRequest(
@@ -5110,9 +5167,7 @@ pub mod ca_registration_v2 {
     /// Lagrange-aggregate responses: `sum_i λ_i(0) * response_i (mod q)` where the λ_i are the
     /// public Lagrange coefficients for the selected slot set evaluated at x=0. Same Shamir
     /// recombination as V1 `aggregate_registration_proof`.
-    pub fn aggregate_responses_v2(
-        responses: &[RegistrationResponseInput],
-    ) -> WorkerResult<String> {
+    pub fn aggregate_responses_v2(responses: &[RegistrationResponseInput]) -> WorkerResult<String> {
         let slots = response_slots(responses)?;
         let coeffs = lagrange_coefficients_at_zero(&slots)?;
         let mut aggregate = Scalar::ZERO;
@@ -5457,8 +5512,8 @@ pub mod vault_state_v2 {
     //
     // Codex M2a P2 #4: import `registration_challenge` to recompute the Fiat-Shamir
     // challenge locally instead of trusting the caller-supplied value.
-    use crate::registration_verifier::{registration_challenge, verify_registration_proof};
     use crate::mpc_spdz_adapter::is_safe_id;
+    use crate::registration_verifier::{registration_challenge, verify_registration_proof};
     use crate::{assert_slot, WorkerError, WorkerResult, DEOPERATOR_COUNT, DEOPERATOR_THRESHOLD};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
@@ -6095,7 +6150,8 @@ pub mod vault_state_v2 {
                 || existing.player_id != req.player_id
                 || normalize_hex(&existing.ca_dkg_transcript_hash, 32)? != ca_transcript
                 || normalize_hex(&existing.vault_ek_transcript_hash, 32)? != vault_ek_transcript
-                || normalize_hex(&existing.registration_transcript_hash, 32)? != registration_transcript
+                || normalize_hex(&existing.registration_transcript_hash, 32)?
+                    != registration_transcript
                 || normalize_hex(&existing.roster_hash, 32)? != roster_hash
                 || existing.selected_slots != sorted
                 || normalize_hex(&existing.vault_ek_hex, 32)? != vault_ek_hex
@@ -6418,9 +6474,8 @@ pub mod vault_state_v2 {
 
         // Load the persisted vault_state_v2.json. Missing → finalize is meaningless.
         let file_path = vault_state_file_path(state_dir);
-        let existing = load_vault_state_v2(state_dir)?.ok_or_else(|| {
-            WorkerError::InvalidDkgState("missing_vault_state_file".to_string())
-        })?;
+        let existing = load_vault_state_v2(state_dir)?
+            .ok_or_else(|| WorkerError::InvalidDkgState("missing_vault_state_file".to_string()))?;
         // Provenance gate: refuse a finalize whose public inputs don't match the persisted
         // init bindings. This catches a coordinator that fans this finalize body to the wrong
         // worker or a state_dir initialised for a different vault.
@@ -6429,8 +6484,7 @@ pub mod vault_state_v2 {
             || existing.player_id != req.player_id
             || normalize_hex(&existing.ca_dkg_transcript_hash, 32)? != ca_transcript
             || normalize_hex(&existing.vault_ek_transcript_hash, 32)? != vault_ek_transcript
-            || normalize_hex(&existing.registration_transcript_hash, 32)?
-                != registration_transcript
+            || normalize_hex(&existing.registration_transcript_hash, 32)? != registration_transcript
             || normalize_hex(&existing.roster_hash, 32)? != roster_hash
             || existing.selected_slots != sorted
             || normalize_hex(&existing.vault_ek_hex, 32)? != vault_ek_hex
@@ -6669,9 +6723,7 @@ pub mod vault_state_v2 {
 
     /// Normalize an Aptos address to 64-hex lowercase (no 0x), left-padded.
     fn vault_resync_norm_addr(raw: &str) -> Option<String> {
-        let s = raw
-            .trim_start_matches("0x")
-            .trim_start_matches("0X");
+        let s = raw.trim_start_matches("0x").trim_start_matches("0X");
         if s.is_empty() || s.len() > 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
@@ -6710,7 +6762,9 @@ pub mod vault_state_v2 {
 
         // 1. Field well-formedness + the request-internal sequence relationship.
         if req.dkg_epoch.is_empty() || req.request_id.is_empty() {
-            return Err(E::BadRequest("dkg_epoch_and_request_id_required".to_string()));
+            return Err(E::BadRequest(
+                "dkg_epoch_and_request_id_required".to_string(),
+            ));
         }
         if req.tx_hash.is_empty() {
             return Err(E::BadRequest("tx_hash_required".to_string()));
@@ -6748,7 +6802,10 @@ pub mod vault_state_v2 {
             vault_resync_norm_addr(&req.asset_type),
         ) {
             (Some(a), Some(b)) => a == b,
-            _ => vault_resync_norm_hex(trusted_bridge_asset) == vault_resync_norm_hex(&req.asset_type),
+            _ => {
+                vault_resync_norm_hex(trusted_bridge_asset)
+                    == vault_resync_norm_hex(&req.asset_type)
+            }
         };
         if !asset_ok {
             return Err(E::BadRequest("wrong_asset".to_string()));
@@ -6838,11 +6895,13 @@ pub mod vault_state_v2 {
         if vault_resync_norm_hex(&event.root) != vault_resync_norm_hex(&req.root) {
             return Err(bind_err("root"));
         }
-        if vault_resync_norm_hex(&event.nullifier_hash) != vault_resync_norm_hex(&req.nullifier_hash)
+        if vault_resync_norm_hex(&event.nullifier_hash)
+            != vault_resync_norm_hex(&req.nullifier_hash)
         {
             return Err(bind_err("nullifier_hash"));
         }
-        if vault_resync_norm_hex(&event.recipient_hash) != vault_resync_norm_hex(&req.recipient_hash)
+        if vault_resync_norm_hex(&event.recipient_hash)
+            != vault_resync_norm_hex(&req.recipient_hash)
         {
             return Err(bind_err("recipient_hash"));
         }
@@ -6945,7 +7004,9 @@ pub mod vault_state_v2 {
         use VaultResyncError as E;
 
         if req.dkg_epoch.is_empty() || req.request_id.is_empty() {
-            return Err(E::BadRequest("dkg_epoch_and_request_id_required".to_string()));
+            return Err(E::BadRequest(
+                "dkg_epoch_and_request_id_required".to_string(),
+            ));
         }
         if trusted_aptos_node_url.is_empty()
             || trusted_bridge_package.is_empty()
@@ -6969,7 +7030,10 @@ pub mod vault_state_v2 {
             vault_resync_norm_addr(&req.asset_type),
         ) {
             (Some(a), Some(b)) => a == b,
-            _ => vault_resync_norm_hex(trusted_bridge_asset) == vault_resync_norm_hex(&req.asset_type),
+            _ => {
+                vault_resync_norm_hex(trusted_bridge_asset)
+                    == vault_resync_norm_hex(&req.asset_type)
+            }
         };
         if !asset_ok {
             return Err(E::BadRequest("wrong_asset".to_string()));
@@ -7086,9 +7150,8 @@ pub mod vault_state_v2 {
             #[serde(default)]
             worker_transcript_hash: Option<String>,
         }
-        let probe: LegacyProbe = serde_json::from_slice(&raw).map_err(|err| {
-            WorkerError::Crypto(format!("parse vault_state_v2 file: {err}"))
-        })?;
+        let probe: LegacyProbe = serde_json::from_slice(&raw)
+            .map_err(|err| WorkerError::Crypto(format!("parse vault_state_v2 file: {err}")))?;
         if probe.scheme.as_deref() != Some("vault_state_v2") {
             return Err(WorkerError::InvalidDkgState(
                 "vault_state_v2_unexpected_scheme_on_disk".to_string(),
@@ -7393,9 +7456,8 @@ pub mod vault_state_v2 {
         let deposit_nonce = normalize_hex(&req.deposit_nonce, 32)?;
 
         // 3. Load the persisted state. Missing → fail closed.
-        let existing = load_vault_state_v2(state_dir)?.ok_or_else(|| {
-            WorkerError::InvalidDkgState("missing_vault_state_file".to_string())
-        })?;
+        let existing = load_vault_state_v2(state_dir)?
+            .ok_or_else(|| WorkerError::InvalidDkgState("missing_vault_state_file".to_string()))?;
 
         // 4. Provenance gate. Every binding persisted by Milestone 2a's init MUST match the
         //    observe-deposit request — except cursor counters, which the cursor-monotonicity
@@ -7646,9 +7708,7 @@ pub mod mpcca_withdraw_v2 {
     use crate::hpke_aead;
     pub use crate::hpke_aead::HpkeEnvelope;
     use crate::mpc_spdz_adapter::is_safe_id;
-    use crate::registration_verifier::{
-        lagrange_coefficients_at_zero, verify_registration_proof,
-    };
+    use crate::registration_verifier::{lagrange_coefficients_at_zero, verify_registration_proof};
     use crate::transfer_sigma_reference::{
         bcs_fiat_shamir_inputs, bcs_serialize_transfer_session, build_statement,
         sigma_fiat_shamir_seed,
@@ -8588,14 +8648,15 @@ pub mod mpcca_withdraw_v2 {
         for idx in 0..32 {
             commit_bytes[idx] =
                 u8::from_str_radix(&commit_raw[idx * 2..idx * 2 + 2], 16).map_err(|_| {
-                    WorkerError::Crypto(
-                        "ingress_invalid_per_share_commitment_encoding".to_string(),
-                    )
+                    WorkerError::Crypto("ingress_invalid_per_share_commitment_encoding".to_string())
                 })?;
         }
-        let commit_decompressed = CompressedRistretto(commit_bytes).decompress().ok_or_else(
-            || WorkerError::Crypto("ingress_invalid_per_share_commitment_encoding".to_string()),
-        )?;
+        let commit_decompressed =
+            CompressedRistretto(commit_bytes)
+                .decompress()
+                .ok_or_else(|| {
+                    WorkerError::Crypto("ingress_invalid_per_share_commitment_encoding".to_string())
+                })?;
         let h = h_ristretto()?;
         let recomputed = RISTRETTO_BASEPOINT_POINT * a + h * b;
         if recomputed != commit_decompressed {
@@ -8621,8 +8682,12 @@ pub mod mpcca_withdraw_v2 {
         plaintext.extend_from_slice(&a.to_bytes());
         plaintext.extend_from_slice(&b.to_bytes());
         let aad = at_rest_aad(session_id, request_id, self_slot);
-        let env =
-            hpke_aead::seal(&keypair.public_key, HPKE_INFO_INGRESS_AT_REST, &aad, &plaintext)?;
+        let env = hpke_aead::seal(
+            &keypair.public_key,
+            HPKE_INFO_INGRESS_AT_REST,
+            &aad,
+            &plaintext,
+        )?;
         plaintext.zeroize();
         Ok(env)
     }
@@ -8685,7 +8750,9 @@ pub mod mpcca_withdraw_v2 {
         transfer_amount_d_recipient: Vec<String>,
     }
 
-    fn normalise_round2_statement_inputs(req: &Round2Request) -> WorkerResult<Round2StatementInputs> {
+    fn normalise_round2_statement_inputs(
+        req: &Round2Request,
+    ) -> WorkerResult<Round2StatementInputs> {
         normalise_round2_statement_inputs_from_parts(
             &req.recipient_ek,
             &req.old_balance_c,
@@ -8722,8 +8789,11 @@ pub mod mpcca_withdraw_v2 {
         let new_balance_d = normalise_round2_hex_vec(new_balance_d, ROUND2_ELL, "new_balance_d")?;
         let transfer_amount_c =
             normalise_round2_hex_vec(transfer_amount_c, ROUND2_N, "transfer_amount_c")?;
-        let transfer_amount_d_sender =
-            normalise_round2_hex_vec(transfer_amount_d_sender, ROUND2_N, "transfer_amount_d_sender")?;
+        let transfer_amount_d_sender = normalise_round2_hex_vec(
+            transfer_amount_d_sender,
+            ROUND2_N,
+            "transfer_amount_d_sender",
+        )?;
         let transfer_amount_d_recipient = normalise_round2_hex_vec(
             transfer_amount_d_recipient,
             ROUND2_N,
@@ -8815,8 +8885,12 @@ pub mod mpcca_withdraw_v2 {
 
     /// Round 2 (M4 commit 1) worker_transcript_hash = sha256(chained_hash || ":" || statement_inputs_hash).
     /// Byte-equal across TS↔Rust.
-    fn round2_v2_worker_transcript_hash(chained_hash_hex: &str, statement_inputs_hash_hex: &str) -> String {
-        let mut bytes = Vec::with_capacity(chained_hash_hex.len() + 1 + statement_inputs_hash_hex.len());
+    fn round2_v2_worker_transcript_hash(
+        chained_hash_hex: &str,
+        statement_inputs_hash_hex: &str,
+    ) -> String {
+        let mut bytes =
+            Vec::with_capacity(chained_hash_hex.len() + 1 + statement_inputs_hash_hex.len());
         bytes.extend_from_slice(chained_hash_hex.as_bytes());
         bytes.push(b':');
         bytes.extend_from_slice(statement_inputs_hash_hex.as_bytes());
@@ -8926,9 +9000,7 @@ pub mod mpcca_withdraw_v2 {
         let mut out = Vec::with_capacity(COMMITMENT_LEN);
         for (i, hex) in items.iter().enumerate() {
             let norm = normalize_hex(hex, 32).map_err(|err| {
-                WorkerError::InvalidRequest(format!(
-                    "aggregated_sigma_commitments[{i}]: {err:?}"
-                ))
+                WorkerError::InvalidRequest(format!("aggregated_sigma_commitments[{i}]: {err:?}"))
             })?;
             let bytes = hex_to_bytes32(&norm)?;
             let pt = CompressedRistretto(bytes).decompress().ok_or_else(|| {
@@ -8948,13 +9020,8 @@ pub mod mpcca_withdraw_v2 {
 
     /// Decompress an already-normalised 30-entry compressed-hex commitment vector to
     /// `[u8; 32]` entries for `bcs_fiat_shamir_inputs`.
-    fn decode_aggregated_commitments_bytes(
-        normalised: &[String],
-    ) -> WorkerResult<Vec<[u8; 32]>> {
-        normalised
-            .iter()
-            .map(|hex| hex_to_bytes32(hex))
-            .collect()
+    fn decode_aggregated_commitments_bytes(normalised: &[String]) -> WorkerResult<Vec<[u8; 32]>> {
+        normalised.iter().map(|hex| hex_to_bytes32(hex)).collect()
     }
 
     /// Build the public Statement for the Aptos CA TransferV1 sigma protocol from the normalised
@@ -9054,7 +9121,12 @@ pub mod mpcca_withdraw_v2 {
         let mut plaintext = Vec::with_capacity(32);
         plaintext.extend_from_slice(&alpha.to_bytes());
         let aad = round2_at_rest_aad(session_id, request_id, self_slot);
-        let env = hpke_aead::seal(&keypair.public_key, HPKE_INFO_ROUND2_AT_REST, &aad, &plaintext)?;
+        let env = hpke_aead::seal(
+            &keypair.public_key,
+            HPKE_INFO_ROUND2_AT_REST,
+            &aad,
+            &plaintext,
+        )?;
         plaintext.zeroize();
         Ok(env)
     }
@@ -9066,10 +9138,7 @@ pub mod mpcca_withdraw_v2 {
 
     /// Persist the Round2StateFile to disk with mode 0o600. The file holds only public
     /// partial commitments + an HPKE-encrypted-at-rest envelope sealing `α_share_j[0]`.
-    fn persist_round2_dk_state(
-        session_dir: &Path,
-        file: &Round2StateFile,
-    ) -> WorkerResult<()> {
+    fn persist_round2_dk_state(session_dir: &Path, file: &Round2StateFile) -> WorkerResult<()> {
         let path = session_dir.join(round2_dk_state_file_name());
         let json = serde_json::to_string_pretty(file)
             .map_err(|err| WorkerError::Serde(err.to_string()))?;
@@ -9102,18 +9171,12 @@ pub mod mpcca_withdraw_v2 {
         let bytes = serde_json::to_vec_pretty(pin).map_err(|err| {
             WorkerError::Crypto(format!("encode mpcca_withdraw_v2 finalize pin: {err}"))
         })?;
-        crate::atomic_io::write_atomic_no_clobber(
-            &path,
-            &bytes,
-            "mpcca_withdraw_v2_finalize_pin",
-        )
+        crate::atomic_io::write_atomic_no_clobber(&path, &bytes, "mpcca_withdraw_v2_finalize_pin")
     }
 
     /// Convenience read API for tests + replay-idempotency probes. Returns None if no
     /// finalize pin file exists at the per-session path.
-    pub fn load_finalize_pin_file(
-        session_dir: &Path,
-    ) -> WorkerResult<Option<FinalizePinFile>> {
+    pub fn load_finalize_pin_file(session_dir: &Path) -> WorkerResult<Option<FinalizePinFile>> {
         let path = session_dir.join(finalize_pin_file_name());
         if !path.exists() {
             return Ok(None);
@@ -9134,15 +9197,16 @@ pub mod mpcca_withdraw_v2 {
 
     /// Convenience read API for tests + M4 commit-3 finalize. Returns None if no round2
     /// dk-state file exists at the per-session path.
-    pub fn load_round2_dk_state_file(
-        session_dir: &Path,
-    ) -> WorkerResult<Option<Round2StateFile>> {
+    pub fn load_round2_dk_state_file(session_dir: &Path) -> WorkerResult<Option<Round2StateFile>> {
         let path = session_dir.join(round2_dk_state_file_name());
         if !path.exists() {
             return Ok(None);
         }
         let raw = fs::read(&path).map_err(|err| {
-            WorkerError::Crypto(format!("read mpcca round2 dk state {}: {err}", path.display()))
+            WorkerError::Crypto(format!(
+                "read mpcca round2 dk state {}: {err}",
+                path.display()
+            ))
         })?;
         let existing: Round2StateFile = serde_json::from_slice(&raw).map_err(|err| {
             WorkerError::Crypto(format!(
@@ -9314,8 +9378,7 @@ pub mod mpcca_withdraw_v2 {
         state_dir: &Path,
         req: &Round1Request,
     ) -> WorkerResult<Round1IngressResult> {
-        let (normalised, _existing, session_dir) =
-            common_public_binding_work(state_dir, req)?;
+        let (normalised, _existing, session_dir) = common_public_binding_work(state_dir, req)?;
         let ingress = normalise_ingress_fields(
             &req.amount_commitment,
             &req.per_share_commitments,
@@ -9492,8 +9555,8 @@ pub mod mpcca_withdraw_v2 {
             observed_deposit_transcript_hashes: observed_deposit_transcript_hashes.to_vec(),
         };
         let path = session_dir.join(round_file_name(round_name));
-        let json =
-            serde_json::to_string_pretty(&file).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let json = serde_json::to_string_pretty(&file)
+            .map_err(|err| WorkerError::Serde(err.to_string()))?;
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, json.as_bytes()).map_err(|err| WorkerError::Io(err.to_string()))?;
         #[cfg(unix)]
@@ -9538,10 +9601,7 @@ pub mod mpcca_withdraw_v2 {
     /// read from disk and used in computing the worker's Lagrange-weighted dk-contribution
     /// only at M4 commit 3 (finalize). At commit 1 (round2), we only need the public bases
     /// derived from the Statement.
-    pub fn run_round2_v2(
-        state_dir: &Path,
-        req: &Round2Request,
-    ) -> WorkerResult<Round2DkResult> {
+    pub fn run_round2_v2(state_dir: &Path, req: &Round2Request) -> WorkerResult<Round2DkResult> {
         // 1. Shared chained-round public binding.
         let binding = chained_round_public_binding(state_dir, &req.base)?;
 
@@ -9596,9 +9656,7 @@ pub mod mpcca_withdraw_v2 {
         // Aptos CA TransferV1 shape).
         let dk_bases = derive_dk_base_points(&statement, ROUND2_ELL, ROUND2_N, false, 0)?;
         if dk_bases.is_empty() {
-            return Err(WorkerError::Crypto(
-                "round2_dk_base_set_empty".to_string(),
-            ));
+            return Err(WorkerError::Crypto("round2_dk_base_set_empty".to_string()));
         }
 
         // 8. Load α_share_j[0] from the M1-ingressed at-rest envelope (NOT fresh CSPRNG).
@@ -9618,7 +9676,11 @@ pub mod mpcca_withdraw_v2 {
             WorkerError::InvalidDkgState("round2_missing_ingress_state_file".to_string())
         })?;
         let keypair_for_ingress = load_hpke_keypair_for_slot(state_dir, req.base.self_slot)?;
-        let ingress_aad = at_rest_aad(&req.base.session_id, &req.base.request_id, req.base.self_slot);
+        let ingress_aad = at_rest_aad(
+            &req.base.session_id,
+            &req.base.request_id,
+            req.base.self_slot,
+        );
         let mut ingress_plaintext = hpke_aead::open(
             &keypair_for_ingress.private_key,
             HPKE_INFO_INGRESS_AT_REST,
@@ -9703,8 +9765,7 @@ pub mod mpcca_withdraw_v2 {
             // cross-check round2 ↔ finalize Statement input drift directly.
             statement_inputs_hash: statement_inputs_hash_hex.clone(),
         };
-        fs::create_dir_all(&binding.session_dir)
-            .map_err(|err| WorkerError::Io(err.to_string()))?;
+        fs::create_dir_all(&binding.session_dir).map_err(|err| WorkerError::Io(err.to_string()))?;
         persist_round2_dk_state(&binding.session_dir, &round2_state)?;
 
         // 12. Persist round2 RoundStateFile (M3a-shape compat, completed marker is empty
@@ -9902,12 +9963,9 @@ pub mod mpcca_withdraw_v2 {
         // 7. Load the Round2StateFile and validate provenance + previous_round_transcript_hash.
         //    Run all non-secret cross-checks BEFORE touching dk_share / α_share so we
         //    fail closed early.
-        let round2_state =
-            load_round2_dk_state_file(&binding.session_dir)?.ok_or_else(|| {
-                WorkerError::InvalidDkgState(
-                    "finalize_missing_round2_dk_state".to_string(),
-                )
-            })?;
+        let round2_state = load_round2_dk_state_file(&binding.session_dir)?.ok_or_else(|| {
+            WorkerError::InvalidDkgState("finalize_missing_round2_dk_state".to_string())
+        })?;
         if round2_state.dkg_epoch != req.base.dkg_epoch
             || round2_state.request_id != req.base.request_id
             || round2_state.session_id != req.base.session_id
@@ -9975,8 +10033,7 @@ pub mod mpcca_withdraw_v2 {
         //      - replay with different content (= different A or e): link → EEXIST, file
         //        equality fails → InvalidDkgState(
         //        "mpcca_withdraw_v2_finalize_pin_already_exists_with_different_content")
-        fs::create_dir_all(&binding.session_dir)
-            .map_err(|err| WorkerError::Io(err.to_string()))?;
+        fs::create_dir_all(&binding.session_dir).map_err(|err| WorkerError::Io(err.to_string()))?;
         let pin = FinalizePinFile {
             scheme: "mpcca_withdraw_v2_finalize_pin".to_string(),
             slot: req.base.self_slot,
@@ -10004,9 +10061,8 @@ pub mod mpcca_withdraw_v2 {
                 share.dkg_epoch, req.base.dkg_epoch
             )));
         }
-        let mut dk_share_scalar = scalar_from_hex_local(&share.dk_share).map_err(|_| {
-            WorkerError::Crypto("finalize_dk_share_non_canonical".to_string())
-        })?;
+        let mut dk_share_scalar = scalar_from_hex_local(&share.dk_share)
+            .map_err(|_| WorkerError::Crypto("finalize_dk_share_non_canonical".to_string()))?;
         if dk_share_scalar == Scalar::ZERO {
             dk_share_scalar.zeroize();
             return Err(WorkerError::Crypto(
@@ -10035,8 +10091,11 @@ pub mod mpcca_withdraw_v2 {
                 return Err(err);
             }
         };
-        let aad =
-            round2_at_rest_aad(&req.base.session_id, &req.base.request_id, req.base.self_slot);
+        let aad = round2_at_rest_aad(
+            &req.base.session_id,
+            &req.base.request_id,
+            req.base.self_slot,
+        );
         let mut alpha_plaintext = match hpke_aead::open(
             &keypair.private_key,
             HPKE_INFO_ROUND2_AT_REST,
@@ -10219,12 +10278,10 @@ pub mod mpcca_withdraw_v2 {
                 req.deposit_count,
             )));
         }
-        let mut observed_deposit_transcript_hashes = Vec::with_capacity(
-            req.observed_deposit_transcript_hashes.len(),
-        );
-        let mut seen_observed_hashes = std::collections::HashSet::with_capacity(
-            req.observed_deposit_transcript_hashes.len(),
-        );
+        let mut observed_deposit_transcript_hashes =
+            Vec::with_capacity(req.observed_deposit_transcript_hashes.len());
+        let mut seen_observed_hashes =
+            std::collections::HashSet::with_capacity(req.observed_deposit_transcript_hashes.len());
         for h in &req.observed_deposit_transcript_hashes {
             let norm = normalize_hex(h, 32)?;
             if !seen_observed_hashes.insert(norm.clone()) {
@@ -10274,9 +10331,8 @@ pub mod mpcca_withdraw_v2 {
         }
 
         // 3. Load persisted vault_state_v2.json. Missing → fail closed with a specific code.
-        let existing = load_vault_state_v2(state_dir)?.ok_or_else(|| {
-            WorkerError::InvalidDkgState("missing_vault_state_file".to_string())
-        })?;
+        let existing = load_vault_state_v2(state_dir)?
+            .ok_or_else(|| WorkerError::InvalidDkgState("missing_vault_state_file".to_string()))?;
 
         // 4. Provenance gate. Every binding persisted by Milestone 2a's init MUST match the
         //    request. Cursor counters (deposit_count_observed) are NOT enforced here — that's
@@ -10591,10 +10647,11 @@ pub mod mpcca_withdraw_v2 {
         // content collision.
         let created_at_persisted = if file_path.exists() {
             match load_round_state_file(session_dir, round_name)? {
-                Some(existing) if existing.worker_transcript_hash == worker_transcript_hash
-                    && existing.round == round_name
-                    && existing.slot == self_slot
-                    && existing.player_id == player_id =>
+                Some(existing)
+                    if existing.worker_transcript_hash == worker_transcript_hash
+                        && existing.round == round_name
+                        && existing.slot == self_slot
+                        && existing.player_id == player_id =>
                 {
                     Some(existing.created_at_unix_ms)
                 }
@@ -10642,10 +10699,7 @@ pub mod mpcca_withdraw_v2 {
             WorkerError::Crypto(format!("read mpcca round state {}: {err}", path.display()))
         })?;
         let existing: RoundStateFile = serde_json::from_slice(&raw).map_err(|err| {
-            WorkerError::Crypto(format!(
-                "parse mpcca round state {}: {err}",
-                path.display()
-            ))
+            WorkerError::Crypto(format!("parse mpcca round state {}: {err}", path.display()))
         })?;
         if existing.scheme != "mpcca_withdraw_v2" {
             return Err(WorkerError::InvalidDkgState(
@@ -10680,10 +10734,7 @@ pub mod mpcca_withdraw_v2 {
     ) -> WorkerResult<(PathBuf, String)> {
         let path = session_dir.join(round_file_name(round_name));
         let raw = fs::read(&path).map_err(|err| {
-            WorkerError::Crypto(format!(
-                "read mpcca round state {}: {err}",
-                path.display()
-            ))
+            WorkerError::Crypto(format!("read mpcca round state {}: {err}", path.display()))
         })?;
         Ok((path, sha256_hex(&raw)))
     }
@@ -10720,11 +10771,7 @@ pub mod mpcca_withdraw_v2 {
     /// preserves the original `created_at_unix_ms` on replays so the byte content is stable;
     /// a divergent worker_transcript_hash + same path → InvalidDkgState collision.
     fn write_secret_file(path: &Path, contents: &[u8]) -> WorkerResult<()> {
-        crate::atomic_io::write_atomic_no_clobber(
-            path,
-            contents,
-            "mpcca_withdraw_v2_session_state",
-        )
+        crate::atomic_io::write_atomic_no_clobber(path, contents, "mpcca_withdraw_v2_session_state")
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -11038,8 +11085,8 @@ pub mod frost_dkg_v2 {
 
         let round1_secret_json = to_json_value(&round1_secret)?;
         let round1_package_json = to_json_value(&round1_package)?;
-        let package_bytes =
-            serde_json::to_vec(&round1_package_json).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let package_bytes = serde_json::to_vec(&round1_package_json)
+            .map_err(|err| WorkerError::Serde(err.to_string()))?;
         let package_hex = hex_encode(&package_bytes);
         let package_hash = sha256_hex(&package_bytes);
 
@@ -11051,11 +11098,15 @@ pub mod frost_dkg_v2 {
         };
         let epoch_dir = epoch_dir(state_dir, req)?;
         create_private_dir(&epoch_dir)?;
-        write_private_json(&epoch_dir.join(ROUND1_SELF_FILE), &to_json_value(&round1_self)?)?;
+        write_private_json(
+            &epoch_dir.join(ROUND1_SELF_FILE),
+            &to_json_value(&round1_self)?,
+        )?;
         write_state_json(&epoch_dir, req, "round1", &computed_hash)?;
 
         let transcript_hash = round1_transcript_hash(req, &package_hash)?;
-        let artifact_hash = artifact_hash(req, &transcript_hash, &[b"round1", package_hash.as_bytes()]);
+        let artifact_hash =
+            artifact_hash(req, &transcript_hash, &[b"round1", package_hash.as_bytes()]);
         let broadcast = FrostRound1Broadcast {
             slot: req.slot,
             package_hex,
@@ -11140,8 +11191,8 @@ pub mod frost_dkg_v2 {
             let package = round2_packages.get(&identifier).ok_or_else(|| {
                 WorkerError::Crypto(format!("missing round2 package for slot {slot}"))
             })?;
-            let plaintext = serde_json::to_vec(package)
-                .map_err(|err| WorkerError::Serde(err.to_string()))?;
+            let plaintext =
+                serde_json::to_vec(package).map_err(|err| WorkerError::Serde(err.to_string()))?;
             let package_commitment = sha256_hex(&plaintext);
             let recipient_pk = roster
                 .nodes
@@ -11164,24 +11215,24 @@ pub mod frost_dkg_v2 {
         }
 
         let round2_secret_json = to_json_value(&round2_secret)?;
-        write_private_json(
-            &epoch_dir.join(ROUND2_SECRET_FILE),
-            &round2_secret_json,
-        )?;
+        write_private_json(&epoch_dir.join(ROUND2_SECRET_FILE), &round2_secret_json)?;
         let broadcasts_json = to_json_value(&req.frost_round1_broadcasts)?;
         write_private_json(&epoch_dir.join(ROUND1_BROADCASTS_FILE), &broadcasts_json)?;
         // Cleanup: round1 secret has been consumed by part2.
         let _ = fs::remove_file(&round1_self_path);
-        write_state_json(&epoch_dir, req, "round2_send", &normalize_hex(&req.frost_dkg_v2_roster_hash)?)?;
+        write_state_json(
+            &epoch_dir,
+            req,
+            "round2_send",
+            &normalize_hex(&req.frost_dkg_v2_roster_hash)?,
+        )?;
 
         let mut sorted_round1 = broadcasts.values().cloned().collect::<Vec<_>>();
         sorted_round1.sort_by_key(|b| b.slot);
         let mut sorted_envelopes = envelope_commitments.clone();
         sorted_envelopes.sort();
-        let transcript_hash =
-            round2_send_transcript_hash(req, &sorted_round1, &sorted_envelopes)?;
-        let artifact_hash =
-            artifact_hash(req, &transcript_hash, &[b"round2_send"]);
+        let transcript_hash = round2_send_transcript_hash(req, &sorted_round1, &sorted_envelopes)?;
+        let artifact_hash = artifact_hash(req, &transcript_hash, &[b"round2_send"]);
 
         Ok(FrostDkgV2RoundResult {
             request_id: req.request_id.clone(),
@@ -11270,13 +11321,14 @@ pub mod frost_dkg_v2 {
                 complaints.push(complaint_at(envelope.dealer_slot, "bad-aad-hash"));
                 continue;
             }
-            let plaintext = match hpke_aead::open(&keypair.private_key, HPKE_INFO, &aad, &envelope.hpke) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    complaints.push(complaint_at(envelope.dealer_slot, "hpke-open-failed"));
-                    continue;
-                }
-            };
+            let plaintext =
+                match hpke_aead::open(&keypair.private_key, HPKE_INFO, &aad, &envelope.hpke) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        complaints.push(complaint_at(envelope.dealer_slot, "hpke-open-failed"));
+                        continue;
+                    }
+                };
             if sha256_hex(&plaintext) != normalize_hex(&envelope.package_commitment)? {
                 complaints.push(complaint_at(envelope.dealer_slot, "commitment-mismatch"));
                 continue;
@@ -11437,7 +11489,8 @@ pub mod frost_dkg_v2 {
         atomic_replace_private_json(&key_path, &key_package_json)?;
         atomic_replace_private_json(&public_path, &public_package_json)?;
 
-        let key_hash = sha256_hex(&fs::read(&key_path).map_err(|err| WorkerError::Io(err.to_string()))?);
+        let key_hash =
+            sha256_hex(&fs::read(&key_path).map_err(|err| WorkerError::Io(err.to_string()))?);
         let public_hash =
             sha256_hex(&fs::read(&public_path).map_err(|err| WorkerError::Io(err.to_string()))?);
         let manifest = json!({
@@ -11504,15 +11557,17 @@ pub mod frost_dkg_v2 {
         );
         let transcript_hash = sha256_hex(evidence_hash.as_bytes());
         let artifact_hash = artifact_hash(req, &transcript_hash, &[b"complaint"]);
-        Err(WorkerError::Complaint(serde_json::to_string(&json!({
-            "requestId": req.request_id,
-            "sessionId": req.session_id,
-            "slot": req.slot,
-            "transcriptHash": transcript_hash,
-            "artifactHash": artifact_hash,
-            "evidenceHash": evidence_hash,
-        }))
-        .unwrap_or_default()))
+        Err(WorkerError::Complaint(
+            serde_json::to_string(&json!({
+                "requestId": req.request_id,
+                "sessionId": req.session_id,
+                "slot": req.slot,
+                "transcriptHash": transcript_hash,
+                "artifactHash": artifact_hash,
+                "evidenceHash": evidence_hash,
+            }))
+            .unwrap_or_default(),
+        ))
     }
 
     fn validate_round1_broadcasts(
@@ -11538,7 +11593,8 @@ pub mod frost_dkg_v2 {
                     broadcast.slot
                 )));
             }
-            let expected_transcript = round1_transcript_hash_for_slot(req, broadcast.slot, &computed_hash)?;
+            let expected_transcript =
+                round1_transcript_hash_for_slot(req, broadcast.slot, &computed_hash)?;
             if expected_transcript != broadcast.transcript_hash {
                 return Err(WorkerError::InvalidRequest(format!(
                     "round1 broadcast transcriptHash mismatch for slot {}",
@@ -11581,10 +11637,13 @@ pub mod frost_dkg_v2 {
         } else {
             json!({})
         };
-        let obj = value.as_object_mut().ok_or_else(|| {
-            WorkerError::Serde("state.json must be a JSON object".to_string())
-        })?;
-        obj.insert("operatorSetVersion".to_string(), json!(req.operator_set_version));
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| WorkerError::Serde("state.json must be a JSON object".to_string()))?;
+        obj.insert(
+            "operatorSetVersion".to_string(),
+            json!(req.operator_set_version),
+        );
         obj.insert("dkgEpoch".to_string(), json!(req.dkg_epoch));
         obj.insert(
             "frostDkgV2RosterHash".to_string(),
@@ -11689,7 +11748,11 @@ pub mod frost_dkg_v2 {
         Ok(hex_encode(&hasher.finalize()))
     }
 
-    fn artifact_hash(req: &FrostDkgV2RoundRequest, transcript_hash: &str, parts: &[&[u8]]) -> String {
+    fn artifact_hash(
+        req: &FrostDkgV2RoundRequest,
+        transcript_hash: &str,
+        parts: &[&[u8]],
+    ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(FINALIZE_DOMAIN);
         hasher.update(req.request_id.as_bytes());
@@ -11749,7 +11812,8 @@ pub mod frost_dkg_v2 {
     }
 
     fn write_private_json(path: &Path, value: &Value) -> WorkerResult<()> {
-        let bytes = serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
+        let bytes =
+            serde_json::to_vec_pretty(value).map_err(|err| WorkerError::Serde(err.to_string()))?;
         if let Some(parent) = path.parent() {
             create_private_dir(parent)?;
         }
@@ -12224,14 +12288,7 @@ mod tests {
             })
         );
         assert!(matches!(
-            run_program_with_runner(
-                &runner,
-                "../bad",
-                0,
-                &[0, 1, 2, 3, 4],
-                &[],
-                &[],
-            ),
+            run_program_with_runner(&runner, "../bad", 0, &[0, 1, 2, 3, 4], &[], &[],),
             Err(WorkerError::InvalidRequest(_))
         ));
         assert!(matches!(
@@ -12671,8 +12728,8 @@ mod tests {
         use crate::ca_local::{
             aggregate_registration_commitment, aggregate_registration_proof,
             create_registration_nonce_commitment, create_registration_partial_response,
-            init_ca_dkg_local, load_ca_share, registration_challenge,
-            verify_registration_proof, RegistrationCommitmentInput, RegistrationResponseInput,
+            init_ca_dkg_local, load_ca_share, registration_challenge, verify_registration_proof,
+            RegistrationCommitmentInput, RegistrationResponseInput,
         };
 
         let root = std::env::temp_dir().join(format!(
@@ -12722,8 +12779,9 @@ mod tests {
             .collect();
         let aggregate_commitment =
             aggregate_registration_commitment(&commitments).expect("aggregate commitment");
-        let challenge = registration_challenge(&summary.vault_ek, &sender, &asset, 2, &aggregate_commitment)
-            .expect("challenge");
+        let challenge =
+            registration_challenge(&summary.vault_ek, &sender, &asset, 2, &aggregate_commitment)
+                .expect("challenge");
 
         let mut responses = Vec::new();
         for (slot, nonce_result) in &nonce_results {
@@ -12762,8 +12820,18 @@ mod tests {
         .expect("verify registration proof");
 
         assert!(matches!(
-            aggregate_registration_proof(&summary.vault_ek, &sender, &asset, 2, Vec::new(), Vec::new()),
-            Err(WorkerError::UnderQuorum { threshold: 5, count: 0 })
+            aggregate_registration_proof(
+                &summary.vault_ek,
+                &sender,
+                &asset,
+                2,
+                Vec::new(),
+                Vec::new()
+            ),
+            Err(WorkerError::UnderQuorum {
+                threshold: 5,
+                count: 0
+            })
         ));
 
         let valid_commitment = summary.commitments[0].clone();
@@ -12822,14 +12890,13 @@ mod tests {
         use crate::ca_dkg_v2::init_hpke_local;
         use crate::frost_dkg_v2::{
             frost_dkg_v2_roster_hash, run_round, FrostDkgV2Roster, FrostDkgV2RosterNode,
-            FrostDkgV2RoundRequest, FROST_DKG_V2_DIR, FROST_KEY_PACKAGE_FILE,
-            FROST_MANIFEST_FILE, FROST_PUBLIC_PACKAGE_FILE, HPKE_KEYPAIR_FILE,
-            ROUND1_BROADCASTS_FILE, ROUND1_SELF_FILE, ROUND2_RECEIVED_DIR, ROUND2_SECRET_FILE,
-            STATE_FILE,
+            FrostDkgV2RoundRequest, FROST_DKG_V2_DIR, FROST_KEY_PACKAGE_FILE, FROST_MANIFEST_FILE,
+            FROST_PUBLIC_PACKAGE_FILE, HPKE_KEYPAIR_FILE, ROUND1_BROADCASTS_FILE, ROUND1_SELF_FILE,
+            ROUND2_RECEIVED_DIR, ROUND2_SECRET_FILE, STATE_FILE,
         };
         use crate::local_state::{
-            aggregate_frost_signature, create_frost_nonce_commitment, create_frost_partial_signature,
-            FrostCommitmentInput, FrostSignatureShareInput,
+            aggregate_frost_signature, create_frost_nonce_commitment,
+            create_frost_partial_signature, FrostCommitmentInput, FrostSignatureShareInput,
         };
         use std::collections::{BTreeMap, HashSet};
 
@@ -12937,7 +13004,10 @@ mod tests {
         }
         let mut round2_receive_transcripts: Vec<String> = Vec::new();
         for slot in 0..DEOPERATOR_COUNT {
-            let envelopes = envelopes_by_receiver.get(&slot).cloned().unwrap_or_default();
+            let envelopes = envelopes_by_receiver
+                .get(&slot)
+                .cloned()
+                .unwrap_or_default();
             let result = run_round(
                 &root.join(format!("slot-{slot}")),
                 FrostDkgV2RoundRequest {
@@ -13019,7 +13089,13 @@ mod tests {
             let slot_dir = root.join(format!("slot-{slot}"));
             let entries: HashSet<String> = std::fs::read_dir(&slot_dir)
                 .expect("read slot dir")
-                .map(|entry| entry.expect("entry").file_name().into_string().expect("utf8"))
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .into_string()
+                        .expect("utf8")
+                })
                 .collect();
             for name in &expected_files {
                 assert!(entries.contains(*name), "slot {slot} missing {name}");
@@ -13166,7 +13242,9 @@ mod tests {
                     .push(env.clone());
             }
         }
-        let target = corrupted_by_receiver.get_mut(&0).expect("envelopes for slot 0");
+        let target = corrupted_by_receiver
+            .get_mut(&0)
+            .expect("envelopes for slot 0");
         let original_first_byte = target[0]
             .hpke
             .ciphertext
