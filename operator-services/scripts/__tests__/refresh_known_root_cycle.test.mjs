@@ -256,6 +256,33 @@ describe("refresh_known_root_cycle.sh route-ready publication", () => {
     expect(readAllowlist()).toBe(`0xa=0x${"b".repeat(64)},0x1=0x${"b".repeat(64)}`);
   });
 
+  it("defaults to V4 event ingestion when the coordinator state has a V4 asset registry", () => {
+    writeObservedArtifacts(8);
+    writeFileSync(join(stateDir, "asset_registry.json"), JSON.stringify({ assets: [] }, null, 2));
+
+    const result = runWrapper({
+      FAKE_TREE_ROOT: NEW_ROOT,
+      DKG_EPOCH: "1",
+      VAULT_EK: "0x" + "7".repeat(64),
+      CA_DKG_TRANSCRIPT_HASH: "0x" + "8".repeat(64),
+      COORDINATOR_BEARER_TOKEN: "fake-coordinator-token",
+      APTOS_NODE_URL: "https://fullnode.testnet.aptoslabs.com/v1",
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("observe staged route leaves");
+    expect(readAllowlist()).toBe(`0xa=0x${"b".repeat(64)}`);
+    expect(readOps()).toEqual([
+      "normalize",
+      "build",
+      "observe:9",
+      "rollover",
+      "normalize",
+      "record",
+      "asp",
+    ]);
+  });
+
   it("derives coordinator state dir from EUNOMA_STATE_ROOT when no explicit state dir is set", () => {
     const stateRoot = join(tmpRoot, "state-root");
     stateDir = join(stateRoot, "coordinator");
