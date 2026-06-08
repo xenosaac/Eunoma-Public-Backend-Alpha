@@ -22,5 +22,6 @@
   },
   "devDependencies": {
     "puppeteer": "^24.43.1"
-  }
+  },
+  "license": "SEE LICENSE IN LICENSE"
 }
